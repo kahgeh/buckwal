@@ -4,7 +4,8 @@ use crate::config::{Config, EngineConfig};
 use crate::conn::Connection;
 use crate::engine::{engine_error, open_engine, Engine};
 use crate::error::{Error, Result};
-use crate::format::{decode_record, Keys, LocalState, LogRecord};
+use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
+use crate::format::{decode_record, Keys, LocalState, LogRecord, FORMAT};
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, restore_staged};
 use crate::store::{with_retry, ObjectStore, StatsSnap};
@@ -19,9 +20,6 @@ use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use turso_core::{File, OpenFlags, PlatformIO, IO};
 
-const DB_FILE: &str = "app.db";
-const LOCK_FILE: &str = "durable.lock";
-
 /// The canonical directories this process holds (D4). `durable.lock`'s `fcntl` lock is per
 /// process and is released when any handle to it in the process closes, so a second open in
 /// this process must be refused before it opens any file.
@@ -29,10 +27,6 @@ static OPEN_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::def
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::Io(format!("{what}: {e}"))
 }
 
 /// A directory this process holds: its entry in the process registry, and the exclusive lock
@@ -170,9 +164,25 @@ impl std::fmt::Debug for Database {
 /// Open the database `config` names, as its one writer: restore it into an empty directory
 /// when the bucket already holds it, create it when it does not, or continue the directory's
 /// own database.
+///
+/// Opening an empty directory whose bucket prefix holds a database, or a directory restored
+/// by [`crate::restore`] and never opened, takes the database over: this process claims it
+/// under a new writer id, and a writer still running elsewhere is fenced for good (its next
+/// commit fails `Fenced`). [`is_claimed`] tells the cases apart beforehand.
 pub fn open(config: Config) -> Result<Database> {
     let store = config.s3_store()?;
     open_with_store(config, store)
+}
+
+/// Whether `dir` holds a database a writer already owns, so a writer [`open`] continues it.
+/// False for a missing or empty directory, one restored and never opened as a writer, or one
+/// an interrupted restore left: there `open` would restore, claim or create the database,
+/// taking it over from any writer still running. It reads only local files.
+pub fn is_claimed(dir: &Path) -> Result<bool> {
+    if dir.join(RESTORING_FILE).exists() {
+        return Ok(false);
+    }
+    Ok(LocalState::read(dir)?.is_some_and(|s| s.claimed))
 }
 
 #[doc(hidden)]
@@ -311,7 +321,7 @@ fn create_new(
         writer_id.clone(),
     )?;
     let state = LocalState {
-        format: 1,
+        format: FORMAT,
         writer_id,
         generation: 1,
         complete: true,

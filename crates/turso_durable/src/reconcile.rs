@@ -14,11 +14,12 @@
 use crate::bucket::{Bucket, LogPos};
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
+use crate::files::{io_err, DB_FILE, DIRTY_FILE, WAL_FILE};
 use crate::format::{LocalState, Op};
-use crate::io::db_storage::{truncate_dirty_file, DIRTY_FILE, READ_ONLY};
+use crate::io::db_storage::{truncate_dirty_file, READ_ONLY};
+use crate::io::wal_file::EPOCH;
 use crate::restore::{generation_image, page_one_seed, write_synced};
 use std::fs;
-use std::ops::Range;
 use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,17 +30,8 @@ pub(crate) enum Reconciled {
     NewGeneration,
 }
 
-const DB_FILE: &str = "app.db";
-const WAL_FILE: &str = "app.db-wal";
 /// `Ahead` uploads the local `-wal` in chunks of this size where it differs from `B`.
 const CHUNK: usize = 4096;
-/// Bytes 12..24 of the WAL header: checkpoint sequence and the two salts. They change at
-/// every WAL restart, which is a generation boundary (D6).
-const EPOCH: Range<usize> = 12..24;
-
-fn io_err(what: &str, e: std::io::Error) -> Error {
-    Error::Io(format!("{what}: {e}"))
-}
 
 /// Bring `dir` level with the bucket's current generation (D9). `bucket` is attached as
 /// `state.writer_id`; it is handed to `open_engine` afterwards. `Behind` and
@@ -69,9 +61,13 @@ pub(crate) fn reconcile(
         && (head.generation != state.generation + 1 || head.manifest != Some(state.generation))
     {
         return Err(Error::Corrupt(format!(
-            "local state is at generation {}, but the head is at generation {} with manifest \
-             {:?}: only the generation right after a seal of the local one can be taken in",
-            state.generation, head.generation, head.manifest
+            "{} is stale: its local state is at generation {}, but the head is at generation \
+             {} with manifest {:?}, and only the generation right after a seal of the local one \
+             can be taken in; restore again into a new directory",
+            dir.display(),
+            state.generation,
+            head.generation,
+            head.manifest
         )));
     }
     let image = generation_image(&*bucket.store(), bucket.keys(), &head, cfg)?.0;

@@ -8,7 +8,7 @@
 
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
-use crate::format::{encode_record, Head, Keys, LogRecord, Manifest, Op};
+use crate::format::{encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
 use crate::store::{with_retry, CondPut, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -72,8 +72,6 @@ pub(crate) struct Bucket {
     counters: Arc<Counters>,
     events: Option<EventHook>,
 }
-
-const FORMAT: u32 = 1;
 
 /// `with_retry` that also counts extra attempts in `counters.retries`.
 fn retrying<T>(

@@ -5,7 +5,8 @@
 use super::stash::stash;
 use super::{read_at, sync_file, write_at};
 use crate::error::{Error, Result};
-use crate::format::{Keys, LocalState, Manifest};
+use crate::files::{io_err, DIRTY_FILE};
+use crate::format::{Keys, LocalState, Manifest, FORMAT};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
 use crate::uploader::Uploader;
 use std::collections::{BTreeSet, HashSet};
@@ -16,14 +17,12 @@ use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64,
     Ordering::{Relaxed, SeqCst},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use turso_core::io::FileSyncType;
 use turso_core::{Buffer, Completion, DatabaseStorage, File, IOContext, IO};
 
-pub(crate) const DIRTY_FILE: &str = "app.db-dirty";
 /// What a read-only open's IO answers to every write the engine attempts.
 pub(crate) const READ_ONLY: &str = "writes on a read-only open";
-const FORMAT: u32 = 1;
 
 /// The pages a seal uploads: the in-memory dirty set, the persisted dirty set (u32 LE page
 /// numbers; a torn trailing entry is ignored) and every page in a frame of the local `-wal`,
@@ -57,10 +56,6 @@ fn read_dirty_file(path: &Path) -> Result<Vec<u8>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(io_err("read dirty file", e)),
     }
-}
-
-fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::Io(format!("{what}: {e}"))
 }
 
 #[derive(Default)]
@@ -221,8 +216,9 @@ impl BucketDbStorage {
         Ok(())
     }
 
-    /// Fetch every page the manifest names; once all are local, nothing is fetched again.
-    /// Returns early, leaving the rest to be fetched on read, once `stop` is set.
+    /// Fetch every page the manifest names; once all are local, nothing is fetched again, in
+    /// this process or a later one (`mark_complete`). Returns early, leaving the rest to be
+    /// fetched on read, once `stop` is set.
     pub(crate) fn prefetch(&self, stop: &AtomicBool) {
         let Some(m) = &self.manifest else {
             return;
@@ -232,7 +228,36 @@ impl BucketDbStorage {
                 return;
             }
         }
+        // A failure leaves `complete=false` on disk: the next seal records it.
+        let _ = self.mark_complete();
+    }
+
+    /// Every page is local: fsync the fetched pages, then record `complete=true` in the local
+    /// state at once, so a later process fetches nothing either. The in-memory flag is set
+    /// even if that fails (the pages are local in this process).
+    fn mark_complete(&self) -> Result<()> {
+        let dirty = self.dirty.lock().unwrap();
+        let r = sync_file(&*self.file, &*self.io)
+            .map_err(|e| io_err("fsync db", e))
+            .and_then(|_| match LocalState::read(&self.dir)? {
+                Some(state) => self.write_state(
+                    &dirty,
+                    &LocalState {
+                        complete: true,
+                        ..state
+                    },
+                ),
+                None => Ok(()),
+            });
         self.complete.store(true, SeqCst);
+        r
+    }
+
+    /// The one way this process writes `app.db-durable` once the engine is open: under the
+    /// dirty mutex (`_held`), which the seal holds for its whole run, so the seal and
+    /// `mark_complete` never write it at the same time or from stale reads.
+    fn write_state(&self, _held: &MutexGuard<'_, Dirty>, state: &LocalState) -> Result<()> {
+        state.write_atomic(&self.dir)
     }
 
     fn record_written(&self, first: u32, count: usize, page_size: usize) {
@@ -311,15 +336,15 @@ impl BucketDbStorage {
         sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
         // Only a claimed writer seals (a read-only open never writes), and the head's ETag
         // changed with this seal, so none is kept.
-        LocalState {
+        let state = LocalState {
             format: FORMAT,
             writer_id: self.writer_id.clone(),
             generation,
             complete: self.complete.load(SeqCst),
             claimed: true,
             head_etag: String::new(),
-        }
-        .write_atomic(&self.dir)?;
+        };
+        self.write_state(&dirty, &state)?;
         truncate_dirty_file(&self.dirty_path())?;
         dirty.memory.clear();
         dirty.unpersisted.clear();

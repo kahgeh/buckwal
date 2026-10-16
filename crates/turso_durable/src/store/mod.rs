@@ -53,15 +53,15 @@ pub struct StatsSnap {
 }
 
 impl StatsSnap {
-    /// The counters accumulated since the earlier snapshot `e`.
+    /// The counters accumulated since the earlier snapshot `e` (each floors at 0).
     pub fn since(&self, e: &StatsSnap) -> StatsSnap {
         StatsSnap {
-            puts: self.puts - e.puts,
-            gets: self.gets - e.gets,
-            lists: self.lists - e.lists,
-            deletes: self.deletes - e.deletes,
-            bytes_up: self.bytes_up - e.bytes_up,
-            bytes_down: self.bytes_down - e.bytes_down,
+            puts: self.puts.saturating_sub(e.puts),
+            gets: self.gets.saturating_sub(e.gets),
+            lists: self.lists.saturating_sub(e.lists),
+            deletes: self.deletes.saturating_sub(e.deletes),
+            bytes_up: self.bytes_up.saturating_sub(e.bytes_up),
+            bytes_down: self.bytes_down.saturating_sub(e.bytes_down),
         }
     }
     /// Every request is one sequential round trip.
@@ -85,4 +85,36 @@ pub trait ObjectStore: Send + Sync {
     fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError>;
     fn delete(&self, key: &str) -> std::result::Result<(), StoreError>;
     fn stats(&self) -> StatsSnap;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatsSnap;
+
+    /// A snapshot taken from a different store (or one whose counters were reset) never
+    /// underflows: each counter floors at 0.
+    #[test]
+    fn stats_since_saturates() {
+        let small = StatsSnap {
+            puts: 1,
+            gets: 5,
+            ..StatsSnap::default()
+        };
+        let big = StatsSnap {
+            puts: 3,
+            gets: 2,
+            lists: 1,
+            deletes: 1,
+            bytes_up: 10,
+            bytes_down: 10,
+        };
+        assert_eq!(
+            small.since(&big),
+            StatsSnap {
+                gets: 3,
+                ..StatsSnap::default()
+            }
+        );
+        assert_eq!(big.since(&StatsSnap::default()), big);
+    }
 }

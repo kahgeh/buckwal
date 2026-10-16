@@ -6,6 +6,7 @@ pub(crate) mod conn;
 pub(crate) mod db;
 pub(crate) mod engine;
 pub mod error;
+pub(crate) mod files;
 pub(crate) mod format;
 pub(crate) mod guard;
 pub(crate) mod io;
@@ -17,7 +18,7 @@ pub(crate) mod uploader;
 
 pub use config::{Config, Event, EventHook};
 pub use conn::{CheckpointMode, Connection, Transaction};
-pub use db::{open, Database};
+pub use db::{is_claimed, open, Database};
 #[doc(hidden)]
 pub use db::{open_read_only, open_read_only_with_store, open_with_store};
 pub use error::{Error, Result};

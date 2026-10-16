@@ -512,6 +512,38 @@ fn crash_matrix(mode: &str) {
     }
 }
 
+/// The engine's own checkpoint (PASSIVE, every 1000 WAL frames; soak without
+/// `--checkpoint`): three runs, each killed after at least `kill_after` acks and at least one
+/// finished seal (the auto-checkpoint's WAL restart seals in the commit after it).
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_auto() {
+    for kill_after in [700, 1500, 2500] {
+        let ctx = Ctx::new(&format!("crash_auto_{kill_after}"));
+        let dir = ctx.dir("db");
+        let mut soak = Soak::spawn(&ctx, &dir, &[]);
+        soak.wait_acks(kill_after);
+        soak.wait_for("a seal", |s| s.count("event seal-finished") >= 1);
+        soak.kill();
+        assert!(soak.errors().is_empty(), "auto: {:?}", soak.errors());
+        let seals = soak.count("event seal-finished");
+        assert!(seals >= 1, "auto: no seal before the kill\n{}", soak.tail());
+        let acks = soak.acks();
+        let head = ctx.head();
+        assert!(
+            head.manifest.is_some(),
+            "auto: the bucket holds no sealed manifest"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        eprintln!(
+            "crash_auto: kill after {acks} acks (target {kill_after}): acked={} seals={seals} \
+             head generation={} {} unacked_present={}",
+            v.acked, head.generation, v.restored, v.unacked_present
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_passive() {
@@ -667,7 +699,16 @@ fn fault_deleted_page_object_fails_read() {
     let r = r.to_str().unwrap();
     ctx.ok(&["restore", "--dir", r]);
     let sql = "SELECT count(*), sum(length(payload)) FROM soak";
+    // Without --claim, sql refuses the restored directory and leaves the head alone.
     let out = ctx.run(&["sql", "--dir", r, sql]);
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("--claim"), "{}", out.stderr);
+    assert_eq!(
+        ctx.head().writer_id,
+        head.writer_id,
+        "a refused sql claimed"
+    );
+    let out = ctx.run(&["sql", "--claim", "--dir", r, sql]);
     assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
     let key = victim.strip_prefix(&format!("{}/", ctx.prefix())).unwrap();
     assert!(

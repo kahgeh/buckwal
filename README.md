@@ -61,7 +61,8 @@ The API:
 
 | Item | What it does |
 |---|---|
-| `open(Config) -> Result<Database>` | Opens `config.dir` as the database's one writer (see the table below). |
+| `open(Config) -> Result<Database>` | Opens `config.dir` as the database's one writer (see the table below). On an empty or restored directory it takes the database over (see the warning below). |
+| `is_claimed(dir) -> Result<bool>` | `true` when `dir` already holds a writer's own database, so `open` continues it. `false` for a missing or empty directory, or one restored and never opened, where `open` would take the database over. It reads only local files. |
 | `Database::connect() -> Result<Connection>` | A new connection. Open one per thread. |
 | `Database::generation()` | The generation the bucket's head is at, as this writer last saw it. |
 | `Database::bucket_stats()` | PUTs, GETs, LISTs, DELETEs and bytes sent so far (`store::StatsSnap`). |
@@ -84,6 +85,8 @@ What `open` does depends on the directory:
 | restored by `restore`, never opened | — | Claims it, then continues. |
 | this library's directory | — | Continues it. It first reconciles the local WAL with the bucket (D9). |
 | an `app.db` this library did not create | — | `Error::Config`. An existing SQLite or tursodb file cannot be adopted. |
+
+**Warning: opening a restored or empty directory as the writer takes the database over.** `open` claims the database under a new writer id, and the old writer, if it is still running anywhere, is fenced for good: its next commit fails with `Fenced`. Open such a directory only on purpose, for example to move the database to a new machine. To read the database without taking it over, use `verify` (CLI). Call `is_claimed(dir)` first to tell the cases apart.
 
 The files in the directory:
 
@@ -120,11 +123,13 @@ Errors are `turso_durable::Error`:
 |---|---|
 | `restore --dir DIR` | Restores into an empty `DIR`. It prints `restored generation=… log_objects=… gets=… lists=… bytes=… ms=…`. |
 | `verify --dir DIR [--acked FILE]` | Opens `DIR` read-only and runs `PRAGMA integrity_check`. With `--acked`, it checks that every id in FILE (lines `ack <id>` or `<id>`) is in table `soak`, and fails if an id was acked twice. `DIR` may be empty, in which case it restores first. Verify never claims, never seals and never writes to the bucket. |
-| `sql --dir DIR SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. |
+| `sql --dir DIR [--claim] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, or restored and never opened) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. There is no read-only fallback; use `verify` to read. |
 | `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors. |
 | `bench --dir DIR --commits N` | Runs N single-row commits of 1 KB and prints `key=value` lines: commit p50/p95/p99/max, commits/s, log PUTs per commit, page PUTs, and each seal's ms and page count. |
 
 Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on bad arguments.
+
+**Warning:** `sql --claim` on a restored or empty directory takes the database over. The old writer is fenced, and its next commit fails. `soak` and `bench` always open as the writer, so run them only on their own prefix.
 
 ## Settings
 
@@ -138,7 +143,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_SECRET_KEY` | `secret_key` | required | Redacted from `Debug`. |
 | `DURABLE_REGION` | `region` | `us-east-1` | Used for SigV4. |
 | `DURABLE_PATH_STYLE` | `path_style` | `true` | `endpoint/bucket/key`. Set it to `false` for virtual-hosted style. Accepts `0`/`1`/`true`/`false`. |
-| `DURABLE_PREFIX` | `prefix` | `""` (bucket root) | Every key goes under `<prefix>/`. Use one prefix per database. |
+| `DURABLE_PREFIX` | `prefix` | `""` (bucket root) | Every key goes under `<prefix>/`. Use one prefix per database. Only `A-Z a-z 0-9 . _ - /` are allowed, with no leading or trailing `/` and no `//`; anything else fails with `Config`. |
 | `DURABLE_RETRY_DEADLINE_MS` | `retry_deadline` | 30 s | How long one bucket job may keep retrying transient errors: a commit's log upload, a seal, or a page fetch. |
 | `DURABLE_REQUEST_TIMEOUT_MS` | `request_timeout` | 10 s | One HTTP request. |
 | `DURABLE_UPLOAD_CONCURRENCY` | `upload_concurrency` | 16 | Parallel page PUTs in a seal, and parallel log GETs in a restore. Must be at least 1. |
@@ -147,8 +152,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 
 Where the defaults live:
 - `crates/turso_durable/src/config.rs`, `mod defaults`, holds every default above.
-- The retry backoff is fixed and cannot be configured. It starts at 50 ms, doubles, and is capped at 2 s. It lives in `crates/turso_durable/src/store/retry.rs` (`RetryPolicy::default`).
-- A copy of the 30 s retry deadline also sits in `RetryPolicy::default`; `config.rs` always overrides it.
+- The retry backoff is fixed and cannot be configured. It starts at 50 ms (`FIRST_BACKOFF`), doubles, and is capped at 2 s (`MAX_BACKOFF`). Both are in `mod defaults` too. `RetryPolicy::default` in `crates/turso_durable/src/store/retry.rs` takes all three retry values from there.
 - There is no batching setting in stage 1: every commit is its own upload. The runtime batching setting comes in stage 2.
 - The busy timeout between connections is fixed at 5 s. It lives in `crates/turso_durable/src/conn.rs` (`BUSY_TIMEOUT`).
 
@@ -196,7 +200,7 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 ```
 
 - It is written to a temp file, fsynced, renamed, and then the directory is fsynced.
-- `complete=false` means pages not yet read since this process opened come from the bucket.
+- `complete=false` means pages not yet read since this process opened come from the bucket. A finished prefetch writes `complete=true` at once; a seal also writes the current value.
 - `claimed=false` with `head_etag` marks a restored directory that no writer has opened yet. An older file without these two keys reads as `claimed=true` with an empty `head_etag`.
 
 **Writer id.** 16 random bytes in hex. A new database and every claim get a new id.
@@ -256,6 +260,12 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - In the 5000-commit bench, the commit p50 was 1.33 ms, while the slowest commit took 69.8 ms. That commit is most likely the one that crossed the first boundary (bench does not record which commit triggered a seal), whose seal took 39.4 ms for 169 pages.
 - Each in-run seal took 37–44 ms for 169–172 pages.
 - You can move this wait off a latency-sensitive path by calling `Connection::checkpoint(CheckpointMode::Truncate)` at a quiet moment.
+
+**Limits.**
+- Without `prefetch`, a restored database fetches pages lazily in every process that opens it, until a prefetch completes. Each process fetches each page it reads once. Only a finished prefetch marks the directory `complete`.
+- Short-lived processes never trim. The trimmer waits `trim_grace` (10 min by default) after each seal, and close stops it. A process that exits sooner than `trim_grace` after its seals deletes nothing, so the bucket grows until a long-lived process trims or stage 3's `gc` runs.
+- Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large (a long-running reader that blocks checkpoints, for example) makes the seal large too. `CheckpointMode::Truncate` at quiet moments keeps generations small.
+- Never copy a live database directory (`cp -r`, a VM or disk clone). The copy has the same writer id, so fencing cannot tell the two processes apart. Restore into a new directory instead.
 
 **Edge cases.**
 - `PRAGMA wal_checkpoint` reports an upload failure as a busy row, not as an error (vdbe/execute.rs:796-803). Use `Connection::checkpoint` to get the error.

@@ -155,16 +155,57 @@ fn between<'a>(s: &'a str, open: &str, close: &str) -> Vec<&'a str> {
     out
 }
 
+/// Undo XML escaping in element text: the five predefined entities and numeric character
+/// references (`&#NN;`, `&#xHH;`). Anything else (an unknown or malformed reference, a bare
+/// `&`) is kept as it is.
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').and_then(|j| {
+            let c = match &rest[1..j] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                e => {
+                    let n = match e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => e.strip_prefix('#')?.parse().ok()?,
+                    };
+                    char::from_u32(n)?
+                }
+            };
+            Some((c, j + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub(crate) fn parse_list(xml: &str) -> ListPage {
     let keys = between(xml, "<Key>", "</Key>")
         .into_iter()
-        .map(str::to_string)
+        .map(xml_unescape)
         .collect();
     let truncated = between(xml, "<IsTruncated>", "</IsTruncated>").first() == Some(&"true");
     let next = if truncated {
         between(xml, "<NextContinuationToken>", "</NextContinuationToken>")
             .first()
-            .map(|s| s.to_string())
+            .map(|s| xml_unescape(s))
     } else {
         None
     };
@@ -482,6 +523,25 @@ mod tests {
         let last =
             parse_list("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
         assert!(last.keys.is_empty() && last.next.is_none());
+    }
+
+    /// ListObjectsV2 escapes XML special characters in `<Key>` (and in the token): they are
+    /// unescaped, so a key comes back exactly as it was written.
+    #[test]
+    fn parse_list_unescapes_xml() {
+        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+            <Contents><Key>p&amp;q/&lt;x&gt;&quot;&apos;&#65;&#x42;&#x3c;/1</Key></Contents>\
+            <Contents><Key>a&amp;amp;b &unknown; &#xZZ; &</Key></Contents>\
+            <NextContinuationToken>t&amp;k</NextContinuationToken></ListBucketResult>";
+        let page = parse_list(xml);
+        assert_eq!(
+            page.keys,
+            vec![
+                "p&q/<x>\"'AB</1".to_string(),
+                "a&amp;b &unknown; &#xZZ; &".to_string()
+            ]
+        );
+        assert_eq!(page.next.as_deref(), Some("t&k"));
     }
 
     #[test]

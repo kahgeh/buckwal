@@ -5,6 +5,7 @@
 use crate::bucket::Bucket;
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
+use crate::files::{io_err, DB_FILE};
 use crate::format::LocalState;
 use crate::io::db_storage::StorageParts;
 use crate::io::{stash, BucketDbStorage, DurableIo};
@@ -66,14 +67,13 @@ pub(crate) fn open_engine(
     trim_tx: Option<Sender<TrimSnapshot>>,
 ) -> Result<Engine> {
     let db_path = dir
-        .join("app.db")
+        .join(DB_FILE)
         .to_str()
         .ok_or_else(|| Error::Config(format!("{} is not UTF-8", dir.display())))?
         .to_string();
     // The engine opens its WAL at exactly this path (database.rs:1495).
     let wal_path = format!("{db_path}-wal");
-    let platform: Arc<dyn IO> =
-        Arc::new(PlatformIO::new().map_err(|e| Error::Io(format!("platform IO: {e}")))?);
+    let platform: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| io_err("platform IO", e))?);
     let store = bucket.store();
     let keys = bucket.keys().clone();
     let manifest = bucket.manifest().cloned();
@@ -131,7 +131,7 @@ pub(crate) fn open_engine(
                 s.prefetch(&stop2);
                 done2.store(true, SeqCst);
             })
-            .map_err(|e| Error::Io(format!("spawn prefetch thread: {e}")))?;
+            .map_err(|e| io_err("spawn prefetch thread", e))?;
         Some(Prefetch {
             stop,
             done,

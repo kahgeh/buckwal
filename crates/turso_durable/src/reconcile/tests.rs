@@ -4,8 +4,9 @@ use crate::engine::tests::{
     restored, run, seal_now, writer, writer_with,
 };
 use crate::engine::{open_engine, Engine};
+use crate::files::DIRTY_FILE;
 use crate::format::{encode_record, Head, LogRecord};
-use crate::io::db_storage::{seal_page_set, DIRTY_FILE};
+use crate::io::db_storage::seal_page_set;
 use crate::io::stash;
 use crate::io::wal_file::wal_frame_pages;
 use crate::restore::{generation_image, restore_into};
@@ -477,7 +478,8 @@ fn dirty_pages_are_local_at_open() {
 }
 
 /// Behind the head by more than one sealed generation, or by one the head's manifest does
-/// not name: the local files cannot be brought level.
+/// not name: the local files cannot be brought level, and the error says the directory is
+/// stale and to restore again.
 #[test]
 fn generation_jump_is_corrupt() {
     let mem = Arc::new(MemStore::new());
@@ -492,7 +494,8 @@ fn generation_jump_is_corrupt() {
     s.generation = 0;
     let r = reconcile(crashed.path(), &mut b, &mut s, &cfg());
     assert!(
-        matches!(&r, Err(Error::Corrupt(m)) if m.contains("generation")),
+        matches!(&r, Err(Error::Corrupt(m))
+            if m.contains("generation") && m.contains("stale") && m.contains("restore again")),
         "{r:?}"
     );
 
@@ -509,7 +512,8 @@ fn generation_jump_is_corrupt() {
     let wal = local_wal(crashed2.path());
     let r = reconcile(crashed2.path(), &mut b, &mut s, &cfg());
     assert!(
-        matches!(&r, Err(Error::Corrupt(m)) if m.contains("generation")),
+        matches!(&r, Err(Error::Corrupt(m))
+            if m.contains("generation") && m.contains("stale") && m.contains("restore again")),
         "{r:?}"
     );
     assert_eq!(

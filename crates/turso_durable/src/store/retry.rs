@@ -1,6 +1,7 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Bounded retry with exponential backoff for transient store errors.
 use super::StoreError;
+use crate::config::defaults;
 use crate::error::{Error, Result};
 use std::time::{Duration, Instant};
 
@@ -11,12 +12,13 @@ pub struct RetryPolicy {
     pub max_backoff: Duration,
 }
 
+/// The policy of a default [`crate::Config`]: every value from [`crate::config::defaults`].
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            deadline: Duration::from_secs(30),
-            first_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_secs(2),
+            deadline: defaults::RETRY_DEADLINE,
+            first_backoff: defaults::FIRST_BACKOFF,
+            max_backoff: defaults::MAX_BACKOFF,
         }
     }
 }

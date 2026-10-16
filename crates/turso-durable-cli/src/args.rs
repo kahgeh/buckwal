@@ -32,6 +32,8 @@ pub enum Command {
     Sql {
         dir: PathBuf,
         statements: Vec<String>,
+        /// Allowed to restore, claim or create the database (`is_claimed` is false).
+        claim: bool,
     },
     Soak(SoakArgs),
     Bench {
@@ -43,7 +45,7 @@ pub enum Command {
 pub const USAGE: &str = "usage: turso-durable <command> [options]
   restore --dir DIR
   verify  --dir DIR [--acked FILE]
-  sql     --dir DIR SQL...
+  sql     --dir DIR [--claim] SQL...
   soak    --dir DIR [--checkpoint passive|full|restart|truncate|reopen] [--every N]
           [--start ID] [--count N] [--page-put-delay-ms N]
   bench   --dir DIR --commits N
@@ -66,6 +68,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut count = None;
     let mut delay = None;
     let mut commits = None;
+    let mut claim = false;
 
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -81,6 +84,10 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         let known = match (cmd.as_str(), a.as_str()) {
             (_, "--dir") => {
                 dir = Some(PathBuf::from(value(a)?));
+                true
+            }
+            ("sql", "--claim") => {
+                claim = true;
                 true
             }
             ("verify", "--acked") => {
@@ -143,6 +150,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::Sql {
                 dir,
                 statements: positional,
+                claim,
             })
         }
         "soak" => Ok(Command::Soak(SoakArgs {
@@ -209,7 +217,16 @@ mod tests {
             p(&["sql", "--dir", "d", "SELECT 1", "SELECT 2"]),
             Ok(Command::Sql {
                 dir: d.clone(),
-                statements: vec!["SELECT 1".into(), "SELECT 2".into()]
+                statements: vec!["SELECT 1".into(), "SELECT 2".into()],
+                claim: false
+            })
+        );
+        assert_eq!(
+            p(&["sql", "--claim", "--dir", "d", "SELECT 1"]),
+            Ok(Command::Sql {
+                dir: d.clone(),
+                statements: vec!["SELECT 1".into()],
+                claim: true
             })
         );
         assert_eq!(
@@ -263,6 +280,10 @@ mod tests {
         assert!(p(&["soak", "--dir", "d", "--checkpoint", "weird"]).is_err());
         assert!(p(&["soak", "--dir", "d", "--count", "x"]).is_err());
         assert!(p(&["sql", "--dir", "d"]).is_err());
+        assert!(p(&["sql", "--dir", "d", "--claim"]).is_err());
+        // --claim belongs to sql alone.
+        assert!(p(&["restore", "--dir", "d", "--claim"]).is_err());
+        assert!(p(&["verify", "--dir", "d", "--claim"]).is_err());
     }
 
     #[test]

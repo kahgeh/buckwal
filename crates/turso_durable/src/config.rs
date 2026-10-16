@@ -14,6 +14,11 @@ pub mod defaults {
 
     /// How long one bucket call (with its retries) may take before it fails.
     pub const RETRY_DEADLINE: Duration = Duration::from_secs(30);
+    /// The first sleep after a transient bucket error; each later sleep doubles. Fixed: no
+    /// `Config` field or variable sets it.
+    pub const FIRST_BACKOFF: Duration = Duration::from_millis(50);
+    /// The longest sleep between two retries. Fixed: no `Config` field or variable sets it.
+    pub const MAX_BACKOFF: Duration = Duration::from_secs(2);
     /// How long one HTTP request may take.
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
     /// Parallel uploads in a seal, and parallel log fetches in a restore.
@@ -39,7 +44,8 @@ pub struct Config {
     /// Path-style addressing (`endpoint/bucket/key`) rather than virtual-hosted.
     pub path_style: bool,
     pub bucket: String,
-    /// Every key of this database goes under `<prefix>/` ("" = the bucket root).
+    /// Every key of this database goes under `<prefix>/` ("" = the bucket root). Only
+    /// `[A-Za-z0-9._/-]`, with no leading, trailing or doubled `/` (`Config` otherwise).
     pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
@@ -103,6 +109,29 @@ fn parse_num<T: std::str::FromStr>(var: &str, v: &str) -> Result<T> {
     v.trim()
         .parse()
         .map_err(|_| Error::Config(format!("{var} must be a non-negative integer, not {v:?}")))
+}
+
+/// A prefix is "" or `/`-separated non-empty segments of `[A-Za-z0-9._-]`. Keys must come
+/// back from a LIST spelled exactly as they were written; these characters need no XML or
+/// URL escaping anywhere.
+fn validate_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    if let Some(c) = prefix
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')))
+    {
+        return Err(Error::Config(format!(
+            "prefix {prefix:?} holds {c:?}: only A-Z, a-z, 0-9, '.', '_', '-' and '/' are allowed"
+        )));
+    }
+    if prefix.split('/').any(str::is_empty) {
+        return Err(Error::Config(format!(
+            "prefix {prefix:?} must not start or end with '/' or hold '//'"
+        )));
+    }
+    Ok(())
 }
 
 impl Config {
@@ -201,7 +230,7 @@ impl Config {
                 "upload_concurrency must be at least 1".into(),
             ));
         }
-        Ok(())
+        validate_prefix(&self.prefix)
     }
 
     pub(crate) fn keys(&self) -> Keys {
@@ -212,7 +241,8 @@ impl Config {
         EngineConfig {
             retry: RetryPolicy {
                 deadline: self.retry_deadline,
-                ..RetryPolicy::default()
+                first_backoff: defaults::FIRST_BACKOFF,
+                max_backoff: defaults::MAX_BACKOFF,
             },
             upload_concurrency: self.upload_concurrency,
             prefetch: self.prefetch,
@@ -299,6 +329,17 @@ mod tests {
         assert_eq!(c.trim_grace, Duration::from_secs(600));
         assert!(!c.prefetch);
         assert!(!format!("{c:?}").contains("sk\""), "the secret is printed");
+        let mut c = c;
+        c.retry_deadline = Duration::from_millis(1234);
+        let r = c.engine(false).retry;
+        assert_eq!(
+            (r.deadline, r.first_backoff, r.max_backoff),
+            (
+                Duration::from_millis(1234),
+                Duration::from_millis(50),
+                Duration::from_secs(2)
+            )
+        );
     }
 
     #[test]
@@ -377,5 +418,42 @@ mod tests {
         assert!(matches!(crate::open(c), Err(Error::Config(_))));
         let c = Config::new("/d", "https://e", "b", "ak", "sk");
         assert!(matches!(crate::open(c), Err(Error::Unsupported("https"))));
+    }
+
+    /// A prefix is limited to `[A-Za-z0-9._/-]` with no empty segment: anything else (XML
+    /// special characters above all) would come back from a LIST in another spelling.
+    #[test]
+    fn config_prefix_validation() {
+        let with = |prefix: &str| {
+            let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+            c.prefix = prefix.to_string();
+            c.validate()
+        };
+        for ok in ["", "dbs", "dbs/one", "a.b_c-d/E9", "sys/crash_auto-123"] {
+            assert_eq!(with(ok), Ok(()), "{ok:?}");
+        }
+        for bad in [
+            "a&b",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a'b",
+            "a b",
+            "a+b",
+            "caf\u{e9}",
+            "/a",
+            "a/",
+            "/",
+            "a//b",
+            "a\\b",
+        ] {
+            match with(bad) {
+                Err(Error::Config(m)) => assert!(m.contains("prefix"), "{bad:?}: {m}"),
+                r => panic!("{bad:?}: {r:?}"),
+            }
+        }
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.prefix = "x&y".into();
+        assert!(matches!(crate::open(c), Err(Error::Config(_))));
     }
 }

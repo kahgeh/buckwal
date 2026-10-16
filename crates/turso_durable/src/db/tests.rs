@@ -952,6 +952,85 @@ fn close_stops_prefetch_before_releasing_the_dir() {
     assert_eq!(ids(&db.connect().unwrap()), (1..=300).collect::<Vec<_>>());
 }
 
+/// A finished prefetch is recorded in the local state at once, not at the next seal: a later
+/// process of the directory fetches nothing, even when no seal ever ran in between.
+#[test]
+fn finished_prefetch_persists_complete() {
+    let store = mem();
+    let _a = closed_writer(&store, 200);
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let state = || LocalState::read(r.path()).unwrap().unwrap();
+    assert!(!state().complete);
+
+    let mut cfg = config(r.path());
+    cfg.prefetch = true;
+    // No connection: close runs no checkpoint, so nothing seals in this process.
+    let db = open_with_store(cfg, store.clone()).unwrap();
+    let (storage, done) = {
+        let open = db.shared.open.lock().unwrap();
+        let e = &open.as_ref().unwrap().engine;
+        (e.storage.clone(), e.prefetch.as_ref().unwrap().done.clone())
+    };
+    let t = Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "prefetch never ended"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(storage.is_complete());
+    assert!(storage.lazy_gets() > 0);
+    assert!(
+        state().complete,
+        "a finished prefetch is not in the local state"
+    );
+    let generation = state().generation;
+    drop(storage);
+    db.close().unwrap();
+    assert_eq!(state().generation, generation, "nothing sealed");
+
+    let db = open_with_store(config(r.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), (1..=200).collect::<Vec<_>>());
+    let storage = {
+        let open = db.shared.open.lock().unwrap();
+        open.as_ref().unwrap().engine.storage.clone()
+    };
+    assert_eq!(storage.lazy_gets(), 0, "a complete directory fetched pages");
+}
+
+/// `is_claimed` says whether a writer open would continue the directory's own database
+/// (true) or restore, claim or create one (false): empty, missing, restored and never
+/// opened, or mid-restore.
+#[test]
+fn is_claimed_only_for_a_writers_own_directory() {
+    let store = mem();
+    let t = tempdir();
+    assert!(!crate::is_claimed(&fresh(&t)).unwrap(), "missing dir");
+    assert!(!crate::is_claimed(t.path()).unwrap(), "empty dir");
+    let a = closed_writer(&store, 3);
+    assert!(crate::is_claimed(a.path()).unwrap(), "the writer's own dir");
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    assert!(
+        !crate::is_claimed(r.path()).unwrap(),
+        "restored, never opened"
+    );
+    std::fs::write(r.path().join("app.db-restoring"), b"").unwrap();
+    assert!(
+        !crate::is_claimed(r.path()).unwrap(),
+        "an interrupted restore"
+    );
+    std::fs::remove_file(r.path().join("app.db-restoring")).unwrap();
+    open_mem(&store, r.path()).close().unwrap();
+    assert!(
+        crate::is_claimed(r.path()).unwrap(),
+        "claimed by its first open"
+    );
+}
+
 /// Staging directories of a restore that crashed mid-way are swept at the next open.
 #[test]
 fn leftover_staging_dirs_are_swept() {

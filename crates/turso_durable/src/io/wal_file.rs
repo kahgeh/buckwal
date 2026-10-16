@@ -6,6 +6,7 @@ use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
 use crate::error::{Error, Result};
+use crate::files::io_err;
 use crate::format::Op;
 use crate::uploader::Uploader;
 use std::collections::BTreeSet;
@@ -15,8 +16,10 @@ use turso_core::{Buffer, Completion, File, IO};
 
 const WAL_HEADER: usize = 32;
 const FRAME_HEADER: usize = 24;
-/// Bytes 12..24 of the WAL header: checkpoint sequence and the two salts.
-const EPOCH: std::ops::Range<usize> = 12..24;
+/// Bytes 12..24 of the WAL header: checkpoint sequence and the two salts. They change at
+/// every WAL restart, which is a generation boundary (D6). Boundary detection here and
+/// reconcile's "the local WAL holds an older generation" both compare exactly these bytes.
+pub(crate) const EPOCH: std::ops::Range<usize> = 12..24;
 
 /// The page number of every whole frame in a `-wal` image (page size from header bytes
 /// 8..12, frames from offset 32, each `24 + page_size` bytes, page number in frame bytes
@@ -43,7 +46,7 @@ pub(crate) fn wal_frame_pages(wal: &[u8]) -> BTreeSet<u32> {
 }
 
 fn engine_io(e: turso_core::LimboError) -> Error {
-    Error::Io(format!("-wal: {e}"))
+    io_err("-wal", e)
 }
 
 pub(crate) struct ShippingFile {
@@ -133,8 +136,18 @@ impl ShippingFile {
         Ok(())
     }
 
-    fn record(&self, op: Op) {
-        self.pending.lock().unwrap().push(op);
+    /// Record `ops` once the inner call that issued them returned `Ok`: a write or truncate
+    /// refused synchronously never happened, so it must never be shipped. (A failure reported
+    /// later, through its completion, panics the engine, D3.)
+    fn record_if_ok(
+        &self,
+        ops: Vec<Op>,
+        r: turso_core::Result<Completion>,
+    ) -> turso_core::Result<Completion> {
+        if r.is_ok() {
+            self.pending.lock().unwrap().extend(ops);
+        }
+        r
     }
 }
 
@@ -158,11 +171,11 @@ impl File for ShippingFile {
         if pos == 0 {
             self.on_header(buffer.as_slice())?;
         }
-        self.record(Op::Write {
+        let op = Op::Write {
             off: pos,
             bytes: buffer.as_slice().to_vec(),
-        });
-        self.inner.pwrite(pos, buffer, c)
+        };
+        self.record_if_ok(vec![op], self.inner.pwrite(pos, buffer, c))
     }
     fn pwritev(
         &self,
@@ -177,16 +190,15 @@ impl File for ShippingFile {
             }
         }
         let mut off = pos;
-        let mut p = self.pending.lock().unwrap();
+        let mut ops = Vec::with_capacity(buffers.len());
         for b in &buffers {
-            p.push(Op::Write {
+            ops.push(Op::Write {
                 off,
                 bytes: b.as_slice().to_vec(),
             });
             off += b.len() as u64;
         }
-        drop(p);
-        self.inner.pwritev(pos, buffers, c)
+        self.record_if_ok(ops, self.inner.pwritev(pos, buffers, c))
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
         // Upload before any completion exists: a failed upload is a synchronous `Err`, which
@@ -206,7 +218,79 @@ impl File for ShippingFile {
             }
             *h = None;
         }
-        self.record(Op::Truncate { len });
-        self.inner.truncate(len, c)
+        self.record_if_ok(vec![Op::Truncate { len }], self.inner.truncate(len, c))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::writer;
+    use crate::store::MemStore;
+    use turso_core::LimboError;
+
+    /// A `-wal` whose every write and truncate fails synchronously.
+    struct Refusing;
+
+    fn refused() -> LimboError {
+        LimboError::InternalError("refused".into())
+    }
+
+    impl File for Refusing {
+        fn lock_file(&self, _: bool) -> turso_core::Result<()> {
+            Ok(())
+        }
+        fn unlock_file(&self) -> turso_core::Result<()> {
+            Ok(())
+        }
+        fn pread(&self, _: u64, _: Completion) -> turso_core::Result<Completion> {
+            Err(refused())
+        }
+        fn pwrite(&self, _: u64, _: Arc<Buffer>, _: Completion) -> turso_core::Result<Completion> {
+            Err(refused())
+        }
+        fn pwritev(
+            &self,
+            _: u64,
+            _: Vec<Arc<Buffer>>,
+            _: Completion,
+        ) -> turso_core::Result<Completion> {
+            Err(refused())
+        }
+        fn sync(&self, _: Completion, _: FileSyncType) -> turso_core::Result<Completion> {
+            Err(refused())
+        }
+        fn size(&self) -> turso_core::Result<u64> {
+            Ok(0)
+        }
+        fn truncate(&self, _: u64, _: Completion) -> turso_core::Result<Completion> {
+            Err(refused())
+        }
+    }
+
+    /// A write or truncate the inner file refused synchronously never happened: no op is
+    /// left behind for the next sync to ship.
+    #[test]
+    fn refused_writes_record_no_op() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem, d.path());
+        let f = ShippingFile::new(
+            Arc::new(Refusing),
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            e.uploader.clone(),
+            e.storage.clone(),
+            false,
+        )
+        .unwrap();
+        let buf = || Arc::new(Buffer::new(vec![7u8; 64]));
+        assert!(f
+            .pwrite(4096, buf(), Completion::new_write(|_| {}))
+            .is_err());
+        assert!(f
+            .pwritev(4096, vec![buf(), buf()], Completion::new_write(|_| {}))
+            .is_err());
+        assert!(f.truncate(4096, Completion::new_trunc(|_| {})).is_err());
+        assert_eq!(f.pending.lock().unwrap().len(), 0, "phantom ops recorded");
     }
 }

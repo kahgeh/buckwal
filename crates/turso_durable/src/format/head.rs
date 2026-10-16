@@ -1,13 +1,13 @@
 //! `head` object (bucket) and `app.db-durable` (local state): flat JSON.
 use super::json::{escape, Obj};
+use super::FORMAT;
 use crate::error::{Error, Result};
+use crate::files::{io_err, STATE_FILE};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-const FORMAT: u32 = 1;
 const MANIFEST_DIR: &str = "manifest/";
-const LOCAL_FILE: &str = "app.db-durable";
 
 fn corrupt(m: &str) -> Error {
     Error::Corrupt(m.to_string())
@@ -85,10 +85,6 @@ pub(crate) struct LocalState {
     pub head_etag: String,
 }
 
-fn io(what: &str, e: std::io::Error) -> Error {
-    Error::Io(format!("{what}: {e}"))
-}
-
 impl LocalState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         format!(
@@ -125,24 +121,24 @@ impl LocalState {
 
     /// Temp file in `dir`, fsync, rename over `app.db-durable`, fsync `dir`.
     pub(crate) fn write_atomic(&self, dir: &Path) -> Result<()> {
-        let tmp = dir.join(format!("{LOCAL_FILE}.tmp"));
-        let dst = dir.join(LOCAL_FILE);
-        let mut f = File::create(&tmp).map_err(|e| io("create temp state", e))?;
+        let tmp = dir.join(format!("{STATE_FILE}.tmp"));
+        let dst = dir.join(STATE_FILE);
+        let mut f = File::create(&tmp).map_err(|e| io_err("create temp state", e))?;
         f.write_all(&self.encode())
-            .map_err(|e| io("write state", e))?;
-        f.sync_all().map_err(|e| io("fsync state", e))?;
+            .map_err(|e| io_err("write state", e))?;
+        f.sync_all().map_err(|e| io_err("fsync state", e))?;
         drop(f);
-        fs::rename(&tmp, &dst).map_err(|e| io("rename state", e))?;
+        fs::rename(&tmp, &dst).map_err(|e| io_err("rename state", e))?;
         File::open(dir)
             .and_then(|d| d.sync_all())
-            .map_err(|e| io("fsync state dir", e))
+            .map_err(|e| io_err("fsync state dir", e))
     }
 
     pub(crate) fn read(dir: &Path) -> Result<Option<LocalState>> {
-        match fs::read(dir.join(LOCAL_FILE)) {
+        match fs::read(dir.join(STATE_FILE)) {
             Ok(b) => LocalState::decode(&b).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(io("read state", e)),
+            Err(e) => Err(io_err("read state", e)),
         }
     }
 }

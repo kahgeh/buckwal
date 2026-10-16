@@ -146,7 +146,18 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
     db.close().map_err(err)
 }
 
-fn sql(dir: &Path, statements: &[String]) -> CliResult<()> {
+/// Run `statements` with `dir` opened as the writer. Without `claim`, only a directory the
+/// writer already owns: opening any other (empty, or restored and never opened) restores,
+/// claims or creates the database, and fences a writer still running elsewhere.
+fn sql(dir: &Path, statements: &[String], claim: bool) -> CliResult<()> {
+    if !claim && !turso_durable::is_claimed(dir).map_err(err)? {
+        return Err(format!(
+            "{} holds no database this writer owns: opening it would restore or create the \
+             database and take it over from any writer still running, which is then fenced for \
+             good; use `verify --dir` to read it, or pass --claim to take it over",
+            dir.display()
+        ));
+    }
     let db = turso_durable::open(config(dir)?).map_err(err)?;
     let conn = db.connect().map_err(err)?;
     for s in statements {
@@ -170,7 +181,11 @@ fn main() -> ExitCode {
     let result = match &cmd {
         Command::Restore { dir } => restore(dir),
         Command::Verify { dir, acked } => verify(dir, acked.as_deref()),
-        Command::Sql { dir, statements } => sql(dir, statements),
+        Command::Sql {
+            dir,
+            statements,
+            claim,
+        } => sql(dir, statements, *claim),
         Command::Soak(a) => soak::run(a),
         Command::Bench { dir, commits } => bench::run(dir, *commits),
     };
@@ -204,6 +219,22 @@ mod tests {
         assert!(e.contains("[4, 5]"), "{e}");
         let e = check_ids(&[1, 1], &set(&[1])).unwrap_err();
         assert!(e.contains("duplicate_acks=1"), "{e}");
+    }
+
+    /// Without --claim, `sql` refuses a directory a writer open would restore, claim or
+    /// create, before it reads any setting or touches the bucket.
+    #[test]
+    fn sql_refuses_an_unclaimed_directory_without_claim() {
+        let t = tempfile::tempdir().unwrap();
+        for dir in [t.path().to_path_buf(), t.path().join("missing")] {
+            let e = sql(&dir, &["SELECT 1".to_string()], false).unwrap_err();
+            assert!(
+                e.contains("--claim") && e.contains("take") && e.contains("verify"),
+                "{e}"
+            );
+            assert!(!e.contains('\n'), "one line: {e}");
+        }
+        assert!(!t.path().join("missing").exists(), "created the directory");
     }
 
     #[test]

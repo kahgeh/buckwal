@@ -5,7 +5,10 @@
 use crate::config::{Config, EngineConfig};
 use crate::db::DirGuard;
 use crate::error::{Error, Result};
-use crate::format::{apply_ops, decode_record, Head, Keys, LocalState, LogRecord, Manifest};
+use crate::files::{io_err, DB_FILE, DIRTY_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
+use crate::format::{
+    apply_ops, decode_record, Head, Keys, LocalState, LogRecord, Manifest, FORMAT,
+};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
 use std::fs;
 use std::io::Write;
@@ -25,10 +28,6 @@ pub struct RestoreReport {
     /// Bytes downloaded.
     pub bytes: u64,
     pub elapsed: Duration,
-}
-
-fn io_err(what: &str, e: std::io::Error) -> Error {
-    Error::Io(format!("{what}: {e}"))
 }
 
 fn get(store: &dyn ObjectStore, retry: &RetryPolicy, key: &str) -> Result<Vec<u8>> {
@@ -219,7 +218,7 @@ pub(crate) fn restore_into(
 ) -> Result<RestoreReport> {
     let start = Instant::now();
     let before = store.stats();
-    for f in ["app.db", "app.db-wal"] {
+    for f in [DB_FILE, WAL_FILE] {
         if dir.join(f).exists() {
             return Err(Error::Config(format!(
                 "{} already holds a database ({f})",
@@ -247,13 +246,13 @@ pub(crate) fn restore_into(
         None => page_one_seed(&wal)?,
     };
     fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
-    write_synced(&dir.join("app.db-wal"), &wal)?;
-    write_synced(&dir.join("app.db"), &db)?;
+    write_synced(&dir.join(WAL_FILE), &wal)?;
+    write_synced(&dir.join(DB_FILE), &db)?;
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))?;
     LocalState {
-        format: 1,
+        format: FORMAT,
         writer_id: head.writer_id.clone(),
         generation: head.generation,
         complete: false,
@@ -292,10 +291,8 @@ pub fn restore_with_store(
     restore_staged(store, &config.keys(), guard.dir(), &config.engine(false))
 }
 
-/// Present while a restore moves its files into the directory; see `restore_staged`.
-const RESTORING: &str = "app.db-restoring";
 /// Moved in this order: the local state last, so a directory with a state file is whole.
-const RESTORED: [&str; 3] = ["app.db-wal", "app.db", "app.db-durable"];
+const RESTORED: [&str; 3] = [WAL_FILE, DB_FILE, STATE_FILE];
 
 /// Restore into `dir` (held by the caller: `DirGuard`) without ever leaving it half
 /// restored: the files are built in a staging directory next to it (same filesystem), then
@@ -309,7 +306,7 @@ pub(crate) fn restore_staged(
     cfg: &EngineConfig,
 ) -> Result<RestoreReport> {
     clear_interrupted_restore(dir)?;
-    for f in ["app.db", "app.db-wal", "app.db-durable"] {
+    for f in [DB_FILE, WAL_FILE, STATE_FILE] {
         if dir.join(f).exists() {
             return Err(Error::Config(format!(
                 "{} already holds a database ({f})",
@@ -365,7 +362,7 @@ fn fsync_dir(dir: &Path) -> Result<()> {
 }
 
 fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
-    write_synced(&dir.join(RESTORING), b"")?;
+    write_synced(&dir.join(RESTORING_FILE), b"")?;
     fsync_dir(dir)?;
     for f in RESTORED {
         let from = staging.join(f);
@@ -374,7 +371,7 @@ fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
         }
     }
     fsync_dir(dir)?;
-    fs::remove_file(dir.join(RESTORING)).map_err(|e| io_err("remove restore marker", e))?;
+    fs::remove_file(dir.join(RESTORING_FILE)).map_err(|e| io_err("remove restore marker", e))?;
     fsync_dir(dir)
 }
 
@@ -384,10 +381,10 @@ fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
 /// empty again. Called with the directory held, so no restore of it is running.
 pub(crate) fn clear_interrupted_restore(dir: &Path) -> Result<()> {
     sweep_staging_dirs(dir)?;
-    if !dir.join(RESTORING).exists() {
+    if !dir.join(RESTORING_FILE).exists() {
         return Ok(());
     }
-    for f in RESTORED.iter().chain(&["app.db-dirty"]) {
+    for f in RESTORED.iter().chain(&[DIRTY_FILE]) {
         match fs::remove_file(dir.join(f)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -395,6 +392,6 @@ pub(crate) fn clear_interrupted_restore(dir: &Path) -> Result<()> {
         }
     }
     fsync_dir(dir)?;
-    fs::remove_file(dir.join(RESTORING)).map_err(|e| io_err("remove restore marker", e))?;
+    fs::remove_file(dir.join(RESTORING_FILE)).map_err(|e| io_err("remove restore marker", e))?;
     fsync_dir(dir)
 }
