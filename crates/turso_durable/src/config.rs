@@ -300,6 +300,14 @@ pub enum Event {
     Trimmed { deleted: u64 },
 }
 
+impl EngineConfig {
+    /// A writer idle this long checks the head before its next append
+    /// (`Bucket::set_idle_threshold`, `Bucket::check_idle`): half the trim grace.
+    pub(crate) fn idle_threshold(&self) -> Duration {
+        self.trim_grace / 2
+    }
+}
+
 /// How the engine talks to the bucket.
 #[derive(Clone)]
 pub(crate) struct EngineConfig {

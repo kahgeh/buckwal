@@ -66,9 +66,9 @@ pub(crate) fn open_engine(
     cfg: &EngineConfig,
     trim_tx: Option<Sender<TrimSnapshot>>,
 ) -> Result<Engine> {
-    // Only a trimmed `log/G` lets an old writer's append land after a claim, and the trimmer
-    // waits `trim_grace` after the seal that moved the head (`Bucket::check_idle`).
-    bucket.set_idle_threshold(cfg.trim_grace / 2);
+    // `db` sets it right after create or attach, before any append; this covers every other
+    // caller (`Bucket::check_idle`).
+    bucket.set_idle_threshold(cfg.idle_threshold());
     let db_path = dir
         .join(DB_FILE)
         .to_str()

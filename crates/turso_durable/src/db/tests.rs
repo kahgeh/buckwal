@@ -1095,6 +1095,86 @@ fn single_writer_with_idle_check_on_every_append_keeps_working() {
     );
 }
 
+/// The head GETs and log PUTs among `events` (a `FaultStore` log), in order.
+fn head_and_log_events(events: &[String]) -> Vec<String> {
+    let head = format!("get {}", keys().head());
+    events
+        .iter()
+        .filter(|e| **e == head || e.starts_with("put_if_absent ") && e.contains("/log/"))
+        .map(|e| {
+            if *e == head {
+                "get head".to_string()
+            } else {
+                "put log".to_string()
+            }
+        })
+        .collect()
+}
+
+/// The `/2` margin, end to end: with `trim_grace` = 200 ms a commit right after another
+/// makes no head GET, and a commit after 120 ms of idle (past the 100 ms threshold) GETs the
+/// head before its log PUT.
+#[test]
+fn commit_after_half_the_trim_grace_checks_the_head() {
+    let mem = mem();
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let a = tempdir();
+    let mut cfg = config(a.path());
+    cfg.trim_grace = Duration::from_millis(200);
+    let db = open_with_store(cfg, fault.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    insert(&c, 1).unwrap();
+
+    let before = fault.events().len();
+    insert(&c, 2).unwrap();
+    assert_eq!(
+        head_and_log_events(&fault.events()[before..]),
+        ["put log"],
+        "right after a commit: no head GET"
+    );
+
+    std::thread::sleep(Duration::from_millis(120));
+    let before = fault.events().len();
+    insert(&c, 3).unwrap();
+    assert_eq!(
+        head_and_log_events(&fault.events()[before..]),
+        ["get head", "put log"],
+        "after 120 ms of idle: the head first"
+    );
+    crash(db, vec![c]);
+}
+
+/// The claim record (and any record appended before the engine opens) uses the configured
+/// threshold, not the built-in one: with `trim_grace` = 0 the claimer GETs the head right
+/// before it.
+#[test]
+fn claim_record_append_uses_the_configured_idle_threshold() {
+    let mem = mem();
+    let a = tempdir();
+    let db_a = open_mem(&mem, a.path());
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    insert(&ca, 1).unwrap();
+    let gen = head(&*mem).generation;
+    let next = *log_seqs(&*mem, gen).last().unwrap() + 1;
+    let r = tempdir();
+    restore_with_store(&config(r.path()), mem.clone(), r.path()).unwrap();
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let mut cfg = config(r.path());
+    cfg.trim_grace = Duration::ZERO;
+    let db_b = open_with_store(cfg, fault.clone()).unwrap();
+    let ev = fault.events();
+    let claim_put = format!("put_if_absent {}", keys().log(gen, next));
+    let at = ev
+        .iter()
+        .position(|e| *e == claim_put)
+        .expect("the claim record");
+    assert_eq!(ev[at - 1], format!("get {}", keys().head()), "{ev:?}");
+    drop(db_b);
+    crash(db_a, vec![ca]);
+}
+
 /// A claim whose record never landed (the open failed after the head write): the next open
 /// sees the generation's last record is another writer's and appends one then.
 #[test]

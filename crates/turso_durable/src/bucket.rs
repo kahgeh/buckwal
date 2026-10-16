@@ -69,9 +69,11 @@ pub(crate) struct Bucket {
     /// generation + 1, so nothing may go to this generation until that is known.
     pending_seal: Option<PendingSeal>,
     fenced: bool,
-    /// When the last confirmed write (a log record or the head; create and attach count, as
-    /// they read or write the head) was sent. Page and manifest PUTs are not counted, which
-    /// only makes the idle check run sooner.
+    /// The idle timer (`check_idle`): when the request behind the last confirmation was sent.
+    /// It is refreshed by a confirmed log record (`put_log`), a confirmed head write
+    /// (`put_head`, and `create`'s), open's head read (`attach`), and a head GET that passes
+    /// `check_head` (unchanged) or `verify_head`. A failed or ambiguous request refreshes
+    /// nothing, and neither do page and manifest PUTs (which only makes the check run sooner).
     last_confirmed: Instant,
     /// See `set_idle_threshold`.
     idle_threshold: Duration,
@@ -124,11 +126,12 @@ pub(crate) const RESTORE_AGAIN: &str =
 /// claim, an old writer restarting on its own disk is fenced by the writer-id check at
 /// attach. A still-running one is fenced at its next append: through the claim record when
 /// it appends within the trim grace, and otherwise (`log/G` may be trimmed by then) through
-/// the idle head check before that append (`Bucket::check_idle`). It is also fenced at the
-/// start of its next seal (`Bucket::seal_start`: its seal-start record collides, or the head
-/// moved), before it uploads a page or a manifest, so it cannot overwrite a generation the
-/// new writer sealed. The log stays linear; stage 3's lease closes the remaining races
-/// (`seal_start` names one). Such a generation holds the old writer's records, then the new one's, which
+/// the idle head check before that append (`Bucket::check_idle`, under the trim-grace
+/// assumptions it lists). It is also fenced at the start of its next seal
+/// (`Bucket::seal_start`: its seal-start record collides, or the head moved), before it
+/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed.
+/// The log stays linear; stage 3's lease closes the remaining races (`seal_start` names
+/// one). Such a generation holds the old writer's records, then the new one's, which
 /// `restore::generation_image` accepts.
 pub(crate) fn claim(
     store: &dyn ObjectStore,
@@ -336,6 +339,15 @@ impl Bucket {
         self.idle_threshold = t;
     }
 
+    /// Move the idle timer back by `by`, as if the last confirmed write were that much older.
+    #[cfg(test)]
+    pub(crate) fn age_idle_timer(&mut self, by: Duration) {
+        self.last_confirmed = self
+            .last_confirmed
+            .checked_sub(by)
+            .expect("an instant that far back");
+    }
+
     pub(crate) fn set_event_hook(&mut self, events: Option<EventHook>) {
         self.events = events;
     }
@@ -390,12 +402,21 @@ impl Bucket {
 
     /// The idle self-check before an append. Another writer's claim record fences this one at
     /// its next append, but only while `log/G` exists: once that writer has sealed G and its
-    /// trimmer has deleted `log/G` (a trim grace after the seal), this writer's next record
-    /// would land in a log no restore reads, and its commit would be acked. Any append after
-    /// the claim collides with the claim record, so this writer can only reach a trimmed
-    /// `log/G` after being idle for at least the trim grace. So an append after
-    /// `idle_threshold` (half the trim grace) without a confirmed write GETs the head first,
-    /// within the call's deadline (`verify_head`): ours, it proceeds; anything else fences.
+    /// trimmer has deleted `log/G` (its trim grace after the seal), this writer's next record
+    /// would land in a log no restore reads, and its commit would be acked. So an append after
+    /// `idle_threshold` (half this writer's trim grace) without a refresh of the idle timer
+    /// GETs the head first, within the call's deadline (`verify_head`): ours, it proceeds;
+    /// anything else fences.
+    ///
+    /// This holds only under assumptions that nothing here enforces (README, Settings):
+    /// - every writer on the prefix uses the same trim grace; a claimer whose grace is
+    ///   smaller than this writer's can trim `log/G` before this writer's check is due;
+    /// - the trim grace exceeds 2 × (retry deadline + request timeout): an append that
+    ///   skipped the check can still land up to that long after the timer's last refresh;
+    /// - a trim grace of 0 (tests only) checks before every append, but the claimer's
+    ///   trimmer then deletes `log/G` at once, inside any in-flight append's window.
+    ///
+    /// Stage 3's lease replaces this.
     fn check_idle(&mut self, start: Instant) -> Result<()> {
         if self.last_confirmed.elapsed() < self.idle_threshold {
             return Ok(());

@@ -313,13 +313,14 @@ fn create_new(
     cfg: &EngineConfig,
 ) -> Result<(Bucket, LocalState)> {
     let writer_id = new_writer_id()?;
-    let bucket = Bucket::create(
+    let mut bucket = Bucket::create(
         store.clone(),
         keys.clone(),
         cfg.retry.clone(),
         cfg.upload_concurrency,
         writer_id.clone(),
     )?;
+    bucket.set_idle_threshold(cfg.idle_threshold());
     let state = LocalState {
         format: FORMAT,
         writer_id,
@@ -364,6 +365,8 @@ fn attach_existing(
         cfg.upload_concurrency,
         &state.writer_id,
     )?;
+    // Before reconcile's catch-up record and the claim (or foreign-tail) record below.
+    bucket.set_idle_threshold(cfg.idle_threshold());
     let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
     if !cfg.read_only && (claiming || last_record_is_foreign(&bucket, &state.writer_id, cfg)?) {
         bucket.append_log(vec![])?;

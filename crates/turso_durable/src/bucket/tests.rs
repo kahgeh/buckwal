@@ -300,12 +300,13 @@ fn seal_start_accepts_our_own_late_head() {
 }
 
 /// The idle self-check: an append after `idle_threshold` without a confirmed write GETs the
-/// head first; one before it does not.
+/// head first; one before it does not. The timer is moved by hand (`age_idle_timer`), so a
+/// slow machine cannot turn "before" into "after".
 #[test]
 fn append_after_idle_threshold_checks_the_head_first() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.set_idle_threshold(Duration::from_millis(100));
+    b.set_idle_threshold(Duration::from_secs(10));
     let k = keys();
 
     let before = f.fault.events().len();
@@ -316,25 +317,80 @@ fn append_after_idle_threshold_checks_the_head_first() {
         "inside the threshold: no head GET"
     );
 
-    std::thread::sleep(Duration::from_millis(150));
+    b.age_idle_timer(Duration::from_secs(9));
     let before = f.fault.events().len();
     b.append_log(syncs(2)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
+        [format!("put_if_absent {}", k.log(1, 2))],
+        "9 s of a 10 s threshold: no head GET"
+    );
+
+    b.age_idle_timer(Duration::from_secs(11));
+    let before = f.fault.events().len();
+    b.append_log(syncs(3)).unwrap();
+    assert_eq!(
+        f.fault.events()[before..],
         [
             format!("get {}", k.head()),
-            format!("put_if_absent {}", k.log(1, 2))
+            format!("put_if_absent {}", k.log(1, 3))
         ],
         "idle past the threshold: the head is checked first"
     );
 
     // The append just confirmed a write: the next one goes straight to the log again.
     let before = f.fault.events().len();
-    b.append_log(syncs(3)).unwrap();
+    b.append_log(syncs(4)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
-        [format!("put_if_absent {}", k.log(1, 3))]
+        [format!("put_if_absent {}", k.log(1, 4))]
     );
+}
+
+/// A failed or ambiguous append confirms nothing: it does not refresh the idle timer, so
+/// once the threshold has passed since the last confirmed write, the next append still GETs
+/// the head first (then settles the in-doubt record).
+#[test]
+fn failed_or_ambiguous_append_does_not_refresh_the_idle_timer() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let k = keys();
+    for ambiguous in [false, true] {
+        let f = Fixture::new();
+        let mut b = f.create(short.clone(), 4);
+        b.set_idle_threshold(Duration::from_secs(10));
+        b.append_log(syncs(1)).unwrap();
+        // 9 s after the last confirmed write: no check, and this append fails.
+        b.age_idle_timer(Duration::from_secs(9));
+        if ambiguous {
+            f.fault.store_then_fail_next_puts(1);
+        }
+        f.fault.fail_puts_after(0);
+        let before = f.fault.events().len();
+        assert!(matches!(b.append_log(syncs(2)), Err(Error::Timeout(_))));
+        assert!(
+            !f.fault.events()[before..].contains(&format!("get {}", k.head())),
+            "ambiguous={ambiguous}: no check inside the threshold"
+        );
+        assert_eq!(f.record(1, 2).is_some(), ambiguous);
+        f.fault.fail_puts_after(u64::MAX);
+
+        // 2 s later: 11 s since the last confirmed write. Had the failed append refreshed
+        // the timer, it would be 2 s and nothing would be checked.
+        b.age_idle_timer(Duration::from_secs(2));
+        let before = f.fault.events().len();
+        assert_eq!(b.append_log(syncs(3)).map(|p| p.seq), Ok(3));
+        let ev = f.fault.events()[before..].to_vec();
+        assert_eq!(
+            ev[0],
+            format!("get {}", k.head()),
+            "ambiguous={ambiguous}: {ev:?}"
+        );
+        assert_eq!(f.record(1, 2), Some(ours(2)));
+        assert_eq!(f.record(1, 3), Some(ours(3)));
+    }
 }
 
 /// Idle past the threshold with the head moved by another writer (it claimed and sealed
