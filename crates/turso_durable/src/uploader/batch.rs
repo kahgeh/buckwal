@@ -8,24 +8,30 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 /// One submitted sync waiting to be uploaded: its ops, the setting it was committed with,
-/// its commit number and where its result goes.
+/// its commit number, where its result goes, and its commit's span (the submitter's current
+/// span), which its upload's span hangs from.
 pub(crate) struct Pending {
     pub ops: Vec<Op>,
     pub batching: Batching,
     pub commit: u64,
     pub reply: Sender<Result<LogPos>>,
+    pub span: tracing::Span,
+}
+
+/// The bytes `ops`' writes carry; truncates count nothing.
+pub(crate) fn op_bytes(ops: &[Op]) -> u64 {
+    ops.iter()
+        .map(|op| match op {
+            Op::Write { bytes, .. } => bytes.len() as u64,
+            Op::Truncate { .. } => 0,
+        })
+        .sum()
 }
 
 impl Pending {
     /// The bytes its writes carry; truncates count nothing.
     pub(crate) fn bytes(&self) -> u64 {
-        self.ops
-            .iter()
-            .map(|op| match op {
-                Op::Write { bytes, .. } => bytes.len() as u64,
-                Op::Truncate { .. } => 0,
-            })
-            .sum()
+        op_bytes(&self.ops)
     }
 }
 
@@ -107,6 +113,7 @@ mod tests {
             batching,
             commit: 0,
             reply,
+            span: tracing::Span::none(),
         }
     }
 
@@ -219,6 +226,7 @@ mod tests {
             batching: Batching::Off,
             commit: 1,
             reply,
+            span: tracing::Span::none(),
         };
         assert_eq!(p.bytes(), 15);
     }

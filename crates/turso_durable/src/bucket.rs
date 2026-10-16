@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::Span;
 
 /// Where a log object lives: `log/<generation>/<seq>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,10 +304,17 @@ impl Bucket {
             .ok_or_else(|| Error::NotFound("head".into()))?;
         let head = Head::decode(&obj.body)?;
         if head.writer_id != writer_id {
-            return Err(Error::Fenced(format!(
+            let e = Error::Fenced(format!(
                 "head names writer {:?}, not {writer_id:?}",
                 head.writer_id
-            )));
+            ));
+            tracing::error!(
+                generation = head.generation,
+                writer_id,
+                error = %e,
+                "writer fenced"
+            );
+            return Err(e);
         }
         let manifest = match head.manifest {
             None => None,
@@ -383,6 +391,18 @@ impl Bucket {
         }
     }
 
+    /// This writer is fenced for good: every later append and seal is refused. Returns `e`.
+    fn fence(&mut self, e: Error) -> Error {
+        self.fenced = true;
+        tracing::error!(
+            generation = self.head.generation,
+            writer_id = %self.head.writer_id,
+            error = %e,
+            "writer fenced"
+        );
+        e
+    }
+
     fn check_fenced(&self) -> Result<()> {
         if self.fenced {
             return Err(Error::Fenced(
@@ -409,12 +429,38 @@ impl Bucket {
     /// It emits no `Event::LogUploaded` for this record: only the caller knows its commit
     /// numbers, so the uploader emits it. (Claim and reconcile records are appended before
     /// the uploader sets the event hook.) A record settled on the way is emitted here.
+    ///
+    /// It records `durable.generation` and `durable.seq` (the record's position, or the one
+    /// it was meant for) and `durable.retries` (`Appended::retries`) on the current span.
     pub(crate) fn append_log(
         &mut self,
         syncs: Vec<Vec<Op>>,
     ) -> std::result::Result<Appended, AppendFailure> {
-        let start = Instant::now();
         let retries = self.counters.retries.load(Relaxed);
+        let r = self.append_log_at(syncs, retries);
+        let span = Span::current();
+        let pos = match &r {
+            Ok(a) => a.pos,
+            Err(_) => LogPos {
+                generation: self.head.generation,
+                seq: self.seq,
+            },
+        };
+        span.record("durable.generation", pos.generation);
+        span.record("durable.seq", pos.seq);
+        span.record(
+            "durable.retries",
+            self.counters.retries.load(Relaxed).saturating_sub(retries),
+        );
+        r
+    }
+
+    fn append_log_at(
+        &mut self,
+        syncs: Vec<Vec<Op>>,
+        retries: u64,
+    ) -> std::result::Result<Appended, AppendFailure> {
+        let start = Instant::now();
         if let Err(e) = self.check_fenced().and_then(|()| self.before_record(start)) {
             return Err(AppendFailure {
                 error: upload_error(e),
@@ -525,12 +571,9 @@ impl Bucket {
                 Ok(HeadCheck::Unmoved)
             }
             Some(o) if o.body == pending_body => Ok(HeadCheck::Published(o.etag)),
-            _ => {
-                self.fenced = true;
-                Err(Error::Fenced(
-                    "the head was changed by another writer".into(),
-                ))
-            }
+            _ => Err(self.fence(Error::Fenced(
+                "the head was changed by another writer".into(),
+            ))),
         }
     }
 
@@ -594,10 +637,7 @@ impl Bucket {
                 self.counters.log_puts.fetch_add(1, Relaxed);
                 Ok(pos)
             }
-            Err(e @ Error::Fenced(_)) => {
-                self.fenced = true;
-                Err(e)
-            }
+            Err(e @ Error::Fenced(_)) => Err(self.fence(e)),
             Err(e) => {
                 self.in_doubt = Some(InDoubt { pos, body });
                 Err(e)
@@ -628,6 +668,9 @@ impl Bucket {
     /// Publish generation G: an empty seal-start record and a head check (`seal_start`), then
     /// its dirty pages, its manifest, then move the head to G+1 with a conditional write.
     /// Returns G+1.
+    ///
+    /// It records `durable.generation` (G), `durable.pages` and `durable.retries` on the
+    /// current span, and logs the finished seal.
     pub(crate) fn seal_generation(
         &mut self,
         pages: Vec<(u32, Vec<u8>)>,
@@ -635,9 +678,28 @@ impl Bucket {
         page_count: u32,
     ) -> Result<u64> {
         let start = Instant::now();
-        self.check_fenced()?;
-        self.seal(start, pages, page_size, page_count)
-            .map_err(upload_error)
+        let (generation, n) = (self.head.generation, pages.len() as u64);
+        let retries = self.counters.retries.load(Relaxed);
+        let span = Span::current();
+        span.record("durable.generation", generation);
+        span.record("durable.pages", n);
+        let r = self.check_fenced().and_then(|()| {
+            self.seal(start, pages, page_size, page_count)
+                .map_err(upload_error)
+        });
+        span.record(
+            "durable.retries",
+            self.counters.retries.load(Relaxed).saturating_sub(retries),
+        );
+        if r.is_ok() {
+            tracing::info!(
+                generation,
+                pages = n,
+                ms = start.elapsed().as_millis() as u64,
+                "seal finished"
+            );
+        }
+        r
     }
 
     /// The new head is published: adopt it, its ETag and manifest. Returns its generation.
@@ -763,12 +825,9 @@ impl Bucket {
                 self.last_confirmed = sent;
                 Ok(())
             }
-            _ => {
-                self.fenced = true;
-                Err(Error::Fenced(
-                    "the head was changed by another writer".into(),
-                ))
-            }
+            _ => Err(self.fence(Error::Fenced(
+                "the head was changed by another writer".into(),
+            ))),
         }
     }
 
@@ -827,12 +886,9 @@ impl Bucket {
                 self.last_confirmed = sent;
                 Ok(o.etag)
             }
-            _ => {
-                self.fenced = true;
-                Err(Error::Fenced(
-                    "the head was changed by another writer".into(),
-                ))
-            }
+            _ => Err(self.fence(Error::Fenced(
+                "the head was changed by another writer".into(),
+            ))),
         }
     }
 }

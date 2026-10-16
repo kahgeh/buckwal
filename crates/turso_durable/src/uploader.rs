@@ -12,6 +12,7 @@ use crate::config::{defaults, Event, EventHook};
 use crate::error::{Error, Result};
 use crate::format::{Head, Manifest, Op};
 use crate::stats::StatsCell;
+pub(crate) use batch::op_bytes;
 use batch::{Batch, Pending};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
@@ -19,6 +20,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
+use tracing::field::Empty;
+use tracing::{info_span, Span};
 
 /// What the bucket looked like right after a seal; the trimmer deletes what it no longer needs.
 #[derive(Debug, Clone)]
@@ -55,6 +58,12 @@ impl Ticket {
     pub(crate) fn wait(self) -> Result<LogPos> {
         self.rx.recv().unwrap_or_else(|_| Err(stopped()))
     }
+
+    /// [`Ticket::wait`] inside a `durable.ack_wait` child of `commit`.
+    pub(crate) fn wait_in(self, commit: &Span) -> Result<LogPos> {
+        info_span!(target: "turso_durable", parent: commit, "durable.ack_wait")
+            .in_scope(|| self.wait())
+    }
 }
 
 enum Job {
@@ -64,6 +73,8 @@ enum Job {
         page_size: u32,
         page_count: u32,
         reply: Sender<Result<u64>>,
+        /// The caller's current span: the parent of `durable.checkpoint_upload`.
+        parent: Span,
     },
 }
 
@@ -103,9 +114,11 @@ impl Uploader {
             events,
             trim_tx,
         };
+        // The thread reports to the subscriber of the thread that opened the database.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let thread = std::thread::Builder::new()
             .name("turso-durable-uploader".into())
-            .spawn(move || worker.run(rx))
+            .spawn(move || tracing::dispatcher::with_default(&dispatch, || worker.run(rx)))
             .expect("spawn uploader thread");
         Arc::new(Uploader {
             jobs: Mutex::new(Some(tx)),
@@ -128,6 +141,7 @@ impl Uploader {
 
     /// Queue one sync's ops, committed with `batching`, and return at once. `Off` ships them
     /// (with any waiting Window syncs) as the next log record; a Window waits for its limits.
+    /// The current span is the sync's commit span.
     pub(crate) fn submit_log(&self, ops: Vec<Op>, batching: Batching) -> Ticket {
         let (reply, rx) = mpsc::channel();
         let jobs = self.jobs.lock().unwrap();
@@ -139,6 +153,7 @@ impl Uploader {
                 batching,
                 commit,
                 reply,
+                span: Span::current(),
             }));
         }
         Ticket {
@@ -163,6 +178,7 @@ impl Uploader {
             page_size,
             page_count,
             reply,
+            parent: Span::current(),
         });
         rx.recv().unwrap_or_else(|_| Err(stopped()))
     }
@@ -255,8 +271,10 @@ impl Worker {
                     page_size,
                     page_count,
                     reply,
+                    parent,
                 }) => {
-                    let r = self.seal(pages, page_size, page_count);
+                    let r = self.seal(pages, page_size, page_count, &parent);
+                    drop(parent);
                     self.publish_degraded();
                     let _ = reply.send(r);
                 }
@@ -315,20 +333,54 @@ impl Worker {
 
     /// Upload the owed syncs, then the batch, as one record, and reply to each. Returns the
     /// error every item got, if any. Nothing to upload is `Ok`.
+    ///
+    /// The record's `durable.upload` span is a child of its first commit's span and follows
+    /// from the others'; it closes, and drops its hold on the commit spans, before any reply.
     fn flush(&mut self) -> Result<()> {
         let mut items: Vec<Pending> = self.owed.drain(..).collect();
         items.extend(self.batch.take());
         if items.is_empty() {
             return Ok(());
         }
+        let span = info_span!(
+            target: "turso_durable",
+            parent: &items[0].span,
+            "durable.upload",
+            durable.commits = items.len() as u64,
+            durable.bytes = Empty,
+            durable.generation = Empty,
+            durable.seq = Empty,
+            durable.retries = Empty,
+            s3.status = Empty,
+        );
         let mut syncs = Vec::with_capacity(items.len());
         let mut waiters = Vec::with_capacity(items.len());
-        for p in items {
+        let mut commit_spans = Vec::with_capacity(items.len());
+        for (i, p) in items.into_iter().enumerate() {
+            if i > 0 {
+                span.follows_from(&p.span);
+            }
             syncs.push(p.ops);
             waiters.push((p.batching, p.commit, p.reply));
+            commit_spans.push(p.span);
         }
-        match self.bucket.append_log(syncs) {
+        let r = span.in_scope(|| self.bucket.append_log(syncs));
+        match &r {
             Ok(a) => {
+                span.record("durable.bytes", a.bytes);
+            }
+            Err(f) => span.in_scope(|| {
+                tracing::warn!(
+                    error = %f.error,
+                    commits = waiters.len() as u64,
+                    "log upload failed"
+                );
+            }),
+        }
+        drop(span);
+        match r {
+            Ok(a) => {
+                drop(commit_spans);
                 // Counted, reported and published before any reply, so a waiter that sees
                 // its ack also sees the record.
                 let commits: Vec<u64> = waiters.iter().map(|(_, c, _)| *c).collect();
@@ -353,13 +405,16 @@ impl Worker {
                     // Never sent: the Window syncs stay owed, in order. The Off ones are
                     // dropped: their sync fails, so the engine rolls them back.
                     Some(unsent) => {
-                        for (ops, (batching, commit, reply)) in unsent.into_iter().zip(&waiters) {
+                        // An owed sync keeps its commit span, so its later upload hangs from it.
+                        let owed = unsent.into_iter().zip(&waiters).zip(&commit_spans);
+                        for ((ops, (batching, commit, reply)), span) in owed {
                             if batching != &Batching::Off {
                                 self.owed.push_back(Pending {
                                     ops,
                                     batching: *batching,
                                     commit: *commit,
                                     reply: reply.clone(),
+                                    span: span.clone(),
                                 });
                             }
                         }
@@ -367,6 +422,7 @@ impl Worker {
                     // In doubt at its seq (the bucket settles it), or fenced.
                     None => {}
                 }
+                drop(commit_spans);
                 self.publish_degraded();
                 for (_, _, reply) in waiters {
                     let _ = reply.send(Err(error.clone()));
@@ -377,14 +433,31 @@ impl Worker {
     }
 
     /// Flush first; while owed syncs remain the seal fails with the flush's error, so it
-    /// never seals (or adopts a published head) over them. Then seal as in stage 1.
-    fn seal(&mut self, pages: Vec<(u32, Vec<u8>)>, page_size: u32, page_count: u32) -> Result<u64> {
+    /// never seals (or adopts a published head) over them. Then seal as in stage 1, inside a
+    /// `durable.checkpoint_upload` span under `parent` (the bucket records its fields).
+    fn seal(
+        &mut self,
+        pages: Vec<(u32, Vec<u8>)>,
+        page_size: u32,
+        page_count: u32,
+        parent: &Span,
+    ) -> Result<u64> {
         if let Err(e) = self.flush() {
             if !self.owed.is_empty() {
                 return Err(e);
             }
         }
-        let g = self.bucket.seal_generation(pages, page_size, page_count)?;
+        let span = info_span!(
+            target: "turso_durable",
+            parent: parent,
+            "durable.checkpoint_upload",
+            durable.generation = Empty,
+            durable.pages = Empty,
+            durable.retries = Empty,
+            s3.status = Empty,
+        );
+        let g = span.in_scope(|| self.bucket.seal_generation(pages, page_size, page_count))?;
+        drop(span);
         self.generation.store(g, SeqCst);
         if let Some(tx) = &self.trim_tx {
             // No trimmer listening is not an upload failure.

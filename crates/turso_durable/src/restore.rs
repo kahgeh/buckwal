@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::field::Empty;
 
 #[derive(Debug, Clone)]
 pub struct RestoreReport {
@@ -209,8 +210,41 @@ pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
-/// writes nothing to the bucket.
+/// writes nothing to the bucket. Runs in a `durable.restore` span, and logs the finished
+/// restore.
 pub(crate) fn restore_into(
+    store: Arc<dyn ObjectStore>,
+    keys: &Keys,
+    dir: &Path,
+    cfg: &EngineConfig,
+) -> Result<RestoreReport> {
+    let span = tracing::info_span!(
+        target: "turso_durable",
+        "durable.restore",
+        durable.generation = Empty,
+        durable.log_objects = Empty,
+        durable.gets = Empty,
+        durable.bytes = Empty,
+        s3.status = Empty,
+    );
+    let _in = span.enter();
+    let r = restore_files(store, keys, dir, cfg)?;
+    span.record("durable.generation", r.generation);
+    span.record("durable.log_objects", r.log_objects);
+    span.record("durable.gets", r.gets);
+    span.record("durable.bytes", r.bytes);
+    tracing::info!(
+        generation = r.generation,
+        log_objects = r.log_objects,
+        gets = r.gets,
+        bytes = r.bytes,
+        ms = r.elapsed.as_millis() as u64,
+        "restore finished"
+    );
+    Ok(r)
+}
+
+fn restore_files(
     store: Arc<dyn ObjectStore>,
     keys: &Keys,
     dir: &Path,

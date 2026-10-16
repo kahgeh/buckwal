@@ -9,7 +9,7 @@
 //! `PRAGMA durable_batching` is run here, never by the engine: it reads the effective setting,
 //! or sets the current transaction's own (`txn_batching`), which lasts until no transaction
 //! is open.
-use crate::batching::{ctx, Batching, PendingAck};
+use crate::batching::{ctx, record_outcome, Batching, PendingAck};
 use crate::config::Event;
 use crate::db::{lock, Shared};
 use crate::engine::engine_error;
@@ -143,7 +143,8 @@ impl Connection {
 
     /// Wait, in commit order, for every commit the current call made. Each counts as acked
     /// (`UploadStats::commits_acked`, the wait histogram, `Event::CommitAcked`) only when all
-    /// of them succeeded; otherwise the first error is returned.
+    /// of them succeeded; otherwise the first error is returned. Each commit's span closes as
+    /// its own ack resolves, with its own outcome; a wait is its `durable.ack_wait`.
     fn await_acks(&self) -> Result<()> {
         let mut acked = Vec::new();
         let mut first_err = None;
@@ -153,10 +154,20 @@ impl Connection {
                     commit,
                     waited,
                     batching,
-                } => acked.push((commit, waited, batching)),
-                PendingAck::Waiting { ticket, batching } => {
+                    span,
+                } => {
+                    span.record("durable.outcome", "ok");
+                    acked.push((commit, waited, batching));
+                }
+                PendingAck::Waiting {
+                    ticket,
+                    batching,
+                    span,
+                } => {
                     let (commit, submitted) = (ticket.commit, ticket.submitted);
-                    match ticket.wait() {
+                    let r = ticket.wait_in(&span);
+                    record_outcome(&span, &r);
+                    match r {
                         Ok(_) => acked.push((commit, submitted.elapsed(), batching)),
                         Err(e) => {
                             first_err.get_or_insert(e);

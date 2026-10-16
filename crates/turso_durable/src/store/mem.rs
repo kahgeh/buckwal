@@ -6,6 +6,19 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
+/// Record `status` on the current span's `s3.status`, as `S3Store` records each response's.
+fn status(code: u16) {
+    tracing::Span::current().record("s3.status", code);
+}
+
+/// The status S3 answers a conditional put with.
+fn cond_status(r: &CondPut) -> u16 {
+    match r {
+        CondPut::Created { .. } => 200,
+        CondPut::PreconditionFailed => 412,
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     objects: BTreeMap<String, Object>,
@@ -52,29 +65,35 @@ impl ObjectStore for MemStore {
     fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
         self.count_put(body.len());
         let mut inner = self.inner.lock().unwrap();
+        status(200);
         Ok(Self::store(&mut inner, key, body))
     }
 
     fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
         self.count_put(body.len());
         let mut inner = self.inner.lock().unwrap();
-        if inner.objects.contains_key(key) {
-            return Ok(CondPut::PreconditionFailed);
-        }
-        Ok(CondPut::Created {
-            etag: Self::store(&mut inner, key, body),
-        })
+        let r = if inner.objects.contains_key(key) {
+            CondPut::PreconditionFailed
+        } else {
+            CondPut::Created {
+                etag: Self::store(&mut inner, key, body),
+            }
+        };
+        status(cond_status(&r));
+        Ok(r)
     }
 
     fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
         self.count_put(body.len());
         let mut inner = self.inner.lock().unwrap();
-        match inner.objects.get(key) {
-            Some(o) if o.etag == etag => Ok(CondPut::Created {
+        let r = match inner.objects.get(key) {
+            Some(o) if o.etag == etag => CondPut::Created {
                 etag: Self::store(&mut inner, key, body),
-            }),
-            _ => Ok(CondPut::PreconditionFailed),
-        }
+            },
+            _ => CondPut::PreconditionFailed,
+        };
+        status(cond_status(&r));
+        Ok(r)
     }
 
     fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
@@ -82,6 +101,7 @@ impl ObjectStore for MemStore {
         self.gets.fetch_add(1, Relaxed);
         self.bytes_down
             .fetch_add(v.as_ref().map_or(0, |o| o.body.len()) as u64, Relaxed);
+        status(if v.is_some() { 200 } else { 404 });
         Ok(v)
     }
 
@@ -97,12 +117,14 @@ impl ObjectStore for MemStore {
             .collect();
         self.lists
             .fetch_add(keys.len().div_ceil(1000).max(1) as u64, Relaxed);
+        status(200);
         Ok(keys)
     }
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.deletes.fetch_add(1, Relaxed);
         self.inner.lock().unwrap().objects.remove(key);
+        status(204);
         Ok(())
     }
 

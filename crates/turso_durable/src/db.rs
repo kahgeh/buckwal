@@ -274,6 +274,13 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         )
     });
     let uploader = engine.uploader.clone();
+    tracing::info!(
+        generation = uploader.generation(),
+        writer_id = %state.writer_id,
+        read_only,
+        dir = %dir.display(),
+        "database opened"
+    );
     Ok(Database {
         shared: Arc::new(Shared {
             read_only,

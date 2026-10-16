@@ -60,45 +60,50 @@ pub(crate) fn spawn_trimmer(
     rx: Receiver<TrimSnapshot>,
     events: Option<EventHook>,
 ) -> JoinHandle<()> {
+    // The thread reports to the subscriber of the thread that opened the database.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     std::thread::Builder::new()
         .name("turso-durable-trimmer".into())
         .spawn(move || {
-            // Oldest first: snapshots arrive in seal order.
-            let mut pending: Vec<TrimSnapshot> = Vec::new();
-            loop {
-                let now = Instant::now();
-                if let Some(i) = pending
-                    .iter()
-                    .rposition(|s| now.saturating_duration_since(s.at) >= grace)
-                {
-                    let s = pending
-                        .drain(..=i)
-                        .next_back()
-                        .expect("drained at least one");
-                    if let Ok(deleted) = trim_once(&*store, &keys, &s.head, s.manifest.as_ref()) {
-                        if let Some(hook) = &events {
-                            hook(&Event::Trimmed { deleted });
+            tracing::dispatcher::with_default(&dispatch, || {
+                // Oldest first: snapshots arrive in seal order.
+                let mut pending: Vec<TrimSnapshot> = Vec::new();
+                loop {
+                    let now = Instant::now();
+                    if let Some(i) = pending
+                        .iter()
+                        .rposition(|s| now.saturating_duration_since(s.at) >= grace)
+                    {
+                        let s = pending
+                            .drain(..=i)
+                            .next_back()
+                            .expect("drained at least one");
+                        if let Ok(deleted) = trim_once(&*store, &keys, &s.head, s.manifest.as_ref())
+                        {
+                            if let Some(hook) = &events {
+                                hook(&Event::Trimmed { deleted });
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
-                let next = pending
-                    .first()
-                    .and_then(|s| s.at.checked_add(grace))
-                    .map(|due| due.saturating_duration_since(now));
-                let got = match next {
-                    Some(wait) => rx.recv_timeout(wait),
-                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                };
-                match got {
-                    Ok(s) => {
-                        pending.push(s);
-                        pending.extend(rx.try_iter());
+                    let next = pending
+                        .first()
+                        .and_then(|s| s.at.checked_add(grace))
+                        .map(|due| due.saturating_duration_since(now));
+                    let got = match next {
+                        Some(wait) => rx.recv_timeout(wait),
+                        None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                    };
+                    match got {
+                        Ok(s) => {
+                            pending.push(s);
+                            pending.extend(rx.try_iter());
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return,
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return,
                 }
-            }
+            })
         })
         .expect("spawn trimmer thread")
 }

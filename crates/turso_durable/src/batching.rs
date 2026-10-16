@@ -157,7 +157,8 @@ impl Batching {
 
 /// One commit of a `Connection` call, for the call to ack before it returns. `batching` is
 /// the setting the commit was made with, even when a degraded uploader made a Window commit
-/// take the blocking `Off` path (`Done`).
+/// take the blocking `Off` path (`Done`). `span` is the commit's `durable.commit` span,
+/// which closes when the ack resolves.
 pub(crate) enum PendingAck {
     /// Uploaded inside the WAL sync (`Off`, or a Window commit while the uploader is
     /// degraded): `waited` is how long the upload took.
@@ -165,12 +166,19 @@ pub(crate) enum PendingAck {
         commit: u64,
         waited: Duration,
         batching: Batching,
+        span: tracing::Span,
     },
     /// Submitted to the uploader's batch; the call waits on the ticket.
     Waiting {
         ticket: crate::uploader::Ticket,
         batching: Batching,
+        span: tracing::Span,
     },
+}
+
+/// Record a commit's `durable.outcome`: `ok` when its record is in the bucket, else `error`.
+pub(crate) fn record_outcome<T>(commit: &tracing::Span, r: &Result<T>) {
+    commit.record("durable.outcome", if r.is_ok() { "ok" } else { "error" });
 }
 
 /// The commit context: the setting a `Connection` call commits with, set on the caller's

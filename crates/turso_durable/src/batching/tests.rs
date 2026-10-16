@@ -90,6 +90,7 @@ fn done(commit: u64) -> PendingAck {
         commit,
         waited: Duration::ZERO,
         batching: Batching::Off,
+        span: tracing::Span::none(),
     }
 }
 

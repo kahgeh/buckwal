@@ -7,13 +7,15 @@
 use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
-use crate::batching::{ctx, Batching, PendingAck};
+use crate::batching::{ctx, record_outcome, Batching, PendingAck};
 use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::format::Op;
-use crate::uploader::Uploader;
+use crate::uploader::{op_bytes, Ticket, Uploader};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use tracing::field::{display, Empty};
+use tracing::{info_span, Span};
 use turso_core::io::FileSyncType;
 use turso_core::{Buffer, Completion, File, IO};
 
@@ -52,6 +54,33 @@ fn engine_io(e: turso_core::LimboError) -> Error {
     io_err("-wal", e)
 }
 
+/// The spans of the commit whose ops are pending: `durable.commit`, and its
+/// `durable.local_write`, which closes when the sync starts.
+struct CommitSpans {
+    commit: Span,
+    local_write: Span,
+}
+
+impl CommitSpans {
+    /// At a commit's first recorded op: a child of the caller's current span.
+    fn start() -> CommitSpans {
+        let commit = info_span!(
+            target: "turso_durable",
+            "durable.commit",
+            durable.batching = Empty,
+            durable.commit_no = Empty,
+            durable.bytes = Empty,
+            durable.outcome = Empty,
+        );
+        let local_write =
+            info_span!(target: "turso_durable", parent: &commit, "durable.local_write");
+        CommitSpans {
+            commit,
+            local_write,
+        }
+    }
+}
+
 pub(crate) struct ShippingFile {
     inner: Arc<dyn File>,
     io: Arc<dyn IO>,
@@ -59,6 +88,9 @@ pub(crate) struct ShippingFile {
     storage: Arc<BucketDbStorage>,
     /// Ops written since the last sync.
     pending: Mutex<Vec<Op>>,
+    /// The spans of the commit those ops belong to; `Some` exactly when `pending` is not
+    /// empty. Locked after `pending`.
+    commit: Mutex<Option<CommitSpans>>,
     /// The current generation's WAL header (its first 32 bytes), once one is known.
     header: Mutex<Option<Vec<u8>>>,
     /// A read-only open: every write and truncate is refused.
@@ -86,55 +118,86 @@ impl ShippingFile {
             uploader,
             storage,
             pending: Mutex::new(Vec::new()),
+            commit: Mutex::new(None),
             header: Mutex::new(header),
             read_only,
         })
     }
 
-    fn take_pending(&self) -> Vec<Op> {
-        std::mem::take(&mut *self.pending.lock().unwrap())
+    /// The ops written since the last sync, and their commit's span (its
+    /// `durable.local_write` is closed here; `None` exactly when there are no ops).
+    fn take_pending(&self) -> (Vec<Op>, Option<Span>) {
+        let mut pending = self.pending.lock().unwrap();
+        let spans = self.commit.lock().unwrap().take();
+        let ops = std::mem::take(&mut *pending);
+        let commit = spans.map(|s| {
+            drop(s.local_write);
+            s.commit
+        });
+        (ops, commit)
+    }
+
+    /// Hand `ops` to the uploader as one sync uploaded with `b`, with `commit` as its span,
+    /// which shows `made_with`: the setting the commit was made with.
+    fn submit(&self, commit: &Span, ops: Vec<Op>, b: Batching, made_with: Batching) -> Ticket {
+        commit.record("durable.batching", display(made_with));
+        commit.record("durable.bytes", op_bytes(&ops));
+        let ticket = commit.in_scope(|| self.uploader.submit_log(ops, b));
+        commit.record("durable.commit_no", ticket.commit);
+        ticket
     }
 
     /// Ship the ops written since the last sync as one log record and wait for it (a seal
-    /// does; it acks nothing). On failure they belong to the uploader (in doubt, or dropped
-    /// as an `Off` sync), so they are not requeued.
+    /// does; it acks nothing, so their commit span closes here). On failure they belong to
+    /// the uploader (in doubt, or dropped as an `Off` sync), so they are not requeued.
     fn ship_pending(&self) -> Result<()> {
-        let ops = self.take_pending();
+        let (ops, commit) = self.take_pending();
         if ops.is_empty() {
             return Ok(());
         }
-        self.uploader
-            .submit_log(ops, Batching::Off)
-            .wait()
-            .map(|_| ())
+        let commit = commit.unwrap_or_else(Span::none);
+        let ticket = self.submit(&commit, ops, Batching::Off, Batching::Off);
+        let r = ticket.wait_in(&commit);
+        record_outcome(&commit, &r);
+        r.map(|_| ())
     }
 
     /// A commit's ops, with the setting of the `Connection` call it runs in (`Off` outside
     /// any). `Off`, or any commit while the uploader is degraded, blocks until its record is
     /// in the bucket, so a failure rolls it back. A Window commit only queues: the call waits
     /// on its ticket after the engine returns (`Connection::await_acks`).
-    fn ship_commit(&self) -> Result<()> {
-        let ops = self.take_pending();
+    ///
+    /// Returns the commit's span (`None` with nothing to ship), which goes with its ack;
+    /// a failure closes it here with `durable.outcome = error`.
+    fn ship_commit(&self) -> Result<Option<Span>> {
+        let (ops, span) = self.take_pending();
         if ops.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
+        let span = span.unwrap_or_else(Span::none);
         let b = ctx::current().unwrap_or(Batching::Off);
         if b == Batching::Off || self.uploader.degraded() {
-            let ticket = self.uploader.submit_log(ops, Batching::Off);
+            let ticket = self.submit(&span, ops, Batching::Off, b);
             let (commit, submitted) = (ticket.commit, ticket.submitted);
-            ticket.wait()?;
+            let r = ticket.wait_in(&span);
+            if r.is_err() {
+                record_outcome(&span, &r);
+            }
+            r?;
             ctx::push(PendingAck::Done {
                 commit,
                 waited: submitted.elapsed(),
                 batching: b,
+                span: span.clone(),
             });
         } else {
             ctx::push(PendingAck::Waiting {
-                ticket: self.uploader.submit_log(ops, b),
+                ticket: self.submit(&span, ops, b, b),
                 batching: b,
+                span: span.clone(),
             });
         }
-        Ok(())
+        Ok(Some(span))
     }
 
     /// Seal the generation the local file still holds (D6): its last ops, then the pages.
@@ -183,8 +246,12 @@ impl ShippingFile {
         ops: Vec<Op>,
         r: turso_core::Result<Completion>,
     ) -> turso_core::Result<Completion> {
-        if r.is_ok() {
-            self.pending.lock().unwrap().extend(ops);
+        if r.is_ok() && !ops.is_empty() {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.is_empty() {
+                *self.commit.lock().unwrap() = Some(CommitSpans::start());
+            }
+            pending.extend(ops);
         }
         r
     }
@@ -243,8 +310,13 @@ impl File for ShippingFile {
         // Upload (or queue) before any completion exists: a failed upload is a synchronous
         // `Err`, which rolls the commit back, never a failed completion (which would panic,
         // D3). A queued Window commit is fsynced locally now and acked by its call later.
-        self.ship_commit().map_err(stash)?;
-        self.inner.sync(c, sync_type)
+        match self.ship_commit().map_err(stash)? {
+            Some(commit) => {
+                info_span!(target: "turso_durable", parent: &commit, "durable.local_fsync")
+                    .in_scope(|| self.inner.sync(c, sync_type))
+            }
+            None => self.inner.sync(c, sync_type),
+        }
     }
     fn size(&self) -> turso_core::Result<u64> {
         self.inner.size()

@@ -128,11 +128,15 @@ pub(crate) fn open_engine(
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let (stop2, done2) = (stop.clone(), done.clone());
+        // The thread reports to the subscriber of the thread that opened the database.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let thread = std::thread::Builder::new()
             .name("turso-durable-prefetch".into())
             .spawn(move || {
-                s.prefetch(&stop2);
-                done2.store(true, SeqCst);
+                tracing::dispatcher::with_default(&dispatch, || {
+                    s.prefetch(&stop2);
+                    done2.store(true, SeqCst);
+                })
             })
             .map_err(|e| io_err("spawn prefetch thread", e))?;
         Some(Prefetch {

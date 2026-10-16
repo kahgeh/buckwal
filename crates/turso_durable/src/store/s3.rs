@@ -317,6 +317,8 @@ impl S3Store {
         let net = |e: reqwest::Error| StoreError::Transient(format!("{method} {key}: {e}"));
         let resp = req.body(body.to_vec()).send().map_err(net)?;
         let status = resp.status().as_u16();
+        // The bucket span this request runs in shows its last response's status.
+        tracing::Span::current().record("s3.status", status);
         let etag = resp
             .headers()
             .get("etag")
