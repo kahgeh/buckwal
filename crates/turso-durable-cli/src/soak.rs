@@ -44,9 +44,24 @@ struct Soak<'a> {
     /// Acks so far, over every thread.
     acked: AtomicU64,
     /// The setting this soak chose (`--batching`, then the file), set after every open.
-    batching: Mutex<Option<Batching>>,
-    /// The batching file's (mtime, length) when last read; `None` before the first read.
-    seen: Mutex<Option<Option<(SystemTime, u64)>>>,
+    /// Never held while waiting for the pool.
+    batching: Mutex<Chosen>,
+    seen: Mutex<Seen>,
+}
+
+/// What the batching file looked like when last read.
+#[derive(Default)]
+struct Seen {
+    /// Its (mtime, length), `None` when it could not be read; `None` before the first read.
+    stamp: Option<Option<(SystemTime, u64)>>,
+    /// How many valid changes were read from it.
+    changes: u64,
+}
+
+/// The setting in force, and the number of the file change it came from (0: `--batching`).
+struct Chosen {
+    change: u64,
+    batching: Option<Batching>,
 }
 
 impl Soak<'_> {
@@ -83,7 +98,7 @@ impl Soak<'_> {
             }
             None => turso_durable::open(cfg).map_err(err)?,
         };
-        if let Some(b) = *lock(&self.batching) {
+        if let Some(b) = lock(&self.batching).batching {
             db.set_batching(b).map_err(err)?;
         }
         Ok(db)
@@ -116,7 +131,8 @@ impl Soak<'_> {
 
     /// When the batching file changed since it was last read, read it and set what it says
     /// (printing `batching <setting>`). Unreadable or bad content prints one `error: …` on
-    /// stderr and keeps the setting. One thread handles each change.
+    /// stderr and keeps the setting. One thread handles each change; a change read before a
+    /// newer one already set is dropped.
     fn check_batching_file(&self) {
         let Some(path) = &self.args.batching_file else {
             return;
@@ -124,34 +140,50 @@ impl Soak<'_> {
         let stamp = std::fs::metadata(path)
             .and_then(|m| Ok((m.modified()?, m.len())))
             .ok();
-        let mut seen = lock(&self.seen);
-        if *seen == Some(stamp) {
-            return;
-        }
-        *seen = Some(stamp);
         let name = path.display().to_string();
-        let parsed = std::fs::read_to_string(path)
-            .map_err(|e| format!("{name}: {e}"))
-            .and_then(|text| args::batching(&name, text.trim()));
-        let b = match parsed {
-            Ok(b) => b,
-            Err(m) => {
-                eprintln!("error: {m}");
+        let (b, change) = {
+            let mut seen = lock(&self.seen);
+            if seen.stamp == Some(stamp) {
                 return;
             }
+            seen.stamp = Some(stamp);
+            let parsed = std::fs::read_to_string(path)
+                .map_err(|e| format!("{name}: {e}"))
+                .and_then(|text| args::batching(&name, text.trim()));
+            match parsed {
+                Ok(b) => {
+                    seen.changes += 1;
+                    (b, seen.changes)
+                }
+                Err(m) => {
+                    eprintln!("error: {m}");
+                    return;
+                }
+            }
         };
-        *lock(&self.batching) = Some(b);
+        // With the pool held shared no reopen runs, so `batching` can be held across the set:
+        // changes are set in the order they were read, and stored only once set.
         let pool = self.read();
-        if let Err(e) = pool.as_ref().expect("open").db.set_batching(b) {
-            eprintln!("error: {}: {e}", path.display());
+        let mut chosen = lock(&self.batching);
+        if chosen.change > change {
             return;
         }
-        drop(pool);
+        if let Err(e) = pool.as_ref().expect("open").db.set_batching(b) {
+            eprintln!("error: {name}: {e}");
+            return;
+        }
+        *chosen = Chosen {
+            change,
+            batching: Some(b),
+        };
         say(&format!("batching {b}"));
     }
 
+    /// The upload stats, taken and printed with no commit running, so every commit a block
+    /// counts as uploaded is also counted as acked.
     fn print_stats(&self) {
-        let stats = self.read().as_ref().expect("open").db.upload_stats();
+        let pool = self.write();
+        let stats = pool.as_ref().expect("open").db.upload_stats();
         say_all("stats ", &stats_lines(&stats));
     }
 
@@ -242,8 +274,11 @@ pub fn run(args: &SoakArgs) -> CliResult<()> {
         pool: RwLock::new(None),
         turnstile: Mutex::new(()),
         acked: AtomicU64::new(0),
-        batching: Mutex::new(args.batching),
-        seen: Mutex::new(None),
+        batching: Mutex::new(Chosen {
+            change: 0,
+            batching: args.batching,
+        }),
+        seen: Mutex::new(Seen::default()),
     };
     *soak.write() = Some(soak.open_all());
     let shared = &soak;

@@ -19,15 +19,20 @@ const BIN: &str = env!("CARGO_BIN_EXE_turso-durable");
 /// instead of hanging the suite.
 const WAIT: Duration = Duration::from_secs(120);
 
+/// The Window setting the batched system tests run under.
+const WINDOW: &str = "window 20ms 64 1MiB";
+
 /// Settings a test may set; every child gets them removed first, so the caller's
-/// environment never leaks into a test.
-const OPTIONAL: [&str; 6] = [
+/// environment never leaks into a test. `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not
+/// here: `scripts/test.sh` sets them so the children export under its run id.
+const OPTIONAL: [&str; 7] = [
     "DURABLE_PREFIX",
     "DURABLE_RETRY_DEADLINE_MS",
     "DURABLE_REQUEST_TIMEOUT_MS",
     "DURABLE_UPLOAD_CONCURRENCY",
     "DURABLE_TRIM_GRACE_SECS",
     "DURABLE_PREFETCH",
+    "DURABLE_BATCHING",
 ];
 
 /// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`.
@@ -394,6 +399,34 @@ impl Soak {
         last.expect("an ack").parse().unwrap()
     }
 
+    /// The index of the first line at or after `from` that `p` accepts.
+    fn find(&self, from: usize, p: impl Fn(&str) -> bool) -> Option<usize> {
+        let at = self.lines.iter().skip(from).position(|l| p(l));
+        at.map(|i| from + i)
+    }
+
+    /// The complete `stats` blocks (`--stats-every`) that start at or after line `from`, each
+    /// with the index of its first line. The soak prints a block's nine lines together, but
+    /// the reader may have received only some of the last one.
+    fn stats_blocks(&self, from: usize) -> Vec<(usize, Stats)> {
+        let mut blocks: Vec<(usize, Stats)> = Vec::new();
+        for (i, l) in self.lines.iter().enumerate().skip(from) {
+            let Some(kv) = l.strip_prefix("stats ") else {
+                continue;
+            };
+            if kv.starts_with("commits_acked=") {
+                blocks.push((i, Stats::new()));
+            }
+            let Some((_, block)) = blocks.last_mut() else {
+                continue;
+            };
+            let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!("{l:?}"));
+            block.insert(k.to_string(), v.parse().unwrap_or_else(|_| panic!("{l:?}")));
+        }
+        blocks.retain(|(_, b)| b.contains_key("ack_wait_p99_ms"));
+        blocks
+    }
+
     fn errors(&self) -> Vec<&String> {
         self.lines
             .iter()
@@ -435,6 +468,22 @@ impl Drop for Soak {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// One `stats` block, or `stats`'s output: key → value.
+type Stats = std::collections::BTreeMap<String, f64>;
+
+/// The `key=value` lines of `out` (after `prefix`) as a map; other lines are skipped.
+fn key_values(out: &str, prefix: &str) -> Stats {
+    out.lines()
+        .filter_map(|l| l.strip_prefix(prefix)?.split_once('='))
+        .filter_map(|(k, v)| Some((k.to_string(), v.parse().ok()?)))
+        .collect()
+}
+
+/// `b[key] - a[key]`.
+fn delta(a: &Stats, b: &Stats, key: &str) -> f64 {
+    b[key] - a[key]
 }
 
 /// What `restore` and `verify --acked` reported.
@@ -487,25 +536,41 @@ fn restore_verify(ctx: &Ctx, lines: &[String]) -> Verified {
 }
 
 /// The crash matrix for one mode: three runs, killed after `150`, `600` and `1500` acks.
-fn crash_matrix(mode: &str) {
+/// `auto` is the engine's own checkpoint (no `--checkpoint`). With `batching`, soak runs four
+/// connections under it.
+fn crash_matrix(mode: &str, batching: Option<&str>) {
+    let tag = if batching.is_some() { "window_" } else { "" };
     for kill_after in [150, 600, 1500] {
-        let ctx = Ctx::new(&format!("crash_{mode}_{kill_after}"));
+        let ctx = Ctx::new(&format!("crash_{tag}{mode}_{kill_after}"));
         let dir = ctx.dir("db");
-        let mut soak = Soak::spawn(&ctx, &dir, &["--checkpoint", mode, "--every", "100"]);
+        let mut args = Vec::new();
+        if mode != "auto" {
+            args.extend(["--checkpoint", mode, "--every", "100"]);
+        }
+        if let Some(b) = batching {
+            args.extend(["--batching", b, "--connections", "4"]);
+        }
+        let mut soak = Soak::spawn(&ctx, &dir, &args);
         soak.wait_acks(kill_after);
+        if mode == "auto" && kill_after >= 1500 {
+            // The auto-checkpoint (every 1000 WAL frames) seals in the commit after it.
+            soak.wait_for("a seal", |s| s.count("event seal-finished") >= 1);
+        }
         soak.kill();
         assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
-        // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
         let seals = soak.count("event seal-finished");
-        assert!(
-            seals >= 1 && seals >= kill_after / 100 - 1,
-            "{mode}: {seals} seals before the kill after {kill_after} acks\n{}",
-            soak.tail()
-        );
+        if mode != "auto" {
+            // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
+            assert!(
+                seals >= 1 && seals >= kill_after / 100 - 1,
+                "{mode}: {seals} seals before the kill after {kill_after} acks\n{}",
+                soak.tail()
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
         eprintln!(
-            "crash_{mode}: kill after {kill_after} acks: acked={} seals={seals} {} \
+            "crash_{tag}{mode}: kill after {kill_after} acks: acked={} seals={seals} {} \
              unacked_present={}",
             v.acked, v.restored, v.unacked_present
         );
@@ -547,31 +612,115 @@ fn crash_auto() {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_passive() {
-    crash_matrix("passive");
+    crash_matrix("passive", None);
 }
 
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_full() {
-    crash_matrix("full");
+    crash_matrix("full", None);
 }
 
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_restart() {
-    crash_matrix("restart");
+    crash_matrix("restart", None);
 }
 
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_truncate() {
-    crash_matrix("truncate");
+    crash_matrix("truncate", None);
 }
 
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_reopen() {
-    crash_matrix("reopen");
+    crash_matrix("reopen", None);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_auto() {
+    crash_matrix("auto", Some(WINDOW));
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_truncate() {
+    crash_matrix("truncate", Some(WINDOW));
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_reopen() {
+    crash_matrix("reopen", Some(WINDOW));
+}
+
+/// The batch now waiting, when the soak's last event line says two or more commits wait in
+/// it and the batch began (its `batch-waiting 1`) at most `young` ago: its count.
+fn young_waiting_batch(s: &Soak, young: Duration) -> Option<u64> {
+    let mut events = s
+        .lines
+        .iter()
+        .zip(&s.stamps)
+        .rev()
+        .filter(|(l, _)| l.starts_with("event "));
+    let (last, _) = events.next()?;
+    let n: u64 = last.strip_prefix("event batch-waiting ")?.parse().ok()?;
+    if n < 2 {
+        return None;
+    }
+    // Back through this batch's own lines to its first: none is a log-uploaded.
+    for (l, at) in events {
+        match l.strip_prefix("event batch-waiting ") {
+            Some("1") => return (at.elapsed() <= young).then_some(n),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// SIGKILL while two or more Window commits wait in the uploader's batch (500 ms window, four
+/// connections): the waiting commits were never acked, and every acked one restores.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_kill_while_batched_commits_wait() {
+    let ctx = Ctx::new("crash_window_kill_while_batched_commits_wait");
+    let dir = ctx.dir("db");
+    let args = [
+        "--batching",
+        "window 500ms 1000 64MiB",
+        "--connections",
+        "4",
+    ];
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.wait_acks(200);
+    // A batch begun at most 200 ms ago still has 300 ms of its window left: the kill lands
+    // well before its upload.
+    let young = Duration::from_millis(200);
+    soak.wait_for("a young batch of 2+ waiting commits", |s| {
+        young_waiting_batch(s, young).is_some()
+    });
+    let waiting = young_waiting_batch(&soak, young).unwrap();
+    let acks_at_kill = soak.acks();
+    soak.kill();
+    let last_event = soak.lines.iter().rev().find(|l| l.starts_with("event "));
+    let last_event = last_event.expect("an event line");
+    assert!(
+        last_event.starts_with("event batch-waiting "),
+        "the kill landed before the batch's upload: {last_event:?}\n{}",
+        soak.tail()
+    );
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    eprintln!(
+        "crash_window_kill_while_batched_commits_wait: killed with {waiting} commits waiting \
+         after {acks_at_kill} acks (last event {last_event:?}): acked={} {} unacked_present={}",
+        v.acked, v.restored, v.unacked_present
+    );
 }
 
 /// Killed while a seal's page PUTs are in flight (each delayed 200 ms): on the first seal,
@@ -609,12 +758,15 @@ fn crash_during_seal_upload() {
     }
 }
 
-#[test]
-#[ignore = "needs RustFS: ./scripts/test.sh"]
-fn fault_rustfs_stopped_mid_commit() {
-    let ctx = Ctx::new("fault_rustfs_stopped_mid_commit").set("DURABLE_RETRY_DEADLINE_MS", "2000");
+/// The soak arguments of the batched variant of a test.
+const WINDOW_ARGS: [&str; 4] = ["--batching", WINDOW, "--connections", "4"];
+
+/// RustFS stopped mid-run: error lines while it is down, acks again after `start`; every
+/// acked id restores and `log/<G>/` has no gap. `extra` goes to soak.
+fn rustfs_stopped_mid_commit(name: &str, extra: &[&str]) {
+    let ctx = Ctx::new(name).set("DURABLE_RETRY_DEADLINE_MS", "2000");
     let dir = ctx.dir("db");
-    let mut soak = Soak::spawn(&ctx, &dir, &[]);
+    let mut soak = Soak::spawn(&ctx, &dir, extra);
     soak.wait_acks(200);
     let outage = Outage::start("stop", "start");
     soak.wait_for("an error line", |s| !s.errors().is_empty());
@@ -629,22 +781,32 @@ fn fault_rustfs_stopped_mid_commit() {
     let seqs = ctx.assert_log_contiguous(head.generation);
     let v = restore_verify(&ctx, &soak.lines);
     eprintln!(
-        "fault_rustfs_stopped_mid_commit: {before_start} acks before the restart, \
-         {errors} error lines, killed at {} acks: log/{}/ seqs 1..={seqs} {}",
+        "{name}: {before_start} acks before the restart, {errors} error lines, killed at {} \
+         acks: log/{}/ seqs 1..={seqs} {}",
         v.acked, head.generation, v.restored
     );
 }
 
-/// RustFS paused for 1.5 s mid-run, with a 500 ms request timeout: the writer stalls (an ack
-/// gap of at least 1 s), then carries on; every acked id restores and `log/<G>/` has no gap.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn fault_rustfs_paused_ambiguous_put() {
-    let ctx = Ctx::new("fault_rustfs_paused_ambiguous_put")
+fn fault_rustfs_stopped_mid_commit() {
+    rustfs_stopped_mid_commit("fault_rustfs_stopped_mid_commit", &[]);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn fault_window_rustfs_stopped_mid_commit() {
+    rustfs_stopped_mid_commit("fault_window_rustfs_stopped_mid_commit", &WINDOW_ARGS);
+}
+
+/// RustFS paused for 1.5 s mid-run, with a 500 ms request timeout: the writer stalls (an ack
+/// gap of at least 1 s), then carries on; every acked id restores and `log/<G>/` has no gap.
+fn rustfs_paused_ambiguous_put(name: &str, extra: &[&str]) {
+    let ctx = Ctx::new(name)
         .set("DURABLE_REQUEST_TIMEOUT_MS", "500")
         .set("DURABLE_RETRY_DEADLINE_MS", "5000");
     let dir = ctx.dir("db");
-    let mut soak = Soak::spawn(&ctx, &dir, &[]);
+    let mut soak = Soak::spawn(&ctx, &dir, extra);
     soak.wait_acks(200);
     let outage = Outage::start("pause", "unpause");
     let paused = Instant::now();
@@ -662,9 +824,8 @@ fn fault_rustfs_paused_ambiguous_put() {
     let seqs = ctx.assert_log_contiguous(head.generation);
     let v = restore_verify(&ctx, &soak.lines);
     eprintln!(
-        "fault_rustfs_paused_ambiguous_put: {before_pause} acks before the pause, {during} \
-         during it, longest ack gap {stall:?}, {} error lines, killed at {}: \
-         log/{}/ seqs 1..={seqs} {}",
+        "{name}: {before_pause} acks before the pause, {during} during it, longest ack gap \
+         {stall:?}, {} error lines, killed at {}: log/{}/ seqs 1..={seqs} {}",
         soak.errors().len(),
         v.acked,
         head.generation,
@@ -674,10 +835,22 @@ fn fault_rustfs_paused_ambiguous_put() {
 
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn fault_deleted_page_object_fails_read() {
-    let ctx = Ctx::new("fault_deleted_page_object_fails_read");
+fn fault_rustfs_paused_ambiguous_put() {
+    rustfs_paused_ambiguous_put("fault_rustfs_paused_ambiguous_put", &[]);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn fault_window_rustfs_paused_ambiguous_put() {
+    rustfs_paused_ambiguous_put("fault_window_rustfs_paused_ambiguous_put", &WINDOW_ARGS);
+}
+
+/// A sealed page object deleted from the bucket: restore succeeds (pages are fetched
+/// lazily), and the first read of that page fails naming its key. `extra` goes to soak.
+fn deleted_page_object_fails_read(name: &str, extra: &[&str]) {
+    let ctx = Ctx::new(name);
     let dir = ctx.dir("db");
-    let args = [
+    let mut args = vec![
         "--checkpoint",
         "truncate",
         "--every",
@@ -685,6 +858,7 @@ fn fault_deleted_page_object_fails_read() {
         "--count",
         "300",
     ];
+    args.extend_from_slice(extra);
     Soak::spawn(&ctx, &dir, &args).finish();
     let head = ctx.head();
     let m = head.manifest.expect("closed soak sealed a manifest");
@@ -716,10 +890,19 @@ fn fault_deleted_page_object_fails_read() {
         "stderr names {key}: {}",
         out.stderr
     );
-    eprintln!(
-        "fault_deleted_page_object_fails_read: deleted {key}; stderr: {}",
-        out.stderr.trim()
-    );
+    eprintln!("{name}: deleted {key}; stderr: {}", out.stderr.trim());
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn fault_deleted_page_object_fails_read() {
+    deleted_page_object_fails_read("fault_deleted_page_object_fails_read", &[]);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn fault_window_deleted_page_object_fails_read() {
+    deleted_page_object_fails_read("fault_window_deleted_page_object_fails_read", &WINDOW_ARGS);
 }
 
 /// The coordinator's ruling: a read-only verify of the same bucket while the writer runs
@@ -1152,5 +1335,231 @@ fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
         "idle_old_writer_closing_after_claim_and_seal_loses_nothing: A's close {closed:?}; \
          acked={} {}",
         v.acked, v.restored
+    );
+}
+
+/// Replace the soak's batching file in one step (write aside, rename): an in-place write
+/// truncates first, and a soak that looks between the truncate and the write sees two
+/// changes and prints `batching …` twice.
+fn write_batching_file(path: &Path, setting: &str) {
+    let aside = path.with_extension("new");
+    fs::write(&aside, setting).unwrap();
+    fs::rename(&aside, path).unwrap();
+}
+
+/// `stats --claim` under Off (one log PUT per commit), then one soak whose batching file
+/// switches Off → Window → Off: the `stats` blocks between the switches show one PUT per
+/// commit while Off and more than 1.5 commits per PUT under the window.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn batching_stats_against_rustfs() {
+    let ctx = Ctx::new("batching_stats_against_rustfs");
+    let dir = ctx.dir("db");
+    let d = dir.to_str().unwrap();
+    let inserts: Vec<String> = (1..=30)
+        .map(|i| format!("INSERT INTO t VALUES ({i})"))
+        .collect();
+    let mut args = vec![
+        "stats",
+        "--claim",
+        "--dir",
+        d,
+        "--batching",
+        "off",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+    ];
+    args.extend(inserts.iter().map(String::as_str));
+    let out = ctx.ok(&args);
+    let off = key_values(&out.stdout, "");
+    assert!(off["commits_acked"] >= 31.0, "{}", out.stdout);
+    assert_eq!(off["log_puts"], off["commits_acked"], "{}", out.stdout);
+    assert_eq!(off["commits_per_log_put"], 1.0, "{}", out.stdout);
+
+    let file = ctx.tmp.path().join("batching");
+    write_batching_file(&file, "off");
+    let f = file.to_str().unwrap();
+    let args = [
+        "--connections",
+        "8",
+        "--batching-file",
+        f,
+        "--stats-every",
+        "100",
+    ];
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    let pid = soak.child.id();
+    // Each phase: the switch's `batching` line, then two stats blocks after it, printed
+    // before the next write (a block is a snapshot with no commit running, so a block after
+    // a switch line counts no commit made with the setting before it).
+    let mut phases: Vec<(String, Stats, Stats)> = Vec::new();
+    for (i, setting) in ["off", WINDOW, "off"].into_iter().enumerate() {
+        let written = Instant::now();
+        if i > 0 {
+            write_batching_file(&file, setting);
+        }
+        let from = soak.lines.len();
+        let line = format!("batching {setting}");
+        soak.wait_for(&line, |s| s.find(from, |l| l == line).is_some());
+        let at = soak.find(from, |l| l == line).unwrap();
+        soak.wait_acks_after(written, 200);
+        soak.wait_for("two stats blocks", |s| s.stats_blocks(at).len() >= 2);
+        let blocks = soak.stats_blocks(at);
+        let (first, last) = (blocks[0].1.clone(), blocks.last().unwrap().1.clone());
+        phases.push((setting.to_string(), first, last));
+    }
+    assert_eq!(soak.child.id(), pid);
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let switches = soak.lines.iter().filter(|l| l.starts_with("batching "));
+    assert_eq!(switches.count(), 3, "one process saw every switch");
+    for (setting, a, b) in &phases {
+        let acked = delta(a, b, "commits_acked");
+        let puts = delta(a, b, "log_puts");
+        let per_put = delta(a, b, "commits_uploaded") / puts;
+        eprintln!(
+            "batching_stats_against_rustfs: {setting}: Δcommits_acked={acked} Δlog_puts={puts} \
+             Δcommits_per_log_put={per_put:.3}"
+        );
+        // Two blocks 100 soak acks apart; the library's count may differ by the commits
+        // that finished while a block waited for no commit to be running.
+        assert!(acked >= 50.0, "{setting}: {acked} acks in the window");
+        if setting == "off" {
+            assert_eq!(puts, acked, "{setting}: one log PUT per commit");
+        } else {
+            assert!(per_put > 1.5, "{setting}: {per_put} commits per log PUT");
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    eprintln!(
+        "batching_stats_against_rustfs: stats --batching off: {:?}; soak acked={} {}",
+        off, v.acked, v.restored
+    );
+}
+
+/// Eight connections, the batching file flipped between Off and the window every 50 acks, so
+/// Off and Window commits share the log: every acked id restores and the log has no gap.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn batching_mixed_connections_against_rustfs() {
+    let ctx = Ctx::new("batching_mixed_connections_against_rustfs");
+    let dir = ctx.dir("db");
+    let file = ctx.tmp.path().join("batching");
+    write_batching_file(&file, "off");
+    let args = [
+        "--connections",
+        "8",
+        "--batching-file",
+        file.to_str().unwrap(),
+    ];
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.wait_line("batching off");
+    let flips = 8;
+    for i in 0..flips {
+        let t = Instant::now();
+        soak.wait_acks_after(t, 50);
+        let setting = if i % 2 == 0 { WINDOW } else { "off" };
+        write_batching_file(&file, setting);
+        soak.wait_line(&format!("batching {setting}"));
+    }
+    soak.wait_acks_after(Instant::now(), 50);
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let switches = soak.lines.iter().filter(|l| l.starts_with("batching "));
+    assert_eq!(switches.count(), flips + 1);
+    let uploads = soak
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("event log-uploaded "));
+    let batched = uploads.filter(|l| l.contains(',')).count();
+    assert!(batched > 0, "some log PUT held several commits");
+    fs::remove_dir_all(&dir).unwrap();
+    let head = ctx.head();
+    let seqs = ctx.assert_log_contiguous(head.generation);
+    let v = restore_verify(&ctx, &soak.lines);
+    eprintln!(
+        "batching_mixed_connections_against_rustfs: {flips} flips, {batched} multi-commit log \
+         PUTs, acked={}: log/{}/ seqs 1..={seqs} {}",
+        v.acked, head.generation, v.restored
+    );
+}
+
+/// `bench --commits 300` with `extra` settings: (commit p50 in ms, wall time).
+fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration) {
+    let mut ctx = Ctx::new(name);
+    for (k, v) in extra {
+        ctx = ctx.set(k, v);
+    }
+    let dir = ctx.dir("db");
+    let started = Instant::now();
+    let out = ctx.ok(&["bench", "--dir", dir.to_str().unwrap(), "--commits", "300"]);
+    let wall = started.elapsed();
+    let p50 = key_values(&out.stdout, "")["commit_p50_ms"];
+    eprintln!(
+        "{name}: commit_p50_ms={p50} wall={wall:?} stderr: {}",
+        out.stderr.trim()
+    );
+    (p50, wall)
+}
+
+/// Telemetry on, its collector (a) refusing connections, (b) accepting them and never
+/// answering: bench still exits 0, commits are not slowed, and exit waits at most the 2 s
+/// flush budget.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn telemetry_collector_down_and_blackhole() {
+    let (base_p50, base_wall) = bench_run("telemetry_off", &[("DURABLE_OTEL", "0")]);
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let down = format!("http://127.0.0.1:{port}");
+
+    let blackhole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hole = format!("http://{}", blackhole.local_addr().unwrap());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let holder = {
+        let (stop, accepted) = (stop.clone(), accepted.clone());
+        std::thread::spawn(move || {
+            // Hold every connection open, never reading or writing.
+            let mut held = Vec::new();
+            for conn in blackhole.incoming() {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(c) = conn {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    held.push(c);
+                }
+            }
+        })
+    };
+
+    for (name, endpoint) in [
+        ("telemetry_collector_down", &down),
+        ("telemetry_collector_blackhole", &hole),
+    ] {
+        let (p50, wall) = bench_run(
+            name,
+            &[("DURABLE_OTEL", "1"), ("DURABLE_OTEL_ENDPOINT", endpoint)],
+        );
+        assert!(
+            p50 <= 2.0 * base_p50 + 1.0,
+            "{name}: commit_p50_ms {p50} vs {base_p50} with telemetry off"
+        );
+        assert!(
+            wall <= base_wall + Duration::from_secs(3),
+            "{name}: wall {wall:?} vs {base_wall:?} with telemetry off"
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::net::TcpStream::connect(hole.trim_start_matches("http://"));
+    holder.join().unwrap();
+    let accepted = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(accepted > 0, "the exporter connected to the blackhole");
+    eprintln!(
+        "telemetry_collector_down_and_blackhole: off p50={base_p50} wall={base_wall:?}; \
+         blackhole accepted {accepted} connections"
     );
 }
