@@ -31,6 +31,10 @@ pub mod defaults {
     pub const PREFETCH: bool = false;
     /// Every commit is uploaded on its own.
     pub const BATCHING: super::Batching = super::Batching::Off;
+    /// The longest `max_wait` a window may have (`Batching::validate` refuses more). A
+    /// Window commit's ack can wait the whole `max_wait` (always, on a single connection),
+    /// so a huge one would hang the caller.
+    pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(60);
     pub const REGION: &str = "us-east-1";
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.

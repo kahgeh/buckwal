@@ -1,6 +1,7 @@
 //! The batching setting: how long and how much the uploader gathers before it ships a log
 //! object. Parsed from and shown as the PRAGMA text, `off` or `window <max_wait>
 //! <max_commits> <max_bytes>`, e.g. `window 50ms 64 1MiB`.
+use crate::config::defaults;
 use crate::error::{Error, Result};
 use std::fmt;
 use std::str::FromStr;
@@ -12,7 +13,8 @@ pub enum Batching {
     /// Every commit is uploaded on its own.
     Off,
     /// Gather commits until `max_wait` has passed since the first, or `max_commits` or
-    /// `max_bytes` is reached. Both counts must be at least 1 ([`Batching::validate`]).
+    /// `max_bytes` is reached. Both counts must be at least 1, and `max_wait` at most 60 s
+    /// ([`Batching::validate`]).
     Window {
         max_wait: Duration,
         max_commits: u32,
@@ -132,14 +134,21 @@ impl fmt::Display for Batching {
 }
 
 impl Batching {
-    /// A window needs room for at least one commit and one byte.
+    /// A window needs room for at least one commit and one byte, and may wait at most
+    /// [`defaults::MAX_BATCH_WAIT`] (60 s).
     pub fn validate(&self) -> Result<()> {
         if let Batching::Window {
+            max_wait,
             max_commits,
             max_bytes,
-            ..
         } = *self
         {
+            if max_wait > defaults::MAX_BATCH_WAIT {
+                return Err(Error::Config(format!(
+                    "batching max_wait must be at most {}s",
+                    defaults::MAX_BATCH_WAIT.as_secs()
+                )));
+            }
             if max_commits == 0 {
                 return Err(Error::Config(
                     "batching max_commits must be at least 1".into(),

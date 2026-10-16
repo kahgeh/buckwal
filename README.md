@@ -110,7 +110,7 @@ The API:
 | `Connection::close()` | Closes the connection. The writer's last connection runs a TRUNCATE checkpoint, which seals. Dropping a connection also closes it. |
 | `restore(&Config, dir) -> Result<RestoreReport>` | Restores the bucket's current state into `dir`, which must hold no database. It writes nothing to the bucket. `config.dir` is ignored; `dir` is used. |
 | `Value` | `turso_core::Value`, re-exported. |
-| `Batching` | `Off` or `Window { max_wait: Duration, max_commits: u32, max_bytes: u64 }` (see Batching). It parses from and prints as the PRAGMA's text (`FromStr`, `Display`). `validate()` refuses a `max_commits` or `max_bytes` of 0. |
+| `Batching` | `Off` or `Window { max_wait: Duration, max_commits: u32, max_bytes: u64 }` (see Batching). It parses from and prints as the PRAGMA's text (`FromStr`, `Display`). `validate()` refuses a `max_commits` or `max_bytes` of 0, and a `max_wait` above 60 s. |
 | `UploadStats` | The snapshot `Database::upload_stats` returns (fields below). |
 | `telemetry::TelemetryConfig` | `enabled`, `endpoint`, `level` (`tracing::Level`), `test_run_id`. `Default` is disabled; `TelemetryConfig::from_env()` reads the `DURABLE_OTEL*` variables (see Settings). |
 | `telemetry::init(TelemetryConfig) -> Result<TelemetryGuard>` | Installs the OTLP export as the process's global `tracing` subscriber (see Telemetry). Disabled, it installs nothing and returns an empty guard. `Config` when a global subscriber is already set, or the endpoint is not `http://`. |
@@ -181,7 +181,7 @@ pub enum Batching {
 ```
 
 - `Off` (the default): each commit is its own upload, made inside the WAL sync.
-- `Window`: commits waiting to upload share one PUT. It is sent when the first limit is reached: `max_wait` since the first commit in the batch, `max_commits` commits, or `max_bytes` bytes. Both counts must be at least 1.
+- `Window`: commits waiting to upload share one PUT. It is sent when the first limit is reached: `max_wait` since the first commit in the batch, `max_commits` commits, or `max_bytes` bytes. Both counts must be at least 1, and `max_wait` at most 60 s (`MAX_BATCH_WAIT` in `mod defaults`); a longer one fails with `Config`.
 
 **Where it is set.** All of these work at runtime, with no reopen:
 - `Config::batching` (`DURABLE_BATCHING`): the database's setting at open.
@@ -281,7 +281,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 Where the defaults live:
 - `crates/turso_durable/src/config.rs`, `mod defaults`, holds every default above.
 - The retry backoff is fixed and cannot be configured. It starts at 50 ms (`FIRST_BACKOFF`), doubles, and is capped at 2 s (`MAX_BACKOFF`). Both are in `mod defaults` too. `RetryPolicy::default` in `crates/turso_durable/src/store/retry.rs` takes all three retry values from there.
-- The batching default, `Off`, is `BATCHING` in `mod defaults`. It stays `Off` until there are numbers from real S3. The telemetry defaults are there too (`OTEL`, `OTEL_ENDPOINT`, `OTEL_LEVEL`), with the fixed export limits: one export times out after 1 s (`OTEL_EXPORT_TIMEOUT`), shutdown waits at most 2 s (`OTEL_SHUTDOWN`), and each queue holds 2048 spans or log records (`OTEL_QUEUE`).
+- The batching default, `Off`, is `BATCHING` in `mod defaults`. It stays `Off` until there are numbers from real S3. The 60 s cap on a window's `max_wait` is `MAX_BATCH_WAIT`, there too; it cannot be configured. The telemetry defaults are there too (`OTEL`, `OTEL_ENDPOINT`, `OTEL_LEVEL`), with the fixed export limits: one export times out after 1 s (`OTEL_EXPORT_TIMEOUT`), shutdown waits at most 2 s (`OTEL_SHUTDOWN`), and each queue holds 2048 spans or log records (`OTEL_QUEUE`).
 - The busy timeout between connections is fixed at 5 s. It lives in `crates/turso_durable/src/conn.rs` (`BUSY_TIMEOUT`).
 
 ## Telemetry

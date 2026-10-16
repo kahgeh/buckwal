@@ -85,6 +85,28 @@ fn errors_name_the_bad_text_and_overflow_is_refused() {
     assert!(Batching::Off.validate().is_ok());
 }
 
+#[test]
+fn validate_refuses_a_max_wait_above_the_limit() {
+    use crate::config::defaults::MAX_BATCH_WAIT;
+    let at = Batching::Window {
+        max_wait: MAX_BATCH_WAIT,
+        max_commits: 64,
+        max_bytes: 1 << 20,
+    };
+    assert_eq!(at.validate(), Ok(()));
+    for s in [
+        "window 61s 64 1MiB",
+        "window 60001ms 64 1MiB",
+        "window 18446744073709551615s 64 1MiB",
+    ] {
+        let b: Batching = s.parse().unwrap();
+        match b.validate() {
+            Err(Error::Config(m)) => assert!(m.contains("max_wait") && m.contains("60s"), "{m}"),
+            r => panic!("{s}: {r:?}"),
+        }
+    }
+}
+
 fn done(commit: u64) -> PendingAck {
     PendingAck::Done {
         commit,
