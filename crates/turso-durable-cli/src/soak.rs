@@ -5,6 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use turso_durable::{CheckpointMode, Config, Connection, Database, Event, Value};
 
+/// `error <message>` on one line.
+fn say_error(e: &dyn std::fmt::Display) {
+    let msg = e.to_string().replace(['\n', '\r'], " ");
+    say(&format!("error {msg}"));
+}
+
 fn open_db(args: &SoakArgs) -> CliResult<Database> {
     let mut cfg: Config = config(&args.dir)?;
     cfg.on_event = Some(Arc::new(|e: &Event| match e {
@@ -36,7 +42,7 @@ fn open_all(args: &SoakArgs) -> CliResult<(Database, Connection)> {
         match attempt {
             Ok(x) => return Ok(x),
             Err(m) => {
-                say(&format!("error {m}"));
+                say_error(&m);
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -67,7 +73,7 @@ pub fn run(args: &SoakArgs) -> CliResult<()> {
         match r {
             Ok(_) => say(&format!("ack {id}")),
             Err(e) => {
-                say(&format!("error {e}"));
+                say_error(&e);
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
@@ -81,15 +87,15 @@ pub fn run(args: &SoakArgs) -> CliResult<()> {
         match mode(cp) {
             Some(m) => {
                 if let Err(e) = conn.checkpoint(m) {
-                    say(&format!("error {e}"));
+                    say_error(&e);
                 }
             }
             None => {
                 if let Err(e) = conn.close() {
-                    say(&format!("error {e}"));
+                    say_error(&e);
                 }
                 if let Err(e) = db.close() {
-                    say(&format!("error {e}"));
+                    say_error(&e);
                 }
                 (db, conn) = open_all(args)?;
             }

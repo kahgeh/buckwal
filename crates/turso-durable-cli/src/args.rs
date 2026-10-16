@@ -161,23 +161,19 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     }
 }
 
-/// Ids from an acked file: lines `ack <id>` or `<id>`; blank lines and other lines
-/// (e.g. `event ...`, `error ...`) are skipped. A line that starts like an id but is not one is an error.
-pub fn parse_acked(text: &str) -> Result<Vec<i64>, String> {
-    let mut ids = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        let id = match line.strip_prefix("ack ") {
-            Some(rest) => rest.trim(),
-            None if line.starts_with(|c: char| c.is_ascii_digit()) => line,
-            None => continue,
-        };
-        ids.push(
-            id.parse()
-                .map_err(|_| format!("line {}: bad id {line:?}", n + 1))?,
-        );
-    }
-    Ok(ids)
+/// Ids from an acked file: lines `ack <id>` or a bare `<id>`. Any other line (events, errors,
+/// a torn last line) is skipped; duplicates are kept so the caller can count them.
+pub fn parse_acked(text: &str) -> Vec<i64> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("ack ")
+                .unwrap_or(line)
+                .trim()
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -272,8 +268,10 @@ mod tests {
     #[test]
     fn acked_file_parsing_accepts_both_forms() {
         let text = "ack 1\n2\n\nevent seal-started\nack  3 \nerror boom\n";
-        assert_eq!(parse_acked(text), Ok(vec![1, 2, 3]));
-        assert!(parse_acked("ack x\n").is_err());
-        assert!(parse_acked("12abc\n").is_err());
+        assert_eq!(parse_acked(text), vec![1, 2, 3]);
+        // Torn or odd lines never fail the parse.
+        assert_eq!(parse_acked("ack 1\nack \nack x\n12abc\nack 2"), vec![1, 2]);
+        // Duplicates are kept.
+        assert_eq!(parse_acked("ack 1\nack 1\n"), vec![1, 1]);
     }
 }

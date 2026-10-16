@@ -1,15 +1,25 @@
 //! `bench`: per-commit latency and bucket traffic, one `key=value` line per metric.
-use crate::{config, err, say, CliResult};
+use crate::{config, err, s3_store, say, CliResult};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use turso_durable::store::fault::FaultStore;
 use turso_durable::{Event, Value};
 
 #[derive(Default)]
 struct Counters {
     log_puts: AtomicU64,
     seals: Mutex<Vec<(u64, Option<Duration>)>>,
+}
+
+/// PUTs the store saw whose key contains `needle`.
+fn puts(fault: &FaultStore, needle: &str) -> usize {
+    fault
+        .events()
+        .iter()
+        .filter(|e| e.starts_with("put") && e.contains(needle))
+        .count()
 }
 
 fn ms(d: Duration) -> String {
@@ -40,14 +50,15 @@ pub fn run(dir: &Path, commits: u64) -> CliResult<()> {
         }
         _ => {}
     }));
-    let db = turso_durable::open(cfg).map_err(err)?;
+    let fault = Arc::new(FaultStore::new(s3_store(&cfg)?));
+    let db = turso_durable::open_with_store(cfg, fault.clone()).map_err(err)?;
     let conn = db.connect().map_err(err)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bench(id INTEGER PRIMARY KEY, payload BLOB)",
         &[],
     )
     .map_err(err)?;
-    let before = db.bucket_stats();
+    let log_before = counters.log_puts.load(Relaxed);
     let payload = Value::from_slice(&[0xabu8; 1024]).map_err(err)?;
     let mut lat = Vec::with_capacity(commits as usize);
     let started = Instant::now();
@@ -61,10 +72,12 @@ pub fn run(dir: &Path, commits: u64) -> CliResult<()> {
         lat.push(t.elapsed());
     }
     let total = started.elapsed();
-    let stats = db.bucket_stats().since(&before);
-    let log_puts = counters.log_puts.load(Relaxed);
+    let log_puts = counters.log_puts.load(Relaxed) - log_before;
+
     conn.close().map_err(err)?;
     db.close().map_err(err)?;
+    // The seal at close uploads pages, so count them after it.
+    let page_puts = puts(&fault, "/pages/");
 
     let (slowest, max) = lat
         .iter()
@@ -90,11 +103,8 @@ pub fn run(dir: &Path, commits: u64) -> CliResult<()> {
         "log_puts_per_commit={:.3}",
         log_puts as f64 / commits as f64
     ));
-    say(&format!("bucket_puts={}", stats.puts));
-    say(&format!(
-        "page_puts={}",
-        seals.iter().map(|(p, _)| p).sum::<u64>()
-    ));
+    say(&format!("bucket_puts={}", puts(&fault, "")));
+    say(&format!("page_puts={page_puts}"));
     say(&format!("seals={}", seals.len()));
     for (i, (pages, el)) in seals.iter().enumerate() {
         let t = el.map(ms).unwrap_or_else(|| "unfinished".into());
