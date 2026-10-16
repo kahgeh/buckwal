@@ -1,8 +1,11 @@
 //! turso_durable: make a tursodb database durable in an S3 bucket.
 
+pub(crate) mod bucket;
+pub mod config;
 pub mod error;
 pub(crate) mod format;
 pub mod store;
+pub(crate) mod uploader;
 
 pub use error::{Error, Result};
 
