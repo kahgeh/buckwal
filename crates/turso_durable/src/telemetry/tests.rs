@@ -176,7 +176,7 @@ fn off_commit_has_its_three_children_and_one_upload() {
     // An info record at open, from the library.
     assert!(
         spans.events.iter().any(|e| e.level == Level::INFO
-            && e.target.starts_with("turso_durable")
+            && e.target == "turso_durable"
             && e.field("writer_id").is_some()
             && e.field("generation").is_some()),
         "no open record: {:?}",
@@ -303,7 +303,7 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
     assert!(cp.closed.is_some());
     assert!(
         spans.events.iter().any(|e| e.level == Level::INFO
-            && e.target.starts_with("turso_durable")
+            && e.target == "turso_durable"
             && e.field("pages").is_some()
             && e.field("ms").is_some()),
         "no seal record"
@@ -316,7 +316,7 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
     assert!(r.field("durable.bytes").is_some());
     assert!(
         spans.events.iter().any(|e| e.level == Level::INFO
-            && e.target.starts_with("turso_durable")
+            && e.target == "turso_durable"
             && e.field("log_objects").is_some()),
         "no restore record"
     );
@@ -344,7 +344,7 @@ fn failed_flush_logs_a_warning_and_marks_the_commit_error() {
         spans
             .events
             .iter()
-            .any(|e| e.level == Level::WARN && e.target.starts_with("turso_durable")),
+            .any(|e| e.level == Level::WARN && e.target == "turso_durable"),
         "no warning: {:?}",
         spans.events
     );
@@ -381,7 +381,22 @@ fn engine_tracing_is_not_ours() {
     {
         assert!(keep(&s.target), "{s:?}");
     }
-    for t in ["turso_core", "turso_core::storage::pager", "tonic", "h2"] {
+    for t in [
+        "turso_core",
+        "turso_core::storage::pager",
+        "opentelemetry",
+        "opentelemetry_sdk",
+        "opentelemetry-otlp",
+        "opentelemetry_appender_tracing",
+        "tonic",
+        "tonic::transport",
+        "h2",
+        "hyper",
+        "hyper_util::client",
+        "tower",
+        "tower::buffer::worker",
+        "reqwest",
+    ] {
         assert!(!keep(t), "{t}");
     }
     assert!(keep("turso_durable::uploader"));
@@ -424,7 +439,7 @@ fn a_fenced_writer_logs_one_error() {
         .filter(|e| e.level == Level::ERROR)
         .collect();
     assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].target.starts_with("turso_durable"));
+    assert_eq!(errors[0].target, "turso_durable");
     assert!(errors[0].field("error").unwrap().contains("another writer"));
 }
 
@@ -448,4 +463,349 @@ fn capture_sees_a_callsite_first_hit_on_a_plain_thread() {
         .filter(|e| e.target == "turso_durable::probe")
         .count();
     assert_eq!(probes, 1);
+}
+
+#[test]
+fn attaching_as_another_writer_logs_one_error_with_the_library_target() {
+    use crate::bucket::Bucket;
+    use crate::format::Keys;
+    use crate::store::RetryPolicy;
+    let cap = Capture::new();
+    tracing::subscriber::with_default(cap.subscriber(), || {
+        let mem = Arc::new(MemStore::new());
+        let keys = Keys::new("db");
+        let policy = RetryPolicy::default();
+        Bucket::create(mem.clone(), keys.clone(), policy.clone(), 1, "w1".into()).unwrap();
+        assert!(Bucket::attach(mem, keys, policy, 1, "w2").is_err());
+    });
+    let errors: Vec<_> = cap
+        .spans()
+        .events
+        .into_iter()
+        .filter(|e| e.level == Level::ERROR)
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].target, "turso_durable");
+}
+
+/// An `Off` commit is in the bucket once its blocking wait returns, so its span says `ok`
+/// even when a later statement of the same call fails and its ack is never collected.
+#[test]
+fn an_off_commit_in_a_failed_call_closes_with_outcome_ok() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let db = crate::open_with_store(config(dir.path()), Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        assert!(conn
+            .execute_batch("INSERT INTO t VALUES (7); SELECT * FROM missing")
+            .is_err());
+        assert_eq!(conn.query("SELECT x FROM t", &[]).unwrap().len(), 1);
+        cap.spans()
+    });
+    let c = spans
+        .named("durable.commit")
+        .into_iter()
+        .rev()
+        .find(|c| c.closed.is_some())
+        .expect("a closed commit");
+    assert_eq!(c.field("durable.outcome"), Some("ok"), "{c:?}");
+}
+
+/// A MemStore that logs every `put` and `get` (as a store with its own logging would).
+#[derive(Default)]
+struct ProbeStore {
+    inner: MemStore,
+}
+
+impl ObjectStore for ProbeStore {
+    fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
+        tracing::info!(target: "turso_durable::probe", key, op = "put", "probe");
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
+        tracing::info!(target: "turso_durable::probe", key, op = "get", "probe");
+        self.inner.get(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> StatsSnap {
+        self.inner.stats()
+    }
+}
+
+/// The scoped threads of a seal (page PUTs) and of a restore (log GETs) run under the
+/// caller's dispatcher.
+#[test]
+fn seal_and_restore_threads_run_under_the_callers_subscriber() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let restored = tempfile::tempdir().unwrap();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let store = Arc::new(ProbeStore::default());
+        let db = crate::open_with_store(config(dir.path()), store.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 0..3 {
+            insert(&conn, i).unwrap();
+        }
+        conn.checkpoint(CheckpointMode::Truncate).unwrap();
+        for i in 3..6 {
+            insert(&conn, i).unwrap();
+        }
+        crate::restore_with_store(&config(restored.path()), store, restored.path()).unwrap();
+        cap.spans()
+    });
+    let probes = |op: &str, part: &str| {
+        spans
+            .events
+            .iter()
+            .filter(|e| {
+                e.target == "turso_durable::probe"
+                    && e.field("op") == Some(op)
+                    && e.field("key").is_some_and(|k| k.contains(part))
+            })
+            .count()
+    };
+    assert!(probes("put", "pages/") > 0, "no page PUT seen");
+    assert!(probes("get", "log/") > 0, "no log GET seen");
+}
+
+// --- The export pipeline -------------------------------------------------------------
+
+use super::pipeline::{build_for_test, Providers};
+use super::testing::keep_interest_per_call;
+use super::{init, TelemetryConfig};
+use crate::error::Error;
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _};
+use opentelemetry::{InstrumentationScope, Key};
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::logs::{
+    InMemoryLogExporter, LogProcessor, SdkLoggerProvider, SimpleLogProcessor,
+};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData, SpanExporter};
+use opentelemetry_sdk::Resource;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::Subscriber;
+
+fn test_pipeline(
+    run_id: Option<&str>,
+) -> (
+    impl Subscriber + Send + Sync + 'static,
+    Providers,
+    InMemorySpanExporter,
+    InMemoryLogExporter,
+) {
+    keep_interest_per_call();
+    let spans = InMemorySpanExporter::default();
+    let logs = InMemoryLogExporter::default();
+    let (sub, p) = build_for_test(spans.clone(), logs.clone(), run_id.map(str::to_string));
+    (sub, p, spans, logs)
+}
+
+#[test]
+fn log_records_carry_their_own_time_and_the_run_id() {
+    let (sub, p, _spans, logs) = test_pipeline(Some("run-42"));
+    let before = SystemTime::now();
+    tracing::subscriber::with_default(sub, || tracing::info!(target: "turso_durable", "hello"));
+    let after = SystemTime::now();
+    p.force_flush();
+    let r = &logs.get_emitted_logs().unwrap()[0].record;
+    let t = r.timestamp().expect("record time set");
+    assert!(before <= t && t <= after);
+    assert!(r.attributes_iter().any(|(k, v)| k.as_str() == "test_run_id"
+        && matches!(v, AnyValue::String(s) if s.as_str() == "run-42")));
+}
+
+#[test]
+fn a_record_with_its_own_time_keeps_it() {
+    use super::pipeline::StampedLogs;
+    let exported = InMemoryLogExporter::default();
+    let stamped = StampedLogs::new(SimpleLogProcessor::new(exported.clone()), None);
+    let scope = InstrumentationScope::builder("t").build();
+    let logger = SdkLoggerProvider::builder().build().logger("t");
+    let own = UNIX_EPOCH + Duration::from_secs(1_000);
+    let observed = UNIX_EPOCH + Duration::from_secs(2_000);
+
+    let mut r = logger.create_log_record();
+    r.set_timestamp(own);
+    r.set_observed_timestamp(observed);
+    stamped.emit(&mut r, &scope);
+    let mut r = logger.create_log_record();
+    r.set_observed_timestamp(observed);
+    stamped.emit(&mut r, &scope);
+    let mut r = logger.create_log_record();
+    let before = SystemTime::now();
+    stamped.emit(&mut r, &scope);
+    let after = SystemTime::now();
+
+    let got: Vec<_> = exported
+        .get_emitted_logs()
+        .unwrap()
+        .into_iter()
+        .map(|l| l.record.timestamp().expect("a record time"))
+        .collect();
+    assert_eq!(got[0], own, "its own time");
+    assert_eq!(got[1], observed, "its observed time");
+    assert!(before <= got[2] && got[2] <= after, "the current time");
+    assert!(exported.get_emitted_logs().unwrap()[0]
+        .record
+        .attributes_iter()
+        .all(|(k, _)| k.as_str() != "test_run_id"));
+}
+
+/// An InMemorySpanExporter that keeps the resource the provider hands it.
+#[derive(Debug)]
+struct ResourceSpy {
+    inner: InMemorySpanExporter,
+    seen: Arc<Mutex<Option<Resource>>>,
+}
+
+impl SpanExporter for ResourceSpy {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        self.inner.export(batch)
+    }
+    fn set_resource(&mut self, resource: &Resource) {
+        *self.seen.lock().unwrap() = Some(resource.clone());
+        self.inner.set_resource(resource);
+    }
+}
+
+#[test]
+fn spans_carry_service_name_and_run_id_and_engine_spans_are_dropped() {
+    keep_interest_per_call();
+    let spans = InMemorySpanExporter::default();
+    let seen = Arc::new(Mutex::new(None));
+    let logs = InMemoryLogExporter::default();
+    let spy = ResourceSpy {
+        inner: spans.clone(),
+        seen: seen.clone(),
+    };
+    let (sub, p) = build_for_test(spy, logs.clone(), Some("run-42".into()));
+    let dir = tempfile::tempdir().unwrap();
+    tracing::subscriber::with_default(sub, || {
+        let db = crate::open_with_store(config(dir.path()), Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        insert(&conn, 1).unwrap();
+        drop(conn);
+        drop(db);
+    });
+    p.force_flush();
+    let got = spans.get_finished_spans().unwrap();
+    let names: Vec<&str> = got.iter().map(|s| s.name.as_ref()).collect();
+    for want in ["durable.commit", "durable.upload"] {
+        assert!(names.contains(&want), "{want} not in {names:?}");
+    }
+    for s in &got {
+        let attrs: HashMap<&str, String> = s
+            .attributes
+            .iter()
+            .map(|kv| (kv.key.as_str(), kv.value.to_string()))
+            .collect();
+        assert_eq!(attrs.get("test_run_id").map(String::as_str), Some("run-42"));
+        assert_eq!(s.instrumentation_scope.name(), "turso_durable");
+        let target = attrs.get("target").expect("a target attribute");
+        assert!(target.starts_with("turso_durable"), "{target}");
+        assert!(!target.starts_with("turso_core"), "{target}");
+    }
+    let resource = seen.lock().unwrap().clone().expect("a resource");
+    assert_eq!(
+        resource
+            .get(&Key::new("service.name"))
+            .map(|v| v.to_string()),
+        Some("turso-durable".to_string())
+    );
+    // The log records name the same service: the open record, at least.
+    let records = logs.get_emitted_logs().unwrap();
+    assert!(!records.is_empty());
+    for l in &records {
+        assert_eq!(
+            l.resource
+                .get(&Key::new("service.name"))
+                .map(|v| v.to_string()),
+            Some("turso-durable".to_string())
+        );
+        assert!(l.record.target().is_some_and(|t| t == "turso_durable"));
+    }
+}
+
+#[test]
+fn from_env_parses_and_refuses_bad_values() {
+    let lookup = |pairs: &[(&'static str, &'static str)]| {
+        let env: HashMap<&str, &str> = pairs.iter().copied().collect();
+        TelemetryConfig::from_lookup(|k| env.get(k).map(|v| v.to_string()))
+    };
+    let c = lookup(&[
+        ("DURABLE_OTEL", "1"),
+        ("DURABLE_OTEL_ENDPOINT", "http://h:1"),
+        ("DURABLE_OTEL_LEVEL", "warn"),
+        ("DURABLE_TEST_RUN_ID", "r"),
+    ])
+    .unwrap();
+    assert_eq!(
+        c,
+        TelemetryConfig {
+            enabled: true,
+            endpoint: "http://h:1".into(),
+            level: Level::WARN,
+            test_run_id: Some("r".into()),
+        }
+    );
+    let d = lookup(&[]).unwrap();
+    assert_eq!(d, TelemetryConfig::default());
+    assert!(!d.enabled);
+    assert_eq!(d.endpoint, "http://localhost:4317");
+    assert_eq!(d.level, Level::INFO);
+    assert_eq!(d.test_run_id, None);
+    assert!(!lookup(&[("DURABLE_OTEL", "false")]).unwrap().enabled);
+    assert!(lookup(&[("DURABLE_OTEL", "TRUE")]).unwrap().enabled);
+    for (var, bad) in [("DURABLE_OTEL", "yes"), ("DURABLE_OTEL_LEVEL", "loud")] {
+        match lookup(&[(var, bad)]) {
+            Err(Error::Config(m)) => assert!(m.contains(var) && m.contains(bad), "{m}"),
+            r => panic!("{var}={bad}: {r:?}"),
+        }
+    }
+}
+
+/// Disabled, `init` installs nothing; an https endpoint is refused before anything is.
+/// (Enabled `init` installs a global subscriber, so it is tested in `tests/otel_down.rs`.)
+#[test]
+fn init_disabled_installs_nothing_and_https_is_refused() {
+    // The global default, seen from a thread with no scoped one.
+    let global_is_none = || {
+        std::thread::spawn(|| {
+            tracing::dispatcher::get_default(|d| d.is::<tracing::subscriber::NoSubscriber>())
+        })
+        .join()
+        .unwrap()
+    };
+    let guard = init(TelemetryConfig::default()).unwrap();
+    assert!(global_is_none());
+    drop(guard);
+    let https = TelemetryConfig {
+        enabled: true,
+        endpoint: "https://collector:4317".into(),
+        ..TelemetryConfig::default()
+    };
+    assert!(matches!(init(https), Err(Error::Config(m)) if m.contains("http://")));
+    assert!(global_is_none());
 }

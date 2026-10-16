@@ -15,7 +15,7 @@ pub(crate) mod reconcile;
 pub(crate) mod restore;
 pub mod stats;
 pub mod store;
-pub(crate) mod telemetry;
+pub mod telemetry;
 pub(crate) mod trim;
 pub(crate) mod uploader;
 

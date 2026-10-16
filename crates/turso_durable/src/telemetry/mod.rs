@@ -11,15 +11,178 @@
 //! - `durable.restore` (`durable.generation`, `durable.log_objects`, `durable.gets`,
 //!   `durable.bytes`) (`restore.rs`).
 //!
-//! Threads the library spawns run under the dispatcher of the thread that spawned them, so a
-//! subscriber set on the opening thread sees their spans.
+//! Log events have the target `turso_durable` exactly.
+//!
+//! Threads the library spawns (its own and the scoped ones of a seal or a restore) run under
+//! the dispatcher of the thread that spawned them, so a subscriber set on the opening thread
+//! sees their spans.
+//!
+//! [`init`] exports all of it over OTLP/gRPC, through a global subscriber. A process that
+//! instead only sets scoped subscribers (`tracing::subscriber::with_default`) may lose
+//! callsites: tracing caches each callsite's interest the first time it is hit, and while at
+//! most one dispatcher exists, a callsite first hit on a thread with no subscriber is cached
+//! as disabled for every thread (standard tracing behaviour). A global subscriber avoids it.
+
+mod pipeline;
+
+use crate::config::{defaults, parse_bool};
+use crate::error::{Error, Result};
+use pipeline::Providers;
+use tracing::Level;
 
 /// Whether a span or log record with `target` may be exported: only the library's own
-/// (`turso_durable*`), never the engine's (`turso_core`) or anything else. A stub over the
-/// target; the export pipeline builds its filter on it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// (`turso_durable*`), never the engine's (`turso_core`), nor the exporter's own stack
+/// (`opentelemetry*`, `tonic`, `h2`, `hyper`, `tower`, `reqwest`), whose records would loop
+/// back into the exporter, nor anything else.
 pub(crate) fn export_filter() -> fn(&str) -> bool {
     |target| target.starts_with("turso_durable")
+}
+
+/// What [`init`] installs. [`Default`] is every [`defaults`] value: disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    /// Export at all (`DURABLE_OTEL`).
+    pub enabled: bool,
+    /// The OTLP/gRPC collector, `http://host:port` (`DURABLE_OTEL_ENDPOINT`). Set in code,
+    /// so `OTEL_EXPORTER_OTLP_*ENDPOINT` cannot redirect it; `OTEL_EXPORTER_OTLP_*HEADERS`
+    /// are still sent.
+    pub endpoint: String,
+    /// The least severe log record exported (`DURABLE_OTEL_LEVEL`).
+    pub level: Level,
+    /// Added as `test_run_id` to every span and log record when set (`DURABLE_TEST_RUN_ID`).
+    pub test_run_id: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> TelemetryConfig {
+        TelemetryConfig {
+            enabled: defaults::OTEL,
+            endpoint: defaults::OTEL_ENDPOINT.to_string(),
+            level: defaults::OTEL_LEVEL,
+            test_run_id: None,
+        }
+    }
+}
+
+fn parse_level(var: &str, v: &str) -> Result<Level> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "trace" => Ok(Level::TRACE),
+        "debug" => Ok(Level::DEBUG),
+        "info" => Ok(Level::INFO),
+        "warn" => Ok(Level::WARN),
+        "error" => Ok(Level::ERROR),
+        _ => Err(Error::Config(format!(
+            "{var} must be trace, debug, info, warn or error, not {v:?}"
+        ))),
+    }
+}
+
+impl TelemetryConfig {
+    /// Read `DURABLE_OTEL` (0/1/true/false), `DURABLE_OTEL_ENDPOINT`, `DURABLE_OTEL_LEVEL`
+    /// (trace|debug|info|warn|error) and `DURABLE_TEST_RUN_ID`; an unset one keeps its
+    /// [`defaults`] value. A bad value is a `Config` error.
+    pub fn from_env() -> Result<TelemetryConfig> {
+        TelemetryConfig::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<TelemetryConfig> {
+        let mut c = TelemetryConfig::default();
+        if let Some(v) = get("DURABLE_OTEL") {
+            c.enabled = parse_bool("DURABLE_OTEL", &v)?;
+        }
+        if let Some(v) = get("DURABLE_OTEL_ENDPOINT") {
+            c.endpoint = v;
+        }
+        if let Some(v) = get("DURABLE_OTEL_LEVEL") {
+            c.level = parse_level("DURABLE_OTEL_LEVEL", &v)?;
+        }
+        c.test_run_id = get("DURABLE_TEST_RUN_ID").filter(|v| !v.is_empty());
+        Ok(c)
+    }
+}
+
+/// Export spans and log records over OTLP/gRPC to `cfg.endpoint`, with `service.name =
+/// turso-durable`, through a global `tracing` subscriber. Only `turso_durable*` targets are
+/// exported: spans at INFO and above, log records at `cfg.level` and above. Export runs on
+/// background threads through bounded queues ([`defaults::OTEL_QUEUE`]) that drop when full,
+/// so a slow or missing collector never slows a commit.
+///
+/// Disabled, nothing is installed and the guard is empty. A process that already has a
+/// global subscriber gets a `Config` error. Keep the guard: dropping it flushes and stops
+/// the export, for at most [`defaults::OTEL_SHUTDOWN`].
+pub fn init(cfg: TelemetryConfig) -> Result<TelemetryGuard> {
+    if !cfg.enabled {
+        return Ok(TelemetryGuard { running: None });
+    }
+    if !cfg
+        .endpoint
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("http://")
+    {
+        return Err(Error::Config(format!(
+            "DURABLE_OTEL_ENDPOINT must be http://host:port (no TLS), not {:?}",
+            cfg.endpoint
+        )));
+    }
+    let (providers, runtime) = Providers::otlp(&cfg.endpoint, cfg.test_run_id.clone())?;
+    let subscriber = providers.subscriber(cfg.level);
+    let guard = TelemetryGuard {
+        running: Some(Running {
+            providers,
+            runtime: Some(runtime),
+        }),
+    };
+    // Not `try_init`: with tracing-subscriber's `tracing-log` feature (which turso_core
+    // turns on) it would also install a `log` logger, and fail after the subscriber is set
+    // when a `log` logger already exists. On an error the guard stops the export it built.
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|_| Error::Config("a global tracing subscriber is already set".into()))?;
+    Ok(guard)
+}
+
+/// Keeps the export running. Dropping it, or [`TelemetryGuard::shutdown`], flushes and stops
+/// both providers on helper threads, waiting [`defaults::OTEL_SHUTDOWN`] at most in total,
+/// then lets the export runtime go without blocking. The global subscriber stays installed
+/// and exports nothing more.
+pub struct TelemetryGuard {
+    running: Option<Running>,
+}
+
+struct Running {
+    providers: Providers,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl TelemetryGuard {
+    /// Flush and stop now (as dropping the guard does).
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        let Some(mut r) = self.running.take() else {
+            return;
+        };
+        r.providers.shutdown_within(defaults::OTEL_SHUTDOWN);
+        if let Some(rt) = r.runtime.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl std::fmt::Debug for TelemetryGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryGuard")
+            .field("running", &self.running.is_some())
+            .finish()
+    }
 }
 
 #[cfg(test)]

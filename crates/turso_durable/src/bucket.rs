@@ -309,6 +309,7 @@ impl Bucket {
                 head.writer_id
             ));
             tracing::error!(
+                target: "turso_durable",
                 generation = head.generation,
                 writer_id,
                 error = %e,
@@ -395,6 +396,7 @@ impl Bucket {
     fn fence(&mut self, e: Error) -> Error {
         self.fenced = true;
         tracing::error!(
+            target: "turso_durable",
             generation = self.head.generation,
             writer_id = %self.head.writer_id,
             error = %e,
@@ -693,6 +695,7 @@ impl Bucket {
         );
         if r.is_ok() {
             tracing::info!(
+                target: "turso_durable",
                 generation,
                 pages = n,
                 ms = start.elapsed().as_millis() as u64,
@@ -836,28 +839,31 @@ impl Bucket {
         let next = AtomicUsize::new(0);
         let failed: Mutex<Option<Error>> = Mutex::new(None);
         let workers = self.concurrency.min(pages.len());
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::scope(|s| {
             for _ in 0..workers {
-                s.spawn(|| loop {
-                    if failed.lock().unwrap().is_some() {
-                        return;
-                    }
-                    let Some((page, body)) = pages.get(next.fetch_add(1, Relaxed)) else {
-                        return;
-                    };
-                    let key = self.keys.page(gen, *page);
-                    let r = retrying(&self.counters, &self.remaining(start), &key, || {
-                        self.store.put(&key, body)
-                    });
-                    match r {
-                        Ok(_) => {
-                            self.counters.page_puts.fetch_add(1, Relaxed);
-                        }
-                        Err(e) => {
-                            failed.lock().unwrap().get_or_insert(e);
+                s.spawn(|| {
+                    tracing::dispatcher::with_default(&dispatch, || loop {
+                        if failed.lock().unwrap().is_some() {
                             return;
                         }
-                    }
+                        let Some((page, body)) = pages.get(next.fetch_add(1, Relaxed)) else {
+                            return;
+                        };
+                        let key = self.keys.page(gen, *page);
+                        let r = retrying(&self.counters, &self.remaining(start), &key, || {
+                            self.store.put(&key, body)
+                        });
+                        match r {
+                            Ok(_) => {
+                                self.counters.page_puts.fetch_add(1, Relaxed);
+                            }
+                            Err(e) => {
+                                failed.lock().unwrap().get_or_insert(e);
+                                return;
+                            }
+                        }
+                    })
                 });
             }
         });

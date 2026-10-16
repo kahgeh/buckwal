@@ -275,6 +275,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     });
     let uploader = engine.uploader.clone();
     tracing::info!(
+        target: "turso_durable",
         generation = uploader.generation(),
         writer_id = %state.writer_id,
         read_only,

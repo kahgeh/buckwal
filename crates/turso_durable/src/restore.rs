@@ -64,24 +64,27 @@ pub(crate) fn fetch_generation(
     let slots: Vec<Mutex<Option<LogRecord>>> = seqs.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let failed: Mutex<Option<Error>> = Mutex::new(None);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     std::thread::scope(|s| {
         for _ in 0..concurrency.max(1).min(seqs.len()) {
-            s.spawn(|| loop {
-                if failed.lock().unwrap().is_some() {
-                    return;
-                }
-                let i = next.fetch_add(1, Relaxed);
-                let Some(&seq) = seqs.get(i) else {
-                    return;
-                };
-                let r = get(store, retry, &keys.log(gen, seq)).and_then(|b| decode_record(&b));
-                match r {
-                    Ok(rec) => *slots[i].lock().unwrap() = Some(rec),
-                    Err(e) => {
-                        failed.lock().unwrap().get_or_insert(e);
+            s.spawn(|| {
+                tracing::dispatcher::with_default(&dispatch, || loop {
+                    if failed.lock().unwrap().is_some() {
                         return;
                     }
-                }
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some(&seq) = seqs.get(i) else {
+                        return;
+                    };
+                    let r = get(store, retry, &keys.log(gen, seq)).and_then(|b| decode_record(&b));
+                    match r {
+                        Ok(rec) => *slots[i].lock().unwrap() = Some(rec),
+                        Err(e) => {
+                            failed.lock().unwrap().get_or_insert(e);
+                            return;
+                        }
+                    }
+                })
             });
         }
     });
@@ -234,6 +237,7 @@ pub(crate) fn restore_into(
     span.record("durable.gets", r.gets);
     span.record("durable.bytes", r.bytes);
     tracing::info!(
+        target: "turso_durable",
         generation = r.generation,
         log_objects = r.log_objects,
         gets = r.gets,

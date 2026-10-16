@@ -156,7 +156,9 @@ impl Connection {
                     batching,
                     span,
                 } => {
-                    span.record("durable.outcome", "ok");
+                    // Its outcome was recorded when its blocking wait returned; it closes
+                    // at its ack.
+                    drop(span);
                     acked.push((commit, waited, batching));
                 }
                 PendingAck::Waiting {

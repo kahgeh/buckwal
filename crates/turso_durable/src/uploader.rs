@@ -371,6 +371,7 @@ impl Worker {
             }
             Err(f) => span.in_scope(|| {
                 tracing::warn!(
+                    target: "turso_durable",
                     error = %f.error,
                     commits = waiters.len() as u64,
                     "log upload failed"

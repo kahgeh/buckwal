@@ -90,7 +90,7 @@ impl Subscriber for Idle {
 /// Two idle dispatchers that live for the whole test process keep that state from ever
 /// returning: every callsite asks all registered dispatchers, and the idle ones' `sometimes`
 /// makes each call check the current thread's subscriber.
-fn keep_interest_per_call() {
+pub(crate) fn keep_interest_per_call() {
     static IDLE: OnceLock<[Dispatch; 2]> = OnceLock::new();
     IDLE.get_or_init(|| [Dispatch::new(Idle), Dispatch::new(Idle)]);
 }

@@ -35,6 +35,20 @@ pub mod defaults {
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.
     pub const PREFIX: &str = "";
+
+    /// Export traces and logs over OTLP (`DURABLE_OTEL`): off in the library.
+    pub const OTEL: bool = false;
+    /// Where OTLP/gRPC goes (`DURABLE_OTEL_ENDPOINT`); plain `http://` only, no TLS.
+    pub const OTEL_ENDPOINT: &str = "http://localhost:4317";
+    /// The least severe log record exported (`DURABLE_OTEL_LEVEL`); spans are always INFO.
+    pub const OTEL_LEVEL: tracing::Level = tracing::Level::INFO;
+    /// How long one OTLP export may take. Fixed.
+    pub const OTEL_EXPORT_TIMEOUT: Duration = Duration::from_secs(1);
+    /// How long `TelemetryGuard` waits, in total, for both providers to flush and stop. Fixed.
+    pub const OTEL_SHUTDOWN: Duration = Duration::from_secs(2);
+    /// How many spans, and how many log records, may wait for export; more are dropped.
+    /// Fixed.
+    pub const OTEL_QUEUE: usize = 2048;
 }
 
 /// Where a database lives: its local directory and its bucket.
@@ -105,7 +119,7 @@ const ENV_VARS: [&str; 13] = [
     "DURABLE_BATCHING",
 ];
 
-fn parse_bool(var: &str, v: &str) -> Result<bool> {
+pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "1" | "true" => Ok(true),
         "0" | "false" => Ok(false),

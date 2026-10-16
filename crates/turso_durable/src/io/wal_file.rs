@@ -167,8 +167,8 @@ impl ShippingFile {
     /// in the bucket, so a failure rolls it back. A Window commit only queues: the call waits
     /// on its ticket after the engine returns (`Connection::await_acks`).
     ///
-    /// Returns the commit's span (`None` with nothing to ship), which goes with its ack;
-    /// a failure closes it here with `durable.outcome = error`.
+    /// Returns the commit's span (`None` with nothing to ship), which goes with its ack. A
+    /// blocking wait records its `durable.outcome` here (`ok`, or `error`, which closes it).
     fn ship_commit(&self) -> Result<Option<Span>> {
         let (ops, span) = self.take_pending();
         if ops.is_empty() {
@@ -180,9 +180,9 @@ impl ShippingFile {
             let ticket = self.submit(&span, ops, Batching::Off, b);
             let (commit, submitted) = (ticket.commit, ticket.submitted);
             let r = ticket.wait_in(&span);
-            if r.is_err() {
-                record_outcome(&span, &r);
-            }
+            // Either way it is decided now: `Done` means its record is in the bucket, so the
+            // span says `ok` even if the call fails later and its ack is never collected.
+            record_outcome(&span, &r);
             r?;
             ctx::push(PendingAck::Done {
                 commit,
