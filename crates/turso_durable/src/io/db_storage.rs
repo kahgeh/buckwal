@@ -32,16 +32,29 @@ pub(crate) fn seal_page_set(
     wal_pages: &BTreeSet<u32>,
     page_count: u32,
 ) -> BTreeSet<u32> {
-    let from_file = persisted
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()));
     memory
         .iter()
         .copied()
-        .chain(from_file)
+        .chain(persisted_pages(persisted))
         .chain(wal_pages.iter().copied())
         .filter(|p| (1..=page_count).contains(p))
         .collect()
+}
+
+/// The page numbers in the dirty file's bytes (u32 LE; a torn trailing entry is ignored).
+fn persisted_pages(persisted: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    persisted
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+}
+
+/// The dirty file's bytes; none when it does not exist.
+fn read_dirty_file(path: &Path) -> Result<Vec<u8>> {
+    match fs::read(path) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(io_err("read dirty file", e)),
+    }
 }
 
 fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
@@ -188,6 +201,18 @@ impl BucketDbStorage {
         Ok(())
     }
 
+    /// Pages the dirty file names were written locally since the last seal, so the local
+    /// file holds a version newer than the bucket's: never fetch them over it. Called at open,
+    /// before the engine reads anything.
+    pub(crate) fn adopt_persisted_dirty(&self) -> Result<()> {
+        let persisted = read_dirty_file(&self.dirty_path())?;
+        self.local
+            .lock()
+            .unwrap()
+            .extend(persisted_pages(&persisted));
+        Ok(())
+    }
+
     /// Fetch every page the manifest names; once all are local, nothing is fetched again.
     pub(crate) fn prefetch(&self) {
         let Some(m) = &self.manifest else {
@@ -245,11 +270,7 @@ impl BucketDbStorage {
         let size = DatabaseStorage::size(self).map_err(|e| io_err("db size", e))?;
         let page_count = u32::try_from(size / ps as u64)
             .map_err(|_| Error::Corrupt(format!("database of {size} bytes is too large")))?;
-        let persisted = match fs::read(self.dirty_path()) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(io_err("read dirty file", e)),
-        };
+        let persisted = read_dirty_file(&self.dirty_path())?;
         let set = seal_page_set(&dirty.memory, &persisted, wal_frame_pages, page_count);
         let complete = self.complete.load(SeqCst);
         let local = self.local.lock().unwrap().clone();
@@ -257,6 +278,16 @@ impl BucketDbStorage {
         for p in set {
             // A page never made local in this process (only a stale frame names it) is
             // unchanged since the manifest: the bucket copy stays.
+            //
+            // Invariant this skip relies on: a page written to the local file in an earlier
+            // process of this generation is written again in this one before any boundary.
+            // turso 0.8.3 starts `nbackfills` at 0 when a WAL is opened without shared
+            // coordination (sqlite3_ondisk.rs:1567, 2018) and restarts the log only when
+            // `max_frame == nbackfills` (wal.rs:5287-5299), so every valid frame is
+            // backfilled again (`write_page`, marking its page local) before the restart that
+            // triggers this seal. Pages in the dirty file are also marked local at open
+            // (`adopt_persisted_dirty`). Pinned by `seal_after_passive_checkpoint_crash_keeps_
+            // pages` (reconcile tests), on a locally created and on a restored directory.
             if !complete && !local.contains(&p) {
                 continue;
             }
@@ -283,7 +314,7 @@ impl BucketDbStorage {
     }
 }
 
-fn truncate_dirty_file(path: &Path) -> Result<()> {
+pub(crate) fn truncate_dirty_file(path: &Path) -> Result<()> {
     match fs::OpenOptions::new().write(true).open(path) {
         Ok(f) => f
             .set_len(0)

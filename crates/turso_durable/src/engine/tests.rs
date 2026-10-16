@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Value, IO};
 
-const PREFIX: &str = "t";
+pub(crate) const PREFIX: &str = "t";
 
-fn keys() -> Keys {
+pub(crate) fn keys() -> Keys {
     Keys::new(PREFIX)
 }
 
-fn cfg_deadline(deadline: Duration) -> EngineConfig {
+pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
     EngineConfig {
         retry: RetryPolicy {
             deadline,
@@ -32,13 +32,13 @@ fn cfg_deadline(deadline: Duration) -> EngineConfig {
     }
 }
 
-fn cfg() -> EngineConfig {
+pub(crate) fn cfg() -> EngineConfig {
     cfg_deadline(Duration::from_secs(5))
 }
 
 /// Create a database in `dir` (new writer id, generation 1) or attach to the one its local
 /// state names, then open the engine and one connection.
-fn writer_with(
+pub(crate) fn writer_with(
     store: Arc<dyn ObjectStore>,
     dir: &Path,
     cfg: &EngineConfig,
@@ -47,7 +47,7 @@ fn writer_with(
 }
 
 /// `writer_with`, handing seal snapshots to `trim_tx`.
-fn writer_trimmed(
+pub(crate) fn writer_trimmed(
     store: Arc<dyn ObjectStore>,
     dir: &Path,
     cfg: &EngineConfig,
@@ -92,13 +92,13 @@ fn writer_trimmed(
     (e, conn)
 }
 
-fn writer(store: Arc<dyn ObjectStore>, dir: &Path) -> (Engine, Arc<Connection>) {
+pub(crate) fn writer(store: Arc<dyn ObjectStore>, dir: &Path) -> (Engine, Arc<Connection>) {
     writer_with(store, dir, &cfg())
 }
 
 /// Model a process crash on the same disk: forget the engine (nothing runs on drop), then
 /// copy its files to a new directory, which `Database::open`'s registry has never seen.
-fn crash_copy(engine: Engine, dir: &Path) -> TempDir {
+pub(crate) fn crash_copy(engine: Engine, dir: &Path) -> TempDir {
     std::mem::forget(engine);
     let to = tempfile::tempdir().unwrap();
     for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-dirty"] {
@@ -111,36 +111,39 @@ fn crash_copy(engine: Engine, dir: &Path) -> TempDir {
 }
 
 /// `crash_copy` for a writer whose connection must not run its close checkpoint either.
-fn crash(engine: Engine, conn: Arc<Connection>, dir: &Path) -> TempDir {
+pub(crate) fn crash(engine: Engine, conn: Arc<Connection>, dir: &Path) -> TempDir {
     std::mem::forget(conn);
     crash_copy(engine, dir)
 }
 
 /// Restore the bucket into a new directory and open it.
-fn restored(store: Arc<dyn ObjectStore>) -> (TempDir, Engine, Arc<Connection>) {
+pub(crate) fn restored(store: Arc<dyn ObjectStore>) -> (TempDir, Engine, Arc<Connection>) {
     let r = tempfile::tempdir().unwrap();
     restore_into(store.clone(), &keys(), r.path(), &cfg()).unwrap();
     let (e, c) = writer(store, r.path());
     (r, e, c)
 }
 
-fn run(conn: &Arc<Connection>, sql: &str) -> std::result::Result<Vec<Vec<Value>>, LimboError> {
+pub(crate) fn run(
+    conn: &Arc<Connection>,
+    sql: &str,
+) -> std::result::Result<Vec<Vec<Value>>, LimboError> {
     stash::clear();
     conn.prepare(sql)?.run_collect_rows()
 }
 
-fn exec(conn: &Arc<Connection>, sql: &str) {
+pub(crate) fn exec(conn: &Arc<Connection>, sql: &str) {
     run(conn, sql).unwrap_or_else(|e| panic!("{sql}: {e} ({:?})", stash::take()));
 }
 
-fn int(v: &Value) -> i64 {
+pub(crate) fn int(v: &Value) -> i64 {
     match v {
         Value::Numeric(Numeric::Integer(i)) => *i,
         v => panic!("not an integer: {v:?}"),
     }
 }
 
-fn ids(conn: &Arc<Connection>) -> Vec<i64> {
+pub(crate) fn ids(conn: &Arc<Connection>) -> Vec<i64> {
     run(conn, "SELECT id FROM t ORDER BY id")
         .unwrap()
         .iter()
@@ -148,19 +151,19 @@ fn ids(conn: &Arc<Connection>) -> Vec<i64> {
         .collect()
 }
 
-fn integrity(conn: &Arc<Connection>) -> String {
+pub(crate) fn integrity(conn: &Arc<Connection>) -> String {
     match &run(conn, "PRAGMA integrity_check").unwrap()[0][0] {
         Value::Text(t) => t.as_str().to_string(),
         v => panic!("integrity_check returned {v:?}"),
     }
 }
 
-fn create_table(conn: &Arc<Connection>) {
+pub(crate) fn create_table(conn: &Arc<Connection>) {
     exec(conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
 }
 
 /// One autocommit insert of a 1000-byte row: one commit, one shipped log record.
-fn commit_row(conn: &Arc<Connection>, id: i64) -> std::result::Result<(), LimboError> {
+pub(crate) fn commit_row(conn: &Arc<Connection>, id: i64) -> std::result::Result<(), LimboError> {
     run(
         conn,
         &format!("INSERT INTO t(id, v) VALUES ({id}, randomblob(1000))"),
@@ -169,7 +172,7 @@ fn commit_row(conn: &Arc<Connection>, id: i64) -> std::result::Result<(), LimboE
 }
 
 /// Seal the current generation now: a TRUNCATE checkpoint ends with `truncate(0)`.
-fn seal_now(conn: &Arc<Connection>) {
+pub(crate) fn seal_now(conn: &Arc<Connection>) {
     stash::clear();
     conn.checkpoint(CheckpointMode::Truncate {
         upper_bound_inclusive: None,
@@ -177,17 +180,17 @@ fn seal_now(conn: &Arc<Connection>) {
     .unwrap_or_else(|e| panic!("checkpoint: {e} ({:?})", stash::take()));
 }
 
-fn head(store: &dyn ObjectStore) -> Head {
+pub(crate) fn head(store: &dyn ObjectStore) -> Head {
     Head::decode(&store.get(&keys().head()).unwrap().unwrap().body).unwrap()
 }
 
-fn manifest(store: &dyn ObjectStore) -> (u64, Manifest) {
+pub(crate) fn manifest(store: &dyn ObjectStore) -> (u64, Manifest) {
     let g = head(store).manifest.expect("sealed at least once");
     let body = store.get(&keys().manifest(g)).unwrap().unwrap().body;
     (g, Manifest::decode(&body).unwrap())
 }
 
-fn log_seqs(store: &dyn ObjectStore, gen: u64) -> Vec<u64> {
+pub(crate) fn log_seqs(store: &dyn ObjectStore, gen: u64) -> Vec<u64> {
     store
         .list(&keys().log_prefix(gen))
         .unwrap()

@@ -6,6 +6,7 @@ pub(crate) mod engine;
 pub mod error;
 pub(crate) mod format;
 pub(crate) mod io;
+pub(crate) mod reconcile;
 pub(crate) mod restore;
 pub mod store;
 pub(crate) mod trim;

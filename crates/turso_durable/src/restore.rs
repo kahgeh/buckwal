@@ -118,8 +118,57 @@ fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
         .map(|f| &f[24..])
 }
 
+/// The `-wal` image `B` of the head's generation: every record of `log/<generation>`
+/// replayed in order, and the number of records. A record of any other writer is `Fenced`.
+pub(crate) fn generation_image(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    head: &Head,
+    cfg: &EngineConfig,
+) -> Result<(Vec<u8>, u64)> {
+    let records = fetch_generation(
+        store,
+        keys,
+        head.generation,
+        cfg.upload_concurrency,
+        &cfg.retry,
+    )?;
+    let mut wal = Vec::new();
+    for rec in &records {
+        match rec {
+            LogRecord::Extents { writer_id, syncs } if *writer_id == head.writer_id => {
+                for ops in syncs {
+                    apply_ops(&mut wal, ops)?;
+                }
+            }
+            LogRecord::Extents { writer_id, .. } | LogRecord::Fence { writer_id } => {
+                return Err(Error::Fenced(format!(
+                    "log/{} holds a record of writer {writer_id:?}, not {:?}",
+                    head.generation, head.writer_id
+                )));
+            }
+        }
+    }
+    Ok((wal, records.len() as u64))
+}
+
+/// The database file to put next to the `-wal` image `wal` while the bucket holds no page
+/// (never sealed). The engine reads an empty database file as a new database and deletes a
+/// WAL holding frames next to it as an orphan (database.rs:738-760, 2223-2246). Any page-1
+/// frame bootstraps it (page size, reserved space); page 1 itself is read from the WAL, which
+/// holds the current version. Empty when `wal` has no page-1 frame.
+pub(crate) fn page_one_seed(wal: &[u8]) -> Result<Vec<u8>> {
+    match wal_page_one(wal) {
+        Some(p) => {
+            refuse_mvcc(p)?;
+            Ok(p.to_vec())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Write `bytes` to `path` and fsync it.
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = fs::File::create(path).map_err(|e| io_err("create", e))?;
     f.write_all(bytes)
         .and_then(|_| f.sync_all())
@@ -153,41 +202,11 @@ pub(crate) fn restore_into(
             .ok_or_else(|| Error::Corrupt(format!("manifest/{g} has no entry for page 1")))?;
         refuse_mvcc(&get(&*store, retry, &keys.page(*pg, 1))?)?;
     }
-    let records = fetch_generation(
-        &*store,
-        keys,
-        head.generation,
-        cfg.upload_concurrency,
-        retry,
-    )?;
-    let mut wal = Vec::new();
-    for rec in &records {
-        match rec {
-            LogRecord::Extents { writer_id, syncs } if *writer_id == head.writer_id => {
-                for ops in syncs {
-                    apply_ops(&mut wal, ops)?;
-                }
-            }
-            LogRecord::Extents { writer_id, .. } | LogRecord::Fence { writer_id } => {
-                return Err(Error::Fenced(format!(
-                    "log/{} holds a record of writer {writer_id:?}, not {:?}",
-                    head.generation, head.writer_id
-                )));
-            }
-        }
-    }
-    // Never sealed: the bucket holds no page, but the engine reads an empty database file as
-    // a new database and ignores the WAL. Any page-1 frame bootstraps it (page size, reserved
-    // space); page 1 itself is read from the WAL, which holds the current version.
+    let (wal, log_objects) = generation_image(&*store, keys, &head, cfg)?;
+    // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).
     let db = match head.manifest {
         Some(_) => Vec::new(),
-        None => match wal_page_one(&wal) {
-            Some(p) => {
-                refuse_mvcc(p)?;
-                p.to_vec()
-            }
-            None => Vec::new(),
-        },
+        None => page_one_seed(&wal)?,
     };
     fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
     write_synced(&dir.join("app.db-wal"), &wal)?;
@@ -205,7 +224,7 @@ pub(crate) fn restore_into(
     let delta = store.stats().since(&before);
     Ok(RestoreReport {
         generation: head.generation,
-        log_objects: records.len() as u64,
+        log_objects,
         gets: delta.gets,
         lists: delta.lists,
         bytes: delta.bytes_down,

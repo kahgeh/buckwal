@@ -78,6 +78,7 @@ pub(crate) fn open_engine(
         manifest,
         complete: state.complete,
     }));
+    storage.adopt_persisted_dirty()?;
     let io = Arc::new(DurableIo::new(
         platform,
         wal_path,
@@ -107,4 +108,4 @@ pub(crate) fn open_engine(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
