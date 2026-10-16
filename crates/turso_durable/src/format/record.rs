@@ -66,6 +66,7 @@ pub(crate) fn encode_record(r: &LogRecord) -> Vec<u8> {
         LogRecord::Fence { writer_id } => {
             out.push(KIND_FENCE);
             put_writer_id(&mut out, writer_id);
+            out.extend(0u32.to_le_bytes()); // sync_count, always 0
         }
     }
     let sha = Sha256::digest(&out);
@@ -115,7 +116,8 @@ pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
     }
     let writer_id = String::from_utf8_lossy(writer_id).into_owned();
     let rec = match kind {
-        KIND_FENCE => LogRecord::Fence { writer_id },
+        // Bytes after the writer id are ignored so later stages can extend fences.
+        KIND_FENCE => return Ok(LogRecord::Fence { writer_id }),
         KIND_EXTENTS => {
             let sync_count = r.u32()?;
             let mut syncs = Vec::new();
@@ -150,18 +152,24 @@ pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
 
 /// Apply ops with file semantics: a write past the end zero-fills the gap;
 /// truncate sets the length (zero-extending when it grows).
-pub(crate) fn apply_ops(buf: &mut Vec<u8>, ops: &[Op]) {
+pub(crate) fn apply_ops(buf: &mut Vec<u8>, ops: &[Op]) -> Result<()> {
     for op in ops {
         match op {
             Op::Write { off, bytes } => {
-                let off = *off as usize;
-                let end = off + bytes.len();
+                let off = usize::try_from(*off).map_err(|_| corrupt("write offset overflow"))?;
+                let end = off
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| corrupt("write offset overflow"))?;
                 if buf.len() < end {
                     buf.resize(end, 0);
                 }
                 buf[off..end].copy_from_slice(bytes);
             }
-            Op::Truncate { len } => buf.resize(*len as usize, 0),
+            Op::Truncate { len } => buf.resize(
+                usize::try_from(*len).map_err(|_| corrupt("truncate length overflow"))?,
+                0,
+            ),
         }
     }
+    Ok(())
 }

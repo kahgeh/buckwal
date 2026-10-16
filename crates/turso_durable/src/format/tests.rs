@@ -88,13 +88,14 @@ fn apply_ops_matches_file_semantics() {
             off: 10,
             bytes: vec![7, 8, 9],
         }],
-    );
+    )
+    .unwrap();
     assert_eq!(buf.len(), 13);
     assert!(buf[..10].iter().all(|b| *b == 0));
     assert_eq!(&buf[10..], &[7, 8, 9]);
-    apply_ops(&mut buf, &[Op::Truncate { len: 4 }]);
+    apply_ops(&mut buf, &[Op::Truncate { len: 4 }]).unwrap();
     assert_eq!(buf.len(), 4);
-    apply_ops(&mut buf, &[Op::Truncate { len: 6 }]);
+    apply_ops(&mut buf, &[Op::Truncate { len: 6 }]).unwrap();
     assert_eq!(buf, vec![0; 6]);
 }
 
@@ -196,7 +197,6 @@ fn head_rejects_bad_json() {
         r#"{"format":1,"generation":-1,"manifest":null,"writer_id":"w"}"#,
         r#"{"format":1,"generation":0,"manifest":null}"#,
         r#"{"format":1,"generation":0,"manifest":null,"writer_id":"w"} x"#,
-        r#"{"format":1,"generation":0,"manifest":null,"writer_id":"w\u0001"}"#,
         "{\"format\":1,\"generation\":0,\"manifest\":null,\"writer_id\":\"w\n\"}",
         r#"{"format":1,"generation":0,"manifest":null,"writer_id":"w""#,
         r#"{"format":1,"generation":99999999999999999999999,"manifest":null,"writer_id":"w"}"#,
@@ -242,4 +242,211 @@ fn local_state_atomic_write() {
     assert_eq!(names, vec!["app.db-durable".to_string()]);
     std::fs::write(dir.path().join("app.db-durable"), b"garbage").unwrap();
     assert!(is_corrupt(LocalState::read(dir.path())));
+}
+
+/// Append the sha256 of `body` (computed here, independent of the codecs).
+fn seal(mut body: Vec<u8>) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let sha = Sha256::digest(&body);
+    body.extend_from_slice(&sha);
+    body
+}
+
+#[test]
+fn golden_extents_record() {
+    let body = hex::decode(concat!(
+        "54444c4f47000001", // magic
+        "01",               // kind extents
+        "02",
+        "7731",             // writer id "w1"
+        "01000000",         // sync_count 1
+        "01000000",         // op_count 1
+        "01",               // write tag
+        "0010000000000000", // off 0x1000
+        "03000000",         // len 3
+        "0a0b0c",
+    ))
+    .unwrap();
+    let r = LogRecord::Extents {
+        writer_id: "w1".into(),
+        syncs: vec![vec![Op::Write {
+            off: 0x1000,
+            bytes: vec![10, 11, 12],
+        }]],
+    };
+    assert_eq!(encode_record(&r), seal(body.clone()));
+    assert_eq!(decode_record(&seal(body)).unwrap(), r);
+}
+
+#[test]
+fn golden_truncate_op() {
+    let body = hex::decode(concat!(
+        "54444c4f47000001",
+        "01",
+        "01",
+        "77",
+        "01000000",
+        "01000000",
+        "02",
+        "0500000000000000",
+    ))
+    .unwrap();
+    let r = LogRecord::Extents {
+        writer_id: "w".into(),
+        syncs: vec![vec![Op::Truncate { len: 5 }]],
+    };
+    assert_eq!(encode_record(&r), seal(body));
+}
+
+#[test]
+fn golden_fence_record() {
+    let body = hex::decode(concat!("54444c4f47000001", "02", "02", "7732", "00000000")).unwrap();
+    let r = LogRecord::Fence {
+        writer_id: "w2".into(),
+    };
+    assert_eq!(encode_record(&r), seal(body.clone()));
+    // bytes after the writer id are ignored (sha still verified)
+    let mut ext = hex::decode(concat!("54444c4f47000001", "02", "02", "7732", "deadbeef")).unwrap();
+    assert_eq!(decode_record(&seal(ext.clone())).unwrap(), r);
+    let mut bad = seal(ext.clone());
+    bad[10] ^= 1;
+    assert!(is_corrupt(decode_record(&bad)));
+    ext.clear();
+}
+
+#[test]
+fn golden_manifest() {
+    let body = hex::decode(concat!(
+        "54444d414e000001", // magic
+        "00100000",         // page_size 4096
+        "03000000",         // page_count 3
+        "01000000",         // run_count 1
+        "01000000",         // first 1
+        "03000000",         // count 3
+        "0200000000000000", // generation 2
+    ))
+    .unwrap();
+    let m = Manifest {
+        page_size: 4096,
+        page_count: 3,
+        pages: [(1, 2), (2, 2), (3, 2)].into(),
+    };
+    assert_eq!(m.encode(), seal(body.clone()));
+    assert_eq!(Manifest::decode(&seal(body)).unwrap(), m);
+}
+
+fn manifest_body(page_count: u32, run_count: u32, runs: &[(u32, u32, u64)]) -> Vec<u8> {
+    let mut b = b"TDMAN\0\0\x01".to_vec();
+    b.extend(4096u32.to_le_bytes());
+    b.extend(page_count.to_le_bytes());
+    b.extend(run_count.to_le_bytes());
+    for (f, c, g) in runs {
+        b.extend(f.to_le_bytes());
+        b.extend(c.to_le_bytes());
+        b.extend(g.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn manifest_rejects_structural_lies_with_valid_sha() {
+    let ok = manifest_body(10, 2, &[(1, 2, 1), (5, 2, 2)]);
+    assert!(Manifest::decode(&seal(ok)).is_ok());
+    // unsorted
+    assert!(is_corrupt(Manifest::decode(&seal(manifest_body(
+        10,
+        2,
+        &[(5, 2, 1), (1, 2, 2)]
+    )))));
+    // overlapping
+    assert!(is_corrupt(Manifest::decode(&seal(manifest_body(
+        10,
+        2,
+        &[(1, 3, 1), (3, 2, 2)]
+    )))));
+    // zero count
+    assert!(is_corrupt(Manifest::decode(&seal(manifest_body(
+        10,
+        1,
+        &[(1, 0, 1)]
+    )))));
+    // run_count larger / smaller than the table
+    assert!(is_corrupt(Manifest::decode(&seal(manifest_body(
+        10,
+        3,
+        &[(1, 2, 1)]
+    )))));
+    assert!(is_corrupt(Manifest::decode(&seal(manifest_body(
+        10,
+        1,
+        &[(1, 2, 1), (5, 2, 2)]
+    )))));
+}
+
+#[test]
+fn record_rejects_lying_lengths_with_valid_sha() {
+    let pre = hex::decode("54444c4f47000001010177").unwrap(); // magic, kind 1, id "w"
+    let tail = |parts: &[&str]| {
+        let mut b = pre.clone();
+        for p in parts {
+            b.extend(hex::decode(p).unwrap());
+        }
+        seal(b)
+    };
+    // sync_count lies (3, one present)
+    assert!(is_corrupt(decode_record(&tail(&["03000000", "00000000"]))));
+    // op_count lies
+    assert!(is_corrupt(decode_record(&tail(&["01000000", "ffffffff"]))));
+    // write len lies
+    assert!(is_corrupt(decode_record(&tail(&[
+        "01000000",
+        "01000000",
+        "01",
+        "0000000000000000",
+        "ffffffff",
+        "00"
+    ]))));
+    // sanity: the honest version decodes
+    assert!(decode_record(&tail(&["01000000", "00000000"])).is_ok());
+}
+
+#[test]
+fn apply_ops_rejects_overflow() {
+    let mut buf = Vec::new();
+    let r = apply_ops(
+        &mut buf,
+        &[Op::Write {
+            off: u64::MAX - 1,
+            bytes: vec![1, 2, 3],
+        }],
+    );
+    assert!(is_corrupt(r));
+}
+
+#[test]
+fn json_escapes_decode_and_encode() {
+    let h = Head::decode(
+        br#"{"format":1,"generation":0,"manifest":null,"writer_id":"a\/\b\f\n\r\t\u0041\u00e9\ud83d\ude00"}"#,
+    )
+    .unwrap();
+    assert_eq!(h.writer_id, "a/\u{8}\u{c}\n\r\tA\u{e9}\u{1F600}");
+    for bad in [
+        r#""\ud83d""#,
+        r#""\ud83dx""#,
+        r#""\ude00""#,
+        r#""\u12""#,
+        r#""\uzzzz""#,
+    ] {
+        let j = format!(r#"{{"format":1,"generation":0,"manifest":null,"writer_id":{bad}}}"#);
+        assert!(is_corrupt(Head::decode(j.as_bytes())), "{bad}");
+    }
+    let nasty = Head {
+        format: 1,
+        generation: 0,
+        manifest: None,
+        writer_id: "q\"\\\u{0}\u{1f}\n\t\u{7f}é😀".into(),
+    };
+    let enc = nasty.encode();
+    assert!(enc.iter().all(|b| *b >= 0x20));
+    assert_eq!(Head::decode(&enc).unwrap(), nasty);
 }

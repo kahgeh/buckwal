@@ -17,10 +17,12 @@ pub(crate) fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
         }
-        out.push(c);
     }
     out.push('"');
     out
@@ -46,6 +48,18 @@ impl P<'_> {
             Err(corrupt(&format!("expected '{}'", c as char)))
         }
     }
+    fn hex4(&mut self) -> Result<u32> {
+        let h = self
+            .s
+            .get(self.i..self.i + 4)
+            .ok_or_else(|| corrupt("bad \\u escape"))?;
+        let h = std::str::from_utf8(h).map_err(|_| corrupt("bad \\u escape"))?;
+        if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(corrupt("bad \\u escape"));
+        }
+        self.i += 4;
+        u32::from_str_radix(h, 16).map_err(|_| corrupt("bad \\u escape"))
+    }
     fn string(&mut self) -> Result<String> {
         self.eat(b'"')?;
         let mut out = Vec::new();
@@ -61,7 +75,29 @@ impl P<'_> {
                     let e = *self.s.get(self.i).ok_or_else(|| corrupt("bad escape"))?;
                     self.i += 1;
                     match e {
-                        b'"' | b'\\' => out.push(e),
+                        b'"' | b'\\' | b'/' => out.push(e),
+                        b'b' => out.push(8),
+                        b'f' => out.push(12),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            let mut cp = self.hex4()?;
+                            if (0xD800..0xDC00).contains(&cp) {
+                                if !self.s[self.i..].starts_with(b"\\u") {
+                                    return Err(corrupt("lone surrogate"));
+                                }
+                                self.i += 2;
+                                let lo = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err(corrupt("bad surrogate pair"));
+                                }
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            }
+                            let ch = char::from_u32(cp).ok_or_else(|| corrupt("bad code point"))?;
+                            let mut buf = [0u8; 4];
+                            out.extend(ch.encode_utf8(&mut buf).as_bytes());
+                        }
                         _ => return Err(corrupt("unsupported escape")),
                     }
                 }
