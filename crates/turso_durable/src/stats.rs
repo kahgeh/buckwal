@@ -5,6 +5,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 /// A snapshot of the upload counters since open.
+///
+/// `commits_uploaded`, `log_puts` and `log_put_bytes` undercount after an ambiguous log PUT
+/// (a request whose reply was lost, so its record may have landed). That record's commits
+/// get an error ack at once, and when the record is later settled at its seq (re-put, or
+/// found already there), it is confirmed in the bucket but counted nowhere here.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UploadStats {
     /// Commits whose ack returned `Ok`.
