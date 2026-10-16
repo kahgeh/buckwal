@@ -1,0 +1,14 @@
+[package]
+name = "turso-durable-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "turso-durable"
+path = "src/main.rs"
+
+[dependencies]
+turso_durable = { path = "../turso_durable" }
+
+[dev-dependencies]
+tempfile.workspace = true

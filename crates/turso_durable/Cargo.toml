@@ -1,0 +1,15 @@
+[package]
+name = "turso_durable"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+turso_core.workspace = true
+turso_parser.workspace = true
+reqwest.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
