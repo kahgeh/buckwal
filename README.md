@@ -143,7 +143,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_SECRET_KEY` | `secret_key` | required | Redacted from `Debug`. |
 | `DURABLE_REGION` | `region` | `us-east-1` | Used for SigV4. |
 | `DURABLE_PATH_STYLE` | `path_style` | `true` | `endpoint/bucket/key`. Set it to `false` for virtual-hosted style. Accepts `0`/`1`/`true`/`false`. |
-| `DURABLE_PREFIX` | `prefix` | `""` (bucket root) | Every key goes under `<prefix>/`. Use one prefix per database. Only `A-Z a-z 0-9 . _ - /` are allowed, with no leading or trailing `/` and no `//`; anything else fails with `Config`. |
+| `DURABLE_PREFIX` | `prefix` | `""` (bucket root) | Every key goes under `<prefix>/`. Use one prefix per database. Only `A-Z a-z 0-9 . _ - /` are allowed, with no leading or trailing `/`, no `//` and no `.` or `..` segment; anything else fails with `Config`. |
 | `DURABLE_RETRY_DEADLINE_MS` | `retry_deadline` | 30 s | How long one bucket job may keep retrying transient errors: a commit's log upload, a seal, or a page fetch. |
 | `DURABLE_REQUEST_TIMEOUT_MS` | `request_timeout` | 10 s | One HTTP request. |
 | `DURABLE_UPLOAD_CONCURRENCY` | `upload_concurrency` | 16 | Parallel page PUTs in a seal, and parallel log GETs in a restore. Must be at least 1. |
@@ -200,7 +200,7 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 ```
 
 - It is written to a temp file, fsynced, renamed, and then the directory is fsynced.
-- `complete=false` means pages not yet read since this process opened come from the bucket. A finished prefetch writes `complete=true` at once; a seal also writes the current value.
+- `complete=false` means pages not yet read since this process opened come from the bucket. Only a finished prefetch in a writer open writes `complete=true`, at once; a seal also writes the current value. A read-only open's prefetch keeps it in memory only, because a read-only open never checkpoints its WAL into `app.db`. Taking in a newer generation on a directory no writer has claimed sets `complete=false`.
 - `claimed=false` with `head_etag` marks a restored directory that no writer has opened yet. An older file without these two keys reads as `claimed=true` with an empty `head_etag`.
 
 **Writer id.** 16 random bytes in hex. A new database and every claim get a new id.
@@ -262,7 +262,7 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - You can move this wait off a latency-sensitive path by calling `Connection::checkpoint(CheckpointMode::Truncate)` at a quiet moment.
 
 **Limits.**
-- Without `prefetch`, a restored database fetches pages lazily in every process that opens it, until a prefetch completes. Each process fetches each page it reads once. Only a finished prefetch marks the directory `complete`.
+- Without `prefetch`, a restored database fetches pages lazily in every process that opens it, until a prefetch completes. Each process fetches each page it reads once. Only a finished prefetch in a writer open marks the directory `complete`.
 - Short-lived processes never trim. The trimmer waits `trim_grace` (10 min by default) after each seal, and close stops it. A process that exits sooner than `trim_grace` after its seals deletes nothing, so the bucket grows until a long-lived process trims or stage 3's `gc` runs.
 - Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large (a long-running reader that blocks checkpoints, for example) makes the seal large too. `CheckpointMode::Truncate` at quiet moments keeps generations small.
 - Never copy a live database directory (`cp -r`, a VM or disk clone). The copy has the same writer id, so fencing cannot tell the two processes apart. Restore into a new directory instead.

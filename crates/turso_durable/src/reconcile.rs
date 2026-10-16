@@ -78,6 +78,12 @@ pub(crate) fn reconcile(
         if head.manifest.is_some() {
             truncate_dirty_file(&dir.join(DIRTY_FILE))?;
         }
+        // An unclaimed directory (restored, or only ever opened read-only) never checkpointed
+        // the replaced WAL into `app.db`: pages the new generation's manifest maps elsewhere
+        // must come from the bucket. A claimed writer's `app.db` holds every page it sealed.
+        if !state.claimed {
+            state.complete = false;
+        }
         replace_file(dir, WAL_FILE, &image)?;
         state.generation = head.generation;
         state.write_atomic(dir)?;

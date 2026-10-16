@@ -45,7 +45,8 @@ pub struct Config {
     pub path_style: bool,
     pub bucket: String,
     /// Every key of this database goes under `<prefix>/` ("" = the bucket root). Only
-    /// `[A-Za-z0-9._/-]`, with no leading, trailing or doubled `/` (`Config` otherwise).
+    /// `[A-Za-z0-9._/-]`, with no leading, trailing or doubled `/` and no `.` or `..` segment
+    /// (`Config` otherwise).
     pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
@@ -111,9 +112,10 @@ fn parse_num<T: std::str::FromStr>(var: &str, v: &str) -> Result<T> {
         .map_err(|_| Error::Config(format!("{var} must be a non-negative integer, not {v:?}")))
 }
 
-/// A prefix is "" or `/`-separated non-empty segments of `[A-Za-z0-9._-]`. Keys must come
-/// back from a LIST spelled exactly as they were written; these characters need no XML or
-/// URL escaping anywhere.
+/// A prefix is "" or `/`-separated non-empty segments of `[A-Za-z0-9._-]`, none of them `.`
+/// or `..`. Keys must come back from a LIST spelled exactly as they were written; these
+/// characters need no XML or URL escaping anywhere, and no segment is a path step that an
+/// HTTP stack might normalise away.
 fn validate_prefix(prefix: &str) -> Result<()> {
     if prefix.is_empty() {
         return Ok(());
@@ -129,6 +131,11 @@ fn validate_prefix(prefix: &str) -> Result<()> {
     if prefix.split('/').any(str::is_empty) {
         return Err(Error::Config(format!(
             "prefix {prefix:?} must not start or end with '/' or hold '//'"
+        )));
+    }
+    if prefix.split('/').any(|s| s == "." || s == "..") {
+        return Err(Error::Config(format!(
+            "prefix {prefix:?} must not hold a '.' or '..' segment"
         )));
     }
     Ok(())
@@ -429,7 +436,15 @@ mod tests {
             c.prefix = prefix.to_string();
             c.validate()
         };
-        for ok in ["", "dbs", "dbs/one", "a.b_c-d/E9", "sys/crash_auto-123"] {
+        for ok in [
+            "",
+            "dbs",
+            "dbs/one",
+            "a.b_c-d/E9",
+            "sys/crash_auto-123",
+            "...",
+            ".a/b.",
+        ] {
             assert_eq!(with(ok), Ok(()), "{ok:?}");
         }
         for bad in [
@@ -446,6 +461,12 @@ mod tests {
             "/",
             "a//b",
             "a\\b",
+            ".",
+            "..",
+            "./a",
+            "a/..",
+            "a/./b",
+            "../x",
         ] {
             match with(bad) {
                 Err(Error::Config(m)) => assert!(m.contains("prefix"), "{bad:?}: {m}"),

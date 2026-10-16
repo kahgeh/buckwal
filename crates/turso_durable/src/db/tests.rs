@@ -1001,6 +1001,71 @@ fn finished_prefetch_persists_complete() {
     assert_eq!(storage.lazy_gets(), 0, "a complete directory fetched pages");
 }
 
+/// A read-only open never checkpoints, so after its prefetch `app.db` holds only the
+/// manifest's pages; the generation's changes live in the local `-wal` alone. Its prefetch
+/// must not persist `complete=true`: once the live writer seals, the next read-only open
+/// replaces that `-wal` with the new generation (`NewGeneration`) and has to fetch the pages
+/// the seal changed rather than trust `app.db`.
+#[test]
+fn read_only_prefetch_then_seal_reads_fresh_pages() {
+    let store = mem();
+    let a = tempdir();
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=50 {
+        insert(&c, id).unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    // Unsealed updates in the current generation.
+    c.execute("UPDATE t SET v = 'new'", &[]).unwrap();
+
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let mut cfg = config(r.path());
+    cfg.prefetch = true;
+    let ro = open_read_only_with_store(cfg, store.clone()).unwrap();
+    let (storage, done) = {
+        let open = ro.shared.open.lock().unwrap();
+        let e = &open.as_ref().unwrap().engine;
+        (e.storage.clone(), e.prefetch.as_ref().unwrap().done.clone())
+    };
+    let t = Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "prefetch never ended"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(storage.is_complete(), "complete in memory for this open");
+    drop(storage);
+    let new_rows = |db: &Database| {
+        let rc = db.connect().unwrap();
+        let rows = rc
+            .query("SELECT count(*) FROM t WHERE v = 'new'", &[])
+            .unwrap();
+        rc.close().unwrap();
+        rows[0][0].as_int().unwrap()
+    };
+    assert_eq!(new_rows(&ro), 50);
+    ro.close().unwrap();
+    assert!(
+        !state(r.path()).complete,
+        "a read-only prefetch persisted complete"
+    );
+
+    // The live writer seals the generation.
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+
+    let ro = open_read_only_with_store(config(r.path()), store.clone()).unwrap();
+    assert_eq!(ro.shared.reconciled, Some(Reconciled::NewGeneration));
+    assert_eq!(new_rows(&ro), 50, "read-only reopen read stale pages");
+    ro.close().unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+}
+
 /// `is_claimed` says whether a writer open would continue the directory's own database
 /// (true) or restore, claim or create one (false): empty, missing, restored and never
 /// opened, or mid-restore.

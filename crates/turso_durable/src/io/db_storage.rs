@@ -232,11 +232,19 @@ impl BucketDbStorage {
         let _ = self.mark_complete();
     }
 
-    /// Every page is local: fsync the fetched pages, then record `complete=true` in the local
-    /// state at once, so a later process fetches nothing either. The in-memory flag is set
-    /// even if that fails (the pages are local in this process).
+    /// Every page is local. A writer open fsyncs the fetched pages, then records
+    /// `complete=true` in the local state at once, so a later process fetches nothing either.
+    /// A read-only open keeps the flag in memory only: it never checkpoints, so its `app.db`
+    /// holds just the manifest's pages while the generation's changes live in the local
+    /// `-wal`, which a later open may replace with a newer generation (`NewGeneration`) whose
+    /// pages must then be fetched. The in-memory flag is set even if persisting fails (the
+    /// pages are local in this process).
     fn mark_complete(&self) -> Result<()> {
         let dirty = self.dirty.lock().unwrap();
+        if self.read_only {
+            self.complete.store(true, SeqCst);
+            return Ok(());
+        }
         let r = sync_file(&*self.file, &*self.io)
             .map_err(|e| io_err("fsync db", e))
             .and_then(|_| match LocalState::read(&self.dir)? {
