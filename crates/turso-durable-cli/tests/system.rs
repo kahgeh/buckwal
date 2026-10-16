@@ -94,9 +94,15 @@ impl Outage {
 }
 
 impl Drop for Outage {
+    /// Never panics (it may run while a failed assertion unwinds): a failed undo is logged.
     fn drop(&mut self) {
-        if self.armed {
-            rustfs(self.undo);
+        if !self.armed {
+            return;
+        }
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/rustfs.sh");
+        match Command::new(&script).arg(self.undo).status() {
+            Ok(s) if s.success() => {}
+            other => eprintln!("rustfs.sh {} after a failed test: {other:?}", self.undo),
         }
     }
 }
@@ -355,6 +361,20 @@ impl Soak {
         self.wait_for(&format!("{n} acks"), |s| s.acks() >= n);
     }
 
+    /// Ack lines the reader thread received at or after `t` (`before` = false), or before it.
+    fn acks_around(&self, t: Instant, before: bool) -> usize {
+        let acks = self.lines.iter().zip(&self.stamps);
+        acks.filter(|(l, at)| l.starts_with("ack ") && ((**at < t) == before))
+            .count()
+    }
+
+    /// Wait for `n` ack lines printed after `t`; lines already in the pipe at `t` don't count.
+    fn wait_acks_after(&mut self, t: Instant, n: usize) {
+        self.wait_for(&format!("{n} acks after a point"), |s| {
+            s.acks_around(t, false) >= n
+        });
+    }
+
     /// Wait for one more `line` than the soak has printed so far.
     fn wait_line(&mut self, line: &str) {
         let n = self.count(line) + 1;
@@ -475,10 +495,11 @@ fn crash_matrix(mode: &str) {
         soak.wait_acks(kill_after);
         soak.kill();
         assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
+        // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
         let seals = soak.count("event seal-finished");
         assert!(
-            seals >= 1,
-            "{mode}: a seal before the kill\n{}",
+            seals >= 1 && seals >= kill_after / 100 - 1,
+            "{mode}: {seals} seals before the kill after {kill_after} acks\n{}",
             soak.tail()
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -564,30 +585,26 @@ fn fault_rustfs_stopped_mid_commit() {
     let mut soak = Soak::spawn(&ctx, &dir, &[]);
     soak.wait_acks(200);
     let outage = Outage::start("stop", "start");
-    let stopped_at = soak.acks();
     soak.wait_for("an error line", |s| !s.errors().is_empty());
     outage.end();
-    let restarted_at = soak.acks();
-    soak.wait_acks(restarted_at + 50);
+    let restarted = Instant::now();
+    soak.wait_acks_after(restarted, 50);
     soak.kill();
+    let before_start = soak.acks_around(restarted, true);
     let errors = soak.errors().len();
     fs::remove_dir_all(&dir).unwrap();
     let head = ctx.head();
     let seqs = ctx.assert_log_contiguous(head.generation);
     let v = restore_verify(&ctx, &soak.lines);
     eprintln!(
-        "fault_rustfs_stopped_mid_commit: stopped after {stopped_at} acks read, {} more read \
-         before the first error (printed before the stop took hold), {errors} error lines, \
-         killed at {}: log/{}/ seqs 1..={seqs} {}",
-        restarted_at - stopped_at,
-        v.acked,
-        head.generation,
-        v.restored
+        "fault_rustfs_stopped_mid_commit: {before_start} acks before the restart, \
+         {errors} error lines, killed at {} acks: log/{}/ seqs 1..={seqs} {}",
+        v.acked, head.generation, v.restored
     );
 }
 
-/// A pause makes PUTs ambiguous: the client times out (500 ms) while RustFS holds the request
-/// and may apply it once unpaused, so a retried log PUT can find its own record already there.
+/// RustFS paused for 1.5 s mid-run, with a 500 ms request timeout: the writer stalls (an ack
+/// gap of at least 1 s), then carries on; every acked id restores and `log/<G>/` has no gap.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn fault_rustfs_paused_ambiguous_put() {
@@ -598,13 +615,14 @@ fn fault_rustfs_paused_ambiguous_put() {
     let mut soak = Soak::spawn(&ctx, &dir, &[]);
     soak.wait_acks(200);
     let outage = Outage::start("pause", "unpause");
-    let paused_at = soak.acks();
+    let paused = Instant::now();
     std::thread::sleep(Duration::from_millis(1500));
     outage.end();
-    let unpaused_at = soak.acks();
-    soak.wait_acks(soak.acks() + 100);
+    let unpaused = Instant::now();
+    soak.wait_acks_after(unpaused, 100);
     soak.kill();
-    // The pause stalled the writer: its requests in flight hung, timed out and were retried.
+    let before_pause = soak.acks_around(paused, true);
+    let during = soak.acks_around(paused, false) - soak.acks_around(unpaused, false);
     let stall = soak.longest_ack_gap();
     assert!(stall >= Duration::from_millis(1000), "{stall:?}");
     fs::remove_dir_all(&dir).unwrap();
@@ -612,8 +630,8 @@ fn fault_rustfs_paused_ambiguous_put() {
     let seqs = ctx.assert_log_contiguous(head.generation);
     let v = restore_verify(&ctx, &soak.lines);
     eprintln!(
-        "fault_rustfs_paused_ambiguous_put: paused after {paused_at} acks read, unpaused \
-         after {unpaused_at}, longest ack gap {stall:?}, {} error lines, killed at {}: \
+        "fault_rustfs_paused_ambiguous_put: {before_pause} acks before the pause, {during} \
+         during it, longest ack gap {stall:?}, {} error lines, killed at {}: \
          log/{}/ seqs 1..={seqs} {}",
         soak.errors().len(),
         v.acked,
@@ -683,20 +701,21 @@ fn verify_while_writer_runs_loses_nothing() {
         "--acked",
         seen.to_str().unwrap(),
     ]);
-    let after_verify = soak.acks();
+    let verified = Instant::now();
     let after = ctx.head();
     assert_eq!(after.writer_id, before.writer_id, "verify claimed nothing");
-    soak.wait_acks(after_verify + 100);
+    // 100 acks printed after the verify returned, not ones buffered while it ran.
+    soak.wait_acks_after(verified, 100);
     soak.kill();
+    let after_verify = soak.acks_around(verified, false);
     assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     assert_eq!(ctx.head().writer_id, before.writer_id);
     fs::remove_dir_all(&dir).unwrap();
     let r = restore_verify(&ctx, &soak.lines);
     eprintln!(
-        "verify_while_writer_runs_loses_nothing: concurrent verify: {}; acks after it: {}; \
-         final acked={} {}",
+        "verify_while_writer_runs_loses_nothing: concurrent verify: {}; acks after it: \
+         {after_verify}; final acked={} {}",
         out.stdout.trim(),
-        r.acked - after_verify,
         r.acked,
         r.restored
     );
@@ -716,7 +735,7 @@ fn second_process_is_refused() {
         "{}",
         out.stderr
     );
-    soak.wait_acks(soak.acks() + 20);
+    soak.wait_acks_after(Instant::now(), 20);
     soak.kill();
     assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     fs::remove_dir_all(&dir).unwrap();
@@ -762,6 +781,8 @@ fn passive_checkpoint_then_restart_then_seal() {
         backfilled > 8192,
         "the passive checkpoint backfilled app.db: {backfilled}"
     );
+    let dirty = fs::metadata(dir.join("app.db-dirty")).unwrap().len();
+    assert!(dirty > 0, "the backfilled pages are recorded as dirty");
     assert!(ctx.list("pages/").is_empty(), "no page PUT finished");
 
     let next = (first.last_ack() + 1).to_string();
@@ -788,7 +809,7 @@ fn passive_checkpoint_then_restart_then_seal() {
     let v = restore_verify(&ctx, &lines);
     eprintln!(
         "passive_checkpoint_then_restart_then_seal: first run killed on seal-started after \
-         {killed_at} acks (app.db {backfilled} bytes); second run killed after seal-finished at \
+         {killed_at} acks (app.db {backfilled} bytes, app.db-dirty {dirty} bytes); second run killed after seal-finished at \
          {} acks; acked={} {}",
         second.acks(),
         v.acked,
@@ -841,6 +862,7 @@ fn mvcc_pragma_refused_then_all_acks_restore() {
         ],
     );
     soak.finish();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     let out = ctx.run(&["sql", "--dir", d, "PRAGMA journal_mode='mvcc'"]);
     assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
     assert!(
@@ -882,7 +904,10 @@ fn trimming_bounds_restore_gets() {
     ];
     let mut soak = Soak::spawn(&ctx, &dir, &args);
     soak.finish();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     let head = ctx.head();
+    // 500 commits at --every 50: a seal per checkpoint (the first at least) plus close.
+    assert!(head.generation >= 9, "checkpoints sealed: {head:?}");
     let logs = ctx.list("log/");
     let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
     assert!(
@@ -895,6 +920,11 @@ fn trimming_bounds_restore_gets() {
     let log_objects = field(&v.restored, "log_objects");
     // head, manifest, page 1 (the MVCC check), then one GET per log object.
     assert!(gets <= 3 + log_objects, "{}", v.restored);
+    assert_eq!(
+        log_objects,
+        logs.len(),
+        "restore read every log object left"
+    );
     eprintln!(
         "trimming_bounds_restore_gets: {} seals; log/ holds {} keys of generation {}; {}",
         soak.count("event seal-finished"),
