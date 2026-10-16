@@ -552,12 +552,19 @@ fn crash_matrix(mode: &str, batching: Option<&str>) {
         }
         let mut soak = Soak::spawn(&ctx, &dir, &args);
         soak.wait_acks(kill_after);
-        if mode == "auto" && kill_after >= 1500 {
+        let sealed_run = mode == "auto" && kill_after >= 1500;
+        if sealed_run {
             // The auto-checkpoint (every 1000 WAL frames) seals in the commit after it.
             soak.wait_for("a seal", |s| s.count("event seal-finished") >= 1);
         }
         soak.kill();
         assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
+        if sealed_run {
+            assert!(
+                ctx.head().manifest.is_some(),
+                "{mode}: the bucket holds no sealed manifest after {kill_after} acks"
+            );
+        }
         let seals = soak.count("event seal-finished");
         if mode != "auto" {
             // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
@@ -639,6 +646,10 @@ fn crash_reopen() {
     crash_matrix("reopen", None);
 }
 
+/// The crash matrix under the engine's own checkpoint, four Window connections. The 150- and
+/// 600-ack kills land before the first seal (the auto-checkpoint needs 1000 WAL frames), so
+/// they restore from the log alone; the 1500-ack run waits for a seal and checks that the
+/// head names a manifest before the wipe.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_window_auto() {
@@ -700,10 +711,13 @@ fn crash_window_kill_while_batched_commits_wait() {
     // A batch begun at most 200 ms ago still has 300 ms of its window left: the kill lands
     // well before its upload.
     let young = Duration::from_millis(200);
+    // Taken inside the predicate: the batch's age is checked once, when it was young.
+    let mut waiting = None;
     soak.wait_for("a young batch of 2+ waiting commits", |s| {
-        young_waiting_batch(s, young).is_some()
+        waiting = young_waiting_batch(s, young);
+        waiting.is_some()
     });
-    let waiting = young_waiting_batch(&soak, young).unwrap();
+    let waiting = waiting.expect("the wait returned on a young batch");
     let acks_at_kill = soak.acks();
     soak.kill();
     let last_event = soak.lines.iter().rev().find(|l| l.starts_with("event "));
@@ -1387,7 +1401,6 @@ fn batching_stats_against_rustfs() {
         "100",
     ];
     let mut soak = Soak::spawn(&ctx, &dir, &args);
-    let pid = soak.child.id();
     // Each phase: the switch's `batching` line, then two stats blocks after it, printed
     // before the next write (a block is a snapshot with no commit running, so a block after
     // a switch line counts no commit made with the setting before it).
@@ -1407,7 +1420,11 @@ fn batching_stats_against_rustfs() {
         let (first, last) = (blocks[0].1.clone(), blocks.last().unwrap().1.clone());
         phases.push((setting.to_string(), first, last));
     }
-    assert_eq!(soak.child.id(), pid);
+    let exited = soak.child.try_wait().expect("poll soak");
+    assert!(
+        exited.is_none(),
+        "one process throughout: soak exited {exited:?}"
+    );
     soak.kill();
     assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     let switches = soak.lines.iter().filter(|l| l.starts_with("batching "));

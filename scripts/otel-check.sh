@@ -21,6 +21,7 @@ fail() { echo "otel check FAILED: $*"; exit 1; }
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "usage: otel-check.sh RUN_ID (letters, digits, . _ -)"
 [[ "$CH_USER" =~ ^[A-Za-z0-9_]+$ ]] || fail "DURABLE_CH_USER must be letters, digits and _"
 
+command -v nc >/dev/null 2>&1 || fail "nc not found"
 if ! curl -sf --max-time 5 "$CH_URL/ping" >/dev/null 2>&1 \
    || ! nc -z -w 3 localhost 4317 >/dev/null 2>&1; then
   echo "otel check SKIPPED: observability stack not running"
@@ -40,7 +41,8 @@ password() {
 PASSWORD="$(password)" || PASSWORD=""
 [[ -n "$PASSWORD" ]] || fail "no password for $CH_USER (set DURABLE_CH_PASSWORD)"
 
-# ch SQL -> the result as TabSeparated on stdout; the error body on failure.
+# ch SQL -> the result as TabSeparated, then the HTTP status on its own line; curl's own
+# error text on stderr.
 ch() {
   local escaped="${PASSWORD//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
@@ -49,10 +51,14 @@ ch() {
       -w '\n%{http_code}'
 }
 
-# query SQL -> sets OUT, or fails with ClickHouse's message.
+# query SQL -> sets OUT, or fails with ClickHouse's message, or curl's on a transport error.
 query() {
-  local r code
-  r="$(ch "$1" 2>&1)" || fail "query failed: $(tail -n 1 <<<"$r")"
+  local r code why
+  if ! r="$(ch "$1" 2>&1)"; then
+    # Everything but the -w status line: curl's own error text (no body on a transport error).
+    why="$(sed '$d' <<<"$r" | tr '\n' ' ' | sed 's/ *$//')"
+    fail "query failed: ${why:-curl exited with an error}"
+  fi
   code="$(tail -n 1 <<<"$r")"
   OUT="$(sed '$d' <<<"$r")"
   [[ "$code" == 200 ]] || fail "HTTP $code: $(head -c 300 <<<"$OUT" | tr '\n' ' ')"
