@@ -2,8 +2,6 @@
 //! The IO layer (prototype 3 on bucket format v1): the engine's `-wal` file ships every
 //! sync to the bucket before its fsync, and the database file is a local page cache backed
 //! by the bucket's sealed pages.
-// The public `Database` (Task 10) is the first non-test user of the engine.
-#![allow(dead_code)]
 pub(crate) mod db_storage;
 pub(crate) mod durable_io;
 pub(crate) mod stash;

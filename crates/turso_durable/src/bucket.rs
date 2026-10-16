@@ -5,9 +5,6 @@
 //! log never forks: a record that may or may not have landed stays "in doubt" and is settled
 //! at the same position before anything else is written, and a position or head held by
 //! another writer fences this one for good.
-// The engine (Task 7) uses this through the uploader; its first non-test user is the public
-// `Database` (Task 10).
-#![allow(dead_code)]
 
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
@@ -98,6 +95,71 @@ fn upload_error(e: Error) -> Error {
     match e {
         Error::Bucket(m) => Error::UploadFailed(m),
         e => e,
+    }
+}
+
+/// What `claim` tells a restored directory whose head moved since the restore.
+pub(crate) const RESTORE_AGAIN: &str =
+    "the bucket changed since this directory was restored; restore again";
+
+/// Take over a restored copy's database as `writer_id`: write the head the restore read
+/// (ETag `head_etag`) again with the new writer id, same generation and manifest, with
+/// `put_if_match`. Nothing else is written. A head that moved since the restore (412, or 404
+/// when it is gone) is `Fenced` with "restore again". Returns the new head's ETag.
+///
+/// After a claim, an old writer restarting on its own disk is fenced by the writer-id check at
+/// attach. A still-running old writer gets a 412 on its next seal's If-Match, so the seal is
+/// fenced. Its log appends can still win a seq race and fence the new writer: no acked
+/// commit is lost and the log stays linear (stage 3's lease closes it). Such a generation
+/// holds the old writer's records, then the new one's, which `restore::generation_image`
+/// accepts.
+pub(crate) fn claim(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    head_etag: &str,
+    writer_id: &str,
+) -> Result<String> {
+    enum Claim {
+        Done(String),
+        Moved,
+    }
+    if !writer_id.is_ascii() || writer_id.len() > u8::MAX as usize {
+        return Err(Error::Config(
+            "writer id must be ASCII and at most 255 bytes".into(),
+        ));
+    }
+    let key = keys.head();
+    let moved = || Error::Fenced(RESTORE_AGAIN.into());
+    let Some(current) = with_retry(retry, &key, |_| store.get(&key))? else {
+        return Err(moved());
+    };
+    if head_etag.is_empty() || current.etag != head_etag {
+        return Err(moved());
+    }
+    let head = Head {
+        writer_id: writer_id.to_string(),
+        ..Head::decode(&current.body)?
+    };
+    let body = head.encode();
+    let r = with_retry(retry, &key, |attempt| {
+        // After a failed attempt the put may have landed: look before writing again.
+        if attempt > 0 {
+            match store.get(&key)? {
+                Some(o) if o.body == body => return Ok(Claim::Done(o.etag)),
+                Some(o) if o.etag == head_etag => {}
+                _ => return Ok(Claim::Moved),
+            }
+        }
+        Ok(match store.put_if_match(&key, &body, head_etag)? {
+            CondPut::Created { etag } => Claim::Done(etag),
+            CondPut::PreconditionFailed => Claim::Moved,
+        })
+    })
+    .map_err(upload_error)?;
+    match r {
+        Claim::Done(etag) => Ok(etag),
+        Claim::Moved => Err(moved()),
     }
 }
 
@@ -237,6 +299,7 @@ impl Bucket {
         self.manifest.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn next_seq(&self) -> u64 {
         self.seq
     }

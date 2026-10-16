@@ -1,8 +1,6 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Assemble the engine: the uploader, the bucket-backed database file and the IO that ships
 //! the `-wal`, opened through `Database::open`.
-// The public `Database` (Task 10) is the first non-test user.
-#![allow(dead_code)]
 
 use crate::bucket::Bucket;
 use crate::config::EngineConfig;
@@ -19,6 +17,8 @@ use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO
 
 pub(crate) struct Engine {
     pub db: Arc<Database>,
+    /// Tests inspect the page cache through it; the engine holds its own handle.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub storage: Arc<BucketDbStorage>,
     pub uploader: Arc<Uploader>,
     pub io: Arc<DurableIo>,
@@ -77,6 +77,7 @@ pub(crate) fn open_engine(
         writer_id: state.writer_id.clone(),
         manifest,
         complete: state.complete,
+        read_only: cfg.read_only,
     }));
     storage.adopt_persisted_dirty()?;
     let io = Arc::new(DurableIo::new(
@@ -84,6 +85,7 @@ pub(crate) fn open_engine(
         wal_path,
         uploader.clone(),
         storage.clone(),
+        cfg.read_only,
     ));
     let opts = OpenOptions::new(Arc::new(SqliteDialect))
         .storage(storage.clone())

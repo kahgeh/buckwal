@@ -185,6 +185,9 @@ impl Obj {
     pub(crate) fn parse(b: &[u8]) -> Result<Obj> {
         parse_object(b).map(Obj)
     }
+    pub(crate) fn has(&self, key: &str) -> bool {
+        self.0.iter().any(|(k, _)| k == key)
+    }
     fn get(&self, key: &str) -> Result<&Val> {
         self.0
             .iter()

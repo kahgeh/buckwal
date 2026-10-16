@@ -21,6 +21,8 @@ use turso_core::io::FileSyncType;
 use turso_core::{Buffer, Completion, DatabaseStorage, File, IOContext, IO};
 
 pub(crate) const DIRTY_FILE: &str = "app.db-dirty";
+/// What a read-only open's IO answers to every write the engine attempts.
+pub(crate) const READ_ONLY: &str = "writes on a read-only open";
 const FORMAT: u32 = 1;
 
 /// The pages a seal uploads: the in-memory dirty set, the persisted dirty set (u32 LE page
@@ -93,6 +95,8 @@ pub(crate) struct BucketDbStorage {
     local: Mutex<HashSet<u32>>,
     dirty: Mutex<Dirty>,
     lazy_gets: AtomicU64,
+    /// A read-only open: every engine write is refused (fetched pages are still cached).
+    read_only: bool,
 }
 
 pub(crate) struct StorageParts {
@@ -106,6 +110,7 @@ pub(crate) struct StorageParts {
     pub writer_id: String,
     pub manifest: Option<Manifest>,
     pub complete: bool,
+    pub read_only: bool,
 }
 
 impl BucketDbStorage {
@@ -131,15 +136,18 @@ impl BucketDbStorage {
             local: Mutex::new(HashSet::new()),
             dirty: Mutex::new(Dirty::default()),
             lazy_gets: AtomicU64::new(0),
+            read_only: p.read_only,
         }
     }
 
     /// Pages fetched from the bucket so far.
+    #[cfg(test)]
     pub(crate) fn lazy_gets(&self) -> u64 {
         self.lazy_gets.load(Relaxed)
     }
 
     /// Every page is local: nothing is fetched any more.
+    #[cfg(test)]
     pub(crate) fn is_complete(&self) -> bool {
         self.complete.load(SeqCst)
     }
@@ -300,17 +308,31 @@ impl BucketDbStorage {
         }
         let generation = self.uploader.seal_generation(pages, ps, page_count)?;
         sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
+        // Only a claimed writer seals (a read-only open never writes), and the head's ETag
+        // changed with this seal, so none is kept.
         LocalState {
             format: FORMAT,
             writer_id: self.writer_id.clone(),
             generation,
             complete: self.complete.load(SeqCst),
+            claimed: true,
+            head_etag: String::new(),
         }
         .write_atomic(&self.dir)?;
         truncate_dirty_file(&self.dirty_path())?;
         dirty.memory.clear();
         dirty.unpersisted.clear();
         Ok(generation)
+    }
+}
+
+impl BucketDbStorage {
+    /// The backstop of a read-only open: the engine never gets to write the database file.
+    fn refuse_if_read_only(&self) -> turso_core::Result<()> {
+        if self.read_only {
+            return Err(stash(Error::Unsupported(READ_ONLY)));
+        }
+        Ok(())
     }
 }
 
@@ -348,6 +370,7 @@ impl DatabaseStorage for BucketDbStorage {
         io_ctx: &IOContext,
         c: Completion,
     ) -> turso_core::Result<Completion> {
+        self.refuse_if_read_only()?;
         self.record_written(page_idx as u32, 1, buffer.len());
         self.inner.write_page(page_idx, buffer, io_ctx, c)
     }
@@ -359,6 +382,7 @@ impl DatabaseStorage for BucketDbStorage {
         io_ctx: &IOContext,
         c: Completion,
     ) -> turso_core::Result<Completion> {
+        self.refuse_if_read_only()?;
         self.record_written(first_page_idx as u32, buffers.len(), page_size);
         self.inner
             .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
@@ -374,6 +398,7 @@ impl DatabaseStorage for BucketDbStorage {
         Ok(self.inner.size()?.max(bucket))
     }
     fn truncate(&self, len: usize, c: Completion) -> turso_core::Result<Completion> {
+        self.refuse_if_read_only()?;
         if let Some(ps) = std::num::NonZeroU32::new(self.page_size.load(SeqCst)) {
             let pages = (len as u64 / ps.get() as u64).min(u32::MAX as u64) as u32;
             self.bucket_pages.store(pages, SeqCst);

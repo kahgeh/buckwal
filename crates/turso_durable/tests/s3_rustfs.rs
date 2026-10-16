@@ -104,3 +104,41 @@ fn rustfs_delete() {
     s.delete(&k).unwrap(); // deleting a missing key is fine
     assert_eq!(s.stats().deletes, 2);
 }
+
+/// The public API end to end over S3: open (create), commit, close, restore, reopen.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn rustfs_open_commit_close_restore() {
+    use turso_durable::{Config, Value};
+    store(); // creates the bucket
+    let p = prefix("api");
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::from_env(dir.path()).expect("config");
+    cfg.prefix = p.trim_end_matches('/').to_string();
+    let db = turso_durable::open(cfg.clone()).expect("open");
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    for id in 1..=20 {
+        c.execute(
+            "INSERT INTO t(id, v) VALUES (?, 'x')",
+            &[Value::from_i64(id)],
+        )
+        .unwrap();
+    }
+    c.close().unwrap();
+    db.close().unwrap();
+
+    let r = tempfile::tempdir().unwrap();
+    let rep = turso_durable::restore(&cfg, r.path()).expect("restore");
+    assert!(rep.generation >= 2, "close seals: {rep:?}");
+    let mut cfg2 = cfg.clone();
+    cfg2.dir = r.path().to_path_buf();
+    let db = turso_durable::open(cfg2).expect("reopen restored");
+    let rows = db
+        .connect()
+        .unwrap()
+        .query("SELECT count(*) FROM t", &[])
+        .unwrap();
+    assert_eq!(rows[0][0].as_int(), Some(20));
+}

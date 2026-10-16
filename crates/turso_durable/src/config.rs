@@ -1,7 +1,240 @@
-//! Public configuration types.
-use crate::store::RetryPolicy;
+//! Public configuration: [`Config`], its defaults, and the progress [`Event`]s.
+use crate::error::{Error, Result};
+use crate::format::Keys;
+use crate::store::s3::{S3Config, S3Store};
+use crate::store::{ObjectStore, RetryPolicy};
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The value every optional [`Config`] field takes when it is not set.
+pub mod defaults {
+    use std::time::Duration;
+
+    /// How long one bucket call (with its retries) may take before it fails.
+    pub const RETRY_DEADLINE: Duration = Duration::from_secs(30);
+    /// How long one HTTP request may take.
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Parallel uploads in a seal, and parallel log fetches in a restore.
+    pub const UPLOAD_CONCURRENCY: usize = 16;
+    /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
+    pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
+    /// Fetch every sealed page in the background after open.
+    pub const PREFETCH: bool = false;
+    pub const REGION: &str = "us-east-1";
+    pub const PATH_STYLE: bool = true;
+    /// Keys go at the root of the bucket.
+    pub const PREFIX: &str = "";
+}
+
+/// Where a database lives: its local directory and its bucket.
+#[derive(Clone)]
+pub struct Config {
+    /// The local directory: `app.db`, its `-wal` and turso_durable's own files.
+    pub dir: PathBuf,
+    /// `http://host[:port]`; https is not supported yet.
+    pub endpoint: String,
+    pub region: String,
+    /// Path-style addressing (`endpoint/bucket/key`) rather than virtual-hosted.
+    pub path_style: bool,
+    pub bucket: String,
+    /// Every key of this database goes under `<prefix>/` ("" = the bucket root).
+    pub prefix: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub retry_deadline: Duration,
+    pub request_timeout: Duration,
+    pub upload_concurrency: usize,
+    pub trim_grace: Duration,
+    pub prefetch: bool,
+    #[doc(hidden)]
+    pub on_event: Option<EventHook>,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("dir", &self.dir)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("path_style", &self.path_style)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("retry_deadline", &self.retry_deadline)
+            .field("request_timeout", &self.request_timeout)
+            .field("upload_concurrency", &self.upload_concurrency)
+            .field("trim_grace", &self.trim_grace)
+            .field("prefetch", &self.prefetch)
+            .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
+}
+
+/// Every environment variable [`Config::from_env`] reads.
+const ENV_VARS: [&str; 12] = [
+    "DURABLE_ENDPOINT",
+    "DURABLE_REGION",
+    "DURABLE_PATH_STYLE",
+    "DURABLE_BUCKET",
+    "DURABLE_PREFIX",
+    "DURABLE_ACCESS_KEY",
+    "DURABLE_SECRET_KEY",
+    "DURABLE_RETRY_DEADLINE_MS",
+    "DURABLE_REQUEST_TIMEOUT_MS",
+    "DURABLE_UPLOAD_CONCURRENCY",
+    "DURABLE_TRIM_GRACE_SECS",
+    "DURABLE_PREFETCH",
+];
+
+fn parse_bool(var: &str, v: &str) -> Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(Error::Config(format!(
+            "{var} must be 0/1 or true/false, not {v:?}"
+        ))),
+    }
+}
+
+fn parse_num<T: std::str::FromStr>(var: &str, v: &str) -> Result<T> {
+    v.trim()
+        .parse()
+        .map_err(|_| Error::Config(format!("{var} must be a non-negative integer, not {v:?}")))
+}
+
+impl Config {
+    /// A configuration with every optional setting at its [`defaults`].
+    pub fn new(
+        dir: impl Into<PathBuf>,
+        endpoint: &str,
+        bucket: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Config {
+        Config {
+            dir: dir.into(),
+            endpoint: endpoint.to_string(),
+            region: defaults::REGION.to_string(),
+            path_style: defaults::PATH_STYLE,
+            bucket: bucket.to_string(),
+            prefix: defaults::PREFIX.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            retry_deadline: defaults::RETRY_DEADLINE,
+            request_timeout: defaults::REQUEST_TIMEOUT,
+            upload_concurrency: defaults::UPLOAD_CONCURRENCY,
+            trim_grace: defaults::TRIM_GRACE,
+            prefetch: defaults::PREFETCH,
+            on_event: None,
+        }
+    }
+
+    /// Read the configuration from `DURABLE_*` environment variables. `DURABLE_ENDPOINT`,
+    /// `DURABLE_BUCKET`, `DURABLE_ACCESS_KEY` and `DURABLE_SECRET_KEY` are required; every
+    /// other one falls back to its [`defaults`] value.
+    pub fn from_env(dir: impl Into<PathBuf>) -> Result<Config> {
+        Config::from_lookup(dir, |k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(
+        dir: impl Into<PathBuf>,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Config> {
+        debug_assert!(ENV_VARS.iter().all(|v| v.starts_with("DURABLE_")));
+        let required = |k: &str| {
+            get(k)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| Error::Config(format!("{k} is not set")))
+        };
+        let mut c = Config::new(
+            dir,
+            &required("DURABLE_ENDPOINT")?,
+            &required("DURABLE_BUCKET")?,
+            &required("DURABLE_ACCESS_KEY")?,
+            &required("DURABLE_SECRET_KEY")?,
+        );
+        if let Some(v) = get("DURABLE_REGION") {
+            c.region = v;
+        }
+        if let Some(v) = get("DURABLE_PATH_STYLE") {
+            c.path_style = parse_bool("DURABLE_PATH_STYLE", &v)?;
+        }
+        if let Some(v) = get("DURABLE_PREFIX") {
+            c.prefix = v;
+        }
+        if let Some(v) = get("DURABLE_RETRY_DEADLINE_MS") {
+            c.retry_deadline = Duration::from_millis(parse_num("DURABLE_RETRY_DEADLINE_MS", &v)?);
+        }
+        if let Some(v) = get("DURABLE_REQUEST_TIMEOUT_MS") {
+            c.request_timeout = Duration::from_millis(parse_num("DURABLE_REQUEST_TIMEOUT_MS", &v)?);
+        }
+        if let Some(v) = get("DURABLE_UPLOAD_CONCURRENCY") {
+            c.upload_concurrency = parse_num("DURABLE_UPLOAD_CONCURRENCY", &v)?;
+        }
+        if let Some(v) = get("DURABLE_TRIM_GRACE_SECS") {
+            c.trim_grace = Duration::from_secs(parse_num("DURABLE_TRIM_GRACE_SECS", &v)?);
+        }
+        if let Some(v) = get("DURABLE_PREFETCH") {
+            c.prefetch = parse_bool("DURABLE_PREFETCH", &v)?;
+        }
+        Ok(c)
+    }
+
+    /// The checks `open` and `restore` make before touching anything.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self
+            .endpoint
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("https://")
+        {
+            return Err(Error::Unsupported("https"));
+        }
+        if self.bucket.is_empty() {
+            return Err(Error::Config("bucket is empty".into()));
+        }
+        if self.upload_concurrency == 0 {
+            return Err(Error::Config(
+                "upload_concurrency must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn keys(&self) -> Keys {
+        Keys::new(self.prefix.trim_matches('/'))
+    }
+
+    pub(crate) fn engine(&self, read_only: bool) -> EngineConfig {
+        EngineConfig {
+            retry: RetryPolicy {
+                deadline: self.retry_deadline,
+                ..RetryPolicy::default()
+            },
+            upload_concurrency: self.upload_concurrency,
+            prefetch: self.prefetch,
+            events: self.on_event.clone(),
+            read_only,
+        }
+    }
+
+    /// The S3 store this configuration names.
+    pub(crate) fn s3_store(&self) -> Result<Arc<dyn ObjectStore>> {
+        self.validate()?;
+        Ok(Arc::new(S3Store::new(S3Config {
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
+            bucket: self.bucket.clone(),
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            path_style: self.path_style,
+            request_timeout: self.request_timeout,
+        })?))
+    }
+}
 
 /// Called synchronously, on the thread that did the work, for each [`Event`].
 pub type EventHook = Arc<dyn Fn(&Event) + Send + Sync>;
@@ -35,4 +268,114 @@ pub(crate) struct EngineConfig {
     /// Fetch every sealed page in the background after open.
     pub prefetch: bool,
     pub events: Option<EventHook>,
+    /// A read-only open: nothing may be written to the bucket, and the engine's writes are
+    /// refused (`ShippingFile`, `BucketDbStorage`).
+    pub read_only: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn required() -> HashMap<&'static str, &'static str> {
+        HashMap::from([
+            ("DURABLE_ENDPOINT", "http://127.0.0.1:9000"),
+            ("DURABLE_BUCKET", "b"),
+            ("DURABLE_ACCESS_KEY", "ak"),
+            ("DURABLE_SECRET_KEY", "sk"),
+        ])
+    }
+
+    #[test]
+    fn config_new_uses_the_defaults() {
+        let c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert_eq!(c.region, "us-east-1");
+        assert!(c.path_style);
+        assert_eq!(c.prefix, "");
+        assert_eq!(c.retry_deadline, Duration::from_secs(30));
+        assert_eq!(c.request_timeout, Duration::from_secs(10));
+        assert_eq!(c.upload_concurrency, 16);
+        assert_eq!(c.trim_grace, Duration::from_secs(600));
+        assert!(!c.prefetch);
+        assert!(!format!("{c:?}").contains("sk\""), "the secret is printed");
+    }
+
+    #[test]
+    fn config_from_env_reads_every_setting() {
+        let all = [
+            ("DURABLE_ENDPOINT", "http://127.0.0.1:9000"),
+            ("DURABLE_REGION", "eu-west-2"),
+            ("DURABLE_PATH_STYLE", "false"),
+            ("DURABLE_BUCKET", "bkt"),
+            ("DURABLE_PREFIX", "dbs/one"),
+            ("DURABLE_ACCESS_KEY", "ak"),
+            ("DURABLE_SECRET_KEY", "sk"),
+            ("DURABLE_RETRY_DEADLINE_MS", "1500"),
+            ("DURABLE_REQUEST_TIMEOUT_MS", "250"),
+            ("DURABLE_UPLOAD_CONCURRENCY", "3"),
+            ("DURABLE_TRIM_GRACE_SECS", "7"),
+            ("DURABLE_PREFETCH", "1"),
+        ];
+        assert_eq!(all.len(), ENV_VARS.len());
+        // No other unit test reads DURABLE_* variables.
+        for (k, v) in all {
+            std::env::set_var(k, v);
+        }
+        let c = Config::from_env("/data/db");
+        for k in ENV_VARS {
+            std::env::remove_var(k);
+        }
+        let c = c.unwrap();
+        assert_eq!(c.dir, PathBuf::from("/data/db"));
+        assert_eq!(c.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(c.region, "eu-west-2");
+        assert!(!c.path_style);
+        assert_eq!(c.bucket, "bkt");
+        assert_eq!(c.prefix, "dbs/one");
+        assert_eq!(c.access_key, "ak");
+        assert_eq!(c.secret_key, "sk");
+        assert_eq!(c.retry_deadline, Duration::from_millis(1500));
+        assert_eq!(c.request_timeout, Duration::from_millis(250));
+        assert_eq!(c.upload_concurrency, 3);
+        assert_eq!(c.trim_grace, Duration::from_secs(7));
+        assert!(c.prefetch);
+
+        // Only the four required ones: the rest are defaults.
+        let env = required();
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(c.region, defaults::REGION);
+        assert_eq!(c.upload_concurrency, defaults::UPLOAD_CONCURRENCY);
+
+        for missing in [
+            "DURABLE_ENDPOINT",
+            "DURABLE_BUCKET",
+            "DURABLE_ACCESS_KEY",
+            "DURABLE_SECRET_KEY",
+        ] {
+            let mut env = required();
+            env.remove(missing);
+            match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+                Err(Error::Config(m)) => assert!(m.contains(missing), "{m}"),
+                r => panic!("{missing}: {r:?}"),
+            }
+        }
+        let mut env = required();
+        env.insert("DURABLE_PREFETCH", "maybe");
+        match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+            Err(Error::Config(m)) => assert!(m.contains("DURABLE_PREFETCH"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn config_validation() {
+        let c = Config::new("/d", "https://s3.example.com", "b", "ak", "sk");
+        assert_eq!(c.validate(), Err(Error::Unsupported("https")));
+        let c = Config::new("/d", "http://e", "", "ak", "sk");
+        assert!(matches!(c.validate(), Err(Error::Config(_))));
+        assert!(matches!(crate::open(c), Err(Error::Config(_))));
+        let c = Config::new("/d", "https://e", "b", "ak", "sk");
+        assert!(matches!(crate::open(c), Err(Error::Unsupported("https"))));
+    }
 }

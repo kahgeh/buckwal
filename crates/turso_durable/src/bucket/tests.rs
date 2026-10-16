@@ -672,3 +672,42 @@ fn head_conflict_fences() {
     assert_eq!(b.head().generation, 1);
     assert!(matches!(b.append_log(syncs(1)), Err(Error::Fenced(_))));
 }
+
+#[test]
+fn claim_rewrites_head_with_new_writer_only_if_unchanged() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.append_log(syncs(1)).unwrap();
+    let before = f.mem.get(&keys().head()).unwrap().unwrap();
+    let old = f.stored_head();
+
+    // An ambiguous first attempt (stored, then an error): the retry finds its own head.
+    f.fault.store_then_fail_next_puts(1);
+    let etag = claim(&*f.store(), &keys(), &fast(), &before.etag, "w2").unwrap();
+    let now = f.mem.get(&keys().head()).unwrap().unwrap();
+    assert_eq!(now.etag, etag);
+    assert_eq!(
+        f.stored_head(),
+        Head {
+            writer_id: "w2".into(),
+            ..old
+        }
+    );
+    // The old writer can no longer attach; the new one can, after the old one's record.
+    assert!(matches!(f.attach("w1"), Err(Error::Fenced(_))));
+    assert_eq!(f.attach("w2").unwrap().next_seq(), 2);
+
+    // The head moved since `before`: refused, and nothing is written.
+    let puts = f.mem.stats().puts;
+    let r = claim(&*f.store(), &keys(), &fast(), &before.etag, "w3");
+    assert!(
+        matches!(&r, Err(Error::Fenced(m)) if m.contains("restore again")),
+        "{r:?}"
+    );
+    assert_eq!(f.mem.stats().puts, puts);
+    let r = claim(&*f.store(), &keys(), &fast(), "", "w3");
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    f.mem.delete(&keys().head()).unwrap();
+    let r = claim(&*f.store(), &keys(), &fast(), &etag, "w3");
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+}

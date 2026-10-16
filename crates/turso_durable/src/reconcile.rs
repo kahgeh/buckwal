@@ -10,14 +10,12 @@
 //!
 //! It reads and writes `app.db-wal` with `std::fs`, which D4 allows only because the engine
 //! has not opened the files yet and `durable.lock` keeps every other process out.
-// The public `open` (Task 10) is the first non-test user.
-#![allow(dead_code)]
 
 use crate::bucket::{Bucket, LogPos};
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
 use crate::format::{LocalState, Op};
-use crate::io::db_storage::{truncate_dirty_file, DIRTY_FILE};
+use crate::io::db_storage::{truncate_dirty_file, DIRTY_FILE, READ_ONLY};
 use crate::restore::{generation_image, page_one_seed, write_synced};
 use std::fs;
 use std::ops::Range;
@@ -65,6 +63,17 @@ pub(crate) fn reconcile(
             state.generation, head.generation
         )));
     }
+    // One seal behind: that seal's manifest covers the local WAL. Anything else (more than one
+    // generation, or a head whose manifest is not the local generation's) cannot be leveled.
+    if state.generation < head.generation
+        && (head.generation != state.generation + 1 || head.manifest != Some(state.generation))
+    {
+        return Err(Error::Corrupt(format!(
+            "local state is at generation {}, but the head is at generation {} with manifest \
+             {:?}: only the generation right after a seal of the local one can be taken in",
+            state.generation, head.generation, head.manifest
+        )));
+    }
     let image = generation_image(&*bucket.store(), bucket.keys(), &head, cfg)?.0;
     let local = read_wal(dir)?;
     let outcome = if state.generation < head.generation || holds_older_generation(&local, &image) {
@@ -87,6 +96,8 @@ pub(crate) fn reconcile(
         state.write_atomic(dir)?;
         replace_file(dir, WAL_FILE, &image)?;
         Reconciled::Behind
+    } else if cfg.read_only {
+        return Err(Error::Unsupported(READ_ONLY));
     } else {
         let uploaded = bucket.append_log(vec![catch_up_ops(&image, &local)])?;
         Reconciled::Ahead { uploaded }

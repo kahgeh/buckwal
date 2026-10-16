@@ -2,7 +2,7 @@
 //! The engine's `-wal` file. Every write and truncate is recorded as an op; `sync` ships the
 //! ops as one log record and only then fsyncs (D3). A rewrite of the WAL header with new salts,
 //! or a truncate to 0, starts a new generation: the old one is sealed first (D6).
-use super::db_storage::BucketDbStorage;
+use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
 use crate::error::{Error, Result};
@@ -55,6 +55,8 @@ pub(crate) struct ShippingFile {
     pending: Mutex<Vec<Op>>,
     /// The current generation's WAL header (its first 32 bytes), once one is known.
     header: Mutex<Option<Vec<u8>>>,
+    /// A read-only open: every write and truncate is refused.
+    read_only: bool,
 }
 
 impl ShippingFile {
@@ -65,6 +67,7 @@ impl ShippingFile {
         io: Arc<dyn IO>,
         uploader: Arc<Uploader>,
         storage: Arc<BucketDbStorage>,
+        read_only: bool,
     ) -> turso_core::Result<ShippingFile> {
         let header = if inner.size()? >= WAL_HEADER as u64 {
             Some(read_at(&*inner, &*io, 0, WAL_HEADER)?)
@@ -78,6 +81,7 @@ impl ShippingFile {
             storage,
             pending: Mutex::new(Vec::new()),
             header: Mutex::new(header),
+            read_only,
         })
     }
 
@@ -121,6 +125,14 @@ impl ShippingFile {
         Ok(())
     }
 
+    /// The backstop of a read-only open: the engine never gets to change the `-wal`.
+    fn refuse_if_read_only(&self) -> turso_core::Result<()> {
+        if self.read_only {
+            return Err(stash(Error::Unsupported(READ_ONLY)));
+        }
+        Ok(())
+    }
+
     fn record(&self, op: Op) {
         self.pending.lock().unwrap().push(op);
     }
@@ -142,6 +154,7 @@ impl File for ShippingFile {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
+        self.refuse_if_read_only()?;
         if pos == 0 {
             self.on_header(buffer.as_slice())?;
         }
@@ -157,6 +170,7 @@ impl File for ShippingFile {
         buffers: Vec<Arc<Buffer>>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
+        self.refuse_if_read_only()?;
         if pos == 0 {
             if let Some(first) = buffers.first() {
                 self.on_header(first.as_slice())?;
@@ -184,6 +198,7 @@ impl File for ShippingFile {
         self.inner.size()
     }
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.refuse_if_read_only()?;
         if len == 0 {
             let mut h = self.header.lock().unwrap();
             if h.is_some() {

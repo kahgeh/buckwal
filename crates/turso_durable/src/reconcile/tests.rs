@@ -475,3 +475,178 @@ fn dirty_pages_are_local_at_open() {
         "fetched a dirty page over its local copy"
     );
 }
+
+/// Behind the head by more than one sealed generation, or by one the head's manifest does
+/// not name: the local files cannot be brought level.
+#[test]
+fn generation_jump_is_corrupt() {
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    commit_rows(&conn, 1..=3);
+    let crashed = crash(e, conn, d.path());
+
+    // Head at 1 with no manifest, local state at 0.
+    let (mut b, mut s) = attach(mem.clone(), crashed.path(), &cfg());
+    s.generation = 0;
+    let r = reconcile(crashed.path(), &mut b, &mut s, &cfg());
+    assert!(
+        matches!(&r, Err(Error::Corrupt(m)) if m.contains("generation")),
+        "{r:?}"
+    );
+
+    // Head at 3 after two seals, local state at 1.
+    let (e2, c2) = writer(mem.clone(), crashed.path());
+    commit_rows(&c2, 4..=6);
+    seal_now(&c2);
+    commit_rows(&c2, 7..=9);
+    seal_now(&c2);
+    let crashed2 = crash(e2, c2, crashed.path());
+    assert_eq!(head(&*mem).generation, 3);
+    let (mut b, mut s) = attach(mem.clone(), crashed2.path(), &cfg());
+    s.generation = 1;
+    let wal = local_wal(crashed2.path());
+    let r = reconcile(crashed2.path(), &mut b, &mut s, &cfg());
+    assert!(
+        matches!(&r, Err(Error::Corrupt(m)) if m.contains("generation")),
+        "{r:?}"
+    );
+    assert_eq!(
+        local_wal(crashed2.path()),
+        wal,
+        "a refused reconcile changes nothing"
+    );
+}
+
+/// Never sealed, restored, then the restored disk lost its database file and half its
+/// `-wal`: the bucket's image comes back and the empty database file is seeded from it.
+#[test]
+fn behind_on_restored_dir_seeds_empty_database_file() {
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    commit_rows(&conn, 1..=40);
+    let _crashed = crash(e, conn, d.path());
+    assert_eq!(head(&*mem).manifest, None);
+
+    let r = tempfile::tempdir().unwrap();
+    restore_into(mem.clone(), &keys(), r.path(), &cfg()).unwrap();
+    let db = r.path().join(DB_FILE);
+    assert!(fs::metadata(&db).unwrap().len() > 0, "restore seeds app.db");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&db)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let wal = r.path().join(WAL_FILE);
+    let len = fs::metadata(&wal).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&wal)
+        .unwrap()
+        .set_len(len / 2)
+        .unwrap();
+
+    let (rec, b, s) = reconciled(mem.clone(), r.path(), &cfg());
+    assert_eq!(rec, Reconciled::Behind);
+    assert!(
+        fs::metadata(&db).unwrap().len() > 0,
+        "app.db was not seeded"
+    );
+    assert_eq!(local_wal(r.path()), bucket_image(&*mem));
+    let (_e2, c2) = open(r.path(), b, &s);
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), (1..=40).collect::<Vec<_>>());
+}
+
+/// A read-only open never uploads: unacknowledged local commits are refused, not shipped.
+#[test]
+fn read_only_reconcile_refuses_to_upload_ahead() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer_with(
+        fault.clone(),
+        d.path(),
+        &cfg_deadline(Duration::from_millis(200)),
+    );
+    create_table(&conn);
+    commit_rows(&conn, 1..=5);
+    fault.fail_next_puts(u64::MAX / 2);
+    assert!(commit_row(&conn, 6).is_err(), "commit 6 must fail");
+    fault.fail_next_puts(0);
+    let crashed = crash(e, conn, d.path());
+    let puts = mem.stats().puts;
+
+    let ro = EngineConfig {
+        read_only: true,
+        ..cfg()
+    };
+    let (mut b, mut s) = attach(mem.clone(), crashed.path(), &ro);
+    let r = reconcile(crashed.path(), &mut b, &mut s, &ro);
+    assert_eq!(r, Err(Error::Unsupported("writes on a read-only open")));
+    assert_eq!(mem.stats().puts, puts, "a read-only reconcile uploaded");
+}
+
+/// After a claim, `log/G` holds the old writer's records, then the claimer's: accepted. An
+/// old writer's record after one of the claimer's means the two interleaved: `Fenced`.
+#[test]
+fn claimed_generation_accepts_old_writer_prefix_only() {
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    commit_rows(&conn, 1..=3);
+    let _crashed = crash(e, conn, d.path());
+    let old = head(&*mem);
+    let claimer = "c".repeat(32);
+    let claimed = Head {
+        writer_id: claimer.clone(),
+        ..old.clone()
+    };
+    mem.put(&keys().head(), &claimed.encode()).unwrap();
+    let image = generation_image(&*mem, &keys(), &claimed, &cfg()).unwrap();
+
+    let next = log_seqs(&*mem, old.generation).len() as u64 + 1;
+    let empty = |w: &str| {
+        encode_record(&LogRecord::Extents {
+            writer_id: w.to_string(),
+            syncs: vec![vec![]],
+        })
+    };
+    mem.put(&keys().log(old.generation, next), &empty(&claimer))
+        .unwrap();
+    let with_claimer = generation_image(&*mem, &keys(), &claimed, &cfg()).unwrap();
+    assert_eq!(with_claimer.0, image.0);
+    assert_eq!(with_claimer.1, image.1 + 1);
+
+    mem.put(
+        &keys().log(old.generation, next + 1),
+        &empty(&old.writer_id),
+    )
+    .unwrap();
+    let r = generation_image(&*mem, &keys(), &claimed, &cfg());
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+
+    // Two claims in one generation: old, then a middle writer, then the head's: accepted. The
+    // old writer resuming after the middle one is not.
+    let middle = "m".repeat(32);
+    let gen = old.generation;
+    mem.put(&keys().log(gen, next), &empty(&middle)).unwrap();
+    mem.put(&keys().log(gen, next + 1), &empty(&claimer))
+        .unwrap();
+    let three = generation_image(&*mem, &keys(), &claimed, &cfg()).unwrap();
+    assert_eq!(three.1, image.1 + 2);
+    mem.put(&keys().log(gen, next + 1), &empty(&old.writer_id))
+        .unwrap();
+    mem.put(&keys().log(gen, next + 2), &empty(&claimer))
+        .unwrap();
+    let r = generation_image(&*mem, &keys(), &claimed, &cfg());
+    assert!(
+        matches!(&r, Err(Error::Fenced(m)) if m.contains("both sides")),
+        "{r:?}"
+    );
+}

@@ -1,6 +1,4 @@
 //! Bucket format v1: key layout and byte/JSON codecs.
-// Nothing outside tests uses these yet; later tasks (uploader, restore, reconcile) do.
-#![allow(dead_code, unused_imports)]
 
 mod head;
 mod json;

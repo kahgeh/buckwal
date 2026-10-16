@@ -20,6 +20,8 @@ pub(crate) struct DurableIo {
     wal_path: String,
     uploader: Arc<Uploader>,
     storage: Arc<BucketDbStorage>,
+    /// A read-only open: the `-wal` refuses every write.
+    read_only: bool,
 }
 
 impl DurableIo {
@@ -28,12 +30,14 @@ impl DurableIo {
         wal_path: String,
         uploader: Arc<Uploader>,
         storage: Arc<BucketDbStorage>,
+        read_only: bool,
     ) -> DurableIo {
         DurableIo {
             inner,
             wal_path,
             uploader,
             storage,
+            read_only,
         }
     }
 }
@@ -67,6 +71,7 @@ impl IO for DurableIo {
             self.inner.clone(),
             self.uploader.clone(),
             self.storage.clone(),
+            self.read_only,
         )?))
     }
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {

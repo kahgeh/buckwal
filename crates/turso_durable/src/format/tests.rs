@@ -223,15 +223,24 @@ fn local_state_atomic_write() {
         writer_id: "w1".into(),
         generation: 3,
         complete: true,
+        claimed: false,
+        head_etag: "\"e1\"".into(),
     };
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s.clone()));
     assert_eq!(
         String::from_utf8(s.encode()).unwrap(),
-        r#"{"format":1,"writer_id":"w1","generation":3,"complete":true}"#
+        r#"{"format":1,"writer_id":"w1","generation":3,"complete":true,"claimed":false,"head_etag":"\"e1\""}"#
     );
+    // A file written before `claimed` and `head_etag` existed: claimed, no ETag.
+    let old =
+        LocalState::decode(br#"{"format":1,"writer_id":"w1","generation":3,"complete":true}"#)
+            .unwrap();
+    assert!(old.claimed);
+    assert_eq!(old.head_etag, "");
     let s2 = LocalState {
         complete: false,
+        claimed: true,
         generation: 4,
         ..s
     };

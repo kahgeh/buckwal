@@ -1,8 +1,6 @@
 //! The trimmer (D10): deletes the log objects, manifests and page objects that no head can
 //! reach any more. Generations only move forward, so an object unreferenced by one head stays
 //! unreferenced by every later one.
-// The public `Database` (Task 10) is the first non-test user of `spawn_trimmer`.
-#![allow(dead_code)]
 
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};

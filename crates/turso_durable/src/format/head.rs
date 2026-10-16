@@ -77,6 +77,12 @@ pub(crate) struct LocalState {
     pub writer_id: String,
     pub generation: u64,
     pub complete: bool,
+    /// False after a restore until the first writer open claims the bucket's head with a new
+    /// writer id (`bucket::claim`). Files written before this key existed decode as true.
+    pub claimed: bool,
+    /// The ETag of the head a restore read; a claim writes the new head only if it still
+    /// matches. Empty when unknown (files written before this key existed decode as "").
+    pub head_etag: String,
 }
 
 fn io(what: &str, e: std::io::Error) -> Error {
@@ -86,11 +92,13 @@ fn io(what: &str, e: std::io::Error) -> Error {
 impl LocalState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         format!(
-            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{}}}",
+            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{}}}",
             self.format,
             escape(&self.writer_id),
             self.generation,
-            self.complete
+            self.complete,
+            self.claimed,
+            escape(&self.head_etag)
         )
         .into_bytes()
     }
@@ -102,6 +110,16 @@ impl LocalState {
             writer_id: o.str("writer_id")?.to_string(),
             generation: o.num("generation")?,
             complete: o.bool("complete")?,
+            claimed: if o.has("claimed") {
+                o.bool("claimed")?
+            } else {
+                true
+            },
+            head_etag: if o.has("head_etag") {
+                o.str("head_etag")?.to_string()
+            } else {
+                String::new()
+            },
         })
     }
 

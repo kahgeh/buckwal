@@ -1,16 +1,11 @@
 //! The background uploader: one thread that owns the [`Bucket`] and runs its jobs in FIFO
 //! order, so a seal can never overtake a log object submitted before it.
-// The engine (Task 7) uses this; its first non-test user is the public `Database` (Task 10).
-#![allow(dead_code)]
 
 use crate::bucket::{Bucket, Counters, LogPos};
 use crate::config::EventHook;
 use crate::error::{Error, Result};
 use crate::format::{Head, Manifest, Op};
-use std::sync::atomic::{
-    AtomicU64,
-    Ordering::{Relaxed, SeqCst},
-};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -24,6 +19,7 @@ pub(crate) struct TrimSnapshot {
     pub manifest: Option<Manifest>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UploaderCounters {
     pub log_puts: u64,
@@ -66,6 +62,7 @@ pub(crate) struct Uploader {
     jobs: Mutex<Option<Sender<Job>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     generation: Arc<AtomicU64>,
+    #[cfg_attr(not(test), allow(dead_code))]
     counters: Arc<Counters>,
 }
 
@@ -130,7 +127,9 @@ impl Uploader {
         self.generation.load(SeqCst)
     }
 
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> UploaderCounters {
+        use std::sync::atomic::Ordering::Relaxed;
         let c = &self.counters;
         UploaderCounters {
             log_puts: c.log_puts.load(Relaxed),

@@ -29,6 +29,7 @@ pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
         upload_concurrency: 8,
         prefetch: false,
         events: None,
+        read_only: false,
     }
 }
 
@@ -82,6 +83,8 @@ pub(crate) fn writer_trimmed(
                 writer_id,
                 generation: 1,
                 complete: true,
+                claimed: true,
+                head_etag: String::new(),
             };
             s.write_atomic(dir).unwrap();
             (b, s)
