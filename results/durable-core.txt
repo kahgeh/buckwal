@@ -92,7 +92,8 @@ real 0.52
 Boundary cost: a seal runs inside the write that restarts the WAL, so the commit that crosses
 a generation boundary waits for that generation's whole page upload. With the default
 automatic checkpoint this commit came about every 500 commits here (about 2 WAL frames per commit).
-- Slowest commit: #502, 69.8 ms (p50 1.33 ms). It crossed the first boundary; that seal
+- Slowest commit: #502, 69.8 ms (p50 1.33 ms). It is most likely the commit that crossed the
+  first boundary (inferred: bench does not record which commit triggered a seal); that seal
   (seal_1) took 39.4 ms for 169 pages. bench does not break down the rest.
 - Each in-run seal against its page count: 169 p 39.4 ms, 170 p 38.2, 170 p 37.2, 172 p 37.4,
   172 p 44.3, 171 p 38.6, 171 p 37.2, 172 p 39.1, 172 p 38.0, 171 p 37.0 (16 PUTs in parallel,

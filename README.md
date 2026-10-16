@@ -70,7 +70,7 @@ The API:
 | `Connection::execute_batch(sql)` | Runs several statements, with no parameters. If the guard refuses any statement, none of them runs. |
 | `Connection::query(sql, params) -> Result<Vec<Vec<Value>>>` | Runs one statement and collects its rows. |
 | `Connection::transaction(\|tx\| …)` | `BEGIN`, your closure (`tx.execute`, `tx.query`), then `COMMIT`. It runs `ROLLBACK` if the closure or the commit fails. |
-| `Connection::checkpoint(CheckpointMode)` | `Passive`, `Full`, `Restart` or `Truncate`. `Restart` and `Truncate` end the generation, so its pages upload (a seal). A failure is returned as an error. |
+| `Connection::checkpoint(CheckpointMode)` | `Passive`, `Full`, `Restart` or `Truncate`. `Truncate` ends the generation inside the call: its pages upload (a seal), and an upload failure is returned as an error. `Restart` only resets the WAL in memory, so the seal happens in the next commit, which also gets any upload error. |
 | `Connection::close()` | Closes the connection. The writer's last connection runs a TRUNCATE checkpoint, which seals. Dropping a connection also closes it. |
 | `restore(&Config, dir) -> Result<RestoreReport>` | Restores the bucket's current state into `dir`, which must hold no database. It writes nothing to the bucket. `config.dir` is ignored; `dir` is used. |
 | `Value` | `turso_core::Value`, re-exported. |
@@ -93,7 +93,7 @@ The files in the directory:
 | `app.db-durable` | Local state as JSON: writer id, generation, whether every page is local, and the claim. |
 | `app.db-dirty` | Page numbers checkpointed since the last seal, fsynced before `app.db` is. |
 | `durable.lock` | The exclusive lock held by the open process. |
-| `app.db-restoring`, `.<dir>.restore-*` (next to the directory) | Exist only while a restore moves files in. Open or restore cleans up after an interrupted restore. |
+| `app.db-restoring` (inside the directory) and `.<dir>.restore-*` (staging directories next to it) | Exist only while a restore runs. Open or restore cleans up after an interrupted restore. |
 
 Errors are `turso_durable::Error`:
 
@@ -119,9 +119,9 @@ Errors are `turso_durable::Error`:
 | Command | What it does |
 |---|---|
 | `restore --dir DIR` | Restores into an empty `DIR`. It prints `restored generation=… log_objects=… gets=… lists=… bytes=… ms=…`. |
-| `verify --dir DIR [--acked FILE]` | Opens `DIR` read-only and runs `PRAGMA integrity_check`. With `--acked`, it checks that every id in FILE (lines `ack <id>` or `<id>`) is in table `soak`. `DIR` may be empty, in which case it restores first. Verify never claims, never seals and never writes to the bucket. |
+| `verify --dir DIR [--acked FILE]` | Opens `DIR` read-only and runs `PRAGMA integrity_check`. With `--acked`, it checks that every id in FILE (lines `ack <id>` or `<id>`) is in table `soak`, and fails if an id was acked twice. `DIR` may be empty, in which case it restores first. Verify never claims, never seals and never writes to the bucket. |
 | `sql --dir DIR SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. |
-| `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. It checkpoints (or closes and reopens) every N commits (default 100). Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors. |
+| `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors. |
 | `bench --dir DIR --commits N` | Runs N single-row commits of 1 KB and prints `key=value` lines: commit p50/p95/p99/max, commits/s, log PUTs per commit, page PUTs, and each seal's ms and page count. |
 
 Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on bad arguments.
@@ -148,6 +148,8 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 Where the defaults live:
 - `crates/turso_durable/src/config.rs`, `mod defaults`, holds every default above.
 - The retry backoff is fixed and cannot be configured. It starts at 50 ms, doubles, and is capped at 2 s. It lives in `crates/turso_durable/src/store/retry.rs` (`RetryPolicy::default`).
+- A copy of the 30 s retry deadline also sits in `RetryPolicy::default`; `config.rs` always overrides it.
+- There is no batching setting in stage 1: every commit is its own upload. The runtime batching setting comes in stage 2.
 - The busy timeout between connections is fixed at 5 s. It lives in `crates/turso_durable/src/conn.rs` (`BUSY_TIMEOUT`).
 
 ## Bucket format v1
@@ -238,7 +240,7 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - The bucket allows one writer per prefix. A writer whose log position or head was taken by another writer gets `Fenced` and stays fenced.
 
 **Restore and the claim.**
-- `restore` is read-only on the bucket. It costs `3 + log_objects` GETs (head, manifest, page 1 for the MVCC check, then the log) and one LIST. Pages are fetched later, on first read, or in the background with `prefetch`.
+- `restore` is read-only on the bucket. It costs `3 + log_objects` GETs when a manifest exists (head, manifest, page 1 for the MVCC check, then the log), or `1 + log_objects` for a prefix never sealed (page 1 is seeded from the WAL), plus one LIST. Pages are fetched later, on first read, or in the background with `prefetch`.
 - A restored directory is *unclaimed*. The first writer open claims it with "a head write, then one log record":
   1. It writes `head` with a new writer id, using `If-Match` on the ETag the restore read.
   2. It appends one empty log record at the generation's next seq. Stage 3's fence record will reuse this slot.
@@ -249,9 +251,9 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - When the bucket holds no manifest yet, restore seeds `app.db` with the WAL's first page-1 frame. turso treats a zero-size database file as new and would delete its WAL (database.rs:738-760, 2223-2246).
 
 **Known cost: the commit that crosses a generation boundary.**
-- Pages are uploaded at the generation boundary: the write that restarts the WAL, inside a commit (D6). That commit waits for the whole generation's page upload, the manifest and the head.
+- Pages are uploaded at the generation boundary (D6): the write that restarts the WAL. After an automatic checkpoint, or a `Passive`, `Full` or `Restart` checkpoint, that write happens in the next commit, which waits for the whole generation's page upload, the manifest and the head. `CheckpointMode::Truncate` and close seal inside the checkpoint instead.
 - With turso's automatic checkpoint (every 1000 WAL frames), the bench crossed a boundary about every 500 commits of 1 KB.
-- In the 5000-commit bench, the commit p50 was 1.33 ms, while the slowest commit took 69.8 ms. That commit crossed the first boundary, whose seal took 39.4 ms for 169 pages.
+- In the 5000-commit bench, the commit p50 was 1.33 ms, while the slowest commit took 69.8 ms. That commit is most likely the one that crossed the first boundary (bench does not record which commit triggered a seal), whose seal took 39.4 ms for 169 pages.
 - Each in-run seal took 37–44 ms for 169–172 pages.
 - You can move this wait off a latency-sensitive path by calling `Connection::checkpoint(CheckpointMode::Truncate)` at a quiet moment.
 
@@ -270,7 +272,7 @@ Source: `results/durable-core.txt`. These are laptop figures (Apple M4 Max, macO
 | Measure | 500 commits | 5000 commits |
 |---|---|---|
 | Commit p50 / p95 / p99 | 1.28 / 1.79 / 2.83 ms | 1.33 / 1.69 / 2.05 ms |
-| Slowest commit | 3.7 ms | 69.8 ms (commit #502, crossing a boundary) |
+| Slowest commit | 3.7 ms | 69.8 ms (commit #502, most likely at the first boundary) |
 | Commits per second | 744 | 674 |
 | Log PUTs per acked commit | 1.000 | 1.002 (one per commit, plus one per WAL restart) |
 | Seals | 1 (at close) | 11 (10 in the run, 1 at close) |

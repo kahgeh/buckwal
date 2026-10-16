@@ -193,8 +193,9 @@ impl Connection {
         r
     }
 
-    /// Checkpoint the WAL into the database file. TRUNCATE and RESTART also end the
-    /// generation: its pages are uploaded first (a seal).
+    /// Checkpoint the WAL into the database file. TRUNCATE also ends the generation inside
+    /// this call: its pages are uploaded first (a seal). RESTART only resets the WAL in memory,
+    /// so the seal happens in the next commit (which also gets any upload error).
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<()> {
         stash::clear();
         if self.shared.read_only {
