@@ -239,6 +239,13 @@ impl Config {
                 "upload_concurrency must be at least 1".into(),
             ));
         }
+        let budget = self.retry_deadline + self.request_timeout;
+        if !self.trim_grace.is_zero() && self.trim_grace <= budget * 2 {
+            return Err(Error::Config(format!(
+                "trim_grace ({:?}) must exceed 2 × (retry_deadline ({:?}) + request_timeout ({:?}))",
+                self.trim_grace, self.retry_deadline, self.request_timeout
+            )));
+        }
         validate_prefix(&self.prefix)
     }
 
@@ -342,6 +349,23 @@ mod tests {
         c.trim_grace = Duration::from_secs(600);
         assert_eq!(c.engine(false).idle_threshold(), Duration::from_secs(300));
     }
+    #[test]
+    fn trim_grace_must_exceed_twice_the_request_budget() {
+        let mut c = Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s");
+        c.retry_deadline = Duration::from_secs(30);
+        c.request_timeout = Duration::from_secs(10);
+        c.trim_grace = Duration::from_secs(80); // == 2 × 40 s: refused
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("trim_grace")));
+        c.trim_grace = Duration::from_secs(81);
+        assert_eq!(c.validate(), Ok(()));
+        c.trim_grace = Duration::ZERO; // tests only, still allowed
+        assert_eq!(c.validate(), Ok(()));
+        assert_eq!(
+            Config::new("/tmp/x", "http://h", "b", "k", "s").validate(),
+            Ok(())
+        ); // defaults: 600 s > 80 s
+    }
+
     use std::collections::HashMap;
 
     fn required() -> HashMap<&'static str, &'static str> {

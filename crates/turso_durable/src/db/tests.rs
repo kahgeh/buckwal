@@ -1121,6 +1121,8 @@ fn commit_after_half_the_trim_grace_checks_the_head() {
     let a = tempdir();
     let mut cfg = config(a.path());
     cfg.trim_grace = Duration::from_millis(200);
+    cfg.retry_deadline = Duration::from_millis(40);
+    cfg.request_timeout = Duration::from_millis(50);
     let db = open_with_store(cfg, fault.clone()).unwrap();
     let c = db.connect().unwrap();
     create(&c);
