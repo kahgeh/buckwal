@@ -224,6 +224,16 @@ pub(crate) mod ctx {
         CTX.with(|c| c.borrow().as_ref().map(|c| c.batching))
     }
 
+    /// The current call commits with `b` from its next commit on (a `PRAGMA
+    /// durable_batching`, or a transaction's end, in the middle of an `execute_batch`).
+    pub(crate) fn set(b: Batching) {
+        CTX.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                c.batching = b;
+            }
+        });
+    }
+
     /// Leave `ack` for the current call; outside every call there is no one to ack, and it
     /// is dropped.
     pub(crate) fn push(ack: PendingAck) {

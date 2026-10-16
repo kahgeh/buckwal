@@ -5,12 +5,16 @@
 //! Every public call runs the engine inside a commit context (`batching::ctx`) holding its
 //! effective batching setting, which the WAL sync reads. A call returns `Ok` only once every
 //! commit it made is confirmed in the bucket (`await_acks`).
+//!
+//! `PRAGMA durable_batching` is run here, never by the engine: it reads the effective setting,
+//! or sets the current transaction's own (`txn_batching`), which lasts until no transaction
+//! is open.
 use crate::batching::{ctx, Batching, PendingAck};
 use crate::config::Event;
 use crate::db::{lock, Shared};
 use crate::engine::engine_error;
 use crate::error::{Error, Result};
-use crate::guard;
+use crate::guard::{self, BatchingPragma};
 use crate::io::db_storage::READ_ONLY;
 use crate::io::stash;
 use std::num::NonZero;
@@ -52,6 +56,10 @@ pub struct Connection {
     io: Arc<dyn IO>,
     /// This connection's own setting; `None` falls back to the database's.
     batching: Mutex<Option<Batching>>,
+    /// The open transaction's own setting ([`Connection::transaction_with`], `PRAGMA
+    /// durable_batching`), ahead of `batching`. Cleared by every call (or statement of a split
+    /// `execute_batch`) that leaves no transaction open.
+    txn_batching: Mutex<Option<Batching>>,
     /// Declared last, so dropped last: when this holds the last `Arc<Shared>`, its drop
     /// releases `durable.lock` and the process registry, and every engine file handle (the
     /// connection's, and the IO's `app.db` and `-wal` through its storage) must be closed
@@ -76,6 +84,7 @@ impl Connection {
             core: Some(core),
             io,
             batching: Mutex::new(None),
+            txn_batching: Mutex::new(None),
             shared,
         }
     }
@@ -96,18 +105,38 @@ impl Connection {
         *lock(&self.batching)
     }
 
-    /// The setting the next commit uses: the connection's, else the database's.
+    /// The setting the next commit uses: the open transaction's, else the connection's, else
+    /// the database's.
     fn effective_batching(&self) -> Batching {
-        // Task 6: a transaction's own setting comes first.
-        self.batching().unwrap_or_else(|| self.shared.batching())
+        let txn = *lock(&self.txn_batching);
+        txn.or_else(|| self.batching())
+            .unwrap_or_else(|| self.shared.batching())
+    }
+
+    /// No transaction is open (COMMIT, ROLLBACK, the engine's own rollback, or none was):
+    /// drop the transaction's setting, and commit the rest of the current call without it.
+    fn end_txn_batching(&self) {
+        let Some(core) = &self.core else {
+            return;
+        };
+        if !core.get_auto_commit() {
+            return;
+        }
+        let had = lock(&self.txn_batching).take().is_some();
+        if had {
+            ctx::set(self.effective_batching());
+        }
     }
 
     /// Run `f` (one engine call) committing with `b`. On `Ok`, wait for every commit it
     /// made; on `Err`, its commits are not acked (their uploads go on) and `f`'s error is
-    /// returned. The context is cleared on every path, a panic included.
+    /// returned. The context is cleared on every path, a panic included, and the
+    /// transaction's setting on every path that leaves no transaction open.
     fn call<T>(&self, b: Batching, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let _ctx = ctx::enter(b);
-        let v = f()?;
+        let r = f();
+        self.end_txn_batching();
+        let v = r?;
         self.await_acks()?;
         Ok(v)
     }
@@ -162,11 +191,24 @@ impl Connection {
         Ok(())
     }
 
-    /// Guard, prepare, check and bind one statement. `single`: `sql` must hold only that
-    /// statement (the engine would silently ignore the rest).
-    fn prepare(&self, sql: &str, params: &[Value], single: bool) -> Result<Statement> {
+    /// Guard, prepare, check and bind one statement, or run it here when it is `PRAGMA
+    /// durable_batching` (the engine never sees that one). `single`: `sql` must hold only that
+    /// statement (the engine would silently ignore the rest); otherwise it is the first of
+    /// the rest of a split `execute_batch`.
+    fn prepare(&self, sql: &str, params: &[Value], single: bool) -> Result<Prepared> {
         stash::clear();
-        guard::check_sql(sql)?;
+        let pragma = if single {
+            guard::check_sql(sql)?;
+            guard::batching_pragma(sql).map(|p| (p, sql.len()))
+        } else {
+            guard::check_sql_split(sql)?;
+            guard::first_batching_pragma(sql)
+        };
+        if let Some((pragma, tail)) = pragma {
+            check_params(params.len(), 0)?;
+            let rows = self.batching_pragma(pragma)?;
+            return Ok(Prepared::Batching { rows, tail });
+        }
         let mut stmt = self.core().prepare(sql).map_err(engine_error)?;
         self.check_sync_mode()?;
         if single && holds_a_statement(sql.get(stmt.tail_offset()..).unwrap_or("")) {
@@ -177,18 +219,36 @@ impl Connection {
         if self.shared.read_only && !stmt.get_program().is_readonly() {
             return Err(Error::Unsupported(READ_ONLY));
         }
-        let want = stmt.parameters_count();
-        if params.len() != want {
-            return Err(Error::Config(format!(
-                "{} parameters given; the statement takes {want}",
-                params.len()
-            )));
-        }
+        check_params(params.len(), stmt.parameters_count())?;
         for (i, v) in params.iter().enumerate() {
             let at = NonZero::new(i + 1).expect("i + 1 > 0");
             stmt.bind_at(at, v.clone()).map_err(engine_error)?;
         }
-        Ok(stmt)
+        Ok(Prepared::Engine(Box::new(stmt)))
+    }
+
+    /// Run `PRAGMA durable_batching`: a read is one row, the effective setting's text; a set
+    /// applies to the open transaction from its next commit on, and returns no rows.
+    fn batching_pragma(&self, pragma: BatchingPragma) -> Result<Vec<Vec<Value>>> {
+        let b = match pragma {
+            BatchingPragma::Read => {
+                let text = self.effective_batching().to_string();
+                return Ok(vec![vec![Value::from_text(text)]]);
+            }
+            BatchingPragma::Set(b) => b,
+        };
+        if self.core().get_auto_commit() {
+            return Err(Error::Config(
+                "PRAGMA durable_batching applies to the current transaction; use \
+                 Connection::set_batching"
+                    .into(),
+            ));
+        }
+        let b = b?;
+        b.validate()?;
+        *lock(&self.txn_batching) = Some(b);
+        ctx::set(b);
+        Ok(Vec::new())
     }
 
     /// Step `stmt` to completion, handing each row to `on_row`.
@@ -213,10 +273,13 @@ impl Connection {
         }
     }
 
-    /// Run one statement; returns the number of rows it changed.
+    /// Run one statement; returns the number of rows it changed (0 for `PRAGMA
+    /// durable_batching`).
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         self.call(self.effective_batching(), || {
-            let mut stmt = self.prepare(sql, params, true)?;
+            let Prepared::Engine(mut stmt) = self.prepare(sql, params, true)? else {
+                return Ok(0);
+            };
             self.step_all(&mut stmt, |_| {})?;
             Ok(stmt.n_change().max(0) as u64)
         })
@@ -227,10 +290,16 @@ impl Connection {
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         self.call(self.effective_batching(), || {
             stash::clear();
-            guard::check_sql(sql)?;
-            if self.shared.read_only {
-                return self.execute_batch_read_only(sql);
+            // A transaction with its own setting may end inside the batch, and the commits
+            // after that must not keep it.
+            let split = self.shared.read_only
+                || guard::mentions_batching(sql)
+                || lock(&self.txn_batching).is_some();
+            if split {
+                guard::check_sql_split(sql)?;
+                return self.execute_batch_split(sql);
             }
+            guard::check_sql(sql)?;
             let r = self.core().prepare_execute_batch(sql).map_err(engine_error);
             // Defence in depth: the guard above refuses every spelling of a lower
             // `synchronous`, but the batch prepares and runs its statements in one engine
@@ -240,14 +309,20 @@ impl Connection {
         })
     }
 
-    /// One statement at a time, so each is checked as read-only before it runs.
-    fn execute_batch_read_only(&self, sql: &str) -> Result<()> {
+    /// One statement at a time, so each is checked as read-only before it runs, a `PRAGMA
+    /// durable_batching` is run in place, and a transaction's setting ends with it.
+    fn execute_batch_split(&self, sql: &str) -> Result<()> {
         let mut rest = sql;
         while holds_a_statement(rest) {
-            let mut stmt = self.prepare(rest, &[], false)?;
-            self.step_all(&mut stmt, |_| {})?;
-            let tail = stmt.tail_offset().clamp(1, rest.len());
-            rest = &rest[tail..];
+            let tail = match self.prepare(rest, &[], false)? {
+                Prepared::Engine(mut stmt) => {
+                    self.step_all(&mut stmt, |_| {})?;
+                    stmt.tail_offset()
+                }
+                Prepared::Batching { tail, .. } => tail,
+            };
+            self.end_txn_batching();
+            rest = &rest[tail.clamp(1, rest.len())..];
         }
         Ok(())
     }
@@ -255,7 +330,10 @@ impl Connection {
     /// Run one statement and collect its rows.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>> {
         self.call(self.effective_batching(), || {
-            let mut stmt = self.prepare(sql, params, true)?;
+            let mut stmt = match self.prepare(sql, params, true)? {
+                Prepared::Engine(stmt) => stmt,
+                Prepared::Batching { rows, .. } => return Ok(rows),
+            };
             let mut rows = Vec::new();
             self.step_all(&mut stmt, |r| rows.push(r))?;
             Ok(rows)
@@ -266,12 +344,37 @@ impl Connection {
     /// (or the commit's) error is returned. Each statement is its own call, so the `COMMIT`
     /// returns only once the transaction is confirmed in the bucket.
     pub fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        self.run_transaction(None, f)
+    }
+
+    /// [`Connection::transaction`] committing with `b`, whatever this connection's and the
+    /// database's settings are; the next transaction or statement is back to them. `Config`
+    /// when `b` is invalid, before anything runs.
+    pub fn transaction_with<T>(
+        &self,
+        b: Batching,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        b.validate()?;
+        self.run_transaction(Some(b), f)
+    }
+
+    fn run_transaction<T>(
+        &self,
+        b: Option<Batching>,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         self.execute("BEGIN", &[])?;
+        if b.is_some() {
+            *lock(&self.txn_batching) = b;
+        }
         let r = f(&Transaction { conn: self }).and_then(|v| self.execute("COMMIT", &[]).map(|_| v));
         if r.is_err() {
             // A failed commit may already have rolled back; that ROLLBACK's error is moot.
             let _ = self.execute("ROLLBACK", &[]);
         }
+        // The COMMIT or ROLLBACK cleared it already, unless the ROLLBACK could not run.
+        *lock(&self.txn_batching) = None;
         r
     }
 
@@ -314,6 +417,23 @@ impl Drop for Connection {
     fn drop(&mut self) {
         let _ = self.finish();
     }
+}
+
+/// One prepared statement, or a `PRAGMA durable_batching` already run.
+enum Prepared {
+    /// Boxed: a `Statement` is large, and the enum is moved by value.
+    Engine(Box<Statement>),
+    /// The PRAGMA's rows, and the offset in the text just past it.
+    Batching { rows: Vec<Vec<Value>>, tail: usize },
+}
+
+fn check_params(given: usize, want: usize) -> Result<()> {
+    if given != want {
+        return Err(Error::Config(format!(
+            "{given} parameters given; the statement takes {want}"
+        )));
+    }
+    Ok(())
 }
 
 /// `rest` holds another statement (not just whitespace, `;` or comments). Text that does not

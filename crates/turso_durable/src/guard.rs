@@ -5,23 +5,44 @@
 //! - `PRAGMA journal_mode` set to anything but `wal`: only the WAL is shipped.
 //! - `PRAGMA synchronous` below FULL: a commit that does not fsync is not uploaded either.
 //! - `ATTACH`: writes to an attached database are not shipped.
+//! - `PRAGMA durable_batching` among other statements: [`crate::Connection`] runs it itself
+//!   ([`batching_pragma`]), so the engine must never be handed it, not even as the first of
+//!   several. The split path ([`check_sql_split`]) catches each statement in place instead.
 //!
 //! Reading a pragma (no value) is fine. A statement that does not parse is left to the
 //! engine, which reports it (and never runs it or anything after it).
+use crate::batching::Batching;
 use crate::error::{Error, Result};
-use turso_parser::ast::{Cmd, Expr, Literal, PragmaBody, Stmt, UnaryOperator};
+use turso_parser::ast::{Cmd, Expr, Literal, PragmaBody, QualifiedName, Stmt, UnaryOperator};
 use turso_parser::parser::Parser;
 
-/// Refuse a statement that would leave WAL mode, lower `synchronous` or attach a database.
+/// Refuse a statement that would leave WAL mode, lower `synchronous` or attach a database,
+/// and a `PRAGMA durable_batching` that is not the only statement in `sql`.
 pub(crate) fn check_sql(sql: &str) -> Result<()> {
+    check(sql, false)
+}
+
+/// [`check_sql`] for a caller that runs `sql` one statement at a time, catching each
+/// `PRAGMA durable_batching` in place ([`first_batching_pragma`]): it may be one of several.
+pub(crate) fn check_sql_split(sql: &str) -> Result<()> {
+    check(sql, true)
+}
+
+fn check(sql: &str, split: bool) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
     if !lower.contains("pragma") && !lower.contains("attach") {
         return Ok(());
     }
+    // Statements parsed; a durable_batching PRAGMA among them; text after them that does
+    // not parse (the engine reports it, but only after preparing what comes before).
+    let (mut cmds, mut batching, mut unparsed) = (0, false, false);
     for cmd in Parser::new(sql.as_bytes()) {
         let Ok(cmd) = cmd else {
-            return Ok(());
+            unparsed = true;
+            break;
         };
+        cmds += 1;
+        batching |= matches!(&cmd, Cmd::Stmt(Stmt::Pragma { name, .. }) if is_batching(name));
         let stmt = match cmd {
             Cmd::Stmt(s) | Cmd::Explain(s) => s,
             Cmd::ExplainQueryPlan { stmt, .. } => stmt,
@@ -34,6 +55,11 @@ pub(crate) fn check_sql(sql: &str) -> Result<()> {
             } => check_pragma(name.name.as_str(), &value)?,
             _ => {}
         }
+    }
+    if batching && !split && (cmds > 1 || unparsed) {
+        return Err(Error::Config(
+            "PRAGMA durable_batching must be its own statement".into(),
+        ));
     }
     Ok(())
 }
@@ -55,6 +81,73 @@ fn check_pragma(name: &str, value: &Expr) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `PRAGMA [main.]durable_batching`, which [`crate::Connection`] runs itself.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BatchingPragma {
+    /// No value: read the setting.
+    Read,
+    /// `= value` or `(value)`, parsed with [`Batching`]'s `FromStr`.
+    Set(Result<Batching>),
+}
+
+/// `sql` mentions `durable_batching` anywhere (case-insensitive); every spelling of the
+/// PRAGMA does.
+pub(crate) fn mentions_batching(sql: &str) -> bool {
+    const NAME: &[u8] = b"durable_batching";
+    sql.as_bytes()
+        .windows(NAME.len())
+        .any(|w| w.eq_ignore_ascii_case(NAME))
+}
+
+/// `sql` is exactly one statement, `PRAGMA [main.]durable_batching` (any case).
+pub(crate) fn batching_pragma(sql: &str) -> Option<BatchingPragma> {
+    if !mentions_batching(sql) {
+        return None;
+    }
+    let mut parser = Parser::new(sql.as_bytes());
+    let pragma = classify(parser.next()?.ok()?)?;
+    parser.next().is_none().then_some(pragma)
+}
+
+/// The first statement of `sql`, when it is `PRAGMA [main.]durable_batching`, and the offset
+/// in `sql` just past it (and its `;`), where the next statement starts.
+pub(crate) fn first_batching_pragma(sql: &str) -> Option<(BatchingPragma, usize)> {
+    if !mentions_batching(sql) {
+        return None;
+    }
+    let mut parser = Parser::new(sql.as_bytes());
+    let pragma = classify(parser.next()?.ok()?)?;
+    Some((pragma, parser.offset()))
+}
+
+/// The pragma `name` is `[main.]durable_batching`.
+fn is_batching(name: &QualifiedName) -> bool {
+    name.name.as_str().eq_ignore_ascii_case("durable_batching")
+        && name
+            .db_name
+            .as_ref()
+            .is_none_or(|db| db.as_str().eq_ignore_ascii_case("main"))
+}
+
+fn classify(cmd: Cmd) -> Option<BatchingPragma> {
+    let Cmd::Stmt(Stmt::Pragma { name, body }) = cmd else {
+        return None;
+    };
+    if !is_batching(&name) {
+        return None;
+    }
+    let Some(PragmaBody::Equals(value) | PragmaBody::Call(value)) = body else {
+        return Some(BatchingPragma::Read);
+    };
+    Some(BatchingPragma::Set(match pragma_value(&value) {
+        Some(text) => text.parse(),
+        None => Err(Error::Config(
+            "PRAGMA durable_batching takes off or 'window <max_wait> <max_commits> <max_bytes>'"
+                .into(),
+        )),
+    }))
 }
 
 /// A pragma value as text: a bare identifier, a quoted string or a (signed) number.
@@ -132,6 +225,82 @@ mod tests {
         for sql in ["ATTACH 'x.db' AS x", "attach database 'x.db' as x"] {
             assert_eq!(refused(sql), "ATTACH", "{sql}");
         }
+    }
+
+    #[test]
+    fn batching_pragma_is_a_lone_durable_batching_pragma() {
+        use BatchingPragma::{Read, Set};
+        let w = Batching::Window {
+            max_wait: std::time::Duration::from_millis(50),
+            max_commits: 64,
+            max_bytes: 1 << 20,
+        };
+        assert_eq!(
+            batching_pragma("PRAGMA durable_batching = 'window 50ms 64 1MiB'"),
+            Some(Set(Ok(w)))
+        );
+        assert_eq!(
+            batching_pragma("pragma DURABLE_BATCHING=off"),
+            Some(Set(Ok(Batching::Off)))
+        );
+        assert_eq!(batching_pragma("PRAGMA durable_batching"), Some(Read));
+        let r = batching_pragma("PRAGMA durable_batching = 'nope'");
+        assert!(matches!(r, Some(Set(Err(Error::Config(_))))), "{r:?}");
+        assert_eq!(batching_pragma("SELECT 'pragma durable_batching'"), None);
+        // Other spellings of the same statement.
+        assert_eq!(
+            batching_pragma("PRAGMA main.durable_batching('window 50ms 64 1MiB');"),
+            Some(Set(Ok(w)))
+        );
+        assert_eq!(batching_pragma(" PRAGMA durable_batching ; "), Some(Read));
+        let r = batching_pragma("PRAGMA durable_batching = NULL");
+        assert!(matches!(r, Some(Set(Err(Error::Config(_))))), "{r:?}");
+        // Not one statement, another pragma, or another schema: not ours to classify.
+        for sql in [
+            // Does not parse: the engine reports it.
+            "PRAGMA durable_batching = 1 + 2",
+            "PRAGMA durable_batching; SELECT 1",
+            "SELECT 1; PRAGMA durable_batching",
+            "PRAGMA journal_mode",
+            "PRAGMA temp.durable_batching = off",
+            "EXPLAIN PRAGMA durable_batching",
+        ] {
+            assert_eq!(batching_pragma(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn guard_refuses_durable_batching_among_several_statements() {
+        for sql in [
+            "SELECT 1; PRAGMA durable_batching = off",
+            "PRAGMA durable_batching; SELECT 1",
+            "BEGIN; pragma MAIN.DURABLE_BATCHING('window 1ms 1 1'); COMMIT",
+            // A parse error after it: the engine would still see the PRAGMA first.
+            "PRAGMA durable_batching = off; SELEC",
+        ] {
+            assert_eq!(
+                check_sql(sql),
+                Err(Error::Config(
+                    "PRAGMA durable_batching must be its own statement".into()
+                )),
+                "{sql}"
+            );
+            if !sql.ends_with("SELEC") {
+                assert_eq!(check_sql_split(sql), Ok(()), "split: {sql}");
+            }
+        }
+        for sql in [
+            "PRAGMA durable_batching",
+            "PRAGMA durable_batching = off;",
+            "SELECT 'durable_batching'; SELECT 1",
+        ] {
+            assert_eq!(check_sql(sql), Ok(()), "{sql}");
+        }
+        // The split path still applies every other rule.
+        assert_eq!(
+            check_sql_split("PRAGMA durable_batching = off; PRAGMA synchronous = off"),
+            Err(Error::Unsupported("synchronous below FULL"))
+        );
     }
 
     #[test]
