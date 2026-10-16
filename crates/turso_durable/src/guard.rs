@@ -5,9 +5,12 @@
 //! - `PRAGMA journal_mode` set to anything but `wal`: only the WAL is shipped.
 //! - `PRAGMA synchronous` below FULL: a commit that does not fsync is not uploaded either.
 //! - `ATTACH`: writes to an attached database are not shipped.
-//! - `PRAGMA durable_batching` among other statements: [`crate::Connection`] runs it itself
-//!   ([`batching_pragma`]), so the engine must never be handed it, not even as the first of
-//!   several. The split path ([`check_sql_split`]) catches each statement in place instead.
+//! - `PRAGMA durable_batching` the engine would be handed: [`crate::Connection`] runs it
+//!   itself ([`batching_pragma`]), and the engine would take it for an unknown pragma and
+//!   silently do nothing. So it is refused among other statements (not even the first of
+//!   several reaches the engine; the split path, [`check_sql_split`], catches each in place
+//!   instead), on a schema other than `main`, and under `EXPLAIN`. A value it could never
+//!   accept is refused here too, so a batch holding one runs none of its statements.
 //!
 //! Reading a pragma (no value) is fine. A statement that does not parse is left to the
 //! engine, which reports it (and never runs it or anything after it).
@@ -42,11 +45,18 @@ fn check(sql: &str, split: bool) -> Result<()> {
             break;
         };
         cmds += 1;
-        batching |= matches!(&cmd, Cmd::Stmt(Stmt::Pragma { name, .. }) if is_batching(name));
+        let explain = !matches!(cmd, Cmd::Stmt(_));
         let stmt = match cmd {
             Cmd::Stmt(s) | Cmd::Explain(s) => s,
             Cmd::ExplainQueryPlan { stmt, .. } => stmt,
         };
+        if let Stmt::Pragma { name, body } = &stmt {
+            if name.name.as_str().eq_ignore_ascii_case("durable_batching") {
+                check_batching(name, body.as_ref(), explain)?;
+                batching = true;
+                continue;
+            }
+        }
         match stmt {
             Stmt::Attach { .. } => return Err(Error::Unsupported("ATTACH")),
             Stmt::Pragma {
@@ -60,6 +70,25 @@ fn check(sql: &str, split: bool) -> Result<()> {
         return Err(Error::Config(
             "PRAGMA durable_batching must be its own statement".into(),
         ));
+    }
+    Ok(())
+}
+
+/// A `PRAGMA durable_batching` the connection can run: on `main`, not explained, and with a
+/// valid value if it has one. (Outside a transaction is only known when it runs.)
+fn check_batching(name: &QualifiedName, body: Option<&PragmaBody>, explain: bool) -> Result<()> {
+    if !is_batching(name) {
+        return Err(Error::Config(
+            "PRAGMA durable_batching applies to main only".into(),
+        ));
+    }
+    if explain {
+        return Err(Error::Config(
+            "EXPLAIN of PRAGMA durable_batching is not supported".into(),
+        ));
+    }
+    if let BatchingPragma::Set(b) = setting(body) {
+        b?.validate()?;
     }
     Ok(())
 }
@@ -135,19 +164,21 @@ fn classify(cmd: Cmd) -> Option<BatchingPragma> {
     let Cmd::Stmt(Stmt::Pragma { name, body }) = cmd else {
         return None;
     };
-    if !is_batching(&name) {
-        return None;
-    }
+    is_batching(&name).then(|| setting(body.as_ref()))
+}
+
+/// What a `PRAGMA durable_batching` with `body` asks for.
+fn setting(body: Option<&PragmaBody>) -> BatchingPragma {
     let Some(PragmaBody::Equals(value) | PragmaBody::Call(value)) = body else {
-        return Some(BatchingPragma::Read);
+        return BatchingPragma::Read;
     };
-    Some(BatchingPragma::Set(match pragma_value(&value) {
+    BatchingPragma::Set(match pragma_value(value) {
         Some(text) => text.parse(),
         None => Err(Error::Config(
             "PRAGMA durable_batching takes off or 'window <max_wait> <max_commits> <max_bytes>'"
                 .into(),
         )),
-    }))
+    })
 }
 
 /// A pragma value as text: a bare identifier, a quoted string or a (signed) number.
@@ -255,7 +286,8 @@ mod tests {
         assert_eq!(batching_pragma(" PRAGMA durable_batching ; "), Some(Read));
         let r = batching_pragma("PRAGMA durable_batching = NULL");
         assert!(matches!(r, Some(Set(Err(Error::Config(_))))), "{r:?}");
-        // Not one statement, another pragma, or another schema: not ours to classify.
+        // Not one statement, another pragma, or another schema: not ours to run (`check_sql`
+        // refuses the durable_batching ones).
         for sql in [
             // Does not parse: the engine reports it.
             "PRAGMA durable_batching = 1 + 2",
@@ -295,6 +327,39 @@ mod tests {
             "SELECT 'durable_batching'; SELECT 1",
         ] {
             assert_eq!(check_sql(sql), Ok(()), "{sql}");
+        }
+        // Another schema, or EXPLAIN: the engine would take it for an unknown pragma and
+        // silently do nothing, so it is refused, as one statement or among several.
+        for (sql, why) in [
+            (
+                "PRAGMA temp.durable_batching = off",
+                "PRAGMA durable_batching applies to main only",
+            ),
+            (
+                "PRAGMA aux.DURABLE_BATCHING",
+                "PRAGMA durable_batching applies to main only",
+            ),
+            (
+                "EXPLAIN PRAGMA durable_batching",
+                "EXPLAIN of PRAGMA durable_batching is not supported",
+            ),
+            (
+                "EXPLAIN QUERY PLAN PRAGMA main.durable_batching = off",
+                "EXPLAIN of PRAGMA durable_batching is not supported",
+            ),
+        ] {
+            let want = Err(Error::Config(why.into()));
+            assert_eq!(check_sql(sql), want, "{sql}");
+            assert_eq!(check_sql_split(&format!("SELECT 1; {sql}")), want, "{sql}");
+        }
+        // A value known to be bad is refused up front, before anything in the batch runs.
+        for sql in [
+            "INSERT INTO t VALUES (1); PRAGMA durable_batching = 'nope'",
+            "SELECT 1; PRAGMA durable_batching = 'window 1ms 0 1'",
+            "PRAGMA durable_batching = NULL",
+        ] {
+            let r = check_sql_split(sql);
+            assert!(matches!(r, Err(Error::Config(_))), "{sql}: {r:?}");
         }
         // The split path still applies every other rule.
         assert_eq!(

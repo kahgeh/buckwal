@@ -201,7 +201,7 @@ impl Connection {
             guard::check_sql(sql)?;
             guard::batching_pragma(sql).map(|p| (p, sql.len()))
         } else {
-            guard::check_sql_split(sql)?;
+            // execute_batch guard-checked the whole string before its first statement.
             guard::first_batching_pragma(sql)
         };
         if let Some((pragma, tail)) = pragma {

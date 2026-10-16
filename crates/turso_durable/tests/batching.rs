@@ -883,7 +883,25 @@ fn durable_batching_pragma_outside_transaction_or_malformed_is_refused() {
         conn.execute_batch("SELECT 1; PRAGMA durable_batching = off"),
         Err(Error::Config(_))
     ));
-    // A refused statement anywhere in a batch means none of it runs.
+    // Never handed to the engine, which would ignore it and return Ok.
+    for sql in [
+        "PRAGMA temp.durable_batching = off",
+        "EXPLAIN PRAGMA durable_batching",
+    ] {
+        let r = conn.execute(sql, &[]);
+        assert!(matches!(r, Err(Error::Config(_))), "{sql}: {r:?}");
+        let r = conn.query(sql, &[]);
+        assert!(matches!(r, Err(Error::Config(_))), "{sql}: {r:?}");
+    }
+    // A refused statement anywhere in a batch means none of it runs, a bad value included.
+    conn.execute("BEGIN", &[]).unwrap();
+    let r = conn.execute_batch("INSERT INTO t VALUES (1); PRAGMA durable_batching = 'nope'");
+    assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
+    conn.execute("COMMIT", &[]).unwrap();
+    assert_eq!(count(&conn), 0);
+    let r = conn.execute_batch("INSERT INTO t VALUES (1); PRAGMA durable_batching = 'nope'");
+    assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
+    assert_eq!(count(&conn), 0);
     let r = conn.execute_batch(
         "INSERT INTO t VALUES (1); PRAGMA durable_batching = off; PRAGMA synchronous = off",
     );
