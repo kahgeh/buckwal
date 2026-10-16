@@ -291,12 +291,22 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
             insert(&conn, i).unwrap();
         }
         conn.checkpoint(CheckpointMode::Truncate).unwrap();
-        crate::restore_with_store(&config(restored.path()), store, restored.path()).unwrap();
-        cap.spans()
+        // One more commit, so generation 2's log has a record to replay.
+        insert(&conn, 3).unwrap();
+        crate::restore_with_store(&config(restored.path()), store.clone(), restored.path())
+            .unwrap();
+        // Counted before the database closes (its close-time seal appends to log/2).
+        let keys = crate::format::Keys::new("");
+        let logged = |g| store.list(&keys.log_prefix(g)).unwrap().len().to_string();
+        (cap.spans(), [logged(1), logged(2)])
     });
+    let (spans, logged) = spans;
+    let logged = |g: usize| logged[g - 1].clone();
     let cp = spans.last_named("durable.checkpoint_upload");
     assert_eq!(cp.target, "turso_durable");
     assert_eq!(cp.field("durable.generation"), Some("1"));
+    // The seal-start record is generation 1's last.
+    assert_eq!(cp.field("durable.seq"), Some(logged(1).as_str()));
     assert!(cp.field("durable.pages").unwrap().parse::<u64>().unwrap() > 0);
     assert_eq!(cp.field("durable.retries"), Some("0"));
     assert_eq!(cp.field("s3.status"), Some("200"));
@@ -313,6 +323,10 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
     assert_eq!(r.field("durable.generation"), Some("2"));
     assert!(r.field("durable.gets").unwrap().parse::<u64>().unwrap() > 0);
     assert!(r.field("durable.log_objects").is_some());
+    // The highest seq replayed: generation 2's last record.
+    assert_ne!(logged(2), "0");
+    assert_eq!(r.field("durable.seq"), Some(logged(2).as_str()));
+    assert_eq!(r.field("durable.retries"), Some("0"));
     assert!(r.field("durable.bytes").is_some());
     assert!(
         spans.events.iter().any(|e| e.level == Level::INFO
@@ -320,6 +334,75 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
             && e.field("log_objects").is_some()),
         "no restore record"
     );
+}
+
+/// A MemStore whose next `fail` GETs fail transiently.
+#[derive(Default)]
+struct FlakyGets {
+    inner: MemStore,
+    fail: Mutex<u64>,
+}
+
+impl ObjectStore for FlakyGets {
+    fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
+        let mut fail = self.fail.lock().unwrap();
+        if *fail > 0 {
+            *fail -= 1;
+            return Err(StoreError::Transient(format!(
+                "injected GET failure for {key}"
+            )));
+        }
+        drop(fail);
+        self.inner.get(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> StatsSnap {
+        self.inner.stats()
+    }
+}
+
+#[test]
+fn restore_span_counts_its_retries_and_an_empty_log_is_seq_0() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let keys = crate::format::Keys::new("");
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let store = Arc::new(FlakyGets::default());
+        let db = crate::open_with_store(config(dir.path()), store.clone()).unwrap();
+        // Nothing committed yet: generation 1's log is empty.
+        assert!(store.list(&keys.log_prefix(1)).unwrap().is_empty());
+        crate::restore_with_store(&config(a.path()), store.clone(), a.path()).unwrap();
+        let empty = cap.spans().last_named("durable.restore").clone();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        // Two failed GETs, retried within the restore's deadline.
+        *store.fail.lock().unwrap() = 2;
+        crate::restore_with_store(&config(b.path()), store, b.path()).unwrap();
+        (empty, cap.spans())
+    });
+    let (empty, spans) = spans;
+    assert_eq!(empty.field("durable.log_objects"), Some("0"));
+    assert_eq!(empty.field("durable.seq"), Some("0"));
+    assert_eq!(empty.field("durable.retries"), Some("0"));
+    let r = spans.last_named("durable.restore");
+    assert_eq!(r.field("durable.retries"), Some("2"));
+    assert_ne!(r.field("durable.seq"), Some("0"));
 }
 
 #[test]

@@ -460,6 +460,7 @@ impl Worker {
             parent: parent,
             "durable.checkpoint_upload",
             durable.generation = Empty,
+            durable.seq = Empty,
             durable.pages = Empty,
             durable.retries = Empty,
             s3.status = Empty,

@@ -992,7 +992,17 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
     // The retried seal is given a different page set; it must not touch the published objects.
     let before = f.fault.events().len();
     let other_pages = vec![(1, vec![7u8; 16]), (2, vec![8u8; 16])];
-    assert_eq!(b.seal_generation(other_pages, 4096, 2), Ok(2));
+    let cap = crate::telemetry::testing::Capture::new();
+    let sealed = tracing::subscriber::with_default(cap.subscriber(), || {
+        tracing::info_span!(target: "turso_durable", "seal", durable.seq = tracing::field::Empty)
+            .in_scope(|| b.seal_generation(other_pages, 4096, 2))
+    });
+    assert_eq!(sealed, Ok(2));
+    // Its seq is the failed attempt's seal-start record, log/1/1.
+    assert_eq!(
+        cap.spans().last_named("seal").field("durable.seq"),
+        Some("1")
+    );
     let ev = f.fault.events()[before..].to_vec();
     assert_eq!(
         ev,

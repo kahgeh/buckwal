@@ -9,11 +9,11 @@ use crate::files::{io_err, DB_FILE, DIRTY_FILE, RESTORING_FILE, STATE_FILE, WAL_
 use crate::format::{
     apply_ops, decode_record, Head, Keys, LocalState, LogRecord, Manifest, FORMAT,
 };
-use crate::store::{with_retry, ObjectStore, RetryPolicy};
+use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
@@ -31,22 +31,44 @@ pub struct RestoreReport {
     pub elapsed: Duration,
 }
 
-fn get(store: &dyn ObjectStore, retry: &RetryPolicy, key: &str) -> Result<Vec<u8>> {
-    with_retry(retry, key, |_| store.get(key))?
+/// `with_retry` that adds its extra attempts (attempt numbers above 0) to `retries`.
+fn counted<T>(
+    retries: &AtomicU64,
+    retry: &RetryPolicy,
+    what: &str,
+    mut op: impl FnMut() -> std::result::Result<T, StoreError>,
+) -> Result<T> {
+    with_retry(retry, what, |attempt| {
+        if attempt > 0 {
+            retries.fetch_add(1, Relaxed);
+        }
+        op()
+    })
+}
+
+fn get(
+    store: &dyn ObjectStore,
+    retry: &RetryPolicy,
+    retries: &AtomicU64,
+    key: &str,
+) -> Result<Vec<u8>> {
+    counted(retries, retry, key, || store.get(key))?
         .map(|o| o.body)
         .ok_or_else(|| Error::NotFound(key.to_string()))
 }
 
 /// Every log record of generation `gen`, in order. The seqs must run 1, 2, 3, … with no gap.
+/// Extra attempts of its requests are added to `retries`.
 pub(crate) fn fetch_generation(
     store: &dyn ObjectStore,
     keys: &Keys,
     gen: u64,
     concurrency: usize,
     retry: &RetryPolicy,
+    retries: &AtomicU64,
 ) -> Result<Vec<LogRecord>> {
     let prefix = keys.log_prefix(gen);
-    let mut seqs: Vec<u64> = with_retry(retry, &prefix, |_| store.list(&prefix))?
+    let mut seqs: Vec<u64> = counted(retries, retry, &prefix, || store.list(&prefix))?
         .iter()
         .filter_map(|k| keys.parse_log(k))
         .filter(|(g, _)| *g == gen)
@@ -76,7 +98,8 @@ pub(crate) fn fetch_generation(
                     let Some(&seq) = seqs.get(i) else {
                         return;
                     };
-                    let r = get(store, retry, &keys.log(gen, seq)).and_then(|b| decode_record(&b));
+                    let r = get(store, retry, retries, &keys.log(gen, seq))
+                        .and_then(|b| decode_record(&b));
                     match r {
                         Ok(rec) => *slots[i].lock().unwrap() = Some(rec),
                         Err(e) => {
@@ -121,7 +144,8 @@ fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
 }
 
 /// The `-wal` image `B` of the head's generation: every record of `log/<generation>`
-/// replayed in order, and the number of records.
+/// replayed in order, and the number of records (which is also the highest seq: the seqs run
+/// 1, 2, 3, …).
 ///
 /// Which writers' records a generation may hold: runs of records by other writer ids (one run
 /// per writer), then only records of `head.writer_id`. A claim (`bucket::claim`) hands a restored copy's head
@@ -138,12 +162,24 @@ pub(crate) fn generation_image(
     head: &Head,
     cfg: &EngineConfig,
 ) -> Result<(Vec<u8>, u64)> {
+    generation_image_counted(store, keys, head, cfg, &AtomicU64::new(0))
+}
+
+/// [`generation_image`], adding the extra attempts of its requests to `retries`.
+fn generation_image_counted(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    head: &Head,
+    cfg: &EngineConfig,
+    retries: &AtomicU64,
+) -> Result<(Vec<u8>, u64)> {
     let records = fetch_generation(
         store,
         keys,
         head.generation,
         cfg.upload_concurrency,
         &cfg.retry,
+        retries,
     )?;
     let fenced = |writer_id: &str| {
         Error::Fenced(format!(
@@ -214,7 +250,8 @@ pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
 /// writes nothing to the bucket. Runs in a `durable.restore` span, and logs the finished
-/// restore.
+/// restore. The span's `durable.seq` is the highest log seq replayed (0 for an empty log), and
+/// `durable.retries` the extra attempts of the restore's requests.
 pub(crate) fn restore_into(
     store: Arc<dyn ObjectStore>,
     keys: &Keys,
@@ -228,12 +265,19 @@ pub(crate) fn restore_into(
         durable.log_objects = Empty,
         durable.gets = Empty,
         durable.bytes = Empty,
+        durable.seq = Empty,
+        durable.retries = Empty,
         s3.status = Empty,
     );
     let _in = span.enter();
-    let r = restore_files(store, keys, dir, cfg)?;
+    let retries = AtomicU64::new(0);
+    let r = restore_files(store, keys, dir, cfg, &retries);
+    span.record("durable.retries", retries.load(Relaxed));
+    let r = r?;
     span.record("durable.generation", r.generation);
     span.record("durable.log_objects", r.log_objects);
+    // The seqs replayed run 1..=log_objects.
+    span.record("durable.seq", r.log_objects);
     span.record("durable.gets", r.gets);
     span.record("durable.bytes", r.bytes);
     tracing::info!(
@@ -253,6 +297,7 @@ fn restore_files(
     keys: &Keys,
     dir: &Path,
     cfg: &EngineConfig,
+    retries: &AtomicU64,
 ) -> Result<RestoreReport> {
     let start = Instant::now();
     let before = store.stats();
@@ -266,18 +311,18 @@ fn restore_files(
     }
     let retry = &cfg.retry;
     let head_key = keys.head();
-    let head_obj = with_retry(retry, &head_key, |_| store.get(&head_key))?
+    let head_obj = counted(retries, retry, &head_key, || store.get(&head_key))?
         .ok_or_else(|| Error::NotFound(head_key.clone()))?;
     let head = Head::decode(&head_obj.body)?;
     if let Some(g) = head.manifest {
-        let manifest = Manifest::decode(&get(&*store, retry, &keys.manifest(g))?)?;
+        let manifest = Manifest::decode(&get(&*store, retry, retries, &keys.manifest(g))?)?;
         let pg = manifest
             .pages
             .get(&1)
             .ok_or_else(|| Error::Corrupt(format!("manifest/{g} has no entry for page 1")))?;
-        refuse_mvcc(&get(&*store, retry, &keys.page(*pg, 1))?)?;
+        refuse_mvcc(&get(&*store, retry, retries, &keys.page(*pg, 1))?)?;
     }
-    let (wal, log_objects) = generation_image(&*store, keys, &head, cfg)?;
+    let (wal, log_objects) = generation_image_counted(&*store, keys, &head, cfg, retries)?;
     // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).
     let db = match head.manifest {
         Some(_) => Vec::new(),

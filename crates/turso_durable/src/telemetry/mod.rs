@@ -6,10 +6,10 @@
 //!   `durable.ack_wait` (`io/wal_file.rs`, `conn.rs`);
 //! - `durable.upload` (`durable.commits`, `durable.bytes`, `durable.generation`,
 //!   `durable.seq`, `durable.retries`, `s3.status`) and `durable.checkpoint_upload`
-//!   (`durable.generation`, `durable.pages`, `durable.retries`, `s3.status`), on the uploader
-//!   thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);
+//!   (`durable.generation`, `durable.seq`, `durable.pages`, `durable.retries`, `s3.status`),
+//!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);
 //! - `durable.restore` (`durable.generation`, `durable.log_objects`, `durable.gets`,
-//!   `durable.bytes`) (`restore.rs`).
+//!   `durable.bytes`, `durable.seq`, `durable.retries`, `s3.status`) (`restore.rs`).
 //!
 //! Log events have the target `turso_durable` exactly.
 //!

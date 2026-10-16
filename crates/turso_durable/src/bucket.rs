@@ -672,7 +672,9 @@ impl Bucket {
     /// Returns G+1.
     ///
     /// It records `durable.generation` (G), `durable.pages` and `durable.retries` on the
-    /// current span, and logs the finished seal.
+    /// current span, and `durable.seq`: the seq of the seal-start record (written now, or by
+    /// the earlier attempt whose head this seal adopts) once the seal reaches it. It logs the
+    /// finished seal.
     pub(crate) fn seal_generation(
         &mut self,
         pages: Vec<(u32, Vec<u8>)>,
@@ -735,9 +737,13 @@ impl Bucket {
                 .pending_seal
                 .take()
                 .expect("a published seal is pending");
+            // Nothing was appended since that attempt's seal-start record (`before_record`
+            // refuses while its head may be published): it is the generation's last.
+            Span::current().record("durable.seq", self.seq - 1);
             return Ok(self.finish_seal(start, p.head, etag, p.manifest));
         }
         self.settle(start)?;
+        Span::current().record("durable.seq", self.seq);
         self.seal_start(start)?;
         let gen = self.head.generation;
         self.emit(Event::SealStarted {

@@ -299,8 +299,8 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `durable.local_fsync` | `durable.commit` | |
 | `durable.ack_wait` | `durable.commit` | The wait for the commit's log record: inside the WAL sync for an Off commit (or a Window commit on the Off path), after the engine returns for a Window commit. |
 | `durable.upload` | the first commit's `durable.commit` | One per log PUT: `durable.commits`, `durable.bytes`, `durable.generation`, `durable.seq`, `durable.retries`, `s3.status` |
-| `durable.checkpoint_upload` | the caller's span | One per seal: `durable.generation`, `durable.pages`, `durable.retries`, `s3.status` |
-| `durable.restore` | the caller's span | `durable.generation`, `durable.log_objects`, `durable.gets`, `durable.bytes`, `s3.status` |
+| `durable.checkpoint_upload` | the caller's span | One per seal: `durable.generation`, `durable.seq` (the seal-start record's), `durable.pages`, `durable.retries`, `s3.status` |
+| `durable.restore` | the caller's span | `durable.generation`, `durable.seq` (the highest log seq replayed, 0 when the log is empty), `durable.log_objects`, `durable.gets`, `durable.bytes`, `durable.retries`, `s3.status` |
 
 Every span and log record also carries `test_run_id` when one is set (`DURABLE_TEST_RUN_ID`).
 
