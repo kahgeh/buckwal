@@ -293,7 +293,9 @@ What the figures show:
   10 and 50 ms traded throughput for fewer PUTs.
 - Acks waited longer than max_wait plus one PUT (about 1.2 ms here) at the larger windows:
   ack wait p50 17.4 ms at 10 ms and 63.5 ms at 50 ms with one connection. The cause was not
-  investigated.
+  investigated. A review found no cause in the code; the excess grows with the window (about
+  0.4, 5.6 and 11.8 ms at 1, 10 and 50 ms), which fits macOS timer coalescing on the
+  uploader's recv_timeout (hypothesis, unverified).
 - Commit latency with 8 Window connections is above the ack wait (p99 49-75 ms vs 4.9-73.7
   ms): it also includes waiting for the WAL write lock behind other connections.
 - c8-off's slowest commit took 3086 ms (#8, near the start; p99 3.45 ms). It is most likely

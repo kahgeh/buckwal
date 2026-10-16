@@ -8,7 +8,7 @@ This is stage 2: one writer process, plain HTTP, a runtime batching setting and 
 
 ## How it works
 
-- **Commits.** Each commit writes WAL frames. With batching `Off` (the default), the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`) before the WAL's fsync. With a `Window`, the fsync completes first, and the commit waits to share one log object with other commits (see Batching). Either way, the commit returns `Ok` only when a log object holding it is in the bucket.
+- **Commits.** Each commit writes WAL frames. With batching `Off` (the default), the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`) before the WAL's fsync. With a `Window`, the commit is queued for the uploader, fsynced locally, and the call then waits while the commit shares one log object with other commits (see Batching). Either way, the commit returns `Ok` only when a log object holding it is in the bucket.
 - **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it. It first appends an empty *seal-start* log record and checks that `head` has not moved, so a writer that was taken over stops before it uploads anything. Then it uploads every page that changed in that generation (`pages/…`), then a manifest that maps each page to the generation holding its latest copy, then moves `head` to the next generation.
 - **Restore.** Restore reads `head`, the newest manifest and the current generation's log. It rebuilds the WAL from the log and fetches pages from the bucket only when the engine first reads them.
 - **Trimming.** After each seal, a background thread deletes log objects, manifests and pages that the new head no longer needs. It waits for the trim grace period first.
@@ -207,13 +207,13 @@ pub enum Batching {
 - **Window:** the WAL sync completes after the local fsync, so the write lock is released and the next commit can start while this one's upload is pending. The call (`execute`, `COMMIT`, …) returns only once the uploader confirms a log object that contains the commit.
 - **Window's trade-off:** other connections in the same process can read a batched commit up to one window before it is durable. If the machine is lost in that gap, the commit is lost, but nobody was told it succeeded. A reader that passes such data on to the outside world could pass on data that is then lost. Off has no such gap.
 - **A single connection gains nothing from a window.** Its next commit cannot start until this one is acked, so each PUT still carries one commit, and every commit also waits out the window. Sharing needs several connections committing at once (see Costs).
-- **An ack waits at most `max_wait` + `retry_deadline`** (30 s by default).
+- **How long an ack can wait.** A Window commit's window starts when the uploader takes the commit off its queue, and the commit's own upload is then retried for at most `retry_deadline` (30 s by default) after its window closes. During an outage, the commit can also queue behind an upload that is already retrying, for up to another `retry_deadline`. So an ack can wait up to about `max_wait` + 2 × `retry_deadline`. The same applies to an Off commit (and to a Window commit on the Off path): queued behind a retrying upload, it waits for that one first, then retries its own for up to `retry_deadline`.
 - **Checkpoints:** before a seal uploads pages, the uploader uploads the waiting commits. If they cannot be uploaded, the seal fails with their error rather than seal over them. Closing the database also uploads what waits.
 
 **A failed upload in Window mode.**
 - Every waiting commit's ack returns an error (`Timeout` or `UploadFailed`; `Fenced` when another writer took over).
 - Those commits are in the local database, and other connections can read them. They are not rolled back.
-- The uploader keeps retrying them in order. Later commits queue behind them, as Off commits do while the bucket fails, so nothing is acked out of order.
+- The uploader keeps retrying them in order. Later commits queue behind them, as Off commits do while the bucket fails, so nothing is acked out of order. The exception is `Fenced`: a fenced writer never uploads again, so the waiting commits are dropped and never become durable from this writer.
 - While the uploader is degraded, a Window commit takes the blocking Off path: it uploads inside its own WAL sync, behind the commits still owed. The uploader is degraded while the writer is fenced, a record is in doubt, a seal's head write is unresolved, or unsent Window commits are owed. So during a bucket outage, Window commits fail and roll back like Off ones, instead of piling up.
 - An error after a Window `COMMIT` means "outcome unknown": the row is visible locally, and it may later become durable (the next upload that succeeds carries it). Retrying the same write can apply it twice. Make retried writes idempotent, for example with your own key and `INSERT OR REPLACE` or `ON CONFLICT DO NOTHING`, or read before you retry. A failed Off commit is rolled back locally, but its upload may still have landed (see Guarantees), so the same advice applies.
 
@@ -385,7 +385,7 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 | `GET` | Restore, lazy page reads. |
 | `ListObjectsV2` (`list-type=2`, continuation tokens) | Listing a generation's log, and trimming. |
 | `DELETE` | Trimming. |
-| Plain HTTP | Stage 1 only (no TLS until stage 4). |
+| Plain HTTP | Only plain HTTP until stage 4 (no TLS). |
 
 `scripts/s3-gate.sh` checks the conditional-PUT behaviour against the local RustFS. Its results for RustFS 1.0.0 are in `results/rustfs-gate.txt`, and all checks passed.
 
@@ -448,9 +448,9 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 
 **Known cost: the commit that crosses a generation boundary.**
 - Pages are uploaded at the generation boundary (D6): the write that restarts the WAL. After an automatic checkpoint, or a `Passive`, `Full` or `Restart` checkpoint, that write happens in the next commit, which waits for the whole generation's page upload, the manifest and the head. `CheckpointMode::Truncate` and close seal inside the checkpoint instead.
-- With turso's automatic checkpoint (every 1000 WAL frames), the bench crossed a boundary about every 500 commits of 1 KB.
-- In the 5000-commit bench, the commit p50 was 1.33 ms, while the slowest commit took 69.8 ms. That commit is most likely the one that crossed the first boundary (bench does not record which commit triggered a seal), whose seal took 39.4 ms for 169 pages.
-- Each in-run seal took 37–44 ms for 169–172 pages.
+- Stage 1: with turso's automatic checkpoint (every 1000 WAL frames), the bench crossed a boundary about every 500 commits of 1 KB.
+- Stage 1: in the 5000-commit bench, the commit p50 was 1.33 ms, while the slowest commit took 69.8 ms. That commit is most likely the one that crossed the first boundary (bench does not record which commit triggered a seal), whose seal took 39.4 ms for 169 pages.
+- Stage 1: each in-run seal took 37–44 ms for 169–172 pages.
 - You can move this wait off a latency-sensitive path by calling `Connection::checkpoint(CheckpointMode::Truncate)` at a quiet moment.
 
 **Limits.**
@@ -462,7 +462,7 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 **Edge cases.**
 - `PRAGMA wal_checkpoint` reports an upload failure as a busy row, not as an error (vdbe/execute.rs:796-803). Use `Connection::checkpoint` to get the error.
 - `close` ignores a failed close-time checkpoint (pager.rs:5458-5472). Nothing acked is lost: the log already holds every acked commit, and the next open or restore replays it.
-- If the local fsync fails after a confirmed upload, the engine panics (pager.rs:4723-4733). This is a local disk failure. The commit is in the bucket, so restore the database elsewhere.
+- If the local fsync fails, the engine panics (pager.rs:4723-4733). This is a local disk failure. For an Off commit the upload was already confirmed, so the commit is in the bucket; restore the database elsewhere. A Window commit is queued before its fsync, so its upload may not have happened yet: after a restore elsewhere it may or may not be there, and it was never acked.
 - VACUUM is untested.
 - Plain HTTP only until stage 4. The figures here are from RustFS on a laptop; nothing has been measured on real S3.
 - Closing during a bucket outage can block for up to the retry deadline.
@@ -484,10 +484,11 @@ Source: `results/batching-knob.txt`. These are laptop figures (Apple M4 Max, Rus
 | 8 | `window 10ms 64 1MiB` | 15.3 / 33.7 / 74.1 ms | 394 | 0.166 | 6.03 | 12.8 / 19.5 / 21.5 ms |
 | 8 | `window 50ms 64 1MiB` | 62.7 / 70.0 / 75.0 ms | 124 | 0.127 | 7.91 | 57.3 / 69.6 / 73.7 ms |
 
+- "Log PUTs per acked commit" is `log_puts` / 2000 bench commits. `upload_stats` itself counted 2002–2005 commits per run, because each WAL restart's header record counts as a commit. The ack-wait columns come from the histogram since open, so they include the setup `CREATE TABLE`'s one ack.
 - Off makes one log PUT per acked commit with 1 or 8 connections (1.002: one per commit, plus one per WAL restart).
 - One connection gains nothing from a window: one commit per PUT, and every commit waits out the window.
 - With 8 connections, a window shares PUTs: 3.1, 6.0 and 7.9 commits per PUT at 1, 10 and 50 ms. Each connection has at most one commit waiting, so a PUT held at most about 8 here. Only the 1 ms window also raised throughput over Off (1038 against 631 commits/s).
-- At 10 and 50 ms, acks waited several ms longer than the window plus one PUT. The cause was not investigated.
+- At 10 and 50 ms, acks waited several ms longer than the window plus one PUT. The cause was not investigated. A review found no cause in the code; the excess grows with the window (about 0.4, 5.6 and 11.8 ms at 1, 10 and 50 ms), which fits macOS timer coalescing on the uploader's `recv_timeout` (a hypothesis, unverified).
 - Checkpoint uploads: with one connection, each in-run seal took 41–45 ms (Off) and 43–75 ms (Window) for 170 pages. With 8 Window connections, no WAL restart happened during the run, so the run's 696–728 pages were sealed once, at close, in 177–186 ms.
 - Restore of the 1-connection Off database (generation 6): 24 ms, 4 GETs (`3 + 1` log object), 1 LIST, 4.4 KB downloaded. A full `verify` of the fresh restore took 0.23 s of wall time.
 
