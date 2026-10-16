@@ -1,0 +1,313 @@
+# turso_durable stage 2 (batching-knob) measurements
+# date: 2026-10-16T19:40:00Z
+# git: 8a20b8419fe2dd884cd118dd711d3ea965ba6eb3 (batching-knob; the measured code, before this file was committed)
+# engine: turso_core 0.8.3 (features fs, json, uuid)
+# RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+# build: cargo build --release --locked -p turso-durable-cli (rustc 1.97.1), target/release/turso-durable
+# machine: Apple M4 Max, macOS 27.0.1
+# laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
+# telemetry: DURABLE_OTEL unset (off), so no span or log record was exported during these runs.
+# One run per configuration; no repeats, so treat small differences as noise.
+#
+# Workload (bench): CREATE TABLE bench(id INTEGER PRIMARY KEY, payload BLOB) on one connection,
+# which is then closed; then 2000 autocommit INSERT OR REPLACE statements of a 1024-byte blob,
+# ids 0..1999, shared by --connections threads (one connection each, ids handed out from
+# one counter); each thread closes its connection when the ids run out; then the database is
+# closed. Default settings otherwise (upload concurrency 16, prefetch off, trim grace 10 min).
+# --batching is set with Database::set_batching after open; no connection sets its own.
+#
+# Keys:
+# - commit_p50/p95/p99_ms: latency of each bench INSERT as the caller saw it (lock waits,
+#   local write, upload and ack wait included).
+# - commits_acked, commits_uploaded, log_puts, log_put_bytes, commits_per_log_put,
+#   bytes_per_log_put: Database::upload_stats() after the commit threads finished (so after
+#   the last connection's close-time TRUNCATE) minus the snapshot taken after the CREATE TABLE.
+#   upload_stats counts the WAL-header record of each WAL restart as a commit: one after the
+#   setup close's TRUNCATE, one per in-run restart, one at the last connection's close. That
+#   is why commits_acked is 2002-2005 for 2000 bench commits.
+# - ack_wait_p50/p95/p99_ms: the upload_stats histogram since open (the CREATE TABLE's one
+#   ack is included; a histogram cannot be subtracted). Each is the upper edge of its
+#   histogram sub-bucket (at most 6.25 % above the true value).
+# - log_puts_per_commit = log_puts / 2000 (log PUTs per acked bench commit).
+# - bucket_puts: every PUT the store saw, setup included. page_puts: PUTs to pages/.
+# - seal_N_ms / seal_N_pages: each checkpoint upload. seal_1 (2 pages) is the setup
+#   connection's close, before the measured commits; the last seal is the close-time
+#   TRUNCATE of the last bench connection; the ones between are in-run WAL restarts after
+#   the engine's automatic checkpoint (every 1000 WAL frames).
+#
+# Commands (DURABLE_* from scripts/rustfs.sh env; DURABLE_OTEL and DURABLE_BATCHING unset;
+# run id 1792179518; <tmp> from mktemp -d, removed afterwards):
+#   for C in 1 8; for B in off 'window 1ms 64 1MiB' 'window 10ms 64 1MiB' 'window 50ms 64 1MiB':
+#     DURABLE_PREFIX=bench/stage2/c<C>-<off|window-Nms>-1792179518 \
+#       turso-durable bench --dir <tmp>/<tag> --commits 2000 --connections C --batching B
+#   DURABLE_PREFIX=bench/stage2/c1-off-1792179518 /usr/bin/time -p turso-durable restore --dir <tmp>/r-c1-off
+#   DURABLE_PREFIX=bench/stage2/c1-off-1792179518 /usr/bin/time -p turso-durable verify  --dir <tmp>/r-c1-off
+
+## c1-off: --connections 1 --batching 'off' (raw)
+commits=2000
+commit_p50_ms=1.189
+commit_p95_ms=1.604
+commit_p99_ms=2.394
+commit_max_ms=69.085
+commit_max_at=503
+commits_per_sec=720.8
+commits_acked=2005
+commits_uploaded=2005
+log_puts=2005
+log_put_bytes=16696626
+commits_per_log_put=1.000
+bytes_per_log_put=8327.5
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.344
+ack_wait_p99_ms=1.664
+log_puts_per_commit=1.002
+bucket_puts=2706
+page_puts=682
+seals=5
+seal_1_ms=6.834 seal_1_pages=2
+seal_2_ms=45.489 seal_2_pages=170
+seal_3_ms=40.941 seal_3_pages=170
+seal_4_ms=44.459 seal_4_pages=170
+seal_5_ms=44.920 seal_5_pages=170
+
+## c1-window-1ms: --connections 1 --batching 'window 1ms 64 1MiB' (raw)
+commits=2000
+commit_p50_ms=2.588
+commit_p95_ms=3.039
+commit_p99_ms=3.350
+commit_max_ms=75.816
+commit_max_at=1004
+commits_per_sec=362.6
+commits_acked=2005
+commits_uploaded=2005
+log_puts=2001
+log_put_bytes=16696314
+commits_per_log_put=1.002
+bytes_per_log_put=8344.0
+ack_wait_p50_ms=2.560
+ack_wait_p95_ms=3.072
+ack_wait_p99_ms=3.328
+log_puts_per_commit=1.000
+bucket_puts=2701
+page_puts=682
+seals=5
+seal_1_ms=5.638 seal_1_pages=2
+seal_2_ms=45.467 seal_2_pages=170
+seal_3_ms=56.430 seal_3_pages=170
+seal_4_ms=43.429 seal_4_pages=170
+seal_5_ms=51.026 seal_5_pages=170
+
+## c1-window-10ms: --connections 1 --batching 'window 10ms 64 1MiB' (raw)
+commits=2000
+commit_p50_ms=16.843
+commit_p95_ms=19.586
+commit_p99_ms=20.687
+commit_max_ms=101.260
+commit_max_at=503
+commits_per_sec=59.7
+commits_acked=2005
+commits_uploaded=2005
+log_puts=2001
+log_put_bytes=16696314
+commits_per_log_put=1.002
+bytes_per_log_put=8344.0
+ack_wait_p50_ms=17.408
+ack_wait_p95_ms=20.480
+ack_wait_p99_ms=21.504
+log_puts_per_commit=1.000
+bucket_puts=2701
+page_puts=682
+seals=5
+seal_1_ms=6.222 seal_1_pages=2
+seal_2_ms=64.993 seal_2_pages=170
+seal_3_ms=43.951 seal_3_pages=170
+seal_4_ms=62.169 seal_4_pages=170
+seal_5_ms=73.306 seal_5_pages=170
+
+## c1-window-50ms: --connections 1 --batching 'window 50ms 64 1MiB' (raw)
+commits=2000
+commit_p50_ms=63.028
+commit_p95_ms=67.760
+commit_p99_ms=69.102
+commit_max_ms=158.227
+commit_max_at=1004
+commits_per_sec=15.9
+commits_acked=2005
+commits_uploaded=2005
+log_puts=2001
+log_put_bytes=16696314
+commits_per_log_put=1.002
+bytes_per_log_put=8344.0
+ack_wait_p50_ms=63.488
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=69.632
+log_puts_per_commit=1.000
+bucket_puts=2701
+page_puts=682
+seals=5
+seal_1_ms=6.190 seal_1_pages=2
+seal_2_ms=72.097 seal_2_pages=170
+seal_3_ms=74.743 seal_3_pages=170
+seal_4_ms=64.347 seal_4_pages=170
+seal_5_ms=82.993 seal_5_pages=170
+
+## c8-off: --connections 8 --batching 'off' (raw)
+commits=2000
+commit_p50_ms=1.322
+commit_p95_ms=1.749
+commit_p99_ms=3.450
+commit_max_ms=3086.068
+commit_max_at=8
+commits_per_sec=630.5
+commits_acked=2004
+commits_uploaded=2004
+log_puts=2004
+log_put_bytes=16861810
+commits_per_log_put=1.000
+bytes_per_log_put=8414.1
+ack_wait_p50_ms=1.280
+ack_wait_p95_ms=1.472
+ack_wait_p99_ms=1.728
+log_puts_per_commit=1.002
+bucket_puts=2721
+page_puts=701
+seals=4
+seal_1_ms=7.275 seal_1_pages=2
+seal_2_ms=43.233 seal_2_pages=170
+seal_3_ms=75.795 seal_3_pages=339
+seal_4_ms=59.752 seal_4_pages=190
+
+## c8-window-1ms: --connections 8 --batching 'window 1ms 64 1MiB' (raw)
+commits=2000
+commit_p50_ms=5.018
+commit_p95_ms=14.963
+commit_p99_ms=49.096
+commit_max_ms=154.935
+commit_max_at=489
+commits_per_sec=1038.2
+commits_acked=2002
+commits_uploaded=2002
+log_puts=646
+log_put_bytes=22918073
+commits_per_log_put=3.099
+bytes_per_log_put=35476.9
+ack_wait_p50_ms=3.200
+ack_wait_p95_ms=4.352
+ack_wait_p99_ms=4.864
+log_puts_per_commit=0.323
+bucket_puts=1385
+page_puts=730
+seals=2
+seal_1_ms=7.659 seal_1_pages=2
+seal_2_ms=185.843 seal_2_pages=728
+
+## c8-window-10ms: --connections 8 --batching 'window 10ms 64 1MiB' (raw)
+commits=2000
+commit_p50_ms=15.271
+commit_p95_ms=33.668
+commit_p99_ms=74.084
+commit_max_ms=153.418
+commit_max_at=1053
+commits_per_sec=394.1
+commits_acked=2002
+commits_uploaded=2002
+log_puts=332
+log_put_bytes=22839852
+commits_per_log_put=6.030
+bytes_per_log_put=68794.7
+ack_wait_p50_ms=12.800
+ack_wait_p95_ms=19.456
+ack_wait_p99_ms=21.504
+log_puts_per_commit=0.166
+bucket_puts=1049
+page_puts=708
+seals=2
+seal_1_ms=6.409 seal_1_pages=2
+seal_2_ms=183.776 seal_2_pages=706
+
+## c8-window-50ms: --connections 8 --batching 'window 50ms 64 1MiB' (raw)
+commits=2000
+commit_p50_ms=62.657
+commit_p95_ms=70.014
+commit_p99_ms=74.994
+commit_max_ms=130.520
+commit_max_at=1971
+commits_per_sec=124.4
+commits_acked=2002
+commits_uploaded=2002
+log_puts=253
+log_put_bytes=23474305
+commits_per_log_put=7.913
+bytes_per_log_put=92783.8
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.127
+bucket_puts=960
+page_puts=698
+seals=2
+seal_1_ms=5.857 seal_1_pages=2
+seal_2_ms=177.364 seal_2_pages=696
+
+## restore of the c1-off prefix into a fresh directory (raw)
+restored generation=6 log_objects=1 gets=4 lists=1 bytes=4426 ms=24
+real 0.04
+user 0.00
+sys 0.00
+
+## verify of that restore (raw; PRAGMA integrity_check reads every page lazily)
+verify ok acked=0 present=0 unacked_present=0 duplicate_acks=0
+real 0.23
+user 0.01
+sys 0.02
+
+## Summary
+laptop (Apple M4 Max, RustFS in podman on the same Mac), not production. 2000 commits of 1 KB
+per run; DURABLE_OTEL off.
+
+| Connections | Batching            | commit p50 / p95 / p99 (ms) | commits/s | log PUTs per acked commit | commits_per_log_put | ack wait p50 / p95 / p99 (ms) | seals: ms (pages) |
+|-------------|---------------------|-----------------------------|-----------|---------------------------|---------------------|-------------------------------|-------------------|
+| 1           | off                 | 1.19 / 1.60 / 2.39          | 721       | 1.002                     | 1.000               | 1.15 / 1.34 / 1.66            | 45.5, 40.9, 44.5 (170 each); close 44.9 (170) |
+| 1           | window 1ms 64 1MiB  | 2.59 / 3.04 / 3.35          | 363       | 1.000                     | 1.002               | 2.56 / 3.07 / 3.33            | 45.5, 56.4, 43.4 (170 each); close 51.0 (170) |
+| 1           | window 10ms 64 1MiB | 16.84 / 19.59 / 20.69       | 60        | 1.000                     | 1.002               | 17.41 / 20.48 / 21.50         | 65.0, 44.0, 62.2 (170 each); close 73.3 (170) |
+| 1           | window 50ms 64 1MiB | 63.03 / 67.76 / 69.10       | 16        | 1.000                     | 1.002               | 63.49 / 69.63 / 69.63         | 72.1, 74.7, 64.3 (170 each); close 83.0 (170) |
+| 8           | off                 | 1.32 / 1.75 / 3.45          | 631       | 1.002                     | 1.000               | 1.28 / 1.47 / 1.73            | 43.2 (170), 75.8 (339); close 59.8 (190) |
+| 8           | window 1ms 64 1MiB  | 5.02 / 14.96 / 49.10        | 1038      | 0.323                     | 3.099               | 3.20 / 4.35 / 4.86            | none in the run; close 185.8 (728) |
+| 8           | window 10ms 64 1MiB | 15.27 / 33.67 / 74.08       | 394       | 0.166                     | 6.030               | 12.80 / 19.46 / 21.50         | none in the run; close 183.8 (706) |
+| 8           | window 50ms 64 1MiB | 62.66 / 70.01 / 74.99       | 124       | 0.127                     | 7.913               | 57.34 / 69.63 / 73.73         | none in the run; close 177.4 (696) |
+
+(Every run's seal_1, 2 pages in 5.6-7.7 ms, is the setup connection's close and is left out
+of the last column.)
+
+What the figures show:
+- Off: one log PUT per acked commit (1.002 = one per commit plus one per WAL restart), with 1
+  or 8 connections. 8 Off connections reach about the same throughput as one (631 vs 721
+  commits/s): each commit holds the WAL write lock until its PUT returns.
+- A single connection gains nothing from a window: it has at most one commit waiting, so
+  every PUT still carries one commit (commits_per_log_put 1.002) and each commit waits the
+  window on top of its PUT. Throughput falls from 721 to 363, 60 and 16 commits/s.
+- With 8 connections a window shares PUTs: 3.1, 6.0 and 7.9 commits per log PUT at 1, 10 and
+  50 ms (log PUTs per acked commit 0.32, 0.17, 0.13). Each connection has at most one commit
+  waiting, so a PUT holds at most 8 here; max_commits 64 and max_bytes 1 MiB were (inferred) never the
+  limit that fired. Only the 1 ms window raised throughput over Off (1038 vs 631 commits/s);
+  10 and 50 ms traded throughput for fewer PUTs.
+- Acks waited longer than max_wait plus one PUT (about 1.2 ms here) at the larger windows:
+  ack wait p50 17.4 ms at 10 ms and 63.5 ms at 50 ms with one connection. The cause was not
+  investigated.
+- Commit latency with 8 Window connections is above the ack wait (p99 49-75 ms vs 4.9-73.7
+  ms): it also includes waiting for the WAL write lock behind other connections.
+- c8-off's slowest commit took 3086 ms (#8, near the start; p99 3.45 ms). It is most likely
+  lock contention between the 8 connections at start-up (inferred; bench does not break it
+  down).
+- Checkpoint uploads (seals): with Off and one connection the automatic checkpoint restarted
+  the WAL every ~500 commits and each seal took 41-45 ms for 170 pages, as in stage 1.
+  Under Window with 8 connections no WAL restart happened in the run, so the whole run's
+  pages (696-728) were sealed once, at the last connection's close, in 177-186 ms. With one
+  Window connection the in-run seals took 43-75 ms for 170 pages.
+
+Restore (the c1-off prefix: generation 6):
+- 24 ms (0.04 s wall with process start), 4 GETs (head, manifest, page 1 for the MVCC check,
+  1 log object = 3 + log_objects), 1 LIST, 4426 bytes downloaded. No page is fetched at
+  restore time.
+- verify (PRAGMA integrity_check, which reads every page lazily) of that fresh restore took
+  0.23 s wall, process start included.

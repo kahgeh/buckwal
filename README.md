@@ -4,11 +4,11 @@ Make a tursodb database durable in an S3 bucket. A Rust library (`turso_durable`
 
 Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
 
-This is stage 1: one writer process, plain HTTP, tested against RustFS on a laptop (not on AWS S3).
+This is stage 2: one writer process, plain HTTP, a runtime batching setting and OpenTelemetry export, tested against RustFS on a laptop (not on AWS S3).
 
 ## How it works
 
-- **Commits.** Each commit writes WAL frames. Before the WAL's fsync, the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`). Only when that object is in the bucket does the commit return `Ok`.
+- **Commits.** Each commit writes WAL frames. With batching `Off` (the default), the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`) before the WAL's fsync. With a `Window`, the fsync completes first, and the commit waits to share one log object with other commits (see Batching). Either way, the commit returns `Ok` only when a log object holding it is in the bucket.
 - **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it. It first appends an empty *seal-start* log record and checks that `head` has not moved, so a writer that was taken over stops before it uploads anything. Then it uploads every page that changed in that generation (`pages/…`), then a manifest that maps each page to the generation holding its latest copy, then moves `head` to the next generation.
 - **Restore.** Restore reads `head`, the newest manifest and the current generation's log. It rebuilds the WAL from the log and fetches pages from the bucket only when the engine first reads them.
 - **Trimming.** After each seal, a background thread deletes log objects, manifests and pages that the new head no longer needs. It waits for the trim grace period first.
@@ -23,9 +23,15 @@ turso_durable = { path = "…/crates/turso_durable" }
 ```
 
 ```rust
-use turso_durable::{CheckpointMode, Config, Value};
+use std::time::Duration;
+use turso_durable::telemetry::{self, TelemetryConfig};
+use turso_durable::{Batching, CheckpointMode, Config, Value};
 
 fn main() -> turso_durable::Result<()> {
+    // Optional: export spans and logs over OTLP when DURABLE_OTEL=1 (see Telemetry).
+    // Keep the guard: dropping it flushes the export.
+    let _telemetry = telemetry::init(TelemetryConfig::from_env()?)?;
+
     // Endpoint, bucket and keys from DURABLE_* (see Settings), or build one with Config::new.
     let config = Config::from_env("/var/lib/myapp/db")?;
     let db = turso_durable::open(config)?;
@@ -44,6 +50,29 @@ fn main() -> turso_durable::Result<()> {
         tx.execute("INSERT INTO notes(body) VALUES (?)", &[Value::from_text("b")])?;
         Ok(())
     })?;
+
+    // Batching (see Batching). Off unless DURABLE_BATCHING or set_batching says otherwise.
+    let window = Batching::Window {
+        max_wait: Duration::from_millis(10),
+        max_commits: 64,
+        max_bytes: 1 << 20,
+    };
+    db.set_batching(window)?; // every connection without its own setting, from its next commit
+    conn.set_batching(Some(Batching::Off))?; // this connection only; None = the database's
+
+    // One transaction with its own setting, whatever the connection's is.
+    conn.transaction_with(window, |tx| {
+        tx.execute("INSERT INTO notes(body) VALUES (?)", &[Value::from_text("c")])?;
+        Ok(())
+    })?;
+    // The same with the PRAGMA, which works only inside a transaction.
+    conn.transaction(|tx| {
+        tx.execute("PRAGMA durable_batching = 'window 50ms 64 1MiB'", &[])?;
+        tx.execute("INSERT INTO notes(body) VALUES (?)", &[Value::from_text("d")])?;
+        Ok(())
+    })?;
+    let stats = db.upload_stats();
+    println!("{} commits acked, {} log PUTs", stats.commits_acked, stats.log_puts);
 
     for row in conn.query("SELECT id, body FROM notes", &[])? {
         println!("{:?} {:?}", row[0].as_int(), row[1].to_text());
@@ -66,15 +95,40 @@ The API:
 | `Database::connect() -> Result<Connection>` | A new connection. Open one per thread. |
 | `Database::generation()` | The generation the bucket's head is at, as this writer last saw it. |
 | `Database::bucket_stats()` | PUTs, GETs, LISTs, DELETEs and bytes sent so far (`store::StatsSnap`). |
+| `Database::upload_stats() -> UploadStats` | How many commits each log PUT carried and how long acks waited, since open (fields below). |
+| `Database::set_batching(Batching) -> Result<()>` | The setting of every connection that has none of its own, from its next commit. It starts as `Config::batching`. `Config` when the setting is invalid. |
+| `Database::batching() -> Batching` | The database's setting. |
 | `Database::close()` | Waits for pending uploads, stops the trimmer, releases the directory. It fails with `Config` while a connection is open. Dropping the last handle and connection also closes it. |
 | `Connection::execute(sql, params) -> Result<u64>` | Runs one statement and returns the number of changed rows. `sql` must hold exactly one statement. |
 | `Connection::execute_batch(sql)` | Runs several statements, with no parameters. If the guard refuses any statement, none of them runs. |
 | `Connection::query(sql, params) -> Result<Vec<Vec<Value>>>` | Runs one statement and collects its rows. |
 | `Connection::transaction(\|tx\| …)` | `BEGIN`, your closure (`tx.execute`, `tx.query`), then `COMMIT`. It runs `ROLLBACK` if the closure or the commit fails. |
+| `Connection::transaction_with(Batching, \|tx\| …)` | `transaction`, committing with this setting whatever the connection's and the database's are. The next statement or transaction is back to them. `Config` when the setting is invalid, before anything runs. |
+| `Connection::set_batching(Option<Batching>) -> Result<()>` | This connection's own setting, from its next commit. `None` falls back to the database's. `Config` when the setting is invalid. |
+| `Connection::batching() -> Option<Batching>` | This connection's own setting (`PRAGMA durable_batching` reads the effective one). |
 | `Connection::checkpoint(CheckpointMode)` | `Passive`, `Full`, `Restart` or `Truncate`. `Truncate` ends the generation inside the call: its pages upload (a seal), and an upload failure is returned as an error. `Restart` only resets the WAL in memory, so the seal happens in the next commit, which also gets any upload error. |
 | `Connection::close()` | Closes the connection. The writer's last connection runs a TRUNCATE checkpoint, which seals. Dropping a connection also closes it. |
 | `restore(&Config, dir) -> Result<RestoreReport>` | Restores the bucket's current state into `dir`, which must hold no database. It writes nothing to the bucket. `config.dir` is ignored; `dir` is used. |
 | `Value` | `turso_core::Value`, re-exported. |
+| `Batching` | `Off` or `Window { max_wait: Duration, max_commits: u32, max_bytes: u64 }` (see Batching). It parses from and prints as the PRAGMA's text (`FromStr`, `Display`). `validate()` refuses a `max_commits` or `max_bytes` of 0. |
+| `UploadStats` | The snapshot `Database::upload_stats` returns (fields below). |
+| `telemetry::TelemetryConfig` | `enabled`, `endpoint`, `level` (`tracing::Level`), `test_run_id`. `Default` is disabled; `TelemetryConfig::from_env()` reads the `DURABLE_OTEL*` variables (see Settings). |
+| `telemetry::init(TelemetryConfig) -> Result<TelemetryGuard>` | Installs the OTLP export as the process's global `tracing` subscriber (see Telemetry). Disabled, it installs nothing and returns an empty guard. `Config` when a global subscriber is already set, or the endpoint is not `http://`. |
+| `telemetry::TelemetryGuard` | Keeps the export running. Dropping it, or `shutdown()`, flushes and stops the export, for at most 2 s. |
+
+`UploadStats` fields (counters since open):
+
+| Field | What it counts |
+|---|---|
+| `commits_acked` | Commits whose ack returned `Ok`. The acks of one call (`execute_batch` can make several commits) are counted only when every ack of that call succeeded. |
+| `commits_uploaded` | Commits in log records confirmed in the bucket. |
+| `log_puts` | Log records confirmed in the bucket that carry at least one commit. The claim, seal-start and reconcile catch-up records carry none and are not counted. |
+| `log_put_bytes` | The encoded size of those records. |
+| `commits_per_log_put` | `commits_uploaded / log_puts`, 0.0 when `log_puts` is 0. |
+| `bytes_per_log_put` | `log_put_bytes / log_puts`, 0.0 when `log_puts` is 0. |
+| `ack_wait_p50`, `ack_wait_p95`, `ack_wait_p99` | `Duration` quantiles of how long acks waited for the bucket. Each is the upper edge of its histogram sub-bucket, at most 6.25 % above the true value. |
+
+The WAL-header record that a WAL restart ships (after a checkpoint, and at a close or `Truncate` checkpoint) counts as a commit in these counters. So a run of N commits can show a few more than N.
 
 What `open` does depends on the directory:
 
@@ -103,7 +157,7 @@ Errors are `turso_durable::Error`:
 | Variant | When |
 |---|---|
 | `Fenced` | Another writer owns the database now, or the bucket changed since this directory was restored ("restore again"). |
-| `Timeout` | A bucket operation kept failing transiently for the whole retry deadline. A commit that fails this way is rolled back locally. |
+| `Timeout` | A bucket operation kept failing transiently for the whole retry deadline. An `Off` commit that fails this way is rolled back locally; a `Window` commit stays in the local database (see Batching). |
 | `UploadFailed` | The bucket refused an upload permanently, or the uploader stopped. |
 | `NotFound` | A key that must exist is missing: no database at this prefix (restore, read-only open), or a page the manifest names. |
 | `Unsupported` | A refused feature: `https`, `MVCC`, `journal_mode other than WAL`, `synchronous below FULL`, `ATTACH`. |
@@ -113,7 +167,60 @@ Errors are `turso_durable::Error`:
 | `Bucket` | A permanent S3 error outside an upload, such as 403 on a GET. |
 | `Engine` | An error from turso_core, such as an SQL error. |
 | `Io` | A local file error. |
-| `Config` | Bad settings, a closed database, or connections still open at `close`. |
+| `Config` | Bad settings (an invalid batching setting or `PRAGMA durable_batching` misused included), a closed database, or connections still open at `close`. |
+
+## Batching
+
+The setting:
+
+```rust
+pub enum Batching {
+    Off,
+    Window { max_wait: Duration, max_commits: u32, max_bytes: u64 },
+}
+```
+
+- `Off` (the default): each commit is its own upload, made inside the WAL sync.
+- `Window`: commits waiting to upload share one PUT. It is sent when the first limit is reached: `max_wait` since the first commit in the batch, `max_commits` commits, or `max_bytes` bytes. Both counts must be at least 1.
+
+**Where it is set.** All of these work at runtime, with no reopen:
+- `Config::batching` (`DURABLE_BATCHING`): the database's setting at open.
+- `Database::set_batching(b)`: the setting of every connection that has none of its own.
+- `Connection::set_batching(Some(b))`: this connection's own setting. `None` falls back to the database's.
+- For one transaction: `Connection::transaction_with(b, |tx| …)`, or `PRAGMA durable_batching` run inside the transaction.
+
+**Which setting a commit uses:** the transaction's, else the connection's, else the database's. A change takes effect from the next commit. It never changes a commit already waiting.
+
+**`PRAGMA durable_batching`.** The wrapper runs it itself; the engine never sees it.
+- `PRAGMA durable_batching = off`, `PRAGMA durable_batching = 'window 50ms 64 1MiB'`, or the call form `PRAGMA durable_batching('…')`.
+- Setting it works only inside a transaction (`BEGIN` … `COMMIT`), and lasts until that transaction ends. Outside a transaction it fails with `Config`; use `Connection::set_batching` there.
+- Reading it (`PRAGMA durable_batching`, anywhere) returns one row: the effective setting as text, for example `off` or `window 50ms 64 1MiB`.
+- `main.` only: `temp.durable_batching` or any other schema is refused with `Config`. `EXPLAIN` of it is refused too.
+- In `execute` and `query` it must be the only statement, with no parameters. `execute_batch` runs it in place among other statements.
+- The text, also used by `DURABLE_BATCHING` and the CLI's `--batching`: `off` or `window <max_wait> <max_commits> <max_bytes>`.
+  - The keywords `off` and `window` are case-insensitive.
+  - The unit suffixes are case-sensitive. `max_wait` is an integer with `us`, `ms` or `s`. `max_bytes` is an integer with no suffix, or `B`, `KiB`, `MiB` or `GiB`.
+
+**What each setting guarantees.**
+- Every ack waits for that commit's own data in the bucket, in every mode. The log is uploaded in order, so an acked commit also means every earlier commit is durable.
+- **Off:** as stage 1. The commit holds the WAL write lock until its PUT returns, so each commit is its own upload when every connection is Off. If Window commits are still waiting when an Off commit syncs, its PUT carries them too, and the log stays in commit order.
+- **Window:** the WAL sync completes after the local fsync, so the write lock is released and the next commit can start while this one's upload is pending. The call (`execute`, `COMMIT`, …) returns only once the uploader confirms a log object that contains the commit.
+- **Window's trade-off:** other connections in the same process can read a batched commit up to one window before it is durable. If the machine is lost in that gap, the commit is lost, but nobody was told it succeeded. A reader that passes such data on to the outside world could pass on data that is then lost. Off has no such gap.
+- **A single connection gains nothing from a window.** Its next commit cannot start until this one is acked, so each PUT still carries one commit, and every commit also waits out the window. Sharing needs several connections committing at once (see Costs).
+- **An ack waits at most `max_wait` + `retry_deadline`** (30 s by default).
+- **Checkpoints:** before a seal uploads pages, the uploader uploads the waiting commits. If they cannot be uploaded, the seal fails with their error rather than seal over them. Closing the database also uploads what waits.
+
+**A failed upload in Window mode.**
+- Every waiting commit's ack returns an error (`Timeout` or `UploadFailed`; `Fenced` when another writer took over).
+- Those commits are in the local database, and other connections can read them. They are not rolled back.
+- The uploader keeps retrying them in order. Later commits queue behind them, as Off commits do while the bucket fails, so nothing is acked out of order.
+- While the uploader is degraded, a Window commit takes the blocking Off path: it uploads inside its own WAL sync, behind the commits still owed. The uploader is degraded while the writer is fenced, a record is in doubt, a seal's head write is unresolved, or unsent Window commits are owed. So during a bucket outage, Window commits fail and roll back like Off ones, instead of piling up.
+- An error after a Window `COMMIT` means "outcome unknown": the row is visible locally, and it may later become durable (the next upload that succeeds carries it). Retrying the same write can apply it twice. Make retried writes idempotent, for example with your own key and `INSERT OR REPLACE` or `ON CONFLICT DO NOTHING`, or read before you retry. A failed Off commit is rolled back locally, but its upload may still have landed (see Guarantees), so the same advice applies.
+
+**Seeing it take effect.**
+- `Database::upload_stats()`: `commits_per_log_put` is 1.0 when every commit is Off, and above 1 when commits share windows. The CLI's `stats` prints it.
+- Each `durable.upload` span carries the number of commits and bytes that PUT held (see Telemetry).
+- `soak --batching-file` changes the setting of a running process, and `--stats-every` prints the stats as it goes (see CLI).
 
 ## CLI
 
@@ -123,9 +230,20 @@ Errors are `turso_durable::Error`:
 |---|---|
 | `restore --dir DIR` | Restores into an empty `DIR`. It prints `restored generation=… log_objects=… gets=… lists=… bytes=… ms=…`. |
 | `verify --dir DIR [--acked FILE]` | Opens `DIR` read-only and runs `PRAGMA integrity_check`. With `--acked`, it checks that every id in FILE (lines `ack <id>` or `<id>`) is in table `soak`, and fails if an id was acked twice. `DIR` may be empty, in which case it restores first. Verify never claims, never seals and never writes to the bucket. |
-| `sql --dir DIR [--claim] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, or restored and never opened) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. There is no read-only fallback; use `verify` to read. |
-| `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors. |
-| `bench --dir DIR --commits N` | Runs N single-row commits of 1 KB and prints `key=value` lines: commit p50/p95/p99/max, commits/s, log PUTs per commit, page PUTs, and each seal's ms and page count. |
+| `sql --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, or restored and never opened) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. There is no read-only fallback; use `verify` to read. |
+| `stats --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer like `sql` (the same `--claim` rule), runs each SQL argument as its own `execute`, then prints `Database::upload_stats()` as `key=value` lines: `commits_acked`, `commits_uploaded`, `log_puts`, `log_put_bytes`, `commits_per_log_put`, `bytes_per_log_put`, `ack_wait_p50_ms`, `ack_wait_p95_ms`, `ack_wait_p99_ms`. |
+| `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N] [--connections N] [--batching SPEC] [--batching-file PATH] [--stats-every N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors, printing `error <message>`. More below. |
+| `bench --dir DIR --commits N [--connections N] [--batching SPEC]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, and each seal's ms and page count. |
+
+`SPEC` is the PRAGMA's text, `off` or `window <max_wait> <max_commits> <max_bytes>` (for example `'window 10ms 64 1MiB'`). `--batching` sets it with `Database::set_batching` after open; without it, `DURABLE_BATCHING` applies.
+
+`soak`'s other options and lines:
+- `--connections N`: N threads, one connection each. Thread `i` commits ids `start + i + k·N`.
+- `--batching-file PATH`: re-read before each commit when the file's mtime or length changed. A valid setting is set on the database and printed as `batching <setting>`. An unreadable file or a bad setting prints one `error: …` line on stderr and keeps the current setting.
+- `--stats-every N`: every N acks, prints the upload stats as `stats <key>=<value>` lines (the `stats` keys), taken while no commit runs.
+- It prints `event seal-started` and `event seal-finished` around each seal. With `--batching` or `--batching-file` it also prints `event batch-waiting <n>` when a Window commit joins a batch of n, and `event log-uploaded <commits>` (commit numbers such as `4,5,6`, or `-` for none) when a log record is confirmed.
+
+Every command exports telemetry when `DURABLE_OTEL=1` (see Telemetry). If the export cannot start, it prints `warning: telemetry off: …` on stderr and runs without it.
 
 Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on bad arguments.
 
@@ -149,12 +267,62 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_UPLOAD_CONCURRENCY` | `upload_concurrency` | 16 | Parallel page PUTs in a seal, and parallel log GETs in a restore. Must be at least 1. |
 | `DURABLE_TRIM_GRACE_SECS` | `trim_grace` | 10 min | How long an unreferenced object stays before it is deleted. A writer idle for half of it checks the head before its next append (one GET). Fencing an old writer after a restore depends on it (see "Restore and the claim"):<br>• Every process that opens a prefix as a writer must use the same value. A claimer's must never be smaller than the old writer's.<br>• It must exceed 2 × (`retry_deadline` + `request_timeout`), 80 s with the defaults. `Config` refuses a smaller value with an error.<br>• `0` (every commit checks the head) is for tests only, so it stays allowed. It is unsafe while an old writer may still be running.<br>Nothing enforces the same-value rule; stage 3's lease replaces it. |
 | `DURABLE_PREFETCH` | `prefetch` | `false` | After open, fetch every sealed page in the background. |
+| `DURABLE_BATCHING` | `batching` | `off` | The database's batching setting at open, in the PRAGMA's text: `off` or `window <max_wait> <max_commits> <max_bytes>` (see Batching). A bad value fails with `Config`. |
+
+`TelemetryConfig::from_env()` reads the telemetry variables (`Config::from_env` does not):
+
+| Variable | `TelemetryConfig` field | Default | Notes |
+|---|---|---|---|
+| `DURABLE_OTEL` | `enabled` | off | Export spans and log records. Accepts `0`/`1`/`true`/`false`. `./scripts/test.sh` turns it on. |
+| `DURABLE_OTEL_ENDPOINT` | `endpoint` | `http://localhost:4317` | The OTLP/gRPC collector. Only `http://` (no TLS); anything else fails with `Config`. Set in code, so `OTEL_EXPORTER_OTLP_*ENDPOINT` cannot redirect it, but `OTEL_EXPORTER_OTLP_*HEADERS` are still sent. |
+| `DURABLE_OTEL_LEVEL` | `level` | `info` | The least severe log record exported: `trace`, `debug`, `info`, `warn` or `error`. Spans are always INFO. |
+| `DURABLE_TEST_RUN_ID` | `test_run_id` | unset | Added as the `test_run_id` attribute to every span and log record. An empty value counts as unset. |
 
 Where the defaults live:
 - `crates/turso_durable/src/config.rs`, `mod defaults`, holds every default above.
 - The retry backoff is fixed and cannot be configured. It starts at 50 ms (`FIRST_BACKOFF`), doubles, and is capped at 2 s (`MAX_BACKOFF`). Both are in `mod defaults` too. `RetryPolicy::default` in `crates/turso_durable/src/store/retry.rs` takes all three retry values from there.
-- There is no batching setting in stage 1: every commit is its own upload. The runtime batching setting comes in stage 2.
+- The batching default, `Off`, is `BATCHING` in `mod defaults`. It stays `Off` until there are numbers from real S3. The telemetry defaults are there too (`OTEL`, `OTEL_ENDPOINT`, `OTEL_LEVEL`), with the fixed export limits: one export times out after 1 s (`OTEL_EXPORT_TIMEOUT`), shutdown waits at most 2 s (`OTEL_SHUTDOWN`), and each queue holds 2048 spans or log records (`OTEL_QUEUE`).
 - The busy timeout between connections is fixed at 5 s. It lives in `crates/turso_durable/src/conn.rs` (`BUSY_TIMEOUT`).
+
+## Telemetry
+
+The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` exports it over OTLP/gRPC to `endpoint` (`http://localhost:4317` by default), with `service.name = turso-durable`, through a global `tracing` subscriber. It is off unless `enabled` (`DURABLE_OTEL=1`). The CLI calls it at start.
+
+**Spans.** These names and attributes are a contract: the HyperDX searches depend on them. Every span is INFO, with target `turso_durable`.
+
+| Span | Parent | Attributes |
+|---|---|---|
+| `durable.commit` | the caller's span | `durable.batching` (the setting's text), `durable.commit_no`, `durable.bytes`, `durable.outcome` (`ok` or `error`) |
+| `durable.local_write` | `durable.commit` | |
+| `durable.local_fsync` | `durable.commit` | |
+| `durable.ack_wait` | `durable.commit` | The wait for the commit's log record: inside the WAL sync for an Off commit (or a Window commit on the Off path), after the engine returns for a Window commit. |
+| `durable.upload` | the first commit's `durable.commit` | One per log PUT: `durable.commits`, `durable.bytes`, `durable.generation`, `durable.seq`, `durable.retries`, `s3.status` |
+| `durable.checkpoint_upload` | the caller's span | One per seal: `durable.generation`, `durable.pages`, `durable.retries`, `s3.status` |
+| `durable.restore` | the caller's span | `durable.generation`, `durable.log_objects`, `durable.gets`, `durable.bytes`, `s3.status` |
+
+Every span and log record also carries `test_run_id` when one is set (`DURABLE_TEST_RUN_ID`).
+
+**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR).
+- Each record keeps its own time. Without one it gets its observed time, and without that the current time.
+- Log records carry no trace or span ids. Adding them would need an experimental OpenTelemetry feature.
+
+**What is exported.** Only targets that start with `turso_durable`: spans at INFO and above, and log records at `level` and above. turso_core's own `tracing` output is never exported, and neither is the exporter's own stack (`opentelemetry*`, `tonic`, `h2`, `hyper`, `tower`, `reqwest`).
+
+**A collector that is down, slow or missing never slows or fails a commit.**
+- Export runs on background threads, through bounded queues (2048 spans, 2048 log records) that drop when full. Each export times out after 1 s.
+- No connect timeout is set on the exporter. A collector that drops SYNs can hold one export longer than 1 s. Commits are unaffected, and the queues drop when full.
+- Dropping the `TelemetryGuard` (or `shutdown()`) flushes and stops the export, and returns within 2 s even when the collector does not answer.
+- The system test `telemetry_collector_down_and_blackhole` runs with a collector that refuses connections and one that accepts them and never answers.
+
+**Subscribers.**
+- `init` sets the global subscriber, and fails with `Config` if one is already set.
+- A process that instead uses only scoped subscribers (`tracing::subscriber::with_default`) can lose spans to tracing's callsite cache: a callsite first hit on a thread with no subscriber is cached as disabled for every thread. `init`'s global subscriber avoids this.
+
+**The ClickHouse check.** `scripts/otel-check.sh RUN_ID` checks that one run's telemetry reached the observability stack.
+- It runs read-only `SELECT`s, as the stack's read-only ClickHouse user, on `otel.otel_traces` and `otel.otel_logs`, for `ServiceName = 'turso-durable'` and that `test_run_id`.
+- It passes when every span name above has at least one span, at least one log record is dated today, and no log record is dated before 2000-01-01. It polls for up to 60 s.
+- Settings: `DURABLE_CH_URL` (default `http://localhost:8123`), `DURABLE_CH_USER` (default `hyperdx_ro`) and `DURABLE_CH_PASSWORD`. Without `DURABLE_CH_PASSWORD`, it reads the password at run time from the stack's users SQL file (`~/Dev/p/sre/stack/clickhouse/00_database_users.sql`). The password reaches curl only on stdin; it is never printed, written to a file or put on a command line.
+- It prints one line: `otel check PASSED: …` (exit 0), `otel check FAILED: …` (exit 1), or, when ClickHouse or the collector port 4317 does not answer, `otel check SKIPPED: observability stack not running` (exit 0). A missing `nc` is `otel check FAILED: nc not found`.
 
 ## Bucket format v1
 
@@ -163,7 +331,7 @@ Everything lives under `<prefix>/`. With an empty prefix, keys have no leading `
 | Key | Holds |
 |---|---|
 | `head` | Where the database is now. |
-| `log/<generation:010>/<seq:020>` | One log object per WAL fsync. `seq` starts at 1 and has no gaps within a generation. |
+| `log/<generation:010>/<seq:020>` | One log object per upload: one WAL fsync when Off, several when commits share a window. `seq` starts at 1 and has no gaps within a generation. |
 | `pages/<generation:010>/<page:010>` | One page, as sealed at the end of `generation`. |
 | `manifest/<generation:010>` | Page map written when `generation` was sealed. |
 
@@ -171,7 +339,7 @@ Everything lives under `<prefix>/`. With an empty prefix, keys have no leading `
 - The magic `b"TDLOG\0\0\x01"`.
 - `kind: u8`: 1 = WAL extents, 2 = fence. Kind 2 is reserved for stage 3; stage 1 reads it as `Fenced`.
 - `writer_id`: a `u8` length, then ASCII.
-- `sync_count: u32`. Stage 1 writes exactly one sync per object and never batches. The claim record and the seal-start record (below) are the exceptions: they hold zero syncs, so they add nothing to the generation's WAL image.
+- `sync_count: u32`. A log object holds one or more syncs: one per commit when Off, several when commits share a window. The claim record and the seal-start record (below) are the exceptions: they hold zero syncs, so they add nothing to the generation's WAL image.
 - For each sync, `op_count: u32`, then the ops:
   - tag 1, a write: `[u64 offset][u32 len][bytes]`;
   - tag 2, a truncate: `[u64 len]`.
@@ -224,9 +392,9 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 ## Guarantees and limits
 
 **What an ack means.**
-- When `execute`, `execute_batch`, `transaction` or `COMMIT` returns `Ok`, the commit is in the bucket and in the local fsynced WAL. A restore on another machine includes it.
+- When `execute`, `execute_batch`, `transaction`, `transaction_with` or `COMMIT` returns `Ok`, the commit is in the bucket and in the local fsynced WAL, under every batching setting. A restore on another machine includes it.
 - `synchronous` is FULL only. `PRAGMA synchronous` set to `OFF`, `NORMAL`, `0` or `1` is refused with `Unsupported("synchronous below FULL")`. A connection whose mode drops anyway has its statement refused, and FULL is put back.
-- A commit that returns an error was not acknowledged. It is rolled back locally and the connection stays usable. Its upload may still have landed, though, because a request can succeed after its reply is lost. Such a record is settled at the same log position before anything else is written, so the log never forks. Treat an error as "outcome unknown", as with any remote database.
+- A commit that returns an error was not acknowledged. With `Off` (or a Window commit that took the Off path), it is rolled back locally and the connection stays usable; a Window commit whose ack failed stays in the local database instead (see Batching). Its upload may still have landed, though, because a request can succeed after its reply is lost. Such a record is settled at the same log position before anything else is written, so the log never forks. Treat an error as "outcome unknown", as with any remote database.
 
 **What is refused.** The `Connection` wrapper parses every SQL string with `turso_parser` and refuses these before the engine sees them (D5, D7):
 
@@ -301,6 +469,30 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 
 ## Costs (measured)
 
+### Stage 2: batching
+
+Source: `results/batching-knob.txt`. These are laptop figures (Apple M4 Max, RustFS in podman on the same Mac), not production numbers. Each run made 2000 commits of `INSERT OR REPLACE` with a 1 KB blob, on 1 or 8 connections, with telemetry off (`DURABLE_OTEL` unset). There was one run per row, so small differences are noise.
+
+| Connections | Batching | Commit p50 / p95 / p99 | Commits/s | Log PUTs per acked commit | `commits_per_log_put` | Ack wait p50 / p95 / p99 |
+|---|---|---|---|---|---|---|
+| 1 | `off` | 1.19 / 1.60 / 2.39 ms | 721 | 1.002 | 1.000 | 1.15 / 1.34 / 1.66 ms |
+| 1 | `window 1ms 64 1MiB` | 2.59 / 3.04 / 3.35 ms | 363 | 1.000 | 1.002 | 2.56 / 3.07 / 3.33 ms |
+| 1 | `window 10ms 64 1MiB` | 16.8 / 19.6 / 20.7 ms | 60 | 1.000 | 1.002 | 17.4 / 20.5 / 21.5 ms |
+| 1 | `window 50ms 64 1MiB` | 63.0 / 67.8 / 69.1 ms | 16 | 1.000 | 1.002 | 63.5 / 69.6 / 69.6 ms |
+| 8 | `off` | 1.32 / 1.75 / 3.45 ms | 631 | 1.002 | 1.000 | 1.28 / 1.47 / 1.73 ms |
+| 8 | `window 1ms 64 1MiB` | 5.02 / 15.0 / 49.1 ms | 1038 | 0.323 | 3.10 | 3.20 / 4.35 / 4.86 ms |
+| 8 | `window 10ms 64 1MiB` | 15.3 / 33.7 / 74.1 ms | 394 | 0.166 | 6.03 | 12.8 / 19.5 / 21.5 ms |
+| 8 | `window 50ms 64 1MiB` | 62.7 / 70.0 / 75.0 ms | 124 | 0.127 | 7.91 | 57.3 / 69.6 / 73.7 ms |
+
+- Off makes one log PUT per acked commit with 1 or 8 connections (1.002: one per commit, plus one per WAL restart).
+- One connection gains nothing from a window: one commit per PUT, and every commit waits out the window.
+- With 8 connections, a window shares PUTs: 3.1, 6.0 and 7.9 commits per PUT at 1, 10 and 50 ms. Each connection has at most one commit waiting, so a PUT held at most about 8 here. Only the 1 ms window also raised throughput over Off (1038 against 631 commits/s).
+- At 10 and 50 ms, acks waited several ms longer than the window plus one PUT. The cause was not investigated.
+- Checkpoint uploads: with one connection, each in-run seal took 41–45 ms (Off) and 43–75 ms (Window) for 170 pages. With 8 Window connections, no WAL restart happened during the run, so the run's 696–728 pages were sealed once, at close, in 177–186 ms.
+- Restore of the 1-connection Off database (generation 6): 24 ms, 4 GETs (`3 + 1` log object), 1 LIST, 4.4 KB downloaded. A full `verify` of the fresh restore took 0.23 s of wall time.
+
+### Stage 1
+
 Source: `results/durable-core.txt`. These are laptop figures (Apple M4 Max, macOS, RustFS 1.0.0 in podman on the same Mac, release build), not production numbers. The workload was one connection running `INSERT OR REPLACE` of a 1 KB blob per commit.
 
 | Measure | 500 commits | 5000 commits |
@@ -339,7 +531,10 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 ## Test command
 
 - `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests.
-- `./scripts/test.sh`: the above, then starts RustFS (`scripts/rustfs.sh up`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming).
+- `./scripts/test.sh`: the above, then starts RustFS (`scripts/rustfs.sh up`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, and collector-down runs).
+  - It runs them with `DURABLE_OTEL=1` under one `DURABLE_TEST_RUN_ID` (`turso-durable-<timestamp>-<pid>`, printed as `test run id: …`).
+  - Then it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then a `restore`), so every span kind is exported.
+  - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
 - `scripts/rustfs.sh up|down|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it.
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
 
@@ -347,8 +542,8 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 
 - `crates/turso_durable`: the library.
 - `crates/turso-durable-cli`: the `turso-durable` binary and the system tests.
-- `scripts/`: `test.sh`, `rustfs.sh` (local S3), `s3-gate.sh`.
-- `results/`: `rustfs-gate.txt` (conditional-PUT gate) and `durable-core.txt` (stage 1 measurements).
+- `scripts/`: `test.sh`, `rustfs.sh` (local S3), `s3-gate.sh`, `otel-check.sh` (the ClickHouse check).
+- `results/`: `rustfs-gate.txt` (conditional-PUT gate), `durable-core.txt` (stage 1 measurements) and `batching-knob.txt` (stage 2 measurements).
 - `LICENSES/`: third-party licences.
 
 ## Provenance
