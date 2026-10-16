@@ -147,9 +147,11 @@ pub(crate) fn restore_into(
     let head = Head::decode(&get(&*store, retry, &keys.head())?)?;
     if let Some(g) = head.manifest {
         let manifest = Manifest::decode(&get(&*store, retry, &keys.manifest(g))?)?;
-        if let Some(&pg) = manifest.pages.get(&1) {
-            refuse_mvcc(&get(&*store, retry, &keys.page(pg, 1))?)?;
-        }
+        let pg = manifest
+            .pages
+            .get(&1)
+            .ok_or_else(|| Error::Corrupt(format!("manifest/{g} has no entry for page 1")))?;
+        refuse_mvcc(&get(&*store, retry, &keys.page(*pg, 1))?)?;
     }
     let records = fetch_generation(
         &*store,

@@ -14,6 +14,7 @@ use crate::uploader::{TrimSnapshot, Uploader};
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Instant;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
 pub(crate) struct Engine {
@@ -29,7 +30,8 @@ pub(crate) fn engine_error(e: turso_core::LimboError) -> Error {
 }
 
 /// Open `<dir>/app.db` through the bucket wrappers. `state` is the directory's local state,
-/// already reconciled with `bucket`.
+/// already reconciled with `bucket`. `trim_tx`, when given, feeds a trimmer
+/// (`trim::spawn_trimmer`): the head at open first, then one snapshot per seal.
 pub(crate) fn open_engine(
     dir: &Path,
     bucket: Bucket,
@@ -49,6 +51,15 @@ pub(crate) fn open_engine(
     let store = bucket.store();
     let keys = bucket.keys().clone();
     let manifest = bucket.manifest().cloned();
+    // D10: the trimmer starts from the head at open; each seal sends the next snapshot.
+    if let Some(tx) = &trim_tx {
+        // No trimmer listening is not an open failure.
+        let _ = tx.send(TrimSnapshot {
+            at: Instant::now(),
+            head: bucket.head().clone(),
+            manifest: manifest.clone(),
+        });
+    }
     let uploader = Uploader::spawn(bucket, trim_tx, cfg.events.clone());
 
     stash::clear();

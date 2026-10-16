@@ -48,6 +48,21 @@ impl Keys {
         self.join(&format!("log/{gen:010}/"))
     }
 
+    /// Every log object's key starts with this.
+    pub(crate) fn log_root(&self) -> String {
+        self.join("log/")
+    }
+
+    /// Every page object's key starts with this.
+    pub(crate) fn page_root(&self) -> String {
+        self.join("pages/")
+    }
+
+    /// Every manifest's key starts with this.
+    pub(crate) fn manifest_root(&self) -> String {
+        self.join("manifest/")
+    }
+
     pub(crate) fn page(&self, gen: u64, page: u32) -> String {
         self.join(&format!("pages/{gen:010}/{page:010}"))
     }

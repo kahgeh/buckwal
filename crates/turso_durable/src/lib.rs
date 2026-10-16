@@ -8,6 +8,7 @@ pub(crate) mod format;
 pub(crate) mod io;
 pub(crate) mod restore;
 pub mod store;
+pub(crate) mod trim;
 pub(crate) mod uploader;
 
 pub use error::{Error, Result};

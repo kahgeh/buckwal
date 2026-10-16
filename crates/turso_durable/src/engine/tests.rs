@@ -43,6 +43,16 @@ fn writer_with(
     dir: &Path,
     cfg: &EngineConfig,
 ) -> (Engine, Arc<Connection>) {
+    writer_trimmed(store, dir, cfg, None)
+}
+
+/// `writer_with`, handing seal snapshots to `trim_tx`.
+fn writer_trimmed(
+    store: Arc<dyn ObjectStore>,
+    dir: &Path,
+    cfg: &EngineConfig,
+    trim_tx: Option<std::sync::mpsc::Sender<crate::uploader::TrimSnapshot>>,
+) -> (Engine, Arc<Connection>) {
     let (bucket, state) = match LocalState::read(dir).unwrap() {
         Some(s) => {
             let b = Bucket::attach(
@@ -77,7 +87,7 @@ fn writer_with(
             (b, s)
         }
     };
-    let e = open_engine(dir, bucket, &state, cfg, None).unwrap();
+    let e = open_engine(dir, bucket, &state, cfg, trim_tx).unwrap();
     let conn = e.db.connect().unwrap();
     (e, conn)
 }
@@ -535,4 +545,391 @@ fn wal_log_gap_is_corrupt() {
         Err(Error::Corrupt(m)) => assert!(m.contains("gap"), "{m}"),
         other => panic!("expected Corrupt(gap), got {other:?}"),
     }
+}
+
+#[test]
+fn removing_the_wal_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(Arc::new(MemStore::new()), d.path());
+    create_table(&conn);
+    commit_row(&conn, 1).unwrap();
+    let wal = d.path().join("app.db-wal");
+    let path = wal.to_str().unwrap();
+    stash::clear();
+    assert!(e.io.remove_file(path).is_err());
+    match stash::take() {
+        Some(Error::Corrupt(m)) => assert_eq!(
+            m,
+            format!("refusing to delete {path}: it may hold acknowledged frames")
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+    assert!(wal_len(d.path()) > 32, "the WAL was touched");
+    // Every other path passes through.
+    let other = d.path().join("scratch");
+    std::fs::write(&other, b"x").unwrap();
+    e.io.remove_file(other.to_str().unwrap()).unwrap();
+    assert!(!other.exists());
+}
+
+#[test]
+fn restore_with_manifest_missing_page_one_is_corrupt() {
+    let mem = Arc::new(MemStore::new());
+    let k = keys();
+    let m = Manifest {
+        page_size: 4096,
+        page_count: 2,
+        pages: [(2, 1)].into_iter().collect(),
+    };
+    mem.put(&k.manifest(1), &m.encode()).unwrap();
+    mem.put(&k.page(1, 2), &[0u8; 4096]).unwrap();
+    let h = Head {
+        format: 1,
+        generation: 2,
+        manifest: Some(1),
+        writer_id: "ab".into(),
+    };
+    mem.put(&k.head(), &h.encode()).unwrap();
+    let r = tempfile::tempdir().unwrap();
+    match restore_into(mem.clone(), &k, r.path(), &cfg()) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("page 1"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+fn wal_len(dir: &Path) -> u64 {
+    std::fs::metadata(dir.join("app.db-wal")).unwrap().len()
+}
+
+const PASSIVE: CheckpointMode = CheckpointMode::Passive {
+    upper_bound_inclusive: None,
+};
+const TRUNCATE: CheckpointMode = CheckpointMode::Truncate {
+    upper_bound_inclusive: None,
+};
+
+/// RESTART and TRUNCATE restart the log inside the checkpoint (D6).
+fn restarts_log(mode: CheckpointMode) -> bool {
+    matches!(
+        mode,
+        CheckpointMode::Restart | CheckpointMode::Truncate { .. }
+    )
+}
+
+/// 400 commits with an explicit `mode` checkpoint every 50; a crash; a restore.
+fn checkpoint_restores_every_ack(mode: CheckpointMode) {
+    let t = Instant::now();
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    for id in 1..=400 {
+        commit_row(&conn, id).unwrap_or_else(|err| panic!("commit {id}: {err}"));
+        if id % 50 == 0 {
+            stash::clear();
+            conn.checkpoint(mode)
+                .unwrap_or_else(|err| panic!("{mode:?} at {id}: {err} ({:?})", stash::take()));
+        }
+    }
+    let seals = e.uploader.counters().seals;
+    if restarts_log(mode) {
+        assert!(seals >= 1, "{mode:?}: no seal");
+    }
+    let _crashed = crash(e, conn, d.path());
+
+    let (_r, _e2, c2) = restored(mem.clone());
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), (1..=400).collect::<Vec<_>>());
+    eprintln!(
+        "{mode:?} restores_every_ack: {seals} seals, {:?}",
+        t.elapsed()
+    );
+}
+
+/// Page uploads fail from just before the checkpoint after commit 350: commits either succeed
+/// or fail at the generation boundary. After the faults clear, 20 more commits succeed and a
+/// restore has exactly the acknowledged ids.
+fn checkpoint_with_page_upload_failure_loses_nothing(mode: CheckpointMode) {
+    let t = Instant::now();
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer_with(
+        fault.clone(),
+        d.path(),
+        &cfg_deadline(Duration::from_millis(30)),
+    );
+    create_table(&conn);
+    let mut acked = vec![];
+    let mut failed = 0;
+    let mut seals_at_arm = 0;
+    for id in 1..=400 {
+        match commit_row(&conn, id) {
+            Ok(()) => acked.push(id),
+            Err(err) => {
+                failed += 1;
+                let stashed = stash::take();
+                assert!(
+                    matches!(&stashed, Some(Error::Timeout(m)) if m.contains("/pages/")),
+                    "{mode:?} commit {id}: {err} ({stashed:?})"
+                );
+            }
+        }
+        if id == 350 {
+            seals_at_arm = e.uploader.counters().seals;
+            fault.only_keys_containing("/pages/");
+            fault.fail_puts_after(0);
+        }
+        if id % 50 == 0 {
+            stash::clear();
+            // Under the faults a checkpoint may fail too; nothing may panic.
+            let _ = conn.checkpoint(mode);
+        }
+    }
+    assert!(failed >= 1, "{mode:?}: no commit met the failing boundary");
+    assert_eq!(e.uploader.counters().seals, seals_at_arm, "{mode:?}");
+
+    fault.fail_puts_after(u64::MAX);
+    for id in 401..=420 {
+        commit_row(&conn, id)
+            .unwrap_or_else(|err| panic!("{mode:?} commit {id}: {err} ({:?})", stash::take()));
+        acked.push(id);
+    }
+    assert!(e.uploader.counters().seals > seals_at_arm, "{mode:?}");
+    assert_eq!(ids(&conn), acked);
+    let _crashed = crash(e, conn, d.path());
+
+    let (_r, _e2, c2) = restored(mem.clone());
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), acked);
+    eprintln!(
+        "{mode:?} page_upload_failure: {failed} failed commits, {:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn checkpoint_mode_passive_restores_every_ack() {
+    checkpoint_restores_every_ack(PASSIVE);
+}
+
+#[test]
+fn checkpoint_mode_full_restores_every_ack() {
+    checkpoint_restores_every_ack(CheckpointMode::Full);
+}
+
+#[test]
+fn checkpoint_mode_restart_restores_every_ack() {
+    checkpoint_restores_every_ack(CheckpointMode::Restart);
+}
+
+#[test]
+fn checkpoint_mode_truncate_restores_every_ack() {
+    checkpoint_restores_every_ack(TRUNCATE);
+}
+
+#[test]
+fn checkpoint_mode_passive_with_page_upload_failure_loses_nothing() {
+    checkpoint_with_page_upload_failure_loses_nothing(PASSIVE);
+}
+
+#[test]
+fn checkpoint_mode_full_with_page_upload_failure_loses_nothing() {
+    checkpoint_with_page_upload_failure_loses_nothing(CheckpointMode::Full);
+}
+
+#[test]
+fn checkpoint_mode_restart_with_page_upload_failure_loses_nothing() {
+    checkpoint_with_page_upload_failure_loses_nothing(CheckpointMode::Restart);
+}
+
+#[test]
+fn checkpoint_mode_truncate_with_page_upload_failure_loses_nothing() {
+    checkpoint_with_page_upload_failure_loses_nothing(TRUNCATE);
+}
+
+#[test]
+fn close_runs_truncate_and_seals() {
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    for id in 1..=100 {
+        commit_row(&conn, id).unwrap();
+    }
+    let before = head(&*mem);
+    assert!(wal_len(d.path()) > 32);
+    stash::clear();
+    conn.close()
+        .unwrap_or_else(|err| panic!("close: {err} ({:?})", stash::take()));
+    let after = head(&*mem);
+    assert!(
+        after.generation > before.generation,
+        "close did not seal: {before:?} -> {after:?}"
+    );
+    assert_eq!(wal_len(d.path()), 0);
+    drop(conn);
+    drop(e);
+
+    let (_r, _e2, c2) = restored(mem.clone());
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), (1..=100).collect::<Vec<_>>());
+}
+
+#[test]
+fn close_with_bucket_down_keeps_wal_and_loses_nothing() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer_with(
+        fault.clone(),
+        d.path(),
+        &cfg_deadline(Duration::from_millis(200)),
+    );
+    create_table(&conn);
+    for id in 1..=100 {
+        commit_row(&conn, id).unwrap();
+    }
+    let before = head(&*mem);
+    // Every put fails: pages, manifest and head.
+    fault.fail_puts_after(0);
+    stash::clear();
+    conn.close()
+        .expect("close ignores a failed shutdown checkpoint");
+    assert!(
+        wal_len(d.path()) > 32,
+        "the local -wal must keep its frames"
+    );
+    assert_eq!(head(&*mem), before);
+    assert_eq!(e.uploader.counters().seals, 0);
+    let _crashed = crash(e, conn, d.path());
+
+    fault.fail_puts_after(u64::MAX);
+    let (_r, _e2, c2) = restored(mem.clone());
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), (1..=100).collect::<Vec<_>>());
+}
+
+/// Review Focus 5.
+#[test]
+fn sql_truncate_checkpoint_with_bucket_down_loses_nothing() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer_with(
+        fault.clone(),
+        d.path(),
+        &cfg_deadline(Duration::from_millis(200)),
+    );
+    create_table(&conn);
+    for id in 1..=50 {
+        commit_row(&conn, id).unwrap();
+    }
+    let gen0 = e.uploader.generation();
+    fault.only_keys_containing("/pages/");
+    fault.fail_puts_after(0);
+    let rows = run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap_or_else(|err| panic!("the PRAGMA must return a row: {err}"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    eprintln!("sql_truncate: row {:?}", rows[0]);
+    assert_eq!(e.uploader.generation(), gen0);
+    assert_eq!(e.uploader.counters().seals, 0);
+
+    fault.fail_puts_after(u64::MAX);
+    commit_row(&conn, 51)
+        .unwrap_or_else(|err| panic!("commit after recovery: {err} ({:?})", stash::take()));
+    assert_eq!(
+        e.uploader.generation(),
+        gen0 + 1,
+        "the commit after the in-memory restart seals the old generation"
+    );
+    assert_eq!(ids(&conn), (1..=51).collect::<Vec<_>>());
+    let _crashed = crash(e, conn, d.path());
+
+    let (_r, _e2, c2) = restored(mem.clone());
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), (1..=51).collect::<Vec<_>>());
+}
+
+#[test]
+fn restore_after_many_checkpoints_reads_only_current_generation() {
+    let t = Instant::now();
+    let mem = Arc::new(MemStore::new());
+    let trimmed = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let hook: EventHook = {
+        let trimmed = trimmed.clone();
+        Arc::new(move |ev: &Event| {
+            if let Event::Trimmed { deleted } = ev {
+                trimmed.lock().unwrap().push(*deleted);
+            }
+        })
+    };
+    let mut cfg = cfg();
+    cfg.events = Some(hook.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _trimmer = crate::trim::spawn_trimmer(mem.clone(), keys(), Duration::ZERO, rx, Some(hook));
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer_trimmed(mem.clone(), d.path(), &cfg, Some(tx));
+    create_table(&conn);
+    let mut id = 0;
+    for _ in 0..6 {
+        for _ in 0..30 {
+            id += 1;
+            commit_row(&conn, id).unwrap();
+        }
+        seal_now(&conn);
+    }
+    assert_eq!(e.uploader.counters().seals, 6);
+    let h = head(&*mem);
+    let m_gen = h.manifest.unwrap();
+    let k = keys();
+
+    // Wait for the trimmer to act on the last seal.
+    loop {
+        let logs = mem.list(&k.log_root()).unwrap();
+        let manifests = mem.list(&k.manifest_root()).unwrap();
+        let done = trimmed.lock().unwrap().iter().any(|&n| n > 0)
+            && logs
+                .iter()
+                .all(|key| k.parse_log(key).map(|(g, _)| g) == Some(h.generation))
+            && manifests == vec![k.manifest(m_gen)];
+        if done {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "never trimmed: {logs:?} {manifests:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (_, m) = manifest(&*mem);
+    for key in mem.list(&k.page_root()).unwrap() {
+        let (g, p) = k.parse_page(&key).unwrap();
+        assert!(
+            g >= m_gen || m.pages.get(&p) == Some(&g),
+            "{key} is unreferenced and was kept"
+        );
+    }
+
+    let r = tempfile::tempdir().unwrap();
+    let rep = restore_into(
+        mem.clone(),
+        &k,
+        r.path(),
+        &cfg_deadline(Duration::from_secs(5)),
+    )
+    .unwrap();
+    assert_eq!(rep.generation, h.generation);
+    assert_eq!(rep.log_objects, log_seqs(&*mem, h.generation).len() as u64);
+    // The head, the manifest, page 1 (the MVCC check) and the current generation's log.
+    assert_eq!(rep.gets, 3 + rep.log_objects, "{rep:?}");
+    assert_eq!(rep.lists, 1, "{rep:?}");
+    let (_e2, c2) = writer(mem.clone(), r.path());
+    assert_eq!(integrity(&c2), "ok");
+    assert_eq!(ids(&c2), (1..=id).collect::<Vec<_>>());
+    eprintln!(
+        "restore_after_many: trimmed {:?}, {rep:?}, {:?}",
+        trimmed.lock().unwrap(),
+        t.elapsed()
+    );
 }
