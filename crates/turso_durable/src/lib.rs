@@ -1,5 +1,6 @@
 //! turso_durable: make a tursodb database durable in an S3 bucket.
 
+pub mod batching;
 pub(crate) mod bucket;
 pub mod config;
 pub(crate) mod conn;
@@ -16,6 +17,7 @@ pub mod store;
 pub(crate) mod trim;
 pub(crate) mod uploader;
 
+pub use batching::Batching;
 pub use config::Config;
 /// Test and diagnostics hooks (`Config::on_event`), not part of the supported API.
 #[doc(hidden)]

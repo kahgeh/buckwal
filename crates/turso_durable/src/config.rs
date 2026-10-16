@@ -1,5 +1,6 @@
 //! Public configuration: [`Config`] and its defaults. `Event` and `EventHook` (the
 //! `on_event` field) are test and diagnostics hooks, hidden from the docs.
+use crate::batching::Batching;
 use crate::error::{Error, Result};
 use crate::format::Keys;
 use crate::store::s3::{S3Config, S3Store};
@@ -28,6 +29,8 @@ pub mod defaults {
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
     /// Fetch every sealed page in the background after open.
     pub const PREFETCH: bool = false;
+    /// Every commit is uploaded on its own.
+    pub const BATCHING: super::Batching = super::Batching::Off;
     pub const REGION: &str = "us-east-1";
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.
@@ -56,6 +59,8 @@ pub struct Config {
     pub upload_concurrency: usize,
     pub trim_grace: Duration,
     pub prefetch: bool,
+    /// How commits are gathered into one upload (`DURABLE_BATCHING`).
+    pub batching: Batching,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -77,13 +82,14 @@ impl fmt::Debug for Config {
             .field("upload_concurrency", &self.upload_concurrency)
             .field("trim_grace", &self.trim_grace)
             .field("prefetch", &self.prefetch)
+            .field("batching", &self.batching)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 12] = [
+const ENV_VARS: [&str; 13] = [
     "DURABLE_ENDPOINT",
     "DURABLE_REGION",
     "DURABLE_PATH_STYLE",
@@ -96,6 +102,7 @@ const ENV_VARS: [&str; 12] = [
     "DURABLE_UPLOAD_CONCURRENCY",
     "DURABLE_TRIM_GRACE_SECS",
     "DURABLE_PREFETCH",
+    "DURABLE_BATCHING",
 ];
 
 fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -166,6 +173,7 @@ impl Config {
             upload_concurrency: defaults::UPLOAD_CONCURRENCY,
             trim_grace: defaults::TRIM_GRACE,
             prefetch: defaults::PREFETCH,
+            batching: defaults::BATCHING,
             on_event: None,
         }
     }
@@ -218,6 +226,9 @@ impl Config {
         if let Some(v) = get("DURABLE_PREFETCH") {
             c.prefetch = parse_bool("DURABLE_PREFETCH", &v)?;
         }
+        if let Some(v) = get("DURABLE_BATCHING") {
+            c.batching = v.parse()?;
+        }
         Ok(c)
     }
 
@@ -239,13 +250,14 @@ impl Config {
                 "upload_concurrency must be at least 1".into(),
             ));
         }
-        let budget = self.retry_deadline + self.request_timeout;
-        if !self.trim_grace.is_zero() && self.trim_grace <= budget * 2 {
+        let budget = self.retry_deadline.saturating_add(self.request_timeout);
+        if !self.trim_grace.is_zero() && self.trim_grace <= budget.saturating_mul(2) {
             return Err(Error::Config(format!(
                 "trim_grace ({:?}) must exceed 2 × (retry_deadline ({:?}) + request_timeout ({:?}))",
                 self.trim_grace, self.retry_deadline, self.request_timeout
             )));
         }
+        self.batching.validate()?;
         validate_prefix(&self.prefix)
     }
 
@@ -355,11 +367,16 @@ mod tests {
         c.retry_deadline = Duration::from_secs(30);
         c.request_timeout = Duration::from_secs(10);
         c.trim_grace = Duration::from_secs(80); // == 2 × 40 s: refused
-        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("trim_grace")));
+        assert!(matches!(c.validate(), Err(Error::Config(m))
+            if m.contains("trim_grace") && m.contains("retry_deadline") && m.contains("request_timeout")));
         c.trim_grace = Duration::from_secs(81);
         assert_eq!(c.validate(), Ok(()));
         c.trim_grace = Duration::ZERO; // tests only, still allowed
         assert_eq!(c.validate(), Ok(()));
+        // Huge durations saturate instead of panicking.
+        c.retry_deadline = Duration::MAX;
+        c.trim_grace = Duration::from_secs(1);
+        assert!(matches!(c.validate(), Err(Error::Config(_))));
         assert_eq!(
             Config::new("/tmp/x", "http://h", "b", "k", "s").validate(),
             Ok(())
@@ -417,6 +434,7 @@ mod tests {
             ("DURABLE_UPLOAD_CONCURRENCY", "3"),
             ("DURABLE_TRIM_GRACE_SECS", "7"),
             ("DURABLE_PREFETCH", "1"),
+            ("DURABLE_BATCHING", "window 10ms 8 64KiB"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads DURABLE_* variables.
@@ -441,12 +459,21 @@ mod tests {
         assert_eq!(c.upload_concurrency, 3);
         assert_eq!(c.trim_grace, Duration::from_secs(7));
         assert!(c.prefetch);
+        assert_eq!(
+            c.batching,
+            Batching::Window {
+                max_wait: Duration::from_millis(10),
+                max_commits: 8,
+                max_bytes: 64 << 10
+            }
+        );
 
         // Only the four required ones: the rest are defaults.
         let env = required();
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(c.region, defaults::REGION);
         assert_eq!(c.upload_concurrency, defaults::UPLOAD_CONCURRENCY);
+        assert_eq!(c.batching, Batching::Off);
 
         for missing in [
             "DURABLE_ENDPOINT",
@@ -467,6 +494,24 @@ mod tests {
             Err(Error::Config(m)) => assert!(m.contains("DURABLE_PREFETCH"), "{m}"),
             r => panic!("{r:?}"),
         }
+    }
+
+    #[test]
+    fn batching_from_env_and_validate() {
+        let mut env = required();
+        env.insert("DURABLE_BATCHING", "nope");
+        match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+            Err(Error::Config(m)) => assert!(m.contains("nope"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert_eq!(c.batching, Batching::Off);
+        c.batching = Batching::Window {
+            max_wait: Duration::from_millis(10),
+            max_commits: 0,
+            max_bytes: 1,
+        };
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("max_commits")));
     }
 
     #[test]
