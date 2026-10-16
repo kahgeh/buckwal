@@ -184,24 +184,29 @@ impl Providers {
             .enable_all()
             .build()
             .map_err(|e| Error::Io(format!("telemetry runtime: {e}")))?;
-        let exporter_err = |e: opentelemetry_otlp::ExporterBuildError| {
-            Error::Config(format!("OTLP exporter for {endpoint}: {e}"))
-        };
-        let (spans, logs) = {
+        let exporters = {
             let _rt = rt.enter();
-            let spans = opentelemetry_otlp::SpanExporter::builder()
+            opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_timeout(defaults::OTEL_EXPORT_TIMEOUT)
                 .build()
-                .map_err(exporter_err)?;
-            let logs = opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .with_timeout(defaults::OTEL_EXPORT_TIMEOUT)
-                .build()
-                .map_err(exporter_err)?;
-            (spans, logs)
+                .and_then(|spans| {
+                    let logs = opentelemetry_otlp::LogExporter::builder()
+                        .with_tonic()
+                        .with_endpoint(endpoint)
+                        .with_timeout(defaults::OTEL_EXPORT_TIMEOUT)
+                        .build()?;
+                    Ok((spans, logs))
+                })
+        };
+        let (spans, logs) = match exporters {
+            Ok(x) => x,
+            Err(e) => {
+                // A plain drop of the runtime panics when the caller is in an async context.
+                rt.shutdown_background();
+                return Err(Error::Config(format!("OTLP exporter for {endpoint}: {e}")));
+            }
         };
         let spans = BatchSpanProcessor::builder(spans)
             .with_batch_config(

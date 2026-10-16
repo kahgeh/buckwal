@@ -101,6 +101,19 @@ impl TelemetryConfig {
     }
 }
 
+/// The endpoint to export to, trimmed once: the value checked is the value used. It must
+/// be `http://`.
+fn endpoint(cfg: &TelemetryConfig) -> Result<&str> {
+    let endpoint = cfg.endpoint.trim();
+    if !endpoint.to_ascii_lowercase().starts_with("http://") {
+        return Err(Error::Config(format!(
+            "DURABLE_OTEL_ENDPOINT must be http://host:port (no TLS), not {:?}",
+            cfg.endpoint
+        )));
+    }
+    Ok(endpoint)
+}
+
 /// Export spans and log records over OTLP/gRPC to `cfg.endpoint`, with `service.name =
 /// turso-durable`, through a global `tracing` subscriber. Only `turso_durable*` targets are
 /// exported: spans at INFO and above, log records at `cfg.level` and above. Export runs on
@@ -114,18 +127,8 @@ pub fn init(cfg: TelemetryConfig) -> Result<TelemetryGuard> {
     if !cfg.enabled {
         return Ok(TelemetryGuard { running: None });
     }
-    if !cfg
-        .endpoint
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("http://")
-    {
-        return Err(Error::Config(format!(
-            "DURABLE_OTEL_ENDPOINT must be http://host:port (no TLS), not {:?}",
-            cfg.endpoint
-        )));
-    }
-    let (providers, runtime) = Providers::otlp(&cfg.endpoint, cfg.test_run_id.clone())?;
+    let endpoint = endpoint(&cfg)?;
+    let (providers, runtime) = Providers::otlp(endpoint, cfg.test_run_id.clone())?;
     let subscriber = providers.subscriber(cfg.level);
     let guard = TelemetryGuard {
         running: Some(Running {

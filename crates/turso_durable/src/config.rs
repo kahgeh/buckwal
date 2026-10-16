@@ -241,7 +241,10 @@ impl Config {
             c.prefetch = parse_bool("DURABLE_PREFETCH", &v)?;
         }
         if let Some(v) = get("DURABLE_BATCHING") {
-            c.batching = v.parse()?;
+            c.batching = v.parse().map_err(|e| match e {
+                Error::Config(m) => Error::Config(format!("DURABLE_BATCHING: {m}")),
+                e => e,
+            })?;
         }
         Ok(c)
     }
@@ -526,7 +529,12 @@ mod tests {
         let mut env = required();
         env.insert("DURABLE_BATCHING", "nope");
         match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
-            Err(Error::Config(m)) => assert!(m.contains("nope"), "{m}"),
+            Err(Error::Config(m)) => {
+                assert!(
+                    m.contains("nope") && m.starts_with("DURABLE_BATCHING: "),
+                    "{m}"
+                )
+            }
             r => panic!("{r:?}"),
         }
         let mut c = Config::new("/d", "http://e", "b", "ak", "sk");

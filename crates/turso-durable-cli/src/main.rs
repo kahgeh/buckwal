@@ -9,10 +9,12 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 use turso_durable::store::fault::FaultStore;
 use turso_durable::store::s3::{S3Config, S3Store};
 use turso_durable::store::ObjectStore;
-use turso_durable::{Config, Value};
+use turso_durable::telemetry::{self, TelemetryConfig, TelemetryGuard};
+use turso_durable::{Batching, Config, Database, UploadStats, Value};
 
 type CliResult<T> = Result<T, String>;
 
@@ -25,6 +27,36 @@ pub fn say(line: &str) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// Print `lines`, each after `prefix`, under one stdout lock and flush them together, so
+/// no other line lands between them.
+pub fn say_all(prefix: &str, lines: &[String]) {
+    let mut out = std::io::stdout().lock();
+    for line in lines {
+        let _ = writeln!(out, "{prefix}{line}");
+    }
+    let _ = out.flush();
+}
+
+/// Milliseconds with 3 decimals.
+pub fn ms(d: Duration) -> String {
+    format!("{:.3}", d.as_secs_f64() * 1000.0)
+}
+
+/// The upload stats as `key=value` lines, in a fixed order.
+pub fn stats_lines(s: &UploadStats) -> Vec<String> {
+    vec![
+        format!("commits_acked={}", s.commits_acked),
+        format!("commits_uploaded={}", s.commits_uploaded),
+        format!("log_puts={}", s.log_puts),
+        format!("log_put_bytes={}", s.log_put_bytes),
+        format!("commits_per_log_put={:.3}", s.commits_per_log_put),
+        format!("bytes_per_log_put={:.1}", s.bytes_per_log_put),
+        format!("ack_wait_p50_ms={}", ms(s.ack_wait_p50)),
+        format!("ack_wait_p95_ms={}", ms(s.ack_wait_p95)),
+        format!("ack_wait_p99_ms={}", ms(s.ack_wait_p99)),
+    ]
 }
 
 pub fn config(dir: &Path) -> CliResult<Config> {
@@ -146,10 +178,11 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
     db.close().map_err(err)
 }
 
-/// Run `statements` with `dir` opened as the writer. Without `claim`, only a directory the
-/// writer already owns: opening any other (empty, or restored and never opened) restores,
-/// claims or creates the database, and fences a writer still running elsewhere.
-fn sql(dir: &Path, statements: &[String], claim: bool) -> CliResult<()> {
+/// Open `dir` as the writer, with `batching` set on it when given. Without `claim`, only a
+/// directory the writer already owns: opening any other (empty, or restored and never
+/// opened) restores, claims or creates the database, and fences a writer still running
+/// elsewhere.
+fn open_writer(dir: &Path, claim: bool, batching: Option<Batching>) -> CliResult<Database> {
     if !claim && !turso_durable::is_claimed(dir).map_err(err)? {
         return Err(format!(
             "{} holds no database this writer owns: opening it would restore or create the \
@@ -159,6 +192,20 @@ fn sql(dir: &Path, statements: &[String], claim: bool) -> CliResult<()> {
         ));
     }
     let db = turso_durable::open(config(dir)?).map_err(err)?;
+    if let Some(b) = batching {
+        db.set_batching(b).map_err(err)?;
+    }
+    Ok(db)
+}
+
+/// Run `statements` with `dir` opened as the writer ([`open_writer`]), printing rows.
+fn sql(
+    dir: &Path,
+    statements: &[String],
+    claim: bool,
+    batching: Option<Batching>,
+) -> CliResult<()> {
+    let db = open_writer(dir, claim, batching)?;
     let conn = db.connect().map_err(err)?;
     for s in statements {
         for row in conn.query(s, &[]).map_err(err)? {
@@ -169,7 +216,38 @@ fn sql(dir: &Path, statements: &[String], claim: bool) -> CliResult<()> {
     db.close().map_err(err)
 }
 
+/// Run each of `statements` as its own commit with `dir` opened as the writer
+/// ([`open_writer`]), then print the upload stats.
+fn stats(
+    dir: &Path,
+    statements: &[String],
+    claim: bool,
+    batching: Option<Batching>,
+) -> CliResult<()> {
+    let db = open_writer(dir, claim, batching)?;
+    let conn = db.connect().map_err(err)?;
+    for s in statements {
+        conn.execute(s, &[]).map_err(err)?;
+    }
+    say_all("", &stats_lines(&db.upload_stats()));
+    conn.close().map_err(err)?;
+    db.close().map_err(err)
+}
+
+/// Export spans and logs as `DURABLE_OTEL*` say; on any failure, warn and run without.
+fn telemetry_init() -> Option<TelemetryGuard> {
+    match TelemetryConfig::from_env().and_then(telemetry::init) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("warning: telemetry off: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // Kept until main returns: dropping it flushes the export.
+    let _telemetry = telemetry_init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match args::parse(&argv) {
         Ok(c) => c,
@@ -185,9 +263,16 @@ fn main() -> ExitCode {
             dir,
             statements,
             claim,
-        } => sql(dir, statements, *claim),
+            batching,
+        } => sql(dir, statements, *claim, *batching),
+        Command::Stats {
+            dir,
+            sql,
+            claim,
+            batching,
+        } => stats(dir, sql, *claim, *batching),
         Command::Soak(a) => soak::run(a),
-        Command::Bench { dir, commits } => bench::run(dir, *commits),
+        Command::Bench(a) => bench::run(a),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -201,6 +286,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn set(v: &[i64]) -> BTreeSet<i64> {
         v.iter().copied().collect()
@@ -227,7 +313,9 @@ mod tests {
     fn sql_refuses_an_unclaimed_directory_without_claim() {
         let t = tempfile::tempdir().unwrap();
         for dir in [t.path().to_path_buf(), t.path().join("missing")] {
-            let e = sql(&dir, &["SELECT 1".to_string()], false).unwrap_err();
+            let e = sql(&dir, &["SELECT 1".to_string()], false, None).unwrap_err();
+            let e2 = stats(&dir, &["SELECT 1".to_string()], false, None).unwrap_err();
+            assert_eq!(e, e2, "stats follows the claim rules of sql");
             assert!(
                 e.contains("--claim") && e.contains("take") && e.contains("verify"),
                 "{e}"
@@ -235,6 +323,35 @@ mod tests {
             assert!(!e.contains('\n'), "one line: {e}");
         }
         assert!(!t.path().join("missing").exists(), "created the directory");
+    }
+
+    #[test]
+    fn stats_lines_name_every_key_with_its_decimals() {
+        let s = turso_durable::UploadStats {
+            commits_acked: 31,
+            commits_uploaded: 30,
+            log_puts: 12,
+            log_put_bytes: 4096,
+            commits_per_log_put: 2.5,
+            bytes_per_log_put: 341.33333,
+            ack_wait_p50: Duration::from_micros(1500),
+            ack_wait_p95: Duration::from_millis(20),
+            ack_wait_p99: Duration::from_nanos(20_123_456),
+        };
+        assert_eq!(
+            stats_lines(&s),
+            [
+                "commits_acked=31",
+                "commits_uploaded=30",
+                "log_puts=12",
+                "log_put_bytes=4096",
+                "commits_per_log_put=2.500",
+                "bytes_per_log_put=341.3",
+                "ack_wait_p50_ms=1.500",
+                "ack_wait_p95_ms=20.000",
+                "ack_wait_p99_ms=20.123",
+            ]
+        );
     }
 
     #[test]

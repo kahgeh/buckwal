@@ -588,7 +588,7 @@ fn seal_and_restore_threads_run_under_the_callers_subscriber() {
 
 use super::pipeline::{build_for_test, Providers};
 use super::testing::keep_interest_per_call;
-use super::{init, TelemetryConfig};
+use super::{endpoint, init, TelemetryConfig};
 use crate::error::Error;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _};
 use opentelemetry::{InstrumentationScope, Key};
@@ -808,4 +808,39 @@ fn init_disabled_installs_nothing_and_https_is_refused() {
     };
     assert!(matches!(init(https), Err(Error::Config(m)) if m.contains("http://")));
     assert!(global_is_none());
+}
+
+/// A malformed endpoint fails exporter building with `Config`, even when `init` runs inside
+/// an async context, where dropping the export runtime plainly would panic.
+#[test]
+fn init_with_a_malformed_endpoint_is_a_config_error_inside_a_runtime() {
+    let bad = || TelemetryConfig {
+        enabled: true,
+        endpoint: "http://bad host:1".into(),
+        ..TelemetryConfig::default()
+    };
+    assert!(matches!(init(bad()), Err(Error::Config(m)) if m.contains("bad host")));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let r = rt.block_on(async { init(bad()) });
+    assert!(matches!(r, Err(Error::Config(m)) if m.contains("bad host")));
+}
+
+/// The endpoint is trimmed once; the trimmed value is both checked and used.
+#[test]
+fn the_endpoint_is_trimmed_before_it_is_checked_and_used() {
+    let cfg = |e: &str| TelemetryConfig {
+        enabled: true,
+        endpoint: e.into(),
+        ..TelemetryConfig::default()
+    };
+    assert_eq!(
+        endpoint(&cfg("  http://collector:4317 \n")).unwrap(),
+        "http://collector:4317"
+    );
+    assert!(matches!(
+        endpoint(&cfg(" https://c:4317")),
+        Err(Error::Config(_))
+    ));
 }
