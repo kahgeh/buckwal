@@ -13,6 +13,7 @@ pub(crate) mod guard;
 pub(crate) mod io;
 pub(crate) mod reconcile;
 pub(crate) mod restore;
+pub mod stats;
 pub mod store;
 pub(crate) mod trim;
 pub(crate) mod uploader;
@@ -30,6 +31,7 @@ pub use error::{Error, Result};
 #[doc(hidden)]
 pub use restore::restore_with_store;
 pub use restore::{restore, RestoreReport};
+pub use stats::UploadStats;
 pub use turso_core::Value;
 
 #[cfg(test)]

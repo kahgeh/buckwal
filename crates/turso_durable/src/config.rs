@@ -306,11 +306,21 @@ pub type EventHook = Arc<dyn Fn(&Event) + Send + Sync>;
 #[derive(Debug, Clone)]
 pub enum Event {
     /// A log object landed at `log/<generation>/<seq>`; `bytes` is its encoded size.
+    /// `commits` lists the commit numbers of the syncs it holds, in order; it is empty for
+    /// a record that carries no commit (a claim, a seal start, a reconcile catch-up, or an
+    /// in-doubt record settled after its commits were already failed).
     LogUploaded {
         generation: u64,
         seq: u64,
         bytes: u64,
+        commits: Vec<u64>,
     },
+    /// A Window commit joined the uploader's batch without flushing it; `commits` is how
+    /// many commits the batch now holds.
+    BatchWaiting { commits: u64 },
+    /// A `Connection` call returned after commit number `commit`, made with `batching`, was
+    /// confirmed in the bucket.
+    CommitAcked { commit: u64, batching: Batching },
     /// Sealing `generation` began with `pages` dirty pages to upload.
     SealStarted { generation: u64, pages: u64 },
     /// `generation` is sealed: the head now points at generation + 1.

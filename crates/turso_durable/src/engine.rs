@@ -89,7 +89,7 @@ pub(crate) fn open_engine(
             manifest: manifest.clone(),
         });
     }
-    let uploader = Uploader::spawn(bucket, trim_tx, cfg.events.clone());
+    let uploader = Uploader::spawn(bucket, trim_tx, cfg.events.clone(), Arc::default());
 
     stash::clear();
     let file = platform

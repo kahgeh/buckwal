@@ -5,6 +5,7 @@
 use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
+use crate::batching::Batching;
 use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::format::Op;
@@ -95,7 +96,10 @@ impl ShippingFile {
         if ops.is_empty() {
             return Ok(());
         }
-        self.uploader.submit_log(ops).wait().map(|_| ())
+        self.uploader
+            .submit_log(ops, Batching::Off)
+            .wait()
+            .map(|_| ())
     }
 
     /// Seal the generation the local file still holds (D6): its last ops, then the pages.

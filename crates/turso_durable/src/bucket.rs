@@ -38,7 +38,6 @@ pub(crate) struct Counters {
 pub(crate) struct Appended {
     pub pos: LogPos,
     /// The encoded record's length.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub bytes: u64,
     /// How much `Counters::retries` grew during the call: its head checks and settle included.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -54,7 +53,8 @@ pub(crate) struct AppendFailure {
     /// or `settle`). They are in no object and owed nowhere, so they may be sent again.
     /// `None` when the record went to `put_log`: it is in doubt (owed at its seq, settled by
     /// the next call) or the writer is fenced. Its syncs must not be sent in another record.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A `Fenced` error wins over `Some`: the caller drops those syncs too, since a fenced
+    /// writer never sends again (`check_fenced` refuses every later append).
     pub unsent: Option<Vec<Vec<Op>>>,
 }
 
@@ -405,6 +405,10 @@ impl Bucket {
     ///
     /// The record is built only once `check_fenced` and `before_record` have passed; a
     /// failure before that hands the syncs back as `AppendFailure::unsent`.
+    ///
+    /// It emits no `Event::LogUploaded` for this record: only the caller knows its commit
+    /// numbers, so the uploader emits it. (Claim and reconcile records are appended before
+    /// the uploader sets the event hook.) A record settled on the way is emitted here.
     pub(crate) fn append_log(
         &mut self,
         syncs: Vec<Vec<Op>>,
@@ -452,7 +456,6 @@ impl Bucket {
     /// seal's head (`check_head`), the idle check (`check_idle`), then the in-doubt record
     /// (`settle`). With nothing owed it sends no PUT. One deadline, counted from its start.
     /// A head that a pending seal published is left for the next seal to adopt (`Ok`).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn catch_up(&mut self) -> Result<()> {
         let start = Instant::now();
         self.check_fenced()?;
@@ -471,7 +474,6 @@ impl Bucket {
 
     /// The writer is fenced, a record is in doubt or a seal's head write is unresolved: the
     /// next append first has to settle something, or fails.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn degraded(&self) -> bool {
         self.fenced || self.in_doubt.is_some() || self.pending_seal.is_some()
     }
@@ -559,11 +561,25 @@ impl Bucket {
             self.in_doubt = Some(d);
             return Err(e);
         }
-        self.put_log(start, d.body).map(|_| ())
+        let bytes = d.body.len() as u64;
+        let pos = self.put_log(start, d.body)?;
+        // Its commits were failed when it went in doubt: it is reported with none.
+        self.emit_uploaded(pos, bytes);
+        Ok(())
+    }
+
+    fn emit_uploaded(&self, pos: LogPos, bytes: u64) {
+        self.emit(Event::LogUploaded {
+            generation: pos.generation,
+            seq: pos.seq,
+            bytes,
+            commits: Vec::new(),
+        });
     }
 
     /// `put_if_absent` at the next seq. Ours (created, or already there with the same bytes)
     /// advances the seq; someone else's fences; anything else leaves `body` in doubt.
+    /// The caller emits `Event::LogUploaded`.
     fn put_log(&mut self, start: Instant, body: Vec<u8>) -> Result<LogPos> {
         let pos = LogPos {
             generation: self.head.generation,
@@ -576,11 +592,6 @@ impl Bucket {
                 self.last_confirmed = sent;
                 self.seq += 1;
                 self.counters.log_puts.fetch_add(1, Relaxed);
-                self.emit(Event::LogUploaded {
-                    generation: pos.generation,
-                    seq: pos.seq,
-                    bytes: body.len() as u64,
-                });
                 Ok(pos)
             }
             Err(e @ Error::Fenced(_)) => {
@@ -724,7 +735,9 @@ impl Bucket {
             writer_id: self.head.writer_id.clone(),
             syncs: Vec::new(),
         });
-        self.put_log(start, body)?;
+        let bytes = body.len() as u64;
+        let pos = self.put_log(start, body)?;
+        self.emit_uploaded(pos, bytes);
         self.verify_head(start)
     }
 
