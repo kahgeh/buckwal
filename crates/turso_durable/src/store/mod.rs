@@ -3,6 +3,7 @@
 pub mod fault;
 pub mod mem;
 pub mod retry;
+pub mod s3;
 
 pub use fault::FaultStore;
 pub use mem::MemStore;
