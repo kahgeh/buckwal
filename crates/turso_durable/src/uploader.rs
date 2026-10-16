@@ -140,14 +140,21 @@ impl Uploader {
         }
     }
 
-    /// Run every queued job, then stop the thread. Later submissions fail.
+    /// Run every queued job, then stop the thread (joined, unless called on it). Later
+    /// submissions fail.
     pub(crate) fn shutdown(&self) {
         // Dropping the sender ends the thread's receive loop once the queue is empty.
         drop(self.jobs.lock().unwrap().take());
-        if let Some(t) = self.thread.lock().unwrap().take() {
-            // A panic on the uploader thread already failed its waiting tickets.
-            let _ = t.join();
+        let Some(t) = self.thread.lock().unwrap().take() else {
+            return;
+        };
+        // The last handle can be dropped on the uploader thread itself (say, by an event
+        // hook). It cannot join itself; it exits by itself once the queue drains.
+        if t.thread().id() == std::thread::current().id() {
+            return;
         }
+        // A panic on the uploader thread already failed its waiting tickets.
+        let _ = t.join();
     }
 }
 

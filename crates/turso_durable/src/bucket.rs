@@ -41,6 +41,21 @@ struct InDoubt {
     body: Vec<u8>,
 }
 
+/// A seal that reached its head write without a definite answer: `head` may already be
+/// published, referencing `manifest` and the pages exactly as they were uploaded.
+struct PendingSeal {
+    head: Head,
+    manifest: Manifest,
+}
+
+/// What a GET of the head says about a pending seal.
+enum HeadCheck {
+    /// No seal is pending, or the head is unchanged: carry on in this generation.
+    Unmoved,
+    /// The pending seal's head is published (with this ETag).
+    Published(String),
+}
+
 pub(crate) struct Bucket {
     store: Arc<dyn ObjectStore>,
     keys: Keys,
@@ -52,9 +67,9 @@ pub(crate) struct Bucket {
     /// The seq the next log object of `head.generation` goes to.
     seq: u64,
     in_doubt: Option<InDoubt>,
-    /// A seal's head write failed without a definite answer: the head may already name
-    /// generation + 1, so no log object may go to this generation until that is known.
-    head_in_doubt: bool,
+    /// Set while a seal's head write has no definite answer: the head may already name
+    /// generation + 1, so nothing may go to this generation until that is known.
+    pending_seal: Option<PendingSeal>,
     fenced: bool,
     counters: Arc<Counters>,
     events: Option<EventHook>,
@@ -104,7 +119,7 @@ impl Bucket {
             manifest: None,
             seq: 1,
             in_doubt: None,
-            head_in_doubt: false,
+            pending_seal: None,
             fenced: false,
             counters: Arc::default(),
             events: None,
@@ -112,6 +127,10 @@ impl Bucket {
     }
 
     /// Start a new database: `put_if_absent(head)` at generation 1 with no manifest.
+    ///
+    /// A create that times out may still have stored its head. A later `create` then finds a
+    /// head and returns `Config` (its first attempt gets a 412, which is never compared);
+    /// the caller should `attach` with the same writer id instead.
     pub(crate) fn create(
         store: Arc<dyn ObjectStore>,
         keys: Keys,
@@ -245,36 +264,49 @@ impl Bucket {
     }
 
     /// Write one log record at the next seq of the current generation.
+    /// Every retry in the call shares one deadline, counted from its start.
     pub(crate) fn append_log(&mut self, syncs: Vec<Vec<Op>>) -> Result<LogPos> {
+        let start = Instant::now();
         self.check_fenced()?;
-        let policy = self.retry.clone();
-        self.settle_head(&policy).map_err(upload_error)?;
-        self.settle(&policy).map_err(upload_error)?;
+        self.append(start, syncs).map_err(upload_error)
+    }
+
+    fn append(&mut self, start: Instant, syncs: Vec<Vec<Op>>) -> Result<LogPos> {
+        if let HeadCheck::Published(_) = self.check_head(start)? {
+            // Only a seal may finish this: it adopts the published head without uploading.
+            return Err(Error::UploadFailed(format!(
+                "generation {} may be sealed; seal again before appending",
+                self.head.generation
+            )));
+        }
+        self.settle(start)?;
         let body = encode_record(&LogRecord::Extents {
             writer_id: self.head.writer_id.clone(),
             syncs,
         });
-        self.put_log(body, &policy).map_err(upload_error)
+        self.put_log(start, body)
     }
 
-    /// After a seal's head write failed ambiguously, find out whether the head moved. Unmoved:
-    /// carry on in this generation. Moved to the head we meant to write: refuse until a seal
-    /// completes it (its `put_if_match` 412 then adopts the stored head). Otherwise: fenced.
-    fn settle_head(&mut self, policy: &RetryPolicy) -> Result<()> {
-        if !self.head_in_doubt {
-            return Ok(());
-        }
+    /// With a seal pending, GET the head. Unchanged ETag: the head write never landed, so the
+    /// pending seal is dropped. The pending head: it is published. Anything else: fenced.
+    ///
+    /// Accepted limit for stage 1: a delayed, still in-flight head PUT from the failed attempt
+    /// could land after an "unchanged" answer here. Stage 3's epoch fencing closes this.
+    fn check_head(&mut self, start: Instant) -> Result<HeadCheck> {
+        let Some(pending) = &self.pending_seal else {
+            return Ok(HeadCheck::Unmoved);
+        };
+        let pending_body = pending.head.encode();
         let key = self.keys.head();
-        let stored = retrying(&self.counters, policy, &key, || self.store.get(&key))?;
+        let stored = retrying(&self.counters, &self.remaining(start), &key, || {
+            self.store.get(&key)
+        })?;
         match stored {
             Some(o) if o.etag == self.head_etag => {
-                self.head_in_doubt = false;
-                Ok(())
+                self.pending_seal = None;
+                Ok(HeadCheck::Unmoved)
             }
-            Some(o) if o.body == self.sealed_head().encode() => Err(Error::UploadFailed(format!(
-                "generation {} may be sealed; seal again before appending",
-                self.head.generation
-            ))),
+            Some(o) if o.body == pending_body => Ok(HeadCheck::Published(o.etag)),
             _ => {
                 self.fenced = true;
                 Err(Error::Fenced(
@@ -295,7 +327,7 @@ impl Bucket {
     }
 
     /// Re-put the in-doubt record, if any, at the position it was meant for.
-    fn settle(&mut self, policy: &RetryPolicy) -> Result<()> {
+    fn settle(&mut self, start: Instant) -> Result<()> {
         let Some(d) = self.in_doubt.take() else {
             return Ok(());
         };
@@ -311,18 +343,18 @@ impl Bucket {
             self.in_doubt = Some(d);
             return Err(e);
         }
-        self.put_log(d.body, policy).map(|_| ())
+        self.put_log(start, d.body).map(|_| ())
     }
 
     /// `put_if_absent` at the next seq. Ours (created, or already there with the same bytes)
     /// advances the seq; someone else's fences; anything else leaves `body` in doubt.
-    fn put_log(&mut self, body: Vec<u8>, policy: &RetryPolicy) -> Result<LogPos> {
+    fn put_log(&mut self, start: Instant, body: Vec<u8>) -> Result<LogPos> {
         let pos = LogPos {
             generation: self.head.generation,
             seq: self.seq,
         };
         let key = self.keys.log(pos.generation, pos.seq);
-        match self.put_log_at(&key, &body, policy) {
+        match self.put_log_at(start, &key, &body) {
             Ok(()) => {
                 self.seq += 1;
                 self.counters.log_puts.fetch_add(1, Relaxed);
@@ -344,14 +376,15 @@ impl Bucket {
         }
     }
 
-    fn put_log_at(&self, key: &str, body: &[u8], policy: &RetryPolicy) -> Result<()> {
+    fn put_log_at(&self, start: Instant, key: &str, body: &[u8]) -> Result<()> {
         let c = &self.counters;
-        if let CondPut::Created { .. } =
-            retrying(c, policy, key, || self.store.put_if_absent(key, body))?
-        {
+        let r = retrying(c, &self.remaining(start), key, || {
+            self.store.put_if_absent(key, body)
+        })?;
+        if let CondPut::Created { .. } = r {
             return Ok(());
         }
-        match retrying(c, policy, key, || self.store.get(key))? {
+        match retrying(c, &self.remaining(start), key, || self.store.get(key))? {
             // An earlier attempt of ours landed and its reply was lost.
             Some(o) if o.body == body => Ok(()),
             Some(_) => Err(Error::Fenced(format!(
@@ -373,9 +406,24 @@ impl Bucket {
     ) -> Result<u64> {
         let start = Instant::now();
         self.check_fenced()?;
-        self.settle(&self.remaining(start)).map_err(upload_error)?;
         self.seal(start, pages, page_size, page_count)
             .map_err(upload_error)
+    }
+
+    /// The new head is published: adopt it, its ETag and manifest. Returns its generation.
+    fn finish_seal(&mut self, start: Instant, head: Head, etag: String, manifest: Manifest) -> u64 {
+        let gen = head.generation;
+        self.head = head;
+        self.head_etag = etag;
+        self.manifest = Some(manifest);
+        self.seq = 1;
+        self.pending_seal = None;
+        self.counters.seals.fetch_add(1, Relaxed);
+        self.emit(Event::SealFinished {
+            generation: gen - 1,
+            elapsed: start.elapsed(),
+        });
+        gen
     }
 
     fn seal(
@@ -385,13 +433,24 @@ impl Bucket {
         page_size: u32,
         page_count: u32,
     ) -> Result<u64> {
+        if let HeadCheck::Published(etag) = self.check_head(start)? {
+            // An earlier attempt published this generation; its pages and manifest are
+            // referenced as uploaded then, so nothing is uploaded again.
+            let p = self
+                .pending_seal
+                .take()
+                .expect("a published seal is pending");
+            return Ok(self.finish_seal(start, p.head, etag, p.manifest));
+        }
+        self.settle(start)?;
         let gen = self.head.generation;
         self.emit(Event::SealStarted {
             generation: gen,
             pages: pages.len() as u64,
         });
-        // Pages and the manifest are unreferenced until the head moves: plain puts, and a
-        // failed seal may overwrite them next time.
+        // Pages and the manifest are unreferenced until the head moves: plain puts. A failed
+        // seal whose head never landed may overwrite them next time (`check_head` above
+        // ensures a published one is adopted instead).
         self.put_pages(start, gen, &pages)?;
 
         let dirty: BTreeSet<u32> = pages.iter().map(|(p, _)| *p).collect();
@@ -412,18 +471,13 @@ impl Bucket {
         })?;
 
         let head = self.sealed_head();
-        let etag = self.put_head(start, &head)?;
-
-        self.head = head;
-        self.head_etag = etag;
-        self.manifest = Some(manifest);
-        self.seq = 1;
-        self.counters.seals.fetch_add(1, Relaxed);
-        self.emit(Event::SealFinished {
-            generation: gen,
-            elapsed: start.elapsed(),
+        // From the first head attempt until a definite answer, the head may be published.
+        self.pending_seal = Some(PendingSeal {
+            head: head.clone(),
+            manifest: manifest.clone(),
         });
-        Ok(gen + 1)
+        let etag = self.put_head(start, &head)?;
+        Ok(self.finish_seal(start, head, etag, manifest))
     }
 
     /// Upload `pages` of generation `gen`, `concurrency` at a time; the first error wins.
@@ -467,21 +521,15 @@ impl Bucket {
     fn put_head(&mut self, start: Instant, head: &Head) -> Result<String> {
         let key = self.keys.head();
         let body = head.encode();
-        // Until a definite answer, an attempt may have landed.
-        self.head_in_doubt = true;
         let c = &self.counters;
         let r = retrying(c, &self.remaining(start), &key, || {
             self.store.put_if_match(&key, &body, &self.head_etag)
         })?;
         if let CondPut::Created { etag } = r {
-            self.head_in_doubt = false;
             return Ok(etag);
         }
         match retrying(c, &self.remaining(start), &key, || self.store.get(&key))? {
-            Some(o) if o.body == body => {
-                self.head_in_doubt = false;
-                Ok(o.etag)
-            }
+            Some(o) if o.body == body => Ok(o.etag),
             _ => {
                 self.fenced = true;
                 Err(Error::Fenced(

@@ -11,7 +11,7 @@ fn keys_with_and_without_prefix() {
     let k = Keys::new("p");
     assert_eq!(k.log(3, 7), "p/log/0000000003/00000000000000000007");
     assert_eq!(k.log_prefix(3), "p/log/0000000003/");
-    assert_eq!(k.page(2, 9), "p/page/0000000002/0000000009");
+    assert_eq!(k.page(2, 9), "p/pages/0000000002/0000000009");
     assert_eq!(k.manifest(2), "p/manifest/0000000002");
     assert_eq!(k.head(), "p/head");
     assert_eq!(Keys::new("").head(), "head");
@@ -28,6 +28,8 @@ fn key_parsers_round_trip_and_reject_malformed() {
         assert_eq!(k.parse_log("log/3/7"), None);
         assert_eq!(k.parse_log(&format!("{}x", k.log(3, 7))), None);
         assert_eq!(k.parse_page("nope"), None);
+        // v1 page keys live under `pages/`; the singular form is not a page key.
+        assert_eq!(k.parse_page(&k.page(2, 9).replace("pages/", "page/")), None);
         assert_eq!(k.parse_manifest(&k.head()), None);
         assert_eq!(k.parse_manifest(&format!("{}/extra", k.manifest(1))), None);
     }

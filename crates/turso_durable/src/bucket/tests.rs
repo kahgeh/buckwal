@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::Event;
 use crate::format::decode_record;
 use crate::store::{FaultStore, MemStore};
 use std::time::Duration;
@@ -272,7 +273,7 @@ fn permanent_error_is_upload_failed() {
     assert_eq!(b.append_log(syncs(2)).map(|p| p.seq), Ok(2));
     assert_eq!(f.record(1, 1), Some(ours(1)));
 
-    f.fault.only_keys_containing("/page/");
+    f.fault.only_keys_containing("/pages/");
     f.fault.fail_next_puts_permanently(1);
     assert!(matches!(
         b.seal_generation(pages(1), 4096, 1),
@@ -290,7 +291,7 @@ fn seal_uploads_pages_manifest_head_in_order() {
 
     let ev = f.fault.events()[before..].to_vec();
     let k = keys();
-    let is_page = |e: &String| e.starts_with(&format!("put {PREFIX}/page/"));
+    let is_page = |e: &String| e.starts_with(&format!("put {PREFIX}/pages/"));
     let manifest_at = ev
         .iter()
         .position(|e| *e == format!("put {}", k.manifest(1)))
@@ -361,7 +362,7 @@ fn seal_respects_concurrency() {
     for (concurrency, lo, hi) in [(16, 100, 400), (1, 1600, 4000)] {
         let f = Fixture::new();
         let mut b = f.create(fast(), concurrency);
-        f.fault.only_keys_containing("/page/");
+        f.fault.only_keys_containing("/pages/");
         f.fault.delay_puts(Duration::from_millis(50));
         let t = Instant::now();
         b.seal_generation(pages(32), 4096, 32).unwrap();
@@ -382,7 +383,7 @@ fn seal_failure_keeps_generation() {
     let f = Fixture::new();
     let mut b = f.create(short, 4);
     let head_before = f.stored_head();
-    f.fault.only_keys_containing("/page/");
+    f.fault.only_keys_containing("/pages/");
     f.fault.fail_puts_after(0);
     let t = Instant::now();
     assert!(matches!(
@@ -513,6 +514,143 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(b.append_log(syncs(1)), Err(Error::Fenced(_))));
     assert!(f.log_keys(1).is_empty());
+}
+
+#[test]
+fn reseal_after_uncertain_head_write_adopts_without_reupload() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let k = keys();
+
+    // The head write landed, every reply was an error: generation 2 is published and
+    // references pages/1/* and manifest/1 as they are now.
+    let f = Fixture::new();
+    let mut b = f.create(short.clone(), 4);
+    let seen: Arc<Mutex<Vec<Event>>> = Arc::default();
+    {
+        let seen = seen.clone();
+        b.set_event_hook(Some(Arc::new(move |e: &Event| {
+            seen.lock().unwrap().push(e.clone())
+        })));
+    }
+    f.fault.only_keys_containing("/head");
+    f.fault.store_then_fail_next_puts(1);
+    f.fault.fail_puts_after(0);
+    assert!(matches!(
+        b.seal_generation(pages(1), 4096, 1),
+        Err(Error::Timeout(_))
+    ));
+    let published_page = f.body(&k.page(1, 1)).unwrap();
+    let published_manifest = f.body(&k.manifest(1)).unwrap();
+    f.fault.fail_puts_after(u64::MAX);
+    seen.lock().unwrap().clear();
+
+    // The retried seal is given a different page set; it must not touch the published objects.
+    let before = f.fault.events().len();
+    let other_pages = vec![(1, vec![7u8; 16]), (2, vec![8u8; 16])];
+    assert_eq!(b.seal_generation(other_pages, 4096, 2), Ok(2));
+    let ev = f.fault.events()[before..].to_vec();
+    assert_eq!(
+        ev,
+        vec![format!("get {}", k.head())],
+        "adopted without uploads"
+    );
+    assert_eq!(f.body(&k.page(1, 1)), Some(published_page));
+    assert_eq!(f.body(&k.page(1, 2)), None);
+    assert_eq!(f.body(&k.manifest(1)), Some(published_manifest.clone()));
+    assert_eq!(
+        b.manifest(),
+        Some(&Manifest::decode(&published_manifest).unwrap())
+    );
+    assert_eq!(b.head(), &f.stored_head());
+    assert_eq!(b.counters().seals.load(Relaxed), 1);
+    assert!(matches!(
+        seen.lock().unwrap().as_slice(),
+        [Event::SealFinished { generation: 1, .. }]
+    ));
+    assert_eq!(
+        b.append_log(syncs(1)),
+        Ok(LogPos {
+            generation: 2,
+            seq: 1
+        })
+    );
+    // The adopted ETag is current.
+    assert_eq!(b.seal_generation(vec![], 4096, 2), Ok(3));
+
+    // The head write never landed: the retried seal uploads its (new) pages normally.
+    let f = Fixture::new();
+    let mut b = f.create(short.clone(), 4);
+    f.fault.only_keys_containing("/head");
+    f.fault.fail_next_puts(100_000);
+    assert!(b.seal_generation(pages(1), 4096, 1).is_err());
+    f.fault.fail_next_puts(0);
+    let other_pages = vec![(1, vec![7u8; 16]), (2, vec![8u8; 16])];
+    assert_eq!(b.seal_generation(other_pages, 4096, 2), Ok(2));
+    assert_eq!(f.body(&k.page(1, 1)), Some(vec![7u8; 16]));
+    assert_eq!(f.body(&k.page(1, 2)), Some(vec![8u8; 16]));
+    assert_eq!(b.manifest().unwrap().page_count, 2);
+
+    // Someone else's head: the retried seal is fenced and uploads nothing.
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    f.fault.only_keys_containing("/head");
+    f.fault.fail_next_puts(100_000);
+    assert!(b.seal_generation(pages(1), 4096, 1).is_err());
+    f.fault.fail_next_puts(0);
+    let other = Head {
+        format: 1,
+        generation: 1,
+        manifest: None,
+        writer_id: "w2".into(),
+    };
+    f.mem.put(&k.head(), &other.encode()).unwrap();
+    let before = f.fault.events().len();
+    assert!(matches!(
+        b.seal_generation(pages(1), 4096, 1),
+        Err(Error::Fenced(_))
+    ));
+    assert_eq!(f.fault.events()[before..], [format!("get {}", k.head())]);
+}
+
+#[test]
+fn append_log_has_one_deadline_per_call() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(200),
+        ..fast()
+    };
+
+    // Every put fails: the settle of the in-doubt record uses up the deadline.
+    let f = Fixture::new();
+    let mut b = f.create(short.clone(), 4);
+    f.fault.fail_next_puts(1_000_000);
+    assert!(matches!(b.append_log(syncs(b'A')), Err(Error::Timeout(_))));
+    let t = Instant::now();
+    assert!(matches!(b.append_log(syncs(b'B')), Err(Error::Timeout(_))));
+    assert!(
+        t.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        t.elapsed()
+    );
+
+    // Every put takes 150 ms. The settle of A lands (150 ms); B's put then fails. With one
+    // deadline for the call B gets one attempt (~300 ms in all); with a fresh 200 ms
+    // deadline per step B would be tried twice (~450 ms).
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    f.fault.fail_next_puts(1_000_000);
+    assert!(matches!(b.append_log(syncs(b'A')), Err(Error::Timeout(_))));
+    f.fault.fail_next_puts(0);
+    f.fault.delay_puts(Duration::from_millis(150));
+    f.fault.fail_puts_after(1);
+    let t = Instant::now();
+    assert!(matches!(b.append_log(syncs(b'B')), Err(Error::Timeout(_))));
+    let el = t.elapsed();
+    assert!(el < Duration::from_millis(390), "{el:?}");
+    assert_eq!(f.record(1, 1), Some(ours(b'A')));
+    assert_eq!(f.record(1, 2), None);
 }
 
 #[test]

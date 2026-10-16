@@ -207,3 +207,46 @@ fn dropping_the_last_handle_stops_the_thread() {
     assert!(t.wait().is_ok());
     assert_eq!(Arc::strong_count(&mem), 1);
 }
+
+#[test]
+fn tickets_from_one_thread_get_seqs_in_submission_order() {
+    let mem = Arc::new(MemStore::new());
+    let up = Uploader::spawn(bucket(mem.clone()), None, None);
+    let tickets: Vec<Ticket> = (1..=50).map(|n| up.submit_log(op(n))).collect();
+    for (i, t) in tickets.into_iter().enumerate() {
+        let n = i as u64 + 1;
+        let pos = t.wait().unwrap();
+        assert_eq!(
+            pos,
+            LogPos {
+                generation: 1,
+                seq: n
+            }
+        );
+        assert_eq!(stored_ops(&mem, pos), vec![op(n)]);
+    }
+}
+
+#[test]
+fn last_handle_dropped_on_the_uploader_thread_does_not_join_itself() {
+    let mem = Arc::new(MemStore::new());
+    let slot: Arc<Mutex<Option<Arc<Uploader>>>> = Arc::default();
+    let hook: EventHook = {
+        let slot = slot.clone();
+        Arc::new(move |_: &Event| {
+            let last = slot.lock().unwrap().take();
+            drop(last); // the final Arc, on the uploader thread
+        })
+    };
+    let up = Uploader::spawn(bucket(mem.clone()), None, Some(hook));
+    *slot.lock().unwrap() = Some(up.clone());
+    let t = up.submit_log(op(1));
+    drop(up);
+    assert!(t.wait().is_ok(), "the uploader thread must not panic");
+    // The thread exits on its own once its queue is closed and drained.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Arc::strong_count(&mem) > 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(Arc::strong_count(&mem), 1);
+}

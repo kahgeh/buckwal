@@ -48,7 +48,7 @@ impl Keys {
     }
 
     pub(crate) fn page(&self, gen: u64, page: u32) -> String {
-        self.join(&format!("page/{gen:010}/{page:010}"))
+        self.join(&format!("pages/{gen:010}/{page:010}"))
     }
 
     pub(crate) fn manifest(&self, gen: u64) -> String {
@@ -62,7 +62,7 @@ impl Keys {
     }
 
     pub(crate) fn parse_page(&self, key: &str) -> Option<(u64, u32)> {
-        let rest = self.strip(key)?.strip_prefix("page/")?;
+        let rest = self.strip(key)?.strip_prefix("pages/")?;
         let (g, p) = rest.split_once('/')?;
         Some((digits(g, 10)?, u32::try_from(digits(p, 10)?).ok()?))
     }
