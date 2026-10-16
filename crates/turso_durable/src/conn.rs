@@ -41,10 +41,14 @@ impl CheckpointMode {
 
 /// One connection to a [`crate::Database`]; open one per thread. Dropping it closes it.
 pub struct Connection {
-    shared: Arc<Shared>,
     /// None once closed.
     core: Option<Arc<turso_core::Connection>>,
     io: Arc<dyn IO>,
+    /// Declared last, so dropped last: when this holds the last `Arc<Shared>`, its drop
+    /// releases `durable.lock` and the process registry, and every engine file handle (the
+    /// connection's, and the IO's `app.db` and `-wal` through its storage) must be closed
+    /// by then.
+    shared: Arc<Shared>,
 }
 
 impl Connection {
@@ -61,9 +65,9 @@ impl Connection {
             core.wal_auto_actions_disable();
         }
         Connection {
-            shared,
             core: Some(core),
             io,
+            shared,
         }
     }
 
@@ -150,6 +154,9 @@ impl Connection {
             return self.execute_batch_read_only(sql);
         }
         let r = self.core().prepare_execute_batch(sql).map_err(engine_error);
+        // Defence in depth: the guard above refuses every spelling of a lower `synchronous`,
+        // but the batch prepares and runs its statements in one engine call, so this can
+        // only look afterwards (and put FULL back for the next call).
         self.check_sync_mode()?;
         r
     }

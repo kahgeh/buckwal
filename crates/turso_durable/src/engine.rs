@@ -10,8 +10,10 @@ use crate::io::db_storage::StorageParts;
 use crate::io::{stash, BucketDbStorage, DurableIo};
 use crate::uploader::{TrimSnapshot, Uploader};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Instant;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
@@ -22,6 +24,30 @@ pub(crate) struct Engine {
     pub storage: Arc<BucketDbStorage>,
     pub uploader: Arc<Uploader>,
     pub io: Arc<DurableIo>,
+    /// The background page fetcher (`EngineConfig::prefetch`); stopped and joined on drop.
+    pub prefetch: Option<Prefetch>,
+}
+
+/// The prefetch thread writes the local database file, so it must be gone before the
+/// directory is released (`durable.lock`, the process registry).
+pub(crate) struct Prefetch {
+    stop: Arc<AtomicBool>,
+    /// Set by the thread as it ends (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub done: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(p) = &mut self.prefetch {
+            p.stop.store(true, SeqCst);
+            if let Some(t) = p.thread.take() {
+                // A panic on the prefetch thread left nothing to clean up.
+                let _ = t.join();
+            }
+        }
+    }
 }
 
 /// The typed error an engine call stashed, else the engine's own message.
@@ -94,18 +120,32 @@ pub(crate) fn open_engine(
     if db.mvcc_enabled() {
         return Err(Error::Unsupported("MVCC"));
     }
-    if cfg.prefetch {
+    let prefetch = if cfg.prefetch {
         let s = storage.clone();
-        std::thread::Builder::new()
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (stop2, done2) = (stop.clone(), done.clone());
+        let thread = std::thread::Builder::new()
             .name("turso-durable-prefetch".into())
-            .spawn(move || s.prefetch())
+            .spawn(move || {
+                s.prefetch(&stop2);
+                done2.store(true, SeqCst);
+            })
             .map_err(|e| Error::Io(format!("spawn prefetch thread: {e}")))?;
-    }
+        Some(Prefetch {
+            stop,
+            done,
+            thread: Some(thread),
+        })
+    } else {
+        None
+    };
     Ok(Engine {
         db,
         storage,
         uploader,
         io,
+        prefetch,
     })
 }
 

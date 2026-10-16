@@ -222,12 +222,13 @@ impl BucketDbStorage {
     }
 
     /// Fetch every page the manifest names; once all are local, nothing is fetched again.
-    pub(crate) fn prefetch(&self) {
+    /// Returns early, leaving the rest to be fetched on read, once `stop` is set.
+    pub(crate) fn prefetch(&self, stop: &AtomicBool) {
         let Some(m) = &self.manifest else {
             return;
         };
         for &p in m.pages.keys() {
-            if self.ensure_local(p).is_err() {
+            if stop.load(SeqCst) || self.ensure_local(p).is_err() {
                 return;
             }
         }

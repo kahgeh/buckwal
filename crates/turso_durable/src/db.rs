@@ -4,7 +4,7 @@ use crate::config::{Config, EngineConfig};
 use crate::conn::Connection;
 use crate::engine::{engine_error, open_engine, Engine};
 use crate::error::{Error, Result};
-use crate::format::{Keys, LocalState};
+use crate::format::{decode_record, Keys, LocalState, LogRecord};
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, restore_staged};
 use crate::store::{with_retry, ObjectStore, StatsSnap};
@@ -325,6 +325,12 @@ fn create_new(
 /// The directory's own database: a writer claims a restored copy first, then attaches and
 /// reconciles against the current log (a record acked by the old writer since the restore
 /// comes in as `Behind`). A read-only open attaches as the directory's writer id, unclaimed.
+///
+/// A writer that just claimed, or whose generation's last record is another writer's (a
+/// claim whose record never landed), appends one empty record at its next seq before the
+/// engine opens: a still-running old writer's next append collides with it and is fenced
+/// for good, so it can never ack into a generation this writer will seal (`bucket::claim`).
+/// If the old writer got there first, this append is `Fenced` and the open fails.
 fn attach_existing(
     dir: &Path,
     store: &Arc<dyn ObjectStore>,
@@ -332,7 +338,8 @@ fn attach_existing(
     cfg: &EngineConfig,
     mut state: LocalState,
 ) -> Result<(Bucket, LocalState, Option<Reconciled>)> {
-    if !state.claimed && !cfg.read_only {
+    let claiming = !state.claimed && !cfg.read_only;
+    if claiming {
         let writer_id = new_writer_id()?;
         let etag = bucket::claim(&**store, keys, &cfg.retry, &state.head_etag, &writer_id)?;
         state.writer_id = writer_id;
@@ -348,7 +355,28 @@ fn attach_existing(
         &state.writer_id,
     )?;
     let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
+    if !cfg.read_only && (claiming || last_record_is_foreign(&bucket, &state.writer_id, cfg)?) {
+        bucket.append_log(vec![])?;
+    }
     Ok((bucket, state, Some(reconciled)))
+}
+
+/// The last record of the head's generation was written by a writer other than `writer_id`.
+fn last_record_is_foreign(bucket: &Bucket, writer_id: &str, cfg: &EngineConfig) -> Result<bool> {
+    let seq = bucket.next_seq();
+    if seq <= 1 {
+        return Ok(false);
+    }
+    let store = bucket.store();
+    let key = bucket.keys().log(bucket.head().generation, seq - 1);
+    let Some(obj) = with_retry(&cfg.retry, &key, |_| store.get(&key))? else {
+        return Ok(false);
+    };
+    Ok(match decode_record(&obj.body)? {
+        LogRecord::Extents { writer_id: w, .. } | LogRecord::Fence { writer_id: w } => {
+            w != writer_id
+        }
+    })
 }
 
 impl Database {

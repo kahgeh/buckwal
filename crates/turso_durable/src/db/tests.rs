@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::tests::{head, keys, log_seqs, PREFIX};
-use crate::format::{Head, LocalState};
+use crate::format::{decode_record, Head, LocalState, LogRecord};
 use crate::reconcile::Reconciled;
 use crate::restore::restore_with_store;
 use crate::store::{FaultStore, MemStore};
@@ -709,7 +709,8 @@ fn verify_against_live_writer_loses_nothing() {
 }
 
 /// The old writer acks a record between the restore and the claim: the claimed writer's
-/// reconcile takes it in (`Behind`), and its own commits follow it in the same generation.
+/// reconcile takes it in (`Behind`), its claim record (no syncs) follows at the next seq, then
+/// its own commits; restore and reconcile both accept that log.
 #[test]
 fn claim_after_old_writer_appended_comes_in_behind() {
     let store = mem();
@@ -724,25 +725,249 @@ fn claim_after_old_writer_appended_comes_in_behind() {
     restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
     insert(&ca, 11).unwrap();
     let gen = head(&*store).generation;
-    let seqs = log_seqs(&*store, gen);
+    let n = log_seqs(&*store, gen).len() as u64;
 
     let db_b = open_mem(&store, r.path());
     assert_eq!(db_b.shared.reconciled, Some(Reconciled::Behind));
+    let b_id = state(r.path()).writer_id;
     let cb = db_b.connect().unwrap();
     assert_eq!(ids(&cb), (1..=11).collect::<Vec<_>>());
     insert(&cb, 12).unwrap();
-    let after = log_seqs(&*store, gen);
-    assert_eq!(after.len(), seqs.len() + 1);
-    assert_eq!(after.last(), Some(&(seqs.len() as u64 + 1)));
+    assert_eq!(log_seqs(&*store, gen), (1..=n + 2).collect::<Vec<_>>());
+    match record(&store, gen, n + 1) {
+        LogRecord::Extents { writer_id, syncs } => {
+            assert_eq!(writer_id, b_id);
+            assert!(syncs.is_empty(), "the claim record holds syncs");
+        }
+        r => panic!("{r:?}"),
+    }
+    assert!(
+        matches!(&record(&store, gen, n + 2), LogRecord::Extents { writer_id, .. } if *writer_id == b_id)
+    );
+    // The old writer's next append collides with the claim record.
+    let r13 = insert(&ca, 13);
+    assert!(matches!(r13, Err(Error::Fenced(_))), "{r13:?}");
     crash(db_a, vec![ca]);
     crash(db_b, vec![cb]);
 
+    // Restore: [A's records, B's claim record, B's record].
     let v = tempdir();
     let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
     assert_eq!(
         ids(&verify.connect().unwrap()),
         (1..=12).collect::<Vec<_>>()
     );
+    drop(verify);
+    // Reconcile: B restarting on (a copy of) its own disk is level with that log, and its
+    // next commit continues the seqs.
+    let b2 = copy_db_files(r.path());
+    let db_b2 = open_mem(&store, b2.path());
+    assert_eq!(db_b2.shared.reconciled, Some(Reconciled::Level));
+    let cb2 = db_b2.connect().unwrap();
+    insert(&cb2, 14).unwrap();
+    assert_eq!(log_seqs(&*store, gen), (1..=n + 3).collect::<Vec<_>>());
+    assert_eq!(ids(&cb2), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]);
+}
+
+fn record(store: &Arc<MemStore>, gen: u64, seq: u64) -> LogRecord {
+    decode_record(&store.get(&keys().log(gen, seq)).unwrap().unwrap().body).unwrap()
+}
+
+/// A copy of a (crashed) directory's database files, in a new directory.
+fn copy_db_files(from: &Path) -> TempDir {
+    let to = tempdir();
+    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-dirty"] {
+        if from.join(f).exists() {
+            std::fs::copy(from.join(f), to.path().join(f)).unwrap();
+        }
+    }
+    to
+}
+
+/// The reviewer's case: A acks after B's claim, then B seals with no append of its own in
+/// between (`seal`, which returns what it acked afterwards), then A commits again. Every
+/// acked row must survive a restore: either A's post-claim insert fails (fenced by B's claim
+/// record) or B's open fails.
+fn old_writer_after_claim_loses_nothing(seal: fn(Database, Connection) -> Vec<i64>) {
+    let store = mem();
+    let a = tempdir();
+    let db_a = open_mem(&store, a.path());
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    let mut acked: Vec<i64> = (1..=10).collect();
+    for &id in &acked {
+        insert(&ca, id).unwrap();
+    }
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let b = open_with_store(config(r.path()), store.clone());
+    let a_after = insert(&ca, 11);
+    if a_after.is_ok() {
+        acked.push(11);
+    }
+    let b_failed = b.is_err();
+    match b {
+        Ok(db_b) => {
+            let cb = db_b.connect().unwrap();
+            acked.extend(seal(db_b, cb));
+        }
+        Err(e) => assert!(matches!(e, Error::Fenced(_)), "{e:?}"),
+    }
+    if insert(&ca, 12).is_ok() {
+        acked.push(12);
+    }
+    assert!(
+        b_failed || a_after.is_err(),
+        "both writers acked after the claim: {a_after:?}"
+    );
+    assert!(matches!(a_after, Err(Error::Fenced(_))), "{a_after:?}");
+    crash(db_a, vec![ca]);
+
+    acked.sort();
+    let v = tempdir();
+    let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    assert_eq!(ids(&verify.connect().unwrap()), acked);
+}
+
+#[test]
+fn old_writer_after_claim_then_truncate_loses_nothing() {
+    old_writer_after_claim_loses_nothing(|db, c| {
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        insert(&c, 100).unwrap();
+        crash(db, vec![c]);
+        vec![100]
+    });
+}
+
+#[test]
+fn old_writer_after_claim_then_close_loses_nothing() {
+    old_writer_after_claim_loses_nothing(|db, c| {
+        c.close().unwrap();
+        db.close().unwrap();
+        vec![]
+    });
+}
+
+/// A claim whose record never landed (the open failed after the head write): the next open
+/// sees the generation's last record is another writer's and appends one then.
+#[test]
+fn reopen_after_claim_without_its_record_appends_one() {
+    let store = mem();
+    let a = tempdir();
+    let db_a = open_mem(&store, a.path());
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    for id in 1..=10 {
+        insert(&ca, id).unwrap();
+    }
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let mut s = state(r.path());
+    let b_id = "b".repeat(32);
+    let cfg = config(r.path()).engine(false);
+    s.head_etag = crate::bucket::claim(&*store, &keys(), &cfg.retry, &s.head_etag, &b_id).unwrap();
+    s.writer_id = b_id.clone();
+    s.claimed = true;
+    s.write_atomic(r.path()).unwrap();
+    // No claim record yet: A still acks.
+    insert(&ca, 11).unwrap();
+
+    let db_b = open_mem(&store, r.path());
+    assert_eq!(db_b.shared.reconciled, Some(Reconciled::Behind));
+    let gen = head(&*store).generation;
+    let last = *log_seqs(&*store, gen).last().unwrap();
+    assert!(
+        matches!(record(&store, gen, last), LogRecord::Extents { writer_id, syncs } if writer_id == b_id && syncs.is_empty())
+    );
+    let r12 = insert(&ca, 12);
+    assert!(matches!(r12, Err(Error::Fenced(_))), "{r12:?}");
+    let cb = db_b.connect().unwrap();
+    insert(&cb, 100).unwrap();
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    crash(db_a, vec![ca]);
+    crash(db_b, vec![cb]);
+
+    let v = tempdir();
+    let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    let mut want: Vec<i64> = (1..=11).collect();
+    want.push(100);
+    assert_eq!(ids(&verify.connect().unwrap()), want);
+}
+
+/// Close stops and joins the prefetch thread before it releases the directory: nothing
+/// writes `app.db` after close, and an immediate reopen works.
+#[test]
+fn close_stops_prefetch_before_releasing_the_dir() {
+    let store = mem();
+    {
+        let a = tempdir();
+        let db = open_mem(&store, a.path());
+        let c = db.connect().unwrap();
+        create(&c);
+        for id in 1..=300 {
+            c.execute(
+                "INSERT INTO t(id, v) VALUES (?, zeroblob(2000))",
+                &[Value::from_i64(id)],
+            )
+            .unwrap();
+        }
+        c.close().unwrap();
+        db.close().unwrap();
+    }
+    let pages = crate::engine::tests::manifest(&*store).1.pages.len() as u64;
+    let fault = Arc::new(FaultStore::new(store.clone()));
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    fault.only_keys_containing("/pages/");
+    fault.delay_gets(Duration::from_millis(3));
+    let mut cfg = config(r.path());
+    cfg.prefetch = true;
+    let db = open_with_store(cfg, fault.clone()).unwrap();
+    let (storage, done) = {
+        let open = db.shared.open.lock().unwrap();
+        let e = &open.as_ref().unwrap().engine;
+        (e.storage.clone(), e.prefetch.as_ref().unwrap().done.clone())
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    let t = Instant::now();
+    db.close().unwrap();
+    assert!(
+        done.load(std::sync::atomic::Ordering::SeqCst),
+        "prefetch still running"
+    );
+    let fetched = storage.lazy_gets();
+    eprintln!(
+        "prefetch: {fetched} of {pages} pages before close; close took {:?}",
+        t.elapsed()
+    );
+    assert!(
+        fetched < pages,
+        "prefetch finished before close; the test proves nothing"
+    );
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(storage.lazy_gets(), fetched, "prefetch fetched after close");
+    drop(storage);
+
+    let db = open_with_store(config(r.path()), store.clone()).unwrap();
+    assert_eq!(ids(&db.connect().unwrap()), (1..=300).collect::<Vec<_>>());
+}
+
+/// Staging directories of a restore that crashed mid-way are swept at the next open.
+#[test]
+fn leftover_staging_dirs_are_swept() {
+    let store = mem();
+    let _a = closed_writer(&store, 3);
+    let t = tempdir();
+    let dir = fresh(&t);
+    let leftover = t.path().join(".db.restore-123-456");
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::write(leftover.join("app.db-wal"), b"partial").unwrap();
+    let other = t.path().join(".dbx.restore-1-2");
+    std::fs::create_dir_all(&other).unwrap();
+    let db = open_mem(&store, &dir);
+    assert!(!leftover.exists(), "a staging dir was left behind");
+    assert!(other.exists(), "another directory's staging dir was swept");
+    assert_eq!(ids(&db.connect().unwrap()), vec![1, 2, 3]);
 }
 
 /// The read-only backstop below the Connection's own check: an engine connection that tries

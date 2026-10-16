@@ -102,17 +102,26 @@ fn upload_error(e: Error) -> Error {
 pub(crate) const RESTORE_AGAIN: &str =
     "the bucket changed since this directory was restored; restore again";
 
-/// Take over a restored copy's database as `writer_id`: write the head the restore read
-/// (ETag `head_etag`) again with the new writer id, same generation and manifest, with
-/// `put_if_match`. Nothing else is written. A head that moved since the restore (412, or 404
-/// when it is gone) is `Fenced` with "restore again". Returns the new head's ETag.
+/// The first half of taking over a restored copy's database as `writer_id`: a claim is a
+/// head write, then one log record.
 ///
-/// After a claim, an old writer restarting on its own disk is fenced by the writer-id check at
-/// attach. A still-running old writer gets a 412 on its next seal's If-Match, so the seal is
-/// fenced. Its log appends can still win a seq race and fence the new writer: no acked
-/// commit is lost and the log stays linear (stage 3's lease closes it). Such a generation
-/// holds the old writer's records, then the new one's, which `restore::generation_image`
-/// accepts.
+/// This writes the head the restore read (ETag `head_etag`) again with the new writer id,
+/// same generation and manifest, with `put_if_match`. A head that moved since the restore
+/// (412, or 404 when it is gone) is `Fenced` with "restore again", and nothing is written.
+/// Returns the new head's ETag. The caller then attaches, reconciles and appends one record
+/// of its own (an empty one) at its next seq (`db::attach_existing`); stage 3's fence record
+/// will take that slot.
+///
+/// That record matters because a still-running old writer does not see the head change: it
+/// keeps appending to the same generation, and the new writer's seal (If-Match on a head only
+/// it moved) would orphan whatever the old one acked after it. The record takes the next seq,
+/// so either the old writer's append collides with it and the old writer is fenced for good,
+/// or the old writer got there first and the new writer's open fails `Fenced`. After a
+/// claim, an old writer restarting on its own disk is fenced by the writer-id check at
+/// attach, and a still-running one gets a 412 on its next seal's If-Match. No acked commit
+/// is lost and the log stays linear (stage 3's lease closes the remaining race). Such a
+/// generation holds the old writer's records, then the new one's, which
+/// `restore::generation_image` accepts.
 pub(crate) fn claim(
     store: &dyn ObjectStore,
     keys: &Keys,
@@ -299,7 +308,6 @@ impl Bucket {
         self.manifest.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn next_seq(&self) -> u64 {
         self.seq
     }

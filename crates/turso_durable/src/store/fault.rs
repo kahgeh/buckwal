@@ -23,6 +23,7 @@ pub struct FaultStore {
     ok_left: AtomicU64,
     only_keys: Mutex<String>,
     delay: Mutex<Duration>,
+    get_delay: Mutex<Duration>,
     events: Mutex<Vec<String>>,
 }
 
@@ -40,6 +41,7 @@ impl FaultStore {
             ok_left: AtomicU64::new(u64::MAX),
             only_keys: Mutex::new(String::new()),
             delay: Mutex::new(Duration::ZERO),
+            get_delay: Mutex::new(Duration::ZERO),
             events: Mutex::new(Vec::new()),
         }
     }
@@ -66,6 +68,10 @@ impl FaultStore {
     /// Sleep `d` before each matching put.
     pub fn delay_puts(&self, d: Duration) {
         *self.delay.lock().unwrap() = d;
+    }
+    /// Sleep `d` before each get of a matching key.
+    pub fn delay_gets(&self, d: Duration) {
+        *self.get_delay.lock().unwrap() = d;
     }
     /// Every call in order, e.g. "put k", "get k", "list p/"; attempts failed by injection included.
     pub fn events(&self) -> Vec<String> {
@@ -143,6 +149,10 @@ impl ObjectStore for FaultStore {
     }
     fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
         self.record("get", key);
+        let d = *self.get_delay.lock().unwrap();
+        if !d.is_zero() && key.contains(self.only_keys.lock().unwrap().as_str()) {
+            std::thread::sleep(d);
+        }
         self.inner.get(key)
     }
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {

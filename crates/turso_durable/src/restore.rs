@@ -324,9 +324,29 @@ pub(crate) fn restore_staged(
     r
 }
 
+/// The name prefix of `dir`'s staging directories: `.<name>.restore-`.
+fn staging_prefix(dir: &Path) -> Option<String> {
+    dir.file_name()
+        .map(|n| format!(".{}.restore-", n.to_string_lossy()))
+}
+
+fn sweep_staging_dirs(dir: &Path) -> Result<()> {
+    let (Some(parent), Some(prefix)) = (dir.parent(), staging_prefix(dir)) else {
+        return Ok(());
+    };
+    let entries = fs::read_dir(parent).map_err(|e| io_err("list parent dir", e))?;
+    for e in entries {
+        let e = e.map_err(|e| io_err("list parent dir", e))?;
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            fs::remove_dir_all(e.path()).map_err(|e| io_err("remove staging dir", e))?;
+        }
+    }
+    Ok(())
+}
+
 /// `<parent>/.<name>.restore-<pid>-<nanos>`.
 fn staging_dir(dir: &Path) -> Result<PathBuf> {
-    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+    let (Some(parent), Some(prefix)) = (dir.parent(), staging_prefix(dir)) else {
         return Err(Error::Config(format!(
             "cannot restore into {}: it has no parent directory",
             dir.display()
@@ -335,11 +355,7 @@ fn staging_dir(dir: &Path) -> Result<PathBuf> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    Ok(parent.join(format!(
-        ".{}.restore-{}-{nanos}",
-        name.to_string_lossy(),
-        std::process::id()
-    )))
+    Ok(parent.join(format!("{prefix}{}-{nanos}", std::process::id())))
 }
 
 fn fsync_dir(dir: &Path) -> Result<()> {
@@ -362,9 +378,12 @@ fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
     fsync_dir(dir)
 }
 
-/// A restore that crashed while moving its files in left `app.db-restoring`: remove what it
-/// moved, so the directory is empty again. Called with the directory held.
+/// Remove what an interrupted restore of `dir` left: staging directories next to it
+/// (`.<name>.restore-*`, a crash during `restore_into`), and, when `app.db-restoring` is
+/// present (a crash while moving the files in), the files it moved, so the directory is
+/// empty again. Called with the directory held, so no restore of it is running.
 pub(crate) fn clear_interrupted_restore(dir: &Path) -> Result<()> {
+    sweep_staging_dirs(dir)?;
     if !dir.join(RESTORING).exists() {
         return Ok(());
     }
