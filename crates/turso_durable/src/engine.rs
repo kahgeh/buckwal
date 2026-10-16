@@ -61,11 +61,14 @@ pub(crate) fn engine_error(e: turso_core::LimboError) -> Error {
 /// (`trim::spawn_trimmer`): the head at open first, then one snapshot per seal.
 pub(crate) fn open_engine(
     dir: &Path,
-    bucket: Bucket,
+    mut bucket: Bucket,
     state: &LocalState,
     cfg: &EngineConfig,
     trim_tx: Option<Sender<TrimSnapshot>>,
 ) -> Result<Engine> {
+    // Only a trimmed `log/G` lets an old writer's append land after a claim, and the trimmer
+    // waits `trim_grace` after the seal that moved the head (`Bucket::check_idle`).
+    bucket.set_idle_threshold(cfg.trim_grace / 2);
     let db_path = dir
         .join(DB_FILE)
         .to_str()

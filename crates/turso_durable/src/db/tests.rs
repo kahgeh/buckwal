@@ -999,6 +999,102 @@ fn old_writer_commit_crossing_its_boundary_after_claim_and_seal_is_fenced() {
     );
 }
 
+/// The merge review of the B1 fix: B claims, commits and seals G, and B's trimmer deletes
+/// `log/G`. An idle old writer A then commits normally: its record would land in the empty
+/// `log/G`, which no restore reads, and the commit would be acked. With A's trim grace (and
+/// so its idle threshold) at zero, A checks the head before that append and is fenced.
+#[test]
+fn idle_old_writer_appending_into_trimmed_log_is_fenced() {
+    let store = mem();
+    let a = tempdir();
+    let mut cfg_a = config(a.path());
+    cfg_a.trim_grace = Duration::ZERO;
+    let db_a = open_with_store(cfg_a, store.clone()).unwrap();
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    let mut acked: Vec<i64> = (1..=10).collect();
+    for &id in &acked {
+        insert(&ca, id).unwrap();
+    }
+    let gen = head(&*store).generation;
+
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let db_b = open_mem(&store, r.path());
+    let cb = db_b.connect().unwrap();
+    for id in 100..=110 {
+        insert(&cb, id).unwrap();
+        acked.push(id);
+    }
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let h = head(&*store);
+    assert_eq!(
+        (h.generation, h.manifest),
+        (gen + 1, Some(gen)),
+        "B sealed G"
+    );
+    let (_, m) = crate::engine::tests::manifest(&*store);
+    crate::trim::trim_once(&*store, &keys(), &h, Some(&m)).unwrap();
+    assert!(log_seqs(&*store, gen).is_empty(), "log/G trimmed");
+    let puts = db_bucket_puts(&store);
+
+    for id in 11..=15 {
+        let r = insert(&ca, id);
+        assert!(matches!(r, Err(Error::Fenced(_))), "A's insert {id}: {r:?}");
+    }
+    assert_eq!(
+        db_bucket_puts(&store),
+        puts,
+        "the fenced writer wrote nothing"
+    );
+    crash(db_a, vec![ca]);
+
+    let v = tempdir();
+    let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    let c = verify.connect().unwrap();
+    integrity_ok(&c);
+    assert_eq!(ids(&c), acked);
+}
+
+/// A single writer that checks the head before every append (trim grace zero) commits,
+/// seals and commits again as usual: its own head (and the one each seal moves it to)
+/// lets every append proceed.
+#[test]
+fn single_writer_with_idle_check_on_every_append_keeps_working() {
+    let store = mem();
+    let a = tempdir();
+    let mut cfg = config(a.path());
+    cfg.trim_grace = Duration::ZERO;
+    let db = open_with_store(cfg.clone(), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=5 {
+        insert(&c, id).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    for id in 6..=10 {
+        insert(&c, id).unwrap();
+    }
+    c.close().unwrap();
+    db.close().unwrap();
+    assert!(head(&*store).generation >= 2, "sealed");
+
+    let db = open_with_store(cfg, store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    insert(&c, 11).unwrap();
+    assert_eq!(ids(&c), (1..=11).collect::<Vec<_>>());
+    crash(db, vec![c]);
+    let v = tempdir();
+    let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    assert_eq!(
+        ids(&verify.connect().unwrap()),
+        (1..=11).collect::<Vec<_>>()
+    );
+}
+
 /// A claim whose record never landed (the open failed after the head write): the next open
 /// sees the generation's last record is another writer's and appends one then.
 #[test]

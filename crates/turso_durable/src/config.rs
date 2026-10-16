@@ -255,6 +255,7 @@ impl Config {
             },
             upload_concurrency: self.upload_concurrency,
             prefetch: self.prefetch,
+            trim_grace: self.trim_grace,
             events: self.on_event.clone(),
             read_only,
         }
@@ -309,6 +310,9 @@ pub(crate) struct EngineConfig {
     pub upload_concurrency: usize,
     /// Fetch every sealed page in the background after open.
     pub prefetch: bool,
+    /// The trimmer's grace; the writer's idle self-check runs after half of it
+    /// (`Bucket::set_idle_threshold`).
+    pub trim_grace: Duration,
     pub events: Option<EventHook>,
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are
     /// refused (`ShippingFile`, `BucketDbStorage`).

@@ -13,7 +13,7 @@ use crate::store::{with_retry, CondPut, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Where a log object lives: `log/<generation>/<seq>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,12 @@ pub(crate) struct Bucket {
     /// generation + 1, so nothing may go to this generation until that is known.
     pending_seal: Option<PendingSeal>,
     fenced: bool,
+    /// When the last confirmed write (a log record or the head; create and attach count, as
+    /// they read or write the head) was sent. Page and manifest PUTs are not counted, which
+    /// only makes the idle check run sooner.
+    last_confirmed: Instant,
+    /// See `set_idle_threshold`.
+    idle_threshold: Duration,
     counters: Arc<Counters>,
     events: Option<EventHook>,
 }
@@ -116,11 +122,13 @@ pub(crate) const RESTORE_AGAIN: &str =
 /// so either the old writer's append collides with it and the old writer is fenced for good,
 /// or the old writer got there first and the new writer's open fails `Fenced`. After a
 /// claim, an old writer restarting on its own disk is fenced by the writer-id check at
-/// attach. A still-running one is fenced at its next append, or at the start of its next
-/// seal (`Bucket::seal_start`: its seal-start record collides, or the head moved), before it
-/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed.
-/// The log stays linear; stage 3's lease closes the remaining races (`seal_start` names
-/// one). Such a generation holds the old writer's records, then the new one's, which
+/// attach. A still-running one is fenced at its next append: through the claim record when
+/// it appends within the trim grace, and otherwise (`log/G` may be trimmed by then) through
+/// the idle head check before that append (`Bucket::check_idle`). It is also fenced at the
+/// start of its next seal (`Bucket::seal_start`: its seal-start record collides, or the head
+/// moved), before it uploads a page or a manifest, so it cannot overwrite a generation the
+/// new writer sealed. The log stays linear; stage 3's lease closes the remaining races
+/// (`seal_start` names one). Such a generation holds the old writer's records, then the new one's, which
 /// `restore::generation_image` accepts.
 pub(crate) fn claim(
     store: &dyn ObjectStore,
@@ -182,6 +190,8 @@ impl Bucket {
         head_etag: String,
     ) -> Bucket {
         Bucket {
+            last_confirmed: Instant::now(),
+            idle_threshold: crate::config::defaults::TRIM_GRACE / 2,
             store,
             keys,
             retry,
@@ -224,6 +234,7 @@ impl Bucket {
         let body = head.encode();
         let key = keys.head();
         let counters = Counters::default();
+        let sent = Instant::now();
         let exists = || Error::Config("a database already exists at this prefix".into());
         let r = retrying(&counters, &retry, &key, || store.put_if_absent(&key, &body))?;
         let etag = match r {
@@ -240,7 +251,8 @@ impl Bucket {
                 }
             }
         };
-        let b = Bucket::new(store, keys, retry, concurrency, head, etag);
+        let mut b = Bucket::new(store, keys, retry, concurrency, head, etag);
+        b.last_confirmed = sent;
         b.counters
             .retries
             .store(counters.retries.load(Relaxed), Relaxed);
@@ -258,6 +270,7 @@ impl Bucket {
     ) -> Result<Bucket> {
         let counters = Counters::default();
         let key = keys.head();
+        let sent = Instant::now();
         let obj = retrying(&counters, &retry, &key, || store.get(&key))?
             .ok_or_else(|| Error::NotFound("head".into()))?;
         let head = Head::decode(&obj.body)?;
@@ -286,6 +299,7 @@ impl Bucket {
         let mut b = Bucket::new(store, keys, retry, concurrency, head, obj.etag);
         b.manifest = manifest;
         b.seq = last.map_or(1, |s| s + 1);
+        b.last_confirmed = sent;
         b.counters
             .retries
             .store(counters.retries.load(Relaxed), Relaxed);
@@ -314,6 +328,12 @@ impl Bucket {
 
     pub(crate) fn counters(&self) -> Arc<Counters> {
         self.counters.clone()
+    }
+
+    /// Appends after this long without a confirmed write check the head first
+    /// (`check_idle`). The engine sets half the trim grace; zero checks before every append.
+    pub(crate) fn set_idle_threshold(&mut self, t: Duration) {
+        self.idle_threshold = t;
     }
 
     pub(crate) fn set_event_hook(&mut self, events: Option<EventHook>) {
@@ -359,12 +379,28 @@ impl Bucket {
                 self.head.generation
             )));
         }
+        self.check_idle(start)?;
         self.settle(start)?;
         let body = encode_record(&LogRecord::Extents {
             writer_id: self.head.writer_id.clone(),
             syncs,
         });
         self.put_log(start, body)
+    }
+
+    /// The idle self-check before an append. Another writer's claim record fences this one at
+    /// its next append, but only while `log/G` exists: once that writer has sealed G and its
+    /// trimmer has deleted `log/G` (a trim grace after the seal), this writer's next record
+    /// would land in a log no restore reads, and its commit would be acked. Any append after
+    /// the claim collides with the claim record, so this writer can only reach a trimmed
+    /// `log/G` after being idle for at least the trim grace. So an append after
+    /// `idle_threshold` (half the trim grace) without a confirmed write GETs the head first,
+    /// within the call's deadline (`verify_head`): ours, it proceeds; anything else fences.
+    fn check_idle(&mut self, start: Instant) -> Result<()> {
+        if self.last_confirmed.elapsed() < self.idle_threshold {
+            return Ok(());
+        }
+        self.verify_head(start)
     }
 
     /// With a seal pending, GET the head. Unchanged ETag: the head write never landed, so the
@@ -378,11 +414,13 @@ impl Bucket {
         };
         let pending_body = pending.head.encode();
         let key = self.keys.head();
+        let sent = Instant::now();
         let stored = retrying(&self.counters, &self.remaining(start), &key, || {
             self.store.get(&key)
         })?;
         match stored {
             Some(o) if o.etag == self.head_etag => {
+                self.last_confirmed = sent;
                 self.pending_seal = None;
                 Ok(HeadCheck::Unmoved)
             }
@@ -434,8 +472,10 @@ impl Bucket {
             seq: self.seq,
         };
         let key = self.keys.log(pos.generation, pos.seq);
+        let sent = Instant::now();
         match self.put_log_at(start, &key, &body) {
             Ok(()) => {
+                self.last_confirmed = sent;
                 self.seq += 1;
                 self.counters.log_puts.fetch_add(1, Relaxed);
                 self.emit(Event::LogUploaded {
@@ -574,8 +614,8 @@ impl Bucket {
     ///    fences this writer and nothing is uploaded; an ambiguous result leaves it in doubt
     ///    and the seal fails, to be settled at the same seq like any other record. It keeps
     ///    the seqs contiguous and adds nothing to the generation's image.
-    /// 2. Then a GET of the head, which must still carry this writer's ETag (or be the very
-    ///    head this seal publishes, below). The record cannot collide once the trimmer has
+    /// 2. Then a GET of the head (`verify_head`), which must still carry this writer's ETag
+    ///    or be the very head this seal publishes. The record cannot collide once the trimmer has
     ///    deleted `log/G` (another writer sealed G and its grace passed), and a claimer's head
     ///    write precedes its claim record; a moved head fences.
     ///
@@ -587,17 +627,31 @@ impl Bucket {
             syncs: Vec::new(),
         });
         self.put_log(start, body)?;
+        self.verify_head(start)
+    }
+
+    /// GET the head: it must still carry this writer's ETag, or be the exact head a seal of
+    /// the current generation publishes. Anything else fences this writer for good.
+    fn verify_head(&mut self, start: Instant) -> Result<()> {
         let key = self.keys.head();
+        let sent = Instant::now();
         let stored = retrying(&self.counters, &self.remaining(start), &key, || {
             self.store.get(&key)
         })?;
         let ours = self.sealed_head().encode();
         match stored {
-            Some(o) if o.etag == self.head_etag => Ok(()),
+            Some(o) if o.etag == self.head_etag => {
+                self.last_confirmed = sent;
+                Ok(())
+            }
             // Our own head for this seal, from an earlier attempt whose PUT landed late (after
-            // a crash and restart, say): `put_head` adopts it, and this seal re-publishes the
-            // generation with every record acked since. Another writer's head names its id.
-            Some(o) if o.body == ours => Ok(()),
+            // a crash and restart, say): `put_head` adopts it at the next seal, which
+            // re-publishes the generation with every record acked since (README, item 1).
+            // Another writer's head names its id.
+            Some(o) if o.body == ours => {
+                self.last_confirmed = sent;
+                Ok(())
+            }
             _ => {
                 self.fenced = true;
                 Err(Error::Fenced(
@@ -649,14 +703,19 @@ impl Bucket {
         let key = self.keys.head();
         let body = head.encode();
         let c = &self.counters;
+        let sent = Instant::now();
         let r = retrying(c, &self.remaining(start), &key, || {
             self.store.put_if_match(&key, &body, &self.head_etag)
         })?;
         if let CondPut::Created { etag } = r {
+            self.last_confirmed = sent;
             return Ok(etag);
         }
         match retrying(c, &self.remaining(start), &key, || self.store.get(&key))? {
-            Some(o) if o.body == body => Ok(o.etag),
+            Some(o) if o.body == body => {
+                self.last_confirmed = sent;
+                Ok(o.etag)
+            }
             _ => {
                 self.fenced = true;
                 Err(Error::Fenced(

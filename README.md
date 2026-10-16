@@ -147,7 +147,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_RETRY_DEADLINE_MS` | `retry_deadline` | 30 s | How long one bucket job may keep retrying transient errors: a commit's log upload, a seal, or a page fetch. |
 | `DURABLE_REQUEST_TIMEOUT_MS` | `request_timeout` | 10 s | One HTTP request. |
 | `DURABLE_UPLOAD_CONCURRENCY` | `upload_concurrency` | 16 | Parallel page PUTs in a seal, and parallel log GETs in a restore. Must be at least 1. |
-| `DURABLE_TRIM_GRACE_SECS` | `trim_grace` | 10 min | How long an unreferenced object stays before it is deleted. |
+| `DURABLE_TRIM_GRACE_SECS` | `trim_grace` | 10 min | How long an unreferenced object stays before it is deleted. A writer idle for half of it checks the head before its next append (one GET); `0` makes every commit do so. |
 | `DURABLE_PREFETCH` | `prefetch` | `false` | After open, fetch every sealed page in the background. |
 
 Where the defaults live:
@@ -249,21 +249,25 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
   1. It writes `head` with a new writer id, using `If-Match` on the ETag the restore read.
   2. It appends one empty log record at the generation's next seq. Stage 3's fence record will reuse this slot.
 - If the head moved since the restore, the claim fails with `Fenced("… restore again")`. Restore into a new directory.
-- An old writer that is still running is fenced at its next append, or at the start of its next seal, before it uploads a page or a manifest. An old writer that restarts is fenced at open.
+- An old writer that is still running is fenced at its next append, and nothing it appends after the claim is acked:
+  - If it appends within the trim grace, that append collides with the claim record (or a later record of the claimer's).
+  - Later than that, the claimer may have sealed the generation and its trimmer may have deleted `log/G`, so a record would land where no restore reads it. Every writer therefore checks the head before an append once it has gone `trim_grace / 2` without a confirmed write (a log record or a head write; open counts). The check is one GET of `head`, retried within that commit's deadline. If the head still has this writer's ETag (or is this writer's own late head, see item 1 below), the append proceeds. Anything else is `Fenced`, and nothing is written. Any append after the claim collides with the claim record, so an old writer can only reach a trimmed `log/G` after being idle for at least the trim grace.
+  - The cost: one GET on the first commit after `trim_grace / 2` of idle (5 min by default). With `trim_grace = 0` every commit makes that GET.
+- An old writer is also fenced at the start of its next seal, before it uploads a page or a manifest. An old writer that restarts is fenced at open.
 - Every seal starts with an empty *seal-start* record at the writer's next seq (`put_if_absent`, one extra log PUT per seal), then a GET of `head` (one extra GET per seal). Page and manifest objects are plain PUTs, so this gate is what stops an old writer from overwriting a generation the claimer already sealed:
   - The old writer's seal-start record lands on the claim record's seq (or a later record of the claimer's). It is fenced and uploads nothing. This covers an idle old writer that closes after the claim (its close-time TRUNCATE seals), and a commit of the old writer that crosses its own generation boundary (the seal runs inside that commit, before its own log record).
   - The head check covers the case where the claimer's trimmer has already deleted `log/G` (the claimer sealed G and the trim grace passed), so the record has nothing to collide with. The head names the claimer, so the old writer is fenced.
   - A seal-start record whose upload is ambiguous is settled at the same seq, like any other in-doubt record, before anything else is written. A retried seal whose earlier head write is now known to be published adopts that head and writes no new record.
 - A generation may then hold the old writer's records followed only by the claimer's, and restore accepts that shape.
-- With these rules, no acked commit is lost to an old writer, except in the narrow races below, which stage 3's lease closes.
+- With these rules, an old writer cannot get a commit acked, or overwrite a sealed generation, after a claim, except in the races and crash windows below, which stage 3's lease and epoch fencing close.
 - One gap remains: between the restore and the claim record, the old writer can still win a seq race. The claimer's open then fails `Fenced`, and nothing acked is lost. Stage 3's lease closes this gap.
 - `verify` (and the hidden `open_read_only`) never claims, never seals and never writes to the bucket.
 - When the bucket holds no manifest yet, restore seeds `app.db` with the WAL's first page-1 frame. turso treats a zero-size database file as new and would delete its WAL (database.rs:738-760, 2223-2246).
 
 **Known races and crash windows (stage 3's lease and epoch fencing close them).** The bucket format does not change for any of them.
 - **An old writer's page PUTs still in flight.** The old writer's seal-start record lands and its head check passes. Then, while its page PUTs are still in flight, another process restores, claims, commits and seals the same generation. The old writer's late page PUTs can overwrite that seal's `pages/G/*` or `manifest/G`. Its head write then fails and it is fenced, but the claimer's pages may already be replaced. Narrowing this needs a lease (stage 3); do not claim a database whose old writer may still be running a seal.
-- **A head PUT in flight at a crash.** A writer crashes while its seal's head PUT is in flight (or, in one process, a failed head PUT lands after the retried seal saw the head unchanged). The restarted writer attaches to the old head and acks commits into `log/G`. Then the delayed PUT lands, and the head names generation G+1 with the manifest the crashed attempt uploaded. A restore then misses the commits acked into `log/G` after the restart, until that writer's next seal re-uploads G's pages and adopts that head (`crates/turso_durable/src/bucket.rs:373-374`, and `Bucket::seal_start` accepts its own late head).
-- **A crash between the claim's head write and the local-state write** (`crates/turso_durable/src/db.rs:352-358`). The head then names a writer id that nobody holds. The new directory still has `claimed=false` and the old ETag, so reopening it fails `Fenced("… restore again")`. No claim record was written, so the old writer keeps appending; its commits stay in `log/G` and restore. It is fenced at its next seal (the head check). Nothing acked is lost; restore again into a new directory to continue.
+- **A head PUT in flight at a crash.** A writer crashes while its seal's head PUT is in flight (or, in one process, a failed head PUT lands after the retried seal saw the head unchanged). The restarted writer attaches to the old head and acks commits into `log/G`. Then the delayed PUT lands, and the head names generation G+1 with the manifest the crashed attempt uploaded. A restore then misses the commits acked into `log/G` after the restart. They stay unrestorable until that writer's next seal re-uploads G's pages and adopts that head (`crates/turso_durable/src/bucket.rs:409-410`; the seal-start and idle head checks accept this writer's own late head). They are lost for good if, before that seal, the writer restarts again (reconcile replaces the local WAL with the G+1 image) or another process restores and claims.
+- **A crash between the claim's head write and the local-state write** (`crates/turso_durable/src/db.rs:352-358`). The head then names a writer id that nobody holds. The new directory still has `claimed=false` and the old ETag, so reopening it fails `Fenced("… restore again")`. No claim record was written, so the old writer keeps appending; its commits stay in `log/G` and restore. It is fenced at its next seal, or at its first append after `trim_grace / 2` of idle (the head checks). Nothing acked is lost; restore again into a new directory to continue.
 
 **Test and diagnostics hooks.** `Config::on_event`, `turso_durable::Event` and `turso_durable::EventHook` are `#[doc(hidden)]`. They exist for the tests and for the CLI's `soak` event lines, and are not part of the supported API: they may change without notice.
 
@@ -302,7 +306,7 @@ Source: `results/durable-core.txt`. These are laptop figures (Apple M4 Max, macO
 | Page PUTs per seal | 169 | 169–172 in the run, 8 at close |
 | Seal time | 44 ms | 37–44 ms in the run, 4.4 ms at close |
 
-These figures predate the seal-start record. Each seal now also makes one extra log PUT and one head GET before its page PUTs.
+These figures predate the seal-start record and the idle head check. Each seal now also makes one extra log PUT and one head GET before its page PUTs. The first commit after `trim_grace / 2` without a confirmed write (5 min by default) makes one head GET; the bench never idles that long.
 
 Restoring the 5000-commit database (generation 12, 1673 pages, 6.9 MB):
 - The restore itself took 33 ms. It made 4 GETs (`3 + 1` log object) and 1 LIST, and downloaded 4.6 KB.

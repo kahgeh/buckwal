@@ -28,6 +28,7 @@ pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
         },
         upload_concurrency: 8,
         prefetch: false,
+        trim_grace: crate::config::defaults::TRIM_GRACE,
         events: None,
         read_only: false,
     }

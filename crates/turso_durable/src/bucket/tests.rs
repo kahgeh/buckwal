@@ -299,6 +299,100 @@ fn seal_start_accepts_our_own_late_head() {
     assert_eq!(b.seal_generation(vec![], 4096, 2), Ok(3));
 }
 
+/// The idle self-check: an append after `idle_threshold` without a confirmed write GETs the
+/// head first; one before it does not.
+#[test]
+fn append_after_idle_threshold_checks_the_head_first() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.set_idle_threshold(Duration::from_millis(100));
+    let k = keys();
+
+    let before = f.fault.events().len();
+    b.append_log(syncs(1)).unwrap();
+    assert_eq!(
+        f.fault.events()[before..],
+        [format!("put_if_absent {}", k.log(1, 1))],
+        "inside the threshold: no head GET"
+    );
+
+    std::thread::sleep(Duration::from_millis(150));
+    let before = f.fault.events().len();
+    b.append_log(syncs(2)).unwrap();
+    assert_eq!(
+        f.fault.events()[before..],
+        [
+            format!("get {}", k.head()),
+            format!("put_if_absent {}", k.log(1, 2))
+        ],
+        "idle past the threshold: the head is checked first"
+    );
+
+    // The append just confirmed a write: the next one goes straight to the log again.
+    let before = f.fault.events().len();
+    b.append_log(syncs(3)).unwrap();
+    assert_eq!(
+        f.fault.events()[before..],
+        [format!("put_if_absent {}", k.log(1, 3))]
+    );
+}
+
+/// Idle past the threshold with the head moved by another writer (it claimed and sealed
+/// this generation, and its trimmer deleted the log): the append is fenced and writes
+/// nothing, even though its seq is free.
+#[test]
+fn idle_append_with_moved_head_is_fenced_and_writes_nothing() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.set_idle_threshold(Duration::ZERO);
+    b.append_log(syncs(1)).unwrap();
+    let other = Head {
+        format: 1,
+        generation: 2,
+        manifest: Some(1),
+        writer_id: "w2".into(),
+    };
+    f.mem.put(&keys().head(), &other.encode()).unwrap();
+    f.mem.delete(&keys().log(1, 1)).unwrap();
+    let before = f.fault.events().len();
+    assert!(matches!(b.append_log(syncs(2)), Err(Error::Fenced(_))));
+    assert_eq!(
+        f.fault.events()[before..],
+        [format!("get {}", keys().head())]
+    );
+    assert!(f.log_keys(1).is_empty());
+    let n = f.fault.events().len();
+    assert!(matches!(b.append_log(syncs(3)), Err(Error::Fenced(_))));
+    assert_eq!(f.fault.events().len(), n, "fenced for good");
+}
+
+/// Idle past the threshold, single writer: the head is unchanged (or is our own late head
+/// for this generation's seal), so the append proceeds.
+#[test]
+fn idle_append_with_our_head_proceeds() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.set_idle_threshold(Duration::ZERO);
+    assert_eq!(b.append_log(syncs(1)).map(|p| p.seq), Ok(1));
+    assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
+    assert_eq!(
+        b.append_log(syncs(2)).map(|p| (p.generation, p.seq)),
+        Ok((2, 1))
+    );
+    let late = Head {
+        format: 1,
+        generation: 3,
+        manifest: Some(2),
+        writer_id: "w1".into(),
+    };
+    f.mem.put(&keys().head(), &late.encode()).unwrap();
+    assert_eq!(
+        b.append_log(syncs(3)).map(|p| (p.generation, p.seq)),
+        Ok((2, 2))
+    );
+    assert_eq!(f.record(2, 2), Some(ours(3)));
+}
+
 /// An ambiguous seal-start record fails the seal before any upload and stays in doubt; the
 /// next seal settles it at the same seq, then puts a fresh seal-start record after it.
 #[test]
