@@ -101,7 +101,10 @@ pub(crate) fn reconcile(
     } else if cfg.read_only {
         return Err(Error::Unsupported(READ_ONLY));
     } else {
-        let uploaded = bucket.append_log(vec![catch_up_ops(&image, &local)])?;
+        let uploaded = bucket
+            .append_log(vec![catch_up_ops(&image, &local)])
+            .map_err(|f| f.error)?
+            .pos;
         Reconciled::Ahead { uploaded }
     };
     if head.manifest.is_none() {

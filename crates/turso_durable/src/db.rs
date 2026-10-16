@@ -369,7 +369,7 @@ fn attach_existing(
     bucket.set_idle_threshold(cfg.idle_threshold());
     let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
     if !cfg.read_only && (claiming || last_record_is_foreign(&bucket, &state.writer_id, cfg)?) {
-        bucket.append_log(vec![])?;
+        bucket.append_log(vec![]).map_err(|f| f.error)?;
     }
     Ok((bucket, state, Some(reconciled)))
 }

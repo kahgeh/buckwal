@@ -174,7 +174,8 @@ fn run(
         match job {
             Job::Log { ops, reply } => {
                 // A dropped ticket is fine: the object is uploaded either way.
-                let _ = reply.send(bucket.append_log(vec![ops]));
+                let r = bucket.append_log(vec![ops]);
+                let _ = reply.send(r.map(|a| a.pos).map_err(|f| f.error));
             }
             Job::Seal {
                 pages,

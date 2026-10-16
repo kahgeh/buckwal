@@ -33,6 +33,31 @@ pub(crate) struct Counters {
     pub retries: AtomicU64,
 }
 
+/// A log record that `append_log` confirmed in the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Appended {
+    pub pos: LogPos,
+    /// The encoded record's length.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub bytes: u64,
+    /// How much `Counters::retries` grew during the call: its head checks and settle included.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub retries: u64,
+}
+
+/// Why `append_log` did not confirm a record, and whether its syncs can be sent again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppendFailure {
+    pub error: Error,
+    /// `Some(syncs)`, the syncs as passed, when no PUT of this record was attempted: the call
+    /// failed before the record was built (fenced already, or in `check_head`, `check_idle`
+    /// or `settle`). They are in no object and owed nowhere, so they may be sent again.
+    /// `None` when the record went to `put_log`: it is in doubt (owed at its seq, settled by
+    /// the next call) or the writer is fenced. Its syncs must not be sent in another record.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub unsent: Option<Vec<Vec<Op>>>,
+}
+
 /// A log record whose upload failed ambiguously: it may be in the bucket at `pos`.
 struct InDoubt {
     pos: LogPos,
@@ -377,27 +402,78 @@ impl Bucket {
 
     /// Write one log record at the next seq of the current generation.
     /// Every retry in the call shares one deadline, counted from its start.
-    pub(crate) fn append_log(&mut self, syncs: Vec<Vec<Op>>) -> Result<LogPos> {
+    ///
+    /// The record is built only once `check_fenced` and `before_record` have passed; a
+    /// failure before that hands the syncs back as `AppendFailure::unsent`.
+    pub(crate) fn append_log(
+        &mut self,
+        syncs: Vec<Vec<Op>>,
+    ) -> std::result::Result<Appended, AppendFailure> {
         let start = Instant::now();
-        self.check_fenced()?;
-        self.append(start, syncs).map_err(upload_error)
+        let retries = self.counters.retries.load(Relaxed);
+        if let Err(e) = self.check_fenced().and_then(|()| self.before_record(start)) {
+            return Err(AppendFailure {
+                error: upload_error(e),
+                unsent: Some(syncs),
+            });
+        }
+        let body = encode_record(&LogRecord::Extents {
+            writer_id: self.head.writer_id.clone(),
+            syncs,
+        });
+        let bytes = body.len() as u64;
+        match self.put_log(start, body) {
+            Ok(pos) => Ok(Appended {
+                pos,
+                bytes,
+                retries: self.counters.retries.load(Relaxed).saturating_sub(retries),
+            }),
+            Err(e) => Err(AppendFailure {
+                error: upload_error(e),
+                unsent: None,
+            }),
+        }
     }
 
-    fn append(&mut self, start: Instant, syncs: Vec<Vec<Op>>) -> Result<LogPos> {
-        if let HeadCheck::Published(_) = self.check_head(start)? {
+    /// Everything an append does before it builds its record (`catch_up_at`); a head that a
+    /// pending seal may have published refuses the append.
+    fn before_record(&mut self, start: Instant) -> Result<()> {
+        if let HeadCheck::Published(_) = self.catch_up_at(start)? {
             // Only a seal may finish this: it adopts the published head without uploading.
             return Err(Error::UploadFailed(format!(
                 "generation {} may be sealed; seal again before appending",
                 self.head.generation
             )));
         }
+        Ok(())
+    }
+
+    /// Resolve what an earlier failure left owed, without writing a new record: a pending
+    /// seal's head (`check_head`), the idle check (`check_idle`), then the in-doubt record
+    /// (`settle`). With nothing owed it sends no PUT. One deadline, counted from its start.
+    /// A head that a pending seal published is left for the next seal to adopt (`Ok`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn catch_up(&mut self) -> Result<()> {
+        let start = Instant::now();
+        self.check_fenced()?;
+        self.catch_up_at(start).map(|_| ()).map_err(upload_error)
+    }
+
+    /// `check_head`, then `check_idle` and `settle` unless the head is `Published`.
+    fn catch_up_at(&mut self, start: Instant) -> Result<HeadCheck> {
+        if let published @ HeadCheck::Published(_) = self.check_head(start)? {
+            return Ok(published);
+        }
         self.check_idle(start)?;
         self.settle(start)?;
-        let body = encode_record(&LogRecord::Extents {
-            writer_id: self.head.writer_id.clone(),
-            syncs,
-        });
-        self.put_log(start, body)
+        Ok(HeadCheck::Unmoved)
+    }
+
+    /// The writer is fenced, a record is in doubt or a seal's head write is unresolved: the
+    /// next append first has to settle something, or fails.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn degraded(&self) -> bool {
+        self.fenced || self.in_doubt.is_some() || self.pending_seal.is_some()
     }
 
     /// The idle self-check before an append. Another writer's claim record fences this one at
