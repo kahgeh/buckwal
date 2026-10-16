@@ -1,0 +1,110 @@
+# turso_durable stage 1 measurements
+# date: 2026-10-16T11:02:00Z
+# git: fab6bebb9cc6044e68359cc51b2cd7266438d9e1 (durable-core; the measured code, before this file was committed)
+# engine: turso_core 0.8.3 (features fs, json, uuid)
+# RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+# build: cargo build --release --locked -p turso-durable-cli (rustc 1.97.1), target/release/turso-durable
+# machine: Apple M4 Max, macOS 27.0.1
+# laptop figures: macOS, RustFS in podman on the same Mac; not production numbers
+#
+# Workload (bench): one connection, CREATE TABLE bench(id INTEGER PRIMARY KEY, payload BLOB),
+# then N autocommit INSERT OR REPLACE statements of a 1024-byte blob, ids 0..N-1, then close.
+# Default settings (upload concurrency 16, prefetch off). The engine's automatic checkpoint
+# (1000 WAL frames, turso_core storage/wal.rs:4845) is the only checkpoint until close, whose
+# TRUNCATE checkpoint seals the last generation.
+# bench counts: log_puts = log objects after the CREATE TABLE; bucket_puts = every PUT incl.
+# setup (the first head, the CREATE TABLE's record); page_puts = PUTs to pages/ counted at the store.
+#
+# Commands (DURABLE_* from scripts/rustfs.sh env; run id 1792148480):
+#   DURABLE_PREFIX=bench13/1792148480/c500  turso-durable bench --dir <tmp>/c500  --commits 500
+#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable bench --dir <tmp>/c5000 --commits 5000
+#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable restore --dir <tmp>/r5000
+#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable verify  --dir <tmp>/r5000
+#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable sql --dir <tmp>/r5000 "SELECT count(*), min(id), max(id) FROM bench"
+#   (then, for a timed verify of a fresh copy:)
+#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p turso-durable restore --dir <tmp>/r5000b
+#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p turso-durable verify  --dir <tmp>/r5000b
+
+## bench --commits 500 (raw)
+commits=500
+commit_p50_ms=1.282
+commit_p95_ms=1.794
+commit_p99_ms=2.833
+commit_max_ms=3.672
+commit_max_at=1
+commits_per_sec=744.3
+log_puts=500
+log_puts_per_commit=1.000
+bucket_puts=675
+page_puts=169
+seals=1
+seal_1_ms=44.037 seal_1_pages=169
+
+## bench --commits 5000 (raw)
+commits=5000
+commit_p50_ms=1.328
+commit_p95_ms=1.690
+commit_p99_ms=2.053
+commit_max_ms=69.816
+commit_max_at=502
+commits_per_sec=673.5
+log_puts=5010
+log_puts_per_commit=1.002
+bucket_puts=6754
+page_puts=1718
+seals=11
+seal_1_ms=39.420 seal_1_pages=169
+seal_2_ms=38.233 seal_2_pages=170
+seal_3_ms=37.174 seal_3_pages=170
+seal_4_ms=37.392 seal_4_pages=172
+seal_5_ms=44.300 seal_5_pages=172
+seal_6_ms=38.645 seal_6_pages=171
+seal_7_ms=37.214 seal_7_pages=171
+seal_8_ms=39.145 seal_8_pages=172
+seal_9_ms=38.011 seal_9_pages=172
+seal_10_ms=37.016 seal_10_pages=171
+seal_11_ms=4.431 seal_11_pages=8
+
+## restore of the 5000-commit prefix into a fresh directory (raw)
+restored generation=12 log_objects=1 gets=4 lists=1 bytes=4651 ms=33
+verify ok acked=0 present=0 unacked_present=0 duplicate_acks=0
+5000	0	4999
+
+## second restore + timed verify (raw; after the sql open above claimed the prefix)
+restored generation=12 log_objects=3 gets=6 lists=1 bytes=4820 ms=29
+real 0.04
+verify ok acked=0 present=0 unacked_present=0 duplicate_acks=0
+real 0.52
+# after verify, <tmp>/r5000b/app.db = 6852608 bytes = 1673 pages of 4096 (every page fetched lazily)
+
+## Summary
+| Measure                                   | 500 commits | 5000 commits |
+|-------------------------------------------|-------------|--------------|
+| commit p50 / p95 / p99 (ms)               | 1.28 / 1.79 / 2.83 | 1.33 / 1.69 / 2.05 |
+| slowest commit (ms, at commit #)          | 3.67 (#1)   | 69.82 (#502) |
+| commits/s (one connection)                | 744         | 674          |
+| log PUTs per acked commit (no batching)   | 1.000       | 1.002        |
+| seals (incl. the one at close)            | 1           | 11           |
+| page PUTs in total                        | 169         | 1718         |
+| page PUTs per seal (generation boundary)  | 169         | 169-172 (in-run), 8 (close) |
+| seal time (ms)                            | 44.0        | 37.0-44.3 (in-run), 4.4 (close) |
+
+Boundary cost: a seal runs inside the write that restarts the WAL, so the commit that crosses
+a generation boundary waits for that generation's whole page upload. With the default
+automatic checkpoint this commit came about every 500 commits here (about 2 WAL frames per commit).
+- Slowest commit: #502, 69.8 ms (p50 1.33 ms). It crossed the first boundary; that seal
+  (seal_1) took 39.4 ms for 169 pages. bench does not break down the rest.
+- Each in-run seal against its page count: 169 p 39.4 ms, 170 p 38.2, 170 p 37.2, 172 p 37.4,
+  172 p 44.3, 171 p 38.6, 171 p 37.2, 172 p 39.1, 172 p 38.0, 171 p 37.0 (16 PUTs in parallel,
+  then the manifest PUT and the head PUT). Each of those 10 commits took at least its seal's
+  time; all of them sit above p99 (2.05 ms).
+- The close seal (8 pages) took 4.4 ms.
+- Log PUTs: one per acked commit, plus one per WAL restart (the WAL header's own sync):
+  5010 = 5000 + 10.
+
+Restore (5000-commit prefix, generation 12, 1673 pages):
+- 33 ms, 4 GETs (head, manifest, page 1 for the MVCC check, 1 log object = 3 + log_objects),
+  1 LIST, 4651 bytes downloaded. No page is fetched at restore time.
+- Pages arrive lazily on first read: verify (PRAGMA integrity_check, which reads every page)
+  of a fresh restore took 0.52 s wall, process start included, and left all 1673 pages local.
+- The restored copy holds all 5000 rows (count 5000, ids 0..4999).
