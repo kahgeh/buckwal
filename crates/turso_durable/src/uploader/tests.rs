@@ -2,7 +2,9 @@ use super::*;
 use crate::config::Event;
 use crate::format::encode_record;
 use crate::format::{decode_record, Keys, LogRecord};
-use crate::store::{FaultStore, MemStore, ObjectStore, RetryPolicy};
+use crate::store::{
+    CondPut, FaultStore, MemStore, Object, ObjectStore, RetryPolicy, StatsSnap, StoreError,
+};
 use std::time::Duration;
 
 fn fast() -> RetryPolicy {
@@ -598,4 +600,77 @@ fn fence_fails_every_waiting_window_commit_and_later_ones() {
         u.seal_generation(vec![], 4096, 0),
         Err(Error::Fenced(_))
     ));
+}
+
+/// A MemStore whose head GETs fail transiently while `failing` is set, and that counts the
+/// log PUTs it is sent.
+#[derive(Default)]
+struct HeadGetsFail {
+    inner: MemStore,
+    failing: AtomicBool,
+    log_puts: AtomicU64,
+}
+
+impl ObjectStore for HeadGetsFail {
+    fn put(&self, key: &str, body: &[u8]) -> std::result::Result<String, StoreError> {
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> std::result::Result<CondPut, StoreError> {
+        if key.contains("/log/") {
+            self.log_puts.fetch_add(1, SeqCst);
+        }
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> std::result::Result<CondPut, StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError> {
+        if key.ends_with("/head") && self.failing.load(SeqCst) {
+            return Err(StoreError::Transient("injected head GET failure".into()));
+        }
+        self.inner.get(key)
+    }
+    fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> StatsSnap {
+        self.inner.stats()
+    }
+}
+
+#[test]
+fn uploader_is_degraded_while_window_syncs_are_owed() {
+    // With an idle threshold of 0 every append GETs the head first (`check_idle`). While
+    // those GETs fail, the record is never built: no PUT is sent, so the bucket has nothing
+    // to settle (not fenced, nothing in doubt, no seal pending) and is not degraded itself.
+    // Only the owed Window sync makes the uploader degraded.
+    let store = Arc::new(HeadGetsFail::default());
+    let mut b = bucket_with(store.clone(), short());
+    b.set_idle_threshold(Duration::ZERO);
+    let u = Uploader::spawn(b, None, None, Arc::default());
+    store.failing.store(true, SeqCst);
+    let t = u.submit_log(op(1), window(10, 64));
+    assert!(matches!(t.wait(), Err(Error::Timeout(_))));
+    assert_eq!(store.log_puts.load(SeqCst), 0, "no record was built");
+    assert!(u.degraded(), "a Window sync is owed");
+    // It stays degraded while the owed sync keeps failing (retried every MAX_BACKOFF).
+    std::thread::sleep(defaults::MAX_BACKOFF + Duration::from_millis(500));
+    assert!(u.degraded(), "the owed sync still has not landed");
+    assert_eq!(store.log_puts.load(SeqCst), 0);
+
+    store.failing.store(false, SeqCst);
+    let until = Instant::now() + defaults::MAX_BACKOFF * 3;
+    while u.degraded() {
+        assert!(Instant::now() < until, "the owed sync never landed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(logged_ops(&store.inner, 1), vec![op(1)]);
 }
