@@ -330,6 +330,18 @@ pub(crate) struct EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idle check's margin is exactly half the trim grace (`Bucket::check_idle`).
+    #[test]
+    fn idle_threshold_is_half_the_trim_grace() {
+        let mut c = Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s");
+        c.trim_grace = Duration::from_millis(200);
+        assert_eq!(c.engine(false).idle_threshold(), Duration::from_millis(100));
+        c.trim_grace = Duration::ZERO;
+        assert_eq!(c.engine(false).idle_threshold(), Duration::ZERO);
+        c.trim_grace = Duration::from_secs(600);
+        assert_eq!(c.engine(false).idle_threshold(), Duration::from_secs(300));
+    }
     use std::collections::HashMap;
 
     fn required() -> HashMap<&'static str, &'static str> {

@@ -412,7 +412,8 @@ impl Bucket {
     /// - every writer on the prefix uses the same trim grace; a claimer whose grace is
     ///   smaller than this writer's can trim `log/G` before this writer's check is due;
     /// - the trim grace exceeds 2 × (retry deadline + request timeout): an append that
-    ///   skipped the check can still land up to that long after the timer's last refresh;
+    ///   skipped the check can still land up to trim grace / 2 + retry deadline + request
+    ///   timeout after the timer's last refresh, which stays below the trim grace only then;
     /// - a trim grace of 0 (tests only) checks before every append, but the claimer's
     ///   trimmer then deletes `log/G` at once, inside any in-flight append's window.
     ///
