@@ -319,7 +319,8 @@ pub enum Event {
     /// many commits the batch now holds.
     BatchWaiting { commits: u64 },
     /// A `Connection` call returned after commit number `commit`, made with `batching`, was
-    /// confirmed in the bucket.
+    /// confirmed in the bucket. `batching` is the setting the commit was made with, even when
+    /// a degraded uploader made a Window commit take the blocking `Off` path.
     CommitAcked { commit: u64, batching: Batching },
     /// Sealing `generation` began with `pages` dirty pages to upload.
     SealStarted { generation: u64, pages: u64 },

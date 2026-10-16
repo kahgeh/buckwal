@@ -161,7 +161,7 @@ const PER_PHASE: usize = 10;
 fn run_phases(db: &Database, phases: &[Phase]) -> Vec<((u64, u64), UploadStats)> {
     let c = db.connect().unwrap();
     create(&c);
-    // start, settings applied, end
+    // start, settings applied (workers released), end
     let barrier = Arc::new(Barrier::new(THREADS + 1));
     let threads: Vec<_> = (0..THREADS)
         .map(|t| {
@@ -186,8 +186,9 @@ fn run_phases(db: &Database, phases: &[Phase]) -> Vec<((u64, u64), UploadStats)>
     for phase in phases {
         db.set_batching(phase.db).unwrap();
         barrier.wait();
-        barrier.wait();
+        // Between the two waits: no worker inserts before the second one releases them.
         let s0 = db.upload_stats();
+        barrier.wait();
         barrier.wait();
         let s1 = db.upload_stats();
         out.push((delta(&s0, &s1), s1));
