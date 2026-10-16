@@ -155,6 +155,11 @@ impl Shared {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn maintenance(&self) -> Option<&Maintenance> {
+        self.maintenance.as_ref()
+    }
+
     /// The engine, while the database is open (maintenance connects to it).
     pub(crate) fn engine_db(&self) -> Option<Arc<turso_core::Database>> {
         lock(&self.open).as_ref().map(|o| o.engine.db.clone())

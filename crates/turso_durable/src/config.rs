@@ -47,9 +47,13 @@ pub mod defaults {
     /// (`DURABLE_MAINTENANCE_GATE_WAIT_MS`). It bounds the stall a maintenance run adds to
     /// a commit.
     pub const MAINTENANCE_GATE_WAIT: Duration = Duration::from_millis(500);
-    /// After a skipped or failed maintenance run, the next one waits at least this long
-    /// (unless the generation passes twice a threshold). Fixed.
+    /// After a skipped or failed maintenance run, the next one waits at least this long.
+    /// Repeated gate timeouts and busy refusals double it, up to `MAINTENANCE_RETRY_MAX`; a
+    /// failed run is retried sooner only once the generation grows by another threshold.
+    /// Fixed.
     pub const MAINTENANCE_RETRY: Duration = Duration::from_secs(1);
+    /// The longest backoff between maintenance runs. Fixed.
+    pub const MAINTENANCE_RETRY_MAX: Duration = Duration::from_secs(30);
     pub const REGION: &str = "us-east-1";
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.
@@ -415,18 +419,19 @@ pub enum Event {
         log_objects: u64,
         wal_bytes: u64,
     },
-    /// A maintenance checkpoint of `generation` ran: `sealed` when it ended the generation.
-    /// `gate_wait` is how long it held new calls back before the checkpoint started;
-    /// `elapsed` is the whole run, the checkpoint (and its seal) included.
+    /// A maintenance checkpoint sealed `generation`. `gate_wait` is how long it held new
+    /// calls back before the checkpoint started; `elapsed` is the whole run, the checkpoint
+    /// (and its seal) included.
     MaintenanceFinished {
         generation: u64,
-        sealed: bool,
         gate_wait: Duration,
         elapsed: Duration,
     },
-    /// A maintenance run of `generation` did not checkpoint, and is retried later: `reason`
-    /// is `gate_timeout` (calls or an open transaction still in flight at the gate wait),
-    /// `busy` (the engine refused the checkpoint) or `error: <message>`.
+    /// A maintenance run of `generation` did not seal, and is retried later: `reason` is
+    /// `bucket degraded` or `last bucket operation failed` (it did not start: no
+    /// `MaintenanceStarted`, the gate stayed open), `gate_timeout` (calls or an open
+    /// transaction still in flight at the gate wait), `busy` (the engine refused the
+    /// checkpoint), `closed` (the database was closing) or `error: <message>`.
     MaintenanceSkipped { generation: u64, reason: String },
 }
 

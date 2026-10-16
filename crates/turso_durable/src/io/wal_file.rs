@@ -344,9 +344,12 @@ impl File for ShippingFile {
                 self.seal().map_err(stash)?;
             }
             *h = None;
+        }
+        let r = self.inner.truncate(len, c);
+        if len == 0 && r.is_ok() {
             self.high_water.store(0, SeqCst);
         }
-        self.record_if_ok(vec![Op::Truncate { len }], self.inner.truncate(len, c))
+        self.record_if_ok(vec![Op::Truncate { len }], r)
     }
 }
 
@@ -421,5 +424,27 @@ mod tests {
             .is_err());
         assert!(f.truncate(4096, Completion::new_trunc(|_| {})).is_err());
         assert_eq!(f.pending.lock().unwrap().len(), 0, "phantom ops recorded");
+    }
+
+    /// A `truncate(0)` the inner file refused leaves the `-wal` as long as it was, so the
+    /// maintenance measure keeps its value.
+    #[test]
+    fn refused_truncate_keeps_the_high_water_mark() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem, d.path());
+        let high_water = Arc::new(AtomicU64::new(0));
+        let f = ShippingFile::new(
+            Arc::new(Refusing),
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            e.uploader.clone(),
+            e.storage.clone(),
+            high_water.clone(),
+            false,
+        )
+        .unwrap();
+        high_water.store(4096, SeqCst);
+        assert!(f.truncate(0, Completion::new_trunc(|_| {})).is_err());
+        assert_eq!(high_water.load(SeqCst), 4096);
     }
 }

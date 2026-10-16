@@ -89,6 +89,9 @@ pub(crate) struct Uploader {
     /// How many log objects the current generation holds (the bucket's next seq − 1).
     log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
+    /// The last bucket operation (a log upload, a seal, or a degraded bucket's catch-up)
+    /// failed; cleared by the next that succeeds.
+    last_failed: Arc<AtomicBool>,
     stats: Arc<StatsCell>,
     #[cfg_attr(not(test), allow(dead_code))]
     counters: Arc<Counters>,
@@ -105,6 +108,7 @@ impl Uploader {
         let generation = Arc::new(AtomicU64::new(bucket.head().generation));
         let log_objects = Arc::new(AtomicU64::new(bucket.next_seq().saturating_sub(1)));
         let degraded = Arc::new(AtomicBool::new(bucket.degraded()));
+        let last_failed = Arc::new(AtomicBool::new(false));
         let counters = bucket.counters();
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
@@ -114,6 +118,7 @@ impl Uploader {
             generation: generation.clone(),
             log_objects: log_objects.clone(),
             degraded: degraded.clone(),
+            last_failed: last_failed.clone(),
             stats: stats.clone(),
             events,
             trim_tx,
@@ -131,6 +136,7 @@ impl Uploader {
             generation,
             log_objects,
             degraded,
+            last_failed,
             stats,
             counters,
         })
@@ -199,6 +205,18 @@ impl Uploader {
         self.log_objects.load(SeqCst)
     }
 
+    /// Why the bucket looks unable to take a seal now, if it does: the uploader is degraded,
+    /// or its last bucket operation failed. Maintenance does not start a run then.
+    pub(crate) fn bucket_failing(&self) -> Option<&'static str> {
+        if self.degraded() {
+            Some("bucket degraded")
+        } else if self.last_failed.load(SeqCst) {
+            Some("last bucket operation failed")
+        } else {
+            None
+        }
+    }
+
     /// The bucket has something to settle (fenced, a record in doubt, a seal's head write
     /// unresolved) or Window syncs are owed. Updated after every job, before its replies.
     pub(crate) fn degraded(&self) -> bool {
@@ -256,6 +274,7 @@ struct Worker {
     generation: Arc<AtomicU64>,
     log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
+    last_failed: Arc<AtomicBool>,
     stats: Arc<StatsCell>,
     events: Option<EventHook>,
     trim_tx: Option<Sender<TrimSnapshot>>,
@@ -294,6 +313,7 @@ impl Worker {
                 }) => {
                     let r = self.seal(pages, page_size, page_count, &parent);
                     drop(parent);
+                    self.last_failed.store(r.is_err(), SeqCst);
                     self.publish_degraded();
                     let _ = reply.send(r);
                 }
@@ -347,7 +367,8 @@ impl Worker {
             None => {
                 if self.bucket.degraded() {
                     // A failure leaves it degraded; the next tick tries again.
-                    let _ = self.bucket.catch_up();
+                    let ok = self.bucket.catch_up().is_ok();
+                    self.last_failed.store(!ok, SeqCst);
                 }
                 self.publish_degraded();
             }
@@ -409,6 +430,7 @@ impl Worker {
                 // its ack also sees the record.
                 let commits: Vec<u64> = waiters.iter().map(|(_, c, _)| *c).collect();
                 self.stats.record_put(commits.len() as u64, a.bytes);
+                self.last_failed.store(false, SeqCst);
                 self.emit(Event::LogUploaded {
                     generation: a.pos.generation,
                     seq: a.pos.seq,
@@ -447,6 +469,7 @@ impl Worker {
                     None => {}
                 }
                 drop(commit_spans);
+                self.last_failed.store(true, SeqCst);
                 self.publish_degraded();
                 for (_, _, reply) in waiters {
                     let _ = reply.send(Err(error.clone()));

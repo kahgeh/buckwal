@@ -1006,6 +1006,39 @@ struct Figures {
     elapsed: Duration,
 }
 
+/// Wait until every maintenance run that started has ended, and none starts for 100 ms, so
+/// a restore is not taken in the middle of a seal.
+fn wait_maintenance_quiet(rec: &Recorder) {
+    let until = Instant::now() + Duration::from_secs(10);
+    let open_runs = |ev: &[Event]| {
+        let started = ev
+            .iter()
+            .filter(|e| matches!(e, Event::MaintenanceStarted { .. }))
+            .count();
+        let ended = ev
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::MaintenanceFinished { .. } | Event::MaintenanceSkipped { .. }
+                )
+            })
+            .count();
+        (started, started.saturating_sub(ended))
+    };
+    loop {
+        let (started, open) = open_runs(&rec.events());
+        if open == 0 {
+            thread::sleep(Duration::from_millis(100));
+            if open_runs(&rec.events()) == (started, 0) {
+                return;
+            }
+        }
+        assert!(Instant::now() < until, "a maintenance run never ended");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Each finished maintenance run's (gate_wait, elapsed).
 fn finished(ev: &[Event]) -> impl Iterator<Item = (Duration, Duration)> + '_ {
     ev.iter().filter_map(|e| match e {
@@ -1076,6 +1109,7 @@ fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Du
         .collect();
     let busy_retries = threads.into_iter().map(|h| h.join().unwrap()).sum();
     let elapsed = t.elapsed();
+    wait_maintenance_quiet(&rec);
     let ev = rec.events();
     let under_load = &ev[..load_end.lock().unwrap().expect("a connection ran out")];
     let restored = tempfile::tempdir().unwrap();
@@ -1192,7 +1226,7 @@ fn maintenance_waits_out_an_open_transaction_and_retries() {
     assert_eq!(count(&reader), 0);
     reader.execute("COMMIT", &[]).unwrap();
     insert(&c, 40).unwrap();
-    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { sealed: true, .. }));
+    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { .. }));
     assert!(seals(&rec.events()) >= 1);
     reader.close().unwrap();
     c.close().unwrap();
@@ -1316,7 +1350,7 @@ fn maintenance_never_fails_a_commit() {
     let failed_at = rec.events().len();
     commit_all(160, 20);
     commit_all(320, 20);
-    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { sealed: true, .. }));
+    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { .. }));
     assert!(seals(&rec.events()[failed_at..]) >= 1);
     c.close().unwrap();
     db.close().unwrap();
@@ -1408,21 +1442,24 @@ fn maintenance_off_when_both_thresholds_zero() {
     reader.execute("COMMIT", &[]).unwrap();
 }
 
+/// A read-only open never runs maintenance, even with the generation far past both
+/// thresholds: the restored copy is taken while the writer is open, so its generation holds
+/// every commit's log object and its `-wal` every frame.
 #[test]
 fn read_only_open_runs_no_maintenance() {
     let store = mem();
-    {
-        let (_d, db) = open(store.clone(), Recorder::default());
-        let c = db.connect().unwrap();
-        create(&c);
-        for x in 0..30 {
-            insert(&c, x).unwrap();
-        }
-        c.close().unwrap();
-        db.close().unwrap();
+    let (_wd, writer) = open_with(store.clone(), Recorder::default(), |c| {
+        c.maintenance_log_objects = 0;
+        c.maintenance_wal_bytes = 0;
+    });
+    let w = writer.connect().unwrap();
+    create(&w);
+    for x in 0..30 {
+        insert(&w, x).unwrap();
     }
     let dir = tempfile::tempdir().unwrap();
-    restore_with_store(&config(dir.path()), store.clone(), dir.path()).unwrap();
+    let report = restore_with_store(&config(dir.path()), store.clone(), dir.path()).unwrap();
+    assert!(report.log_objects >= 30, "{report:?}");
     let rec = Recorder::default();
     let mut cfg = config(dir.path());
     cfg.on_event = Some(rec.hook());
@@ -1436,8 +1473,128 @@ fn read_only_open_runs_no_maintenance() {
     thread::sleep(Duration::from_millis(200));
     let ev = rec.events();
     assert!(
-        !ev.iter()
-            .any(|e| matches!(e, Event::MaintenanceStarted { .. })),
+        !ev.iter().any(|e| matches!(
+            e,
+            Event::MaintenanceStarted { .. }
+                | Event::MaintenanceSkipped { .. }
+                | Event::MaintenanceFinished { .. }
+        )),
         "{ev:?}"
     );
+    c.close().unwrap();
+    db.close().unwrap();
+    w.close().unwrap();
+    writer.close().unwrap();
+}
+
+/// A read transaction held open far longer than `gate_wait` while another connection
+/// commits well past twice the threshold: the runs time out at the gate, and each one backs
+/// off at least `retry` (doubling), so the gate is closed rarely and the committer barely
+/// waits on average.
+#[test]
+fn a_long_transaction_does_not_close_the_gate_back_to_back() {
+    let rec = Recorder::default();
+    let store = mem();
+    let gate_wait = Duration::from_millis(500);
+    let (_d, db) = open_with(store.clone(), rec.clone(), |c| {
+        c.maintenance_log_objects = 20;
+        c.maintenance_wal_bytes = 0;
+        c.maintenance_gate_wait = gate_wait;
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN", &[]).unwrap();
+    count(&reader);
+    let t = Instant::now();
+    let (mut commits, mut waited) = (0u32, Duration::ZERO);
+    while t.elapsed() < Duration::from_secs(4) {
+        let s = Instant::now();
+        insert(&c, commits as i64).unwrap();
+        waited += s.elapsed();
+        commits += 1;
+    }
+    let elapsed = t.elapsed();
+    let ev = rec.events();
+    let started = ev
+        .iter()
+        .filter(|e| matches!(e, Event::MaintenanceStarted { .. }))
+        .count();
+    let avg = waited / commits;
+    eprintln!("long transaction: {commits} commits in {elapsed:?}, {started} runs, avg {avg:?}");
+    assert!(commits > 40, "never past 2× the threshold: {commits}");
+    assert!(started >= 1);
+    // 1 s retry, doubling: runs at about 0, 1.5, 4 s.
+    assert!(
+        started as u64 <= elapsed.as_secs() + 1,
+        "{started} runs in {elapsed:?}"
+    );
+    assert!(avg < gate_wait / 10, "average commit {avg:?}");
+    assert_eq!(seals(&ev), 0);
+    reader.execute("COMMIT", &[]).unwrap();
+    reader.close().unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+}
+
+/// While the bucket fails, maintenance does not start a run (it would hold every call at
+/// the gate behind a seal that cannot finish): it skips and backs off, and reads on other
+/// connections never wait. After recovery it seals.
+#[test]
+fn maintenance_skips_while_the_bucket_fails_and_reads_never_wait() {
+    let rec = Recorder::default();
+    let gate_wait = Duration::from_secs(2);
+    let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
+    let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
+        c.retry_deadline = Duration::from_millis(200);
+        c.request_timeout = Duration::from_millis(50);
+        c.maintenance_log_objects = 0;
+        c.maintenance_wal_bytes = 64 << 10;
+        c.maintenance_gate_wait = gate_wait;
+    });
+    fault.only_keys_containing("log/");
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE b(v BLOB)", &[]).unwrap();
+    let reader = db.connect().unwrap();
+    assert_eq!(
+        reader.query("SELECT count(*) FROM b", &[]).unwrap()[0][0].as_int(),
+        Some(0)
+    );
+    fault.fail_puts_after(0);
+    // A Window commit whose upload fails leaves the uploader degraded (owed).
+    c.set_batching(Some(w(1, 64, 1 << 20))).unwrap();
+    assert!(c
+        .execute("INSERT INTO b VALUES (randomblob(100))", &[])
+        .is_err());
+    // Now the -wal passes the threshold (a commit the failed upload rolls back still wrote
+    // its frames), with the bucket failing.
+    let r = c.execute("INSERT INTO b VALUES (randomblob(200000))", &[]);
+    assert!(r.is_err(), "{r:?}");
+    rec.wait_for(
+        |e| matches!(e, Event::MaintenanceSkipped { reason, .. } if reason.starts_with("bucket")),
+    );
+    let mut slowest = Duration::ZERO;
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(1500) {
+        let s = Instant::now();
+        reader.query("SELECT count(*) FROM b", &[]).unwrap();
+        slowest = slowest.max(s.elapsed());
+    }
+    let ev = rec.events();
+    assert!(
+        !ev.iter()
+            .any(|e| matches!(e, Event::MaintenanceStarted { .. })),
+        "the gate was closed while the bucket failed: {ev:?}"
+    );
+    let skips = ev
+        .iter()
+        .filter(|e| matches!(e, Event::MaintenanceSkipped { .. }))
+        .count();
+    eprintln!("bucket failing: {skips} skips, 0 runs started, slowest read {slowest:?}");
+    assert!(slowest < gate_wait / 10, "a read waited {slowest:?}");
+    fault.fail_puts_after(u64::MAX);
+    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { .. }));
+    reader.close().unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
 }

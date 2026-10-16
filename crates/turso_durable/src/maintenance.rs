@@ -12,8 +12,12 @@
 //!   same path as a user's checkpoint (`ShippingFile::truncate`), which flushes every batched
 //!   commit first.
 //!
-//! A run that cannot drain the gate, finds the engine busy, or fails backs off for `retry`
-//! (sooner once the generation passes twice a threshold). Its outcome is an event, a
+//! No run starts while the bucket looks unable to take a seal (the uploader is degraded or
+//! its last upload failed): the gate would stay closed for the seal's whole retry deadline.
+//! A run that is skipped, cannot drain the gate, finds the engine busy or fails backs off
+//! for `retry`; repeated gate timeouts and busy refusals double it up to `retry_max`
+//! (growth does not fix their cause), and a failed run is retried sooner only once the
+//! generation has grown by another threshold. Its outcome is an event, a
 //! `durable.maintenance` span and, on failure, a warning: never an error to any caller.
 use crate::batching::{ctx, Batching};
 use crate::config::{defaults, Config, Event};
@@ -22,7 +26,8 @@ use crate::db::{lock, Shared};
 use crate::engine::engine_error;
 use crate::error::Error;
 use crate::io::stash;
-use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -40,6 +45,8 @@ pub(crate) struct MaintenanceConfig {
     pub gate_wait: Duration,
     /// The least time between a skipped or failed run and the next.
     pub retry: Duration,
+    /// The longest backoff (repeated gate timeouts and busy refusals double `retry`).
+    pub retry_max: Duration,
 }
 
 impl MaintenanceConfig {
@@ -49,6 +56,7 @@ impl MaintenanceConfig {
             wal_bytes: c.maintenance_wal_bytes,
             gate_wait: c.maintenance_gate_wait,
             retry: defaults::MAINTENANCE_RETRY,
+            retry_max: defaults::MAINTENANCE_RETRY_MAX,
         }
     }
 
@@ -57,21 +65,34 @@ impl MaintenanceConfig {
         self.log_objects > 0 || self.wal_bytes > 0
     }
 
-    /// The generation has reached `factor` × a threshold that is on.
-    fn reached(&self, log_objects: u64, wal_bytes: u64, factor: u64) -> bool {
-        let over = |n: u64, threshold: u64| threshold > 0 && n >= threshold.saturating_mul(factor);
+    /// The generation is due for maintenance.
+    pub(crate) fn due(&self, log_objects: u64, wal_bytes: u64) -> bool {
+        let over = |n: u64, threshold: u64| threshold > 0 && n >= threshold;
         over(log_objects, self.log_objects) || over(wal_bytes, self.wal_bytes)
     }
 
-    /// The generation is due for maintenance.
-    pub(crate) fn due(&self, log_objects: u64, wal_bytes: u64) -> bool {
-        self.reached(log_objects, wal_bytes, 1)
+    /// The measures at which a run that failed at (`log_objects`, `wal_bytes`) may be retried
+    /// before its backoff ends: one more threshold of growth (`u64::MAX`: never, for a
+    /// measure that is off).
+    fn bypass_at(&self, log_objects: u64, wal_bytes: u64) -> (u64, u64) {
+        let at = |n: u64, threshold: u64| {
+            if threshold == 0 {
+                u64::MAX
+            } else {
+                n.saturating_add(threshold)
+            }
+        };
+        (
+            at(log_objects, self.log_objects),
+            at(wal_bytes, self.wal_bytes),
+        )
     }
+}
 
-    /// Past twice a threshold: a run backing off is retried at once.
-    pub(crate) fn overdue(&self, log_objects: u64, wal_bytes: u64) -> bool {
-        self.reached(log_objects, wal_bytes, 2)
-    }
+/// The `n`th backoff in a row (from 1): `retry` doubled `n − 1` times, at most `max`.
+pub(crate) fn backoff(retry: Duration, n: u32, max: Duration) -> Duration {
+    let doublings = n.saturating_sub(1).min(31);
+    retry.saturating_mul(1 << doublings).min(max)
 }
 
 #[derive(Debug, Default)]
@@ -172,11 +193,31 @@ struct Wake {
     stop: bool,
 }
 
-#[derive(Default)]
 struct Signal {
     wake: Mutex<Wake>,
     cv: Condvar,
     phase: AtomicU8,
+    /// While backing off after a failed run: the log objects and `-wal` bytes at which a
+    /// poke retries at once (`u64::MAX`: wait out the backoff).
+    bypass_log: AtomicU64,
+    bypass_wal: AtomicU64,
+    /// Tests: the next run panics.
+    #[cfg(test)]
+    panic_next: std::sync::atomic::AtomicBool,
+}
+
+impl Default for Signal {
+    fn default() -> Signal {
+        Signal {
+            wake: Mutex::default(),
+            cv: Condvar::new(),
+            phase: AtomicU8::new(IDLE),
+            bypass_log: AtomicU64::new(u64::MAX),
+            bypass_wal: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            panic_next: Default::default(),
+        }
+    }
 }
 
 /// The maintenance thread of one writer open; see the module docs.
@@ -190,8 +231,12 @@ pub(crate) struct Maintenance {
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Sealed,
+    /// Not started: the bucket looked unable to take a seal.
+    BucketFailing,
     Busy,
     GateTimeout,
+    /// The database was closing.
+    Closed,
     Error,
 }
 
@@ -199,8 +244,10 @@ impl Outcome {
     fn as_str(&self) -> &'static str {
         match self {
             Outcome::Sealed => "sealed",
+            Outcome::BucketFailing => "bucket_failing",
             Outcome::Busy => "busy",
             Outcome::GateTimeout => "gate_timeout",
+            Outcome::Closed => "closed",
             Outcome::Error => "error",
         }
     }
@@ -229,15 +276,18 @@ impl Maintenance {
     }
 
     /// After a call: wake the thread when the generation is due and no run is in progress,
-    /// nor backing off (unless the generation is overdue). Only atomic loads when nothing is
-    /// due; it never blocks.
+    /// nor backing off (unless a failed run's generation has grown by another threshold
+    /// since). Only atomic loads when nothing is due; it never blocks.
     pub(crate) fn poke(&self, log_objects: u64, wal_bytes: u64) {
         if !self.cfg.due(log_objects, wal_bytes) {
             return;
         }
-        let from = match self.signal.phase.load(SeqCst) {
+        let s = &self.signal;
+        let grown =
+            || log_objects >= s.bypass_log.load(SeqCst) || wal_bytes >= s.bypass_wal.load(SeqCst);
+        let from = match s.phase.load(SeqCst) {
             IDLE => IDLE,
-            BACKOFF if self.cfg.overdue(log_objects, wal_bytes) => BACKOFF,
+            BACKOFF if grown() => BACKOFF,
             _ => return,
         };
         // Only the caller that moves it to RUNNING wakes it.
@@ -249,6 +299,12 @@ impl Maintenance {
         {
             self.wake();
         }
+    }
+
+    /// Tests: the next run panics.
+    #[cfg(test)]
+    pub(crate) fn panic_next_run(&self) {
+        self.signal.panic_next.store(true, SeqCst);
     }
 
     /// Wake the thread for a run (it checks the thresholds again first).
@@ -278,6 +334,8 @@ impl Maintenance {
 /// due. Exits once stopped or the database is gone.
 fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
     let mut retry_at: Option<Instant> = None;
+    // Gate timeouts and busy refusals in a row: each doubles the backoff.
+    let mut held_off = 0u32;
     loop {
         {
             let mut w = lock(&signal.wake);
@@ -308,23 +366,56 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
             return;
         };
         let (log_objects, wal_bytes) = shared.maintenance_measures();
-        let outcome = cfg
-            .due(log_objects, wal_bytes)
-            .then(|| run_once(&shared, cfg, log_objects, wal_bytes));
+        let outcome = cfg.due(log_objects, wal_bytes).then(|| {
+            // A panic must not end maintenance for good (the gate is reopened by `Reopen`).
+            catch_unwind(AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if signal.panic_next.swap(false, SeqCst) {
+                    panic!("injected maintenance panic");
+                }
+                run_once(&shared, cfg, log_objects, wal_bytes)
+            }))
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    target: "turso_durable",
+                    "maintenance checkpoint panicked; retrying later"
+                );
+                Outcome::Error
+            })
+        });
         // Dropped here, not at the loop's end: when it is the last handle, the database
         // closes on this thread (`Shared::finish` then does not join it).
         drop(shared);
-        if matches!(outcome, None | Some(Outcome::Sealed)) {
-            retry_at = None;
-            signal.phase.store(IDLE, SeqCst);
-        } else {
-            retry_at = Some(Instant::now() + cfg.retry);
-            signal.phase.store(BACKOFF, SeqCst);
+        let (mut bypass_log, mut bypass_wal) = (u64::MAX, u64::MAX);
+        let delay = match outcome {
+            None | Some(Outcome::Sealed) => None,
+            Some(Outcome::GateTimeout | Outcome::Busy) => {
+                held_off = held_off.saturating_add(1);
+                Some(backoff(cfg.retry, held_off, cfg.retry_max))
+            }
+            Some(Outcome::Error) => {
+                (bypass_log, bypass_wal) = cfg.bypass_at(log_objects, wal_bytes);
+                Some(cfg.retry)
+            }
+            Some(Outcome::BucketFailing | Outcome::Closed) => Some(cfg.retry),
+        };
+        signal.bypass_log.store(bypass_log, SeqCst);
+        signal.bypass_wal.store(bypass_wal, SeqCst);
+        match delay {
+            None => {
+                held_off = 0;
+                retry_at = None;
+                signal.phase.store(IDLE, SeqCst);
+            }
+            Some(d) => {
+                retry_at = Some(Instant::now() + d);
+                signal.phase.store(BACKOFF, SeqCst);
+            }
         }
     }
 }
 
-/// One run: close and drain the gate, checkpoint, reopen.
+/// One run: unless the bucket is failing, close and drain the gate, checkpoint, reopen.
 fn run_once(shared: &Shared, cfg: &MaintenanceConfig, log_objects: u64, wal_bytes: u64) -> Outcome {
     let generation = shared.uploader.generation();
     let span = tracing::info_span!(
@@ -337,6 +428,21 @@ fn run_once(shared: &Shared, cfg: &MaintenanceConfig, log_objects: u64, wal_byte
         durable.outcome = Empty,
     );
     let _entered = span.enter();
+    if let Some(reason) = shared.uploader.bucket_failing() {
+        let outcome = Outcome::BucketFailing;
+        span.record("durable.outcome", outcome.as_str());
+        tracing::info!(
+            target: "turso_durable",
+            generation,
+            reason,
+            "maintenance checkpoint not started; retrying later"
+        );
+        shared.emit(Event::MaintenanceSkipped {
+            generation,
+            reason: reason.to_string(),
+        });
+        return outcome;
+    }
     shared.emit(Event::MaintenanceStarted {
         generation,
         log_objects,
@@ -366,7 +472,6 @@ fn run_once(shared: &Shared, cfg: &MaintenanceConfig, log_objects: u64, wal_byte
     match reason {
         None => shared.emit(Event::MaintenanceFinished {
             generation,
-            sealed,
             gate_wait,
             elapsed: start.elapsed(),
         }),
@@ -397,8 +502,9 @@ fn run_once(shared: &Shared, cfg: &MaintenanceConfig, log_objects: u64, wal_byte
 /// counted, no gate), set up as `Connection::new` sets one up, inside an `Off` commit context.
 fn checkpoint(shared: &Shared) -> Result<(), (Outcome, String)> {
     let error = |e: Error| (Outcome::Error, format!("error: {e}"));
+    // `Database::close` took the engine and waits for this run (`Shared::finish`).
     let Some(db) = shared.engine_db() else {
-        return Err(error(Error::Config("the database is closed".into())));
+        return Err((Outcome::Closed, "closed".to_string()));
     };
     let _ctx = ctx::enter(Batching::Off);
     stash::clear();
