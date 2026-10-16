@@ -1,6 +1,6 @@
 //! The background uploader: one thread that owns the [`Bucket`] and runs its jobs in FIFO
 //! order, so a seal can never overtake a log object submitted before it.
-// Only tests use this until the WAL wrapper (Task 7) does.
+// The engine (Task 7) uses this; its first non-test user is the public `Database` (Task 10).
 #![allow(dead_code)]
 
 use crate::bucket::{Bucket, Counters, LogPos};

@@ -5,7 +5,8 @@
 //! log never forks: a record that may or may not have landed stays "in doubt" and is settled
 //! at the same position before anything else is written, and a position or head held by
 //! another writer fences this one for good.
-// Only the uploader and tests use this until the WAL wrapper (Task 7) does.
+// The engine (Task 7) uses this through the uploader; its first non-test user is the public
+// `Database` (Task 10).
 #![allow(dead_code)]
 
 use crate::config::{Event, EventHook};
@@ -218,6 +219,14 @@ impl Bucket {
             .retries
             .store(counters.retries.load(Relaxed), Relaxed);
         Ok(b)
+    }
+
+    pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
+    pub(crate) fn keys(&self) -> &Keys {
+        &self.keys
     }
 
     pub(crate) fn head(&self) -> &Head {

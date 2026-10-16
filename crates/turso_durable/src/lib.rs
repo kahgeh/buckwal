@@ -2,8 +2,11 @@
 
 pub(crate) mod bucket;
 pub mod config;
+pub(crate) mod engine;
 pub mod error;
 pub(crate) mod format;
+pub(crate) mod io;
+pub(crate) mod restore;
 pub mod store;
 pub(crate) mod uploader;
 

@@ -1,4 +1,5 @@
 //! Public configuration types.
+use crate::store::RetryPolicy;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,4 +22,17 @@ pub enum Event {
     SealFinished { generation: u64, elapsed: Duration },
     /// The trimmer deleted `deleted` objects no head can reach any more.
     Trimmed { deleted: u64 },
+}
+
+/// How the engine talks to the bucket.
+#[derive(Clone)]
+pub(crate) struct EngineConfig {
+    /// Every bucket call, page fetches included.
+    pub retry: RetryPolicy,
+    /// Parallel log GETs in a restore; the caller builds its `Bucket` with it too (parallel
+    /// page uploads in a seal).
+    pub upload_concurrency: usize,
+    /// Fetch every sealed page in the background after open.
+    pub prefetch: bool,
+    pub events: Option<EventHook>,
 }

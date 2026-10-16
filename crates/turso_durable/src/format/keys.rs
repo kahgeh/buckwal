@@ -1,5 +1,6 @@
 //! Object key layout. Generation is `{:010}`, seq `{:020}`, page `{:010}`.
 
+#[derive(Debug, Clone)]
 pub(crate) struct Keys {
     prefix: String,
 }
