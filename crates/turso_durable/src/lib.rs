@@ -16,7 +16,10 @@ pub mod store;
 pub(crate) mod trim;
 pub(crate) mod uploader;
 
-pub use config::{Config, Event, EventHook};
+pub use config::Config;
+/// Test and diagnostics hooks (`Config::on_event`), not part of the supported API.
+#[doc(hidden)]
+pub use config::{Event, EventHook};
 pub use conn::{CheckpointMode, Connection, Transaction};
 pub use db::{is_claimed, open, Database};
 #[doc(hidden)]

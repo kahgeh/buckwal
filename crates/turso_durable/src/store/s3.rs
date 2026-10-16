@@ -350,18 +350,45 @@ impl S3Store {
         self.count_put(body.len());
         self.send("PUT", key, &[], body, extra)
     }
+}
 
-    fn created(&self, what: &str, r: Reply) -> Result<CondPut, StoreError> {
-        match (r.status, r.etag.clone()) {
-            (200, Some(etag)) => Ok(CondPut::Created { etag }),
-            (200, None) => Err(StoreError::Permanent(format!(
-                "{what}: no ETag in response"
-            ))),
-            (412, _) => Ok(CondPut::PreconditionFailed),
-            // A concurrent conditional write in flight; the caller may retry.
-            (409, _) => Err(StoreError::Transient(format!("{what}: HTTP 409 conflict"))),
-            _ => Err(status_error(what, &r)),
-        }
+/// The `<Code>` of an S3 error response body, if it has one.
+fn error_code(body: &[u8]) -> Option<String> {
+    let body = String::from_utf8_lossy(body);
+    between(&body, "<Code>", "</Code>")
+        .first()
+        .map(|c| c.trim().to_string())
+}
+
+/// The reply to a conditional PUT (`If-None-Match: *` or `If-Match`).
+fn cond_put_reply(what: &str, r: &Reply) -> Result<CondPut, StoreError> {
+    match (r.status, r.etag.clone()) {
+        (200, Some(etag)) => Ok(CondPut::Created { etag }),
+        (200, None) => Err(StoreError::Permanent(format!(
+            "{what}: no ETag in response"
+        ))),
+        (412, _) => Ok(CondPut::PreconditionFailed),
+        // A concurrent conditional write in flight; the caller may retry.
+        (409, _) => Err(StoreError::Transient(format!("{what}: HTTP 409 conflict"))),
+        _ => Err(status_error(what, r)),
+    }
+}
+
+/// The reply to a PUT with `If-Match` in `bucket`. RustFS answers 404 `NoSuchKey` (not 412)
+/// when the key is missing: the precondition is not met. Any other 404 is permanent: a
+/// `NoSuchBucket` names the missing bucket, and a 404 with no recognisable code (a proxy, a
+/// wrong endpoint or addressing style) is no evidence that the key is gone. Reporting either
+/// as `PreconditionFailed` would turn a configuration error into `Fenced`, which sticks.
+fn if_match_reply(what: &str, bucket: &str, r: &Reply) -> Result<CondPut, StoreError> {
+    if r.status != 404 {
+        return cond_put_reply(what, r);
+    }
+    match error_code(&r.body).as_deref() {
+        Some("NoSuchKey") => Ok(CondPut::PreconditionFailed),
+        Some("NoSuchBucket") => Err(StoreError::Permanent(format!(
+            "{what}: bucket {bucket:?} does not exist (HTTP 404 NoSuchBucket)"
+        ))),
+        _ => Err(status_error(what, r)),
     }
 }
 
@@ -379,16 +406,12 @@ impl ObjectStore for S3Store {
 
     fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
         let r = self.put_with(key, body, &[("if-none-match", "*")])?;
-        self.created(&format!("PUT {key} (if-none-match)"), r)
+        cond_put_reply(&format!("PUT {key} (if-none-match)"), &r)
     }
 
     fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
         let r = self.put_with(key, body, &[("if-match", etag)])?;
-        // RustFS answers 404 (not 412) when the key is missing: precondition not met.
-        if r.status == 404 {
-            return Ok(CondPut::PreconditionFailed);
-        }
-        self.created(&format!("PUT {key} (if-match)"), r)
+        if_match_reply(&format!("PUT {key} (if-match)"), &self.cfg.bucket, &r)
     }
 
     fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
@@ -458,6 +481,104 @@ impl ObjectStore for S3Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reply(status: u16, etag: Option<&str>, body: &str) -> Reply {
+        Reply {
+            status,
+            etag: etag.map(str::to_string),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn s3_error(code: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+             <Message>m</Message><Resource>/b/k</Resource></Error>"
+        )
+    }
+
+    /// Item 4: only a missing key is a failed `If-Match`; a missing bucket (or a 404 that
+    /// names no recognisable code) is a permanent error, never `PreconditionFailed`.
+    #[test]
+    fn if_match_404_maps_by_error_code() {
+        let what = "PUT k (if-match)";
+        assert!(matches!(
+            if_match_reply(what, "b", &reply(404, None, &s3_error("NoSuchKey"))),
+            Ok(CondPut::PreconditionFailed)
+        ));
+        match if_match_reply(what, "b", &reply(404, None, &s3_error("NoSuchBucket"))) {
+            Err(StoreError::Permanent(m)) => {
+                assert!(
+                    m.contains("bucket \"b\"") && m.contains("NoSuchBucket"),
+                    "{m}"
+                )
+            }
+            r => panic!("NoSuchBucket: {r:?}"),
+        }
+        for body in ["", "not found", &s3_error("AccessDenied")] {
+            let r = if_match_reply(what, "b", &reply(404, None, body));
+            assert!(
+                matches!(r, Err(StoreError::Permanent(_))),
+                "{body:?}: {r:?}"
+            );
+        }
+        assert!(matches!(
+            if_match_reply(what, "b", &reply(200, Some("\"e\""), "")),
+            Ok(CondPut::Created { etag }) if etag == "\"e\""
+        ));
+        assert!(matches!(
+            if_match_reply(
+                what,
+                "b",
+                &reply(412, None, &s3_error("PreconditionFailed"))
+            ),
+            Ok(CondPut::PreconditionFailed)
+        ));
+    }
+
+    #[test]
+    fn conditional_put_status_mapping() {
+        let what = "PUT k";
+        assert!(matches!(
+            cond_put_reply(what, &reply(200, Some("e"), "")),
+            Ok(CondPut::Created { etag }) if etag == "e"
+        ));
+        assert!(matches!(
+            cond_put_reply(what, &reply(200, None, "")),
+            Err(StoreError::Permanent(_))
+        ));
+        assert!(matches!(
+            cond_put_reply(what, &reply(412, None, "")),
+            Ok(CondPut::PreconditionFailed)
+        ));
+        for status in [409, 408, 429, 500, 503] {
+            assert!(
+                matches!(
+                    cond_put_reply(what, &reply(status, None, "")),
+                    Err(StoreError::Transient(_))
+                ),
+                "{status}"
+            );
+        }
+        for status in [400, 403, 404] {
+            assert!(
+                matches!(
+                    cond_put_reply(what, &reply(status, None, "")),
+                    Err(StoreError::Permanent(_))
+                ),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_code_is_read_from_the_body() {
+        assert_eq!(
+            error_code(s3_error("NoSuchKey").as_bytes()),
+            Some("NoSuchKey".into())
+        );
+        assert_eq!(error_code(b"plain"), None);
+    }
 
     // AWS SigV4 documentation, "Example: GET Object" (s3, us-east-1, 2013-05-24).
     #[test]

@@ -1,7 +1,7 @@
 //! S3 client against a real RustFS. Run through `./scripts/test.sh`.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use turso_durable::store::s3::{S3Config, S3Store};
-use turso_durable::store::{CondPut, ObjectStore};
+use turso_durable::store::{CondPut, ObjectStore, StoreError};
 
 fn env(k: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| {
@@ -83,6 +83,37 @@ fn rustfs_list_follows_pages() {
     let listed = s.list(&p).unwrap();
     assert_eq!(listed, keys);
     assert_eq!(s.stats().since(&before).lists, 2);
+}
+
+/// Item 4: RustFS's 404 for `If-Match` on a missing key carries `NoSuchKey`
+/// (`PreconditionFailed`, asserted above); one for a missing bucket carries `NoSuchBucket` and
+/// is a permanent error naming the bucket, never `PreconditionFailed`.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn rustfs_if_match_on_missing_bucket_is_permanent() {
+    let bucket = format!(
+        "no-such-bucket-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let s = S3Store::new(S3Config {
+        endpoint: env("DURABLE_ENDPOINT"),
+        region: env("DURABLE_REGION"),
+        bucket: bucket.clone(),
+        access_key: env("DURABLE_ACCESS_KEY"),
+        secret_key: env("DURABLE_SECRET_KEY"),
+        path_style: env("DURABLE_PATH_STYLE") == "true",
+        request_timeout: Duration::from_secs(30),
+    })
+    .expect("store");
+    match s.put_if_match("k", b"x", "\"0\"") {
+        Err(StoreError::Permanent(m)) => {
+            assert!(m.contains(&bucket) && m.contains("NoSuchBucket"), "{m}")
+        }
+        r => panic!("If-Match on a missing bucket: {r:?}"),
+    }
 }
 
 #[test]

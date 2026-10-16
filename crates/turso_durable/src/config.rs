@@ -1,4 +1,5 @@
-//! Public configuration: [`Config`], its defaults, and the progress [`Event`]s.
+//! Public configuration: [`Config`] and its defaults. `Event` and `EventHook` (the
+//! `on_event` field) are test and diagnostics hooks, hidden from the docs.
 use crate::error::{Error, Result};
 use crate::format::Keys;
 use crate::store::s3::{S3Config, S3Store};
@@ -55,6 +56,7 @@ pub struct Config {
     pub upload_concurrency: usize,
     pub trim_grace: Duration,
     pub prefetch: bool,
+    /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
 }
@@ -273,10 +275,13 @@ impl Config {
     }
 }
 
-/// Called synchronously, on the thread that did the work, for each [`Event`].
+/// Called synchronously, on the thread that did the work, for each [`Event`]. A test and
+/// diagnostics hook, not part of the supported API (hidden from the docs).
+#[doc(hidden)]
 pub type EventHook = Arc<dyn Fn(&Event) + Send + Sync>;
 
-/// Progress notifications, for tests and instrumentation.
+/// Progress notifications: a test and diagnostics hook, not part of the supported API
+/// (hidden from the docs).
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub enum Event {

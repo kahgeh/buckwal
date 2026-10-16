@@ -9,7 +9,7 @@ This is stage 1: one writer process, plain HTTP, tested against RustFS on a lapt
 ## How it works
 
 - **Commits.** Each commit writes WAL frames. Before the WAL's fsync, the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`). Only when that object is in the bucket does the commit return `Ok`.
-- **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it: it uploads every page that changed in that generation (`pages/…`), then a manifest that maps each page to the generation holding its latest copy, then moves `head` to the next generation.
+- **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it. It first appends an empty *seal-start* log record and checks that `head` has not moved, so a writer that was taken over stops before it uploads anything. Then it uploads every page that changed in that generation (`pages/…`), then a manifest that maps each page to the generation holding its latest copy, then moves `head` to the next generation.
 - **Restore.** Restore reads `head`, the newest manifest and the current generation's log. It rebuilds the WAL from the log and fetches pages from the bucket only when the engine first reads them.
 - **Trimming.** After each seal, a background thread deletes log objects, manifests and pages that the new head no longer needs. It waits for the trim grace period first.
 
@@ -171,7 +171,7 @@ Everything lives under `<prefix>/`. With an empty prefix, keys have no leading `
 - The magic `b"TDLOG\0\0\x01"`.
 - `kind: u8`: 1 = WAL extents, 2 = fence. Kind 2 is reserved for stage 3; stage 1 reads it as `Fenced`.
 - `writer_id`: a `u8` length, then ASCII.
-- `sync_count: u32`. Stage 1 writes exactly one sync per object and never batches. The claim record is the exception: it holds zero syncs.
+- `sync_count: u32`. Stage 1 writes exactly one sync per object and never batches. The claim record and the seal-start record (below) are the exceptions: they hold zero syncs, so they add nothing to the generation's WAL image.
 - For each sync, `op_count: u32`, then the ops:
   - tag 1, a write: `[u64 offset][u32 len][bytes]`;
   - tag 2, a truncate: `[u64 len]`.
@@ -212,7 +212,7 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 | AWS Signature V4 (header auth, signed payload hash) | Every request. |
 | Path-style addressing (the default) or virtual-hosted style | `DURABLE_PATH_STYLE`. |
 | `PUT` with `If-None-Match: *` (412 when the key exists) | Log objects. This is what fences a second writer. |
-| `PUT` with `If-Match: <etag>` (412 when the ETag changed) | `head`. A 404 for a missing key also counts as a failed precondition, because RustFS answers that way. A 409 is retried. |
+| `PUT` with `If-Match: <etag>` (412 when the ETag changed) | `head`. A 404 whose error code is `NoSuchKey` also counts as a failed precondition, because RustFS answers that way for a missing key. A 404 `NoSuchBucket` is a permanent error that names the bucket, and so is a 404 with no recognisable code (a proxy or a wrong endpoint is no evidence that the key is gone); neither is reported as `Fenced`. A 409 is retried. |
 | `ETag` on every PUT response and GET | Checking `head` before moving it. |
 | `GET` | Restore, lazy page reads. |
 | `ListObjectsV2` (`list-type=2`, continuation tokens) | Listing a generation's log, and trimming. |
@@ -249,10 +249,23 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
   1. It writes `head` with a new writer id, using `If-Match` on the ETag the restore read.
   2. It appends one empty log record at the generation's next seq. Stage 3's fence record will reuse this slot.
 - If the head moved since the restore, the claim fails with `Fenced("… restore again")`. Restore into a new directory.
-- An old writer that is still running is fenced at its next append or seal. An old writer that restarts is fenced at open. No acked commit is lost. A generation may then hold the old writer's records followed only by the claimer's, and restore accepts that shape.
+- An old writer that is still running is fenced at its next append, or at the start of its next seal, before it uploads a page or a manifest. An old writer that restarts is fenced at open.
+- Every seal starts with an empty *seal-start* record at the writer's next seq (`put_if_absent`, one extra log PUT per seal), then a GET of `head` (one extra GET per seal). Page and manifest objects are plain PUTs, so this gate is what stops an old writer from overwriting a generation the claimer already sealed:
+  - The old writer's seal-start record lands on the claim record's seq (or a later record of the claimer's). It is fenced and uploads nothing. This covers an idle old writer that closes after the claim (its close-time TRUNCATE seals), and a commit of the old writer that crosses its own generation boundary (the seal runs inside that commit, before its own log record).
+  - The head check covers the case where the claimer's trimmer has already deleted `log/G` (the claimer sealed G and the trim grace passed), so the record has nothing to collide with. The head names the claimer, so the old writer is fenced.
+  - A seal-start record whose upload is ambiguous is settled at the same seq, like any other in-doubt record, before anything else is written. A retried seal whose earlier head write is now known to be published adopts that head and writes no new record.
+- A generation may then hold the old writer's records followed only by the claimer's, and restore accepts that shape.
+- With these rules, no acked commit is lost to an old writer, except in the narrow races below, which stage 3's lease closes.
 - One gap remains: between the restore and the claim record, the old writer can still win a seq race. The claimer's open then fails `Fenced`, and nothing acked is lost. Stage 3's lease closes this gap.
 - `verify` (and the hidden `open_read_only`) never claims, never seals and never writes to the bucket.
 - When the bucket holds no manifest yet, restore seeds `app.db` with the WAL's first page-1 frame. turso treats a zero-size database file as new and would delete its WAL (database.rs:738-760, 2223-2246).
+
+**Known races and crash windows (stage 3's lease and epoch fencing close them).** The bucket format does not change for any of them.
+- **An old writer's page PUTs still in flight.** The old writer's seal-start record lands and its head check passes. Then, while its page PUTs are still in flight, another process restores, claims, commits and seals the same generation. The old writer's late page PUTs can overwrite that seal's `pages/G/*` or `manifest/G`. Its head write then fails and it is fenced, but the claimer's pages may already be replaced. Narrowing this needs a lease (stage 3); do not claim a database whose old writer may still be running a seal.
+- **A head PUT in flight at a crash.** A writer crashes while its seal's head PUT is in flight (or, in one process, a failed head PUT lands after the retried seal saw the head unchanged). The restarted writer attaches to the old head and acks commits into `log/G`. Then the delayed PUT lands, and the head names generation G+1 with the manifest the crashed attempt uploaded. A restore then misses the commits acked into `log/G` after the restart, until that writer's next seal re-uploads G's pages and adopts that head (`crates/turso_durable/src/bucket.rs:373-374`, and `Bucket::seal_start` accepts its own late head).
+- **A crash between the claim's head write and the local-state write** (`crates/turso_durable/src/db.rs:352-358`). The head then names a writer id that nobody holds. The new directory still has `claimed=false` and the old ETag, so reopening it fails `Fenced("… restore again")`. No claim record was written, so the old writer keeps appending; its commits stay in `log/G` and restore. It is fenced at its next seal (the head check). Nothing acked is lost; restore again into a new directory to continue.
+
+**Test and diagnostics hooks.** `Config::on_event`, `turso_durable::Event` and `turso_durable::EventHook` are `#[doc(hidden)]`. They exist for the tests and for the CLI's `soak` event lines, and are not part of the supported API: they may change without notice.
 
 **Known cost: the commit that crosses a generation boundary.**
 - Pages are uploaded at the generation boundary (D6): the write that restarts the WAL. After an automatic checkpoint, or a `Passive`, `Full` or `Restart` checkpoint, that write happens in the next commit, which waits for the whole generation's page upload, the manifest and the head. `CheckpointMode::Truncate` and close seal inside the checkpoint instead.
@@ -289,6 +302,8 @@ Source: `results/durable-core.txt`. These are laptop figures (Apple M4 Max, macO
 | Page PUTs per seal | 169 | 169–172 in the run, 8 at close |
 | Seal time | 44 ms | 37–44 ms in the run, 4.4 ms at close |
 
+These figures predate the seal-start record. Each seal now also makes one extra log PUT and one head GET before its page PUTs.
+
 Restoring the 5000-commit database (generation 12, 1673 pages, 6.9 MB):
 - The restore itself took 33 ms. It made 4 GETs (`3 + 1` log object) and 1 LIST, and downloaded 4.6 KB.
 - A full `verify` of a fresh restore (`PRAGMA integrity_check`, which reads every page lazily) took 0.52 s of wall time, including process start.
@@ -304,7 +319,7 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 | D3 | A failed upload fails the commit without the fsync panic. The WAL file's `sync` uploads before it creates any completion and returns `Err` synchronously, so the engine rolls the commit back. | pager.rs:4711-4733, 4486-4488; vdbe/mod.rs:3400-3409, 3609-3612; wal.rs:4271-4278. |
 | D4 | One process. An explicit exclusive lock on `durable.lock` gives `Locked`, and a process-wide registry gives `AlreadyOpen`. The multiprocess WAL is never enabled. | database.rs:80, 876-879, 1288-1305; io/unix.rs:67-71, 278-297. |
 | D5 | MVCC is refused. The SQL guard refuses the PRAGMA before the engine writes the 255/255 header, and open checks the header and `mvcc_enabled()`. `.db-log` is refused as a backstop. Other journal modes and ATTACH are refused too. | sqlite3_ondisk.rs:200-228; vdbe/execute.rs:19165-19192; journal_mode.rs:19-27, 90-95. |
-| D6 | Pages upload when the WAL restarts (the generation boundary), not at each checkpoint. A seal uploads the union of the in-memory dirty set, the persisted `app.db-dirty`, and every page in the local WAL's frame headers. Then it writes the manifest, then moves the head with `If-Match`. | wal.rs:5171-5180, 5289-5310, 6024-6050; pager.rs:4514-4516, 5458-5472. |
+| D6 | Pages upload when the WAL restarts (the generation boundary), not at each checkpoint. A seal uploads the union of the in-memory dirty set, the persisted `app.db-dirty`, and every page in the local WAL's frame headers. It first appends an empty seal-start record and checks the head (`Bucket::seal_start`), then uploads the pages, then writes the manifest, then moves the head with `If-Match`. | wal.rs:5171-5180, 5289-5310, 6024-6050; pager.rs:4514-4516, 5458-5472. |
 | D7 | `synchronous` is FULL only. The guard refuses lower values, and each statement is checked after `prepare`. | lib.rs:225-229; pager.rs:4711; translate/pragma.rs:662-676. |
 | D8 | Typed errors cross the engine through a thread-local stash. `Connection::checkpoint` uses the engine call that returns `Err`, because the PRAGMA reports busy. | vdbe/execute.rs:796-803; connection.rs:2432-2434. |
 | D9 | On restart on its own disk, the writer reconciles the local WAL with the bucket's generation image: level, behind (take the bucket's), ahead (upload the difference), or a new generation. A different writer id gives `Fenced`. | `crates/turso_durable/src/reconcile.rs` |

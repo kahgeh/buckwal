@@ -5,6 +5,7 @@ use crate::reconcile::Reconciled;
 use crate::restore::restore_with_store;
 use crate::store::{FaultStore, MemStore};
 use crate::{CheckpointMode, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -846,6 +847,156 @@ fn old_writer_after_claim_then_close_loses_nothing() {
         db.close().unwrap();
         vec![]
     });
+}
+
+/// Every object under the test prefix (head, logs, manifests, pages), key → body.
+fn bucket_objects(store: &Arc<MemStore>) -> BTreeMap<String, Vec<u8>> {
+    let k = keys();
+    let mut all = vec![k.head()];
+    for root in [k.log_root(), k.manifest_root(), k.page_root()] {
+        all.extend(store.list(&root).unwrap());
+    }
+    all.into_iter()
+        .filter_map(|key| store.get(&key).unwrap().map(|o| (key, o.body)))
+        .collect()
+}
+
+fn integrity_ok(c: &Connection) {
+    let rows = c.query("PRAGMA integrity_check", &[]).unwrap();
+    assert_eq!(text(&rows[0][0]), "ok");
+}
+
+/// The objects of a seal of `gen`: `pages/<gen>/*` and `manifest/<gen>`.
+fn sealed_objects(all: &BTreeMap<String, Vec<u8>>, gen: u64) -> BTreeMap<String, Vec<u8>> {
+    let k = keys();
+    all.iter()
+        .filter(|(key, _)| {
+            matches!(k.parse_page(key), Some((g, _)) if g == gen)
+                || k.parse_manifest(key) == Some(gen)
+        })
+        .map(|(key, body)| (key.clone(), body.clone()))
+        .collect()
+}
+
+/// B1 (merge review): writer A at generation G; B restores, claims, commits 100..=110 and
+/// seals G (TRUNCATE), then closes. `old_writer` then makes A act on its stale view of G
+/// (A has not committed since the claim) and returns what A's action returned. A must not
+/// touch the bucket: `pages/G/*`, `manifest/G` and every other object stay byte-identical to
+/// what B left, and a fresh restore holds every row either writer acked, integrity ok.
+///
+/// With `trim`, B's trimmer has also run (its grace passed): `log/G` is gone, so A's
+/// seal-start record cannot collide with B's claim record.
+fn old_writer_after_claim_and_seal(
+    prepare_a: fn(&Connection),
+    trim: bool,
+    old_writer: fn(Database, Connection) -> Result<()>,
+) {
+    let store = mem();
+    let a = tempdir();
+    let db_a = open_mem(&store, a.path());
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    let mut acked: Vec<i64> = (1..=10).collect();
+    for &id in &acked {
+        insert(&ca, id).unwrap();
+    }
+    prepare_a(&ca);
+    let gen = head(&*store).generation;
+
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let db_b = open_mem(&store, r.path());
+    let cb = db_b.connect().unwrap();
+    for id in 100..=110 {
+        insert(&cb, id).unwrap();
+        acked.push(id);
+    }
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let h = head(&*store);
+    assert_eq!(
+        (h.generation, h.manifest),
+        (gen + 1, Some(gen)),
+        "B sealed G"
+    );
+    if trim {
+        let (_, m) = crate::engine::tests::manifest(&*store);
+        crate::trim::trim_once(&*store, &keys(), &h, Some(&m)).unwrap();
+        assert!(log_seqs(&*store, gen).is_empty(), "log/G trimmed");
+    }
+    let before = bucket_objects(&store);
+    assert!(!sealed_objects(&before, gen).is_empty());
+
+    let r = old_writer(db_a, ca);
+    assert!(
+        r.is_ok() || matches!(r, Err(Error::Fenced(_))),
+        "the old writer: {r:?}"
+    );
+    // A read-only open writes nothing to the bucket.
+    let v = tempdir();
+    let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    let c = verify.connect().unwrap();
+    integrity_ok(&c);
+    assert_eq!(ids(&c), acked, "every acked row restores");
+    let after = bucket_objects(&store);
+    let changed = |a: &BTreeMap<String, Vec<u8>>, b: &BTreeMap<String, Vec<u8>>| {
+        let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+        keys.into_iter()
+            .filter(|k| a.get(*k) != b.get(*k))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let g_changed = changed(&sealed_objects(&before, gen), &sealed_objects(&after, gen));
+    assert!(
+        g_changed.is_empty(),
+        "pages/G/* and manifest/G differ from B's seal: {g_changed:?}"
+    );
+    let mut all_changed = changed(&before, &after);
+    if trim {
+        // A's seal-start record lands in the trimmed `log/G`: an orphan below the head's
+        // generation, which no restore reads and the next trim deletes.
+        all_changed.retain(|k| !matches!(keys().parse_log(k), Some((g, _)) if g == gen));
+    }
+    assert!(
+        all_changed.is_empty(),
+        "the old writer changed the bucket: {all_changed:?}"
+    );
+}
+
+/// (a) The reviewer's probe: an idle old writer closes; its close-time TRUNCATE would seal
+/// G again. close itself returns Ok (it ignores a failed close-time checkpoint).
+#[test]
+fn idle_old_writer_closing_after_claim_and_seal_changes_nothing() {
+    old_writer_after_claim_and_seal(|_| {}, false, close_old_writer);
+}
+
+fn close_old_writer(db: Database, c: Connection) -> Result<()> {
+    c.close()?;
+    db.close()
+}
+
+/// (a) after B's trimmer deleted `log/G`: the head check fences A instead.
+#[test]
+fn idle_old_writer_closing_after_claim_seal_and_trim_changes_nothing() {
+    old_writer_after_claim_and_seal(|_| {}, true, close_old_writer);
+}
+
+/// (b) The old writer commits once, and that commit crosses its own generation boundary (a
+/// PASSIVE checkpoint backfilled its whole WAL, so the commit restarts the WAL and seals G in
+/// the header write, before its own append). The commit fails Fenced.
+#[test]
+fn old_writer_commit_crossing_its_boundary_after_claim_and_seal_is_fenced() {
+    old_writer_after_claim_and_seal(
+        |c| c.checkpoint(CheckpointMode::Passive).unwrap(),
+        false,
+        |db, c| {
+            let r = insert(&c, 11);
+            assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+            crash(db, vec![c]);
+            r.map(|_| ())
+        },
+    );
 }
 
 /// A claim whose record never landed (the open failed after the head write): the next open

@@ -207,6 +207,142 @@ fn foreign_object_fences_and_stops() {
     assert_eq!(f.body(&keys().log(1, 2)), Some(foreign));
 }
 
+fn empty(writer_id: &str) -> LogRecord {
+    LogRecord::Extents {
+        writer_id: writer_id.into(),
+        syncs: vec![],
+    }
+}
+
+/// No object of a seal of generation `gen` (pages or manifest) exists.
+fn no_seal_objects(f: &Fixture, gen: u64) {
+    let k = keys();
+    let pages: Vec<String> = f.mem.list(&k.page_root()).unwrap();
+    let pages: Vec<&String> = pages
+        .iter()
+        .filter(|p| matches!(k.parse_page(p), Some((g, _)) if g == gen))
+        .collect();
+    assert!(pages.is_empty(), "{pages:?}");
+    assert_eq!(f.body(&k.manifest(gen)), None);
+}
+
+/// B1: another writer's record at this writer's next seq (a claimer's claim record) fences a
+/// seal that has nothing to ship before any page or manifest is written.
+#[test]
+fn seal_start_record_collision_fences_before_any_upload() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.append_log(syncs(1)).unwrap();
+    let head = f.stored_head();
+    let claim = encode_record(&empty("w2"));
+    f.mem.put(&keys().log(1, 2), &claim).unwrap();
+    let before = f.fault.events().len();
+    assert!(matches!(
+        b.seal_generation(pages(4), 4096, 4),
+        Err(Error::Fenced(_))
+    ));
+    assert_eq!(
+        f.fault.events()[before..],
+        [
+            format!("put_if_absent {}", keys().log(1, 2)),
+            format!("get {}", keys().log(1, 2))
+        ]
+    );
+    no_seal_objects(&f, 1);
+    assert_eq!(f.stored_head(), head);
+    assert_eq!(f.body(&keys().log(1, 2)), Some(claim));
+    assert!(matches!(b.append_log(syncs(2)), Err(Error::Fenced(_))));
+}
+
+/// B1 once `log/G` is trimmed: the record lands, but the head moved (another writer sealed
+/// G, or claimed it), so the seal is fenced before any page or manifest is written.
+#[test]
+fn seal_start_with_moved_head_fences_before_any_upload() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    let other = Head {
+        format: 1,
+        generation: 2,
+        manifest: Some(1),
+        writer_id: "w2".into(),
+    };
+    f.mem.put(&keys().head(), &other.encode()).unwrap();
+    assert!(matches!(
+        b.seal_generation(pages(4), 4096, 4),
+        Err(Error::Fenced(_))
+    ));
+    no_seal_objects(&f, 1);
+    assert_eq!(f.stored_head(), other);
+    assert_eq!(f.record(1, 1), Some(empty("w1")));
+    assert!(matches!(b.append_log(syncs(1)), Err(Error::Fenced(_))));
+}
+
+/// A head PUT of ours that lands late (in flight at a crash, after the restarted writer acked
+/// more records into G) is not another writer's: the next seal passes the head check,
+/// re-uploads G's pages and manifest, and adopts that head.
+#[test]
+fn seal_start_accepts_our_own_late_head() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.append_log(syncs(1)).unwrap();
+    let late = Head {
+        format: 1,
+        generation: 2,
+        manifest: Some(1),
+        writer_id: "w1".into(),
+    };
+    f.mem.put(&keys().head(), &late.encode()).unwrap();
+    assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
+    assert_eq!(f.body(&keys().page(1, 2)), Some(vec![2u8; 16]));
+    assert!(f.body(&keys().manifest(1)).is_some());
+    assert_eq!(b.head(), &late);
+    assert_eq!(b.seal_generation(vec![], 4096, 2), Ok(3));
+}
+
+/// An ambiguous seal-start record fails the seal before any upload and stays in doubt; the
+/// next seal settles it at the same seq, then puts a fresh seal-start record after it.
+#[test]
+fn ambiguous_seal_start_record_is_settled_then_sealed() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/log/");
+    f.fault.store_then_fail_next_puts(1);
+    f.fault.fail_puts_after(0);
+    assert!(matches!(
+        b.seal_generation(pages(2), 4096, 2),
+        Err(Error::Timeout(_))
+    ));
+    assert_eq!(f.record(1, 2), Some(empty("w1")), "landed, reply lost");
+    no_seal_objects(&f, 1);
+    assert_eq!(b.next_seq(), 2, "in doubt, not advanced");
+
+    f.fault.fail_puts_after(u64::MAX);
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
+    let ev = f.fault.events()[before..].to_vec();
+    assert_eq!(
+        ev[..4],
+        [
+            format!("put_if_absent {}", keys().log(1, 2)),
+            format!("get {}", keys().log(1, 2)),
+            format!("put_if_absent {}", keys().log(1, 3)),
+            format!("get {}", keys().head()),
+        ],
+        "{ev:?}"
+    );
+    assert_eq!(f.record(1, 3), Some(empty("w1")));
+    assert_eq!(
+        f.log_keys(1),
+        [keys().log(1, 1), keys().log(1, 2), keys().log(1, 3)]
+    );
+    assert_eq!(f.body(&keys().page(1, 2)), Some(vec![2u8; 16]));
+}
+
 #[test]
 fn deadline_failure_leaves_record_in_doubt_then_settles() {
     let short = RetryPolicy {
@@ -301,7 +437,23 @@ fn seal_uploads_pages_manifest_head_in_order() {
         .position(|e| *e == format!("put_if_match {}", k.head()))
         .unwrap();
     assert_eq!(ev.iter().filter(|e| is_page(e)).count(), 8);
-    assert!(ev[..manifest_at].iter().all(is_page), "{ev:?}");
+    // The seal-start gate comes first: an empty record at the next seq, then the head check.
+    assert_eq!(
+        ev[..2],
+        [
+            format!("put_if_absent {}", k.log(1, 2)),
+            format!("get {}", k.head())
+        ],
+        "{ev:?}"
+    );
+    assert_eq!(
+        f.record(1, 2),
+        Some(LogRecord::Extents {
+            writer_id: "w1".into(),
+            syncs: vec![]
+        })
+    );
+    assert!(ev[2..manifest_at].iter().all(is_page), "{ev:?}");
     assert!(manifest_at < head_at, "{ev:?}");
     for p in 1..=8u32 {
         assert_eq!(f.body(&k.page(1, p)), Some(vec![p as u8; 16]));
@@ -396,11 +548,13 @@ fn seal_failure_keeps_generation() {
     assert_eq!(f.body(&keys().manifest(1)), None);
     assert_eq!(b.manifest(), None);
     assert_eq!(b.counters().seals.load(Relaxed), 0);
+    // The failed seal's seal-start record holds seq 1.
+    assert_eq!(f.log_keys(1), [keys().log(1, 1)]);
     assert_eq!(
         b.append_log(syncs(1)),
         Ok(LogPos {
             generation: 1,
-            seq: 1
+            seq: 2
         })
     );
 
@@ -468,7 +622,11 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
         b.append_log(syncs(1)),
         Err(Error::UploadFailed(_))
     ));
-    assert!(f.log_keys(1).is_empty(), "no record after a published seal");
+    assert_eq!(
+        f.log_keys(1),
+        [keys().log(1, 1)],
+        "no record after the seal-start record of a published seal"
+    );
     f.fault.fail_puts_after(u64::MAX);
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
     assert_eq!(
@@ -480,7 +638,8 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     );
     assert_eq!(b.seal_generation(vec![], 4096, 1), Ok(3));
 
-    // The head write never landed: the next append checks, then carries on in generation 1.
+    // The head write never landed: the next append checks, then carries on in generation 1,
+    // after the failed seal's seal-start record.
     let f = Fixture::new();
     let mut b = f.create(short, 4);
     f.fault.only_keys_containing("/head");
@@ -491,7 +650,7 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
         b.append_log(syncs(1)),
         Ok(LogPos {
             generation: 1,
-            seq: 1
+            seq: 2
         })
     );
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
@@ -513,7 +672,11 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(b.append_log(syncs(1)), Err(Error::Fenced(_))));
-    assert!(f.log_keys(1).is_empty());
+    assert_eq!(
+        f.log_keys(1),
+        [keys().log(1, 1)],
+        "only the seal-start record"
+    );
 }
 
 #[test]
@@ -588,7 +751,19 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
     assert!(b.seal_generation(pages(1), 4096, 1).is_err());
     f.fault.fail_next_puts(0);
     let other_pages = vec![(1, vec![7u8; 16]), (2, vec![8u8; 16])];
+    let before = f.fault.events().len();
     assert_eq!(b.seal_generation(other_pages, 4096, 2), Ok(2));
+    // The head GET finds the ETag unchanged; the seal then starts like any other, with a
+    // seal-start record after the failed attempt's.
+    assert_eq!(
+        f.fault.events()[before..before + 3],
+        [
+            format!("get {}", k.head()),
+            format!("put_if_absent {}", k.log(1, 2)),
+            format!("get {}", k.head()),
+        ]
+    );
+    assert_eq!(f.log_keys(1), [k.log(1, 1), k.log(1, 2)]);
     assert_eq!(f.body(&k.page(1, 1)), Some(vec![7u8; 16]));
     assert_eq!(f.body(&k.page(1, 2)), Some(vec![8u8; 16]));
     assert_eq!(b.manifest().unwrap().page_count, 2);
@@ -668,6 +843,7 @@ fn head_conflict_fences() {
         b.seal_generation(pages(1), 4096, 1),
         Err(Error::Fenced(_))
     ));
+    no_seal_objects(&f, 1);
     assert_eq!(f.stored_head(), other);
     assert_eq!(b.head().generation, 1);
     assert!(matches!(b.append_log(syncs(1)), Err(Error::Fenced(_))));

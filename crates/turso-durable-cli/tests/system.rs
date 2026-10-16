@@ -1058,3 +1058,99 @@ fn several_connections_against_rustfs() {
     db.close().unwrap();
     eprintln!("several_connections_against_rustfs: 400 inserts, {reads} reads in {elapsed:?}");
 }
+
+/// B1 (merge review), end to end: writer A (in process, against RustFS) commits and goes
+/// idle; B restores and claims with `sql --claim`, commits and seals with a TRUNCATE
+/// checkpoint (and its close); then A closes, and its close-time TRUNCATE would seal the
+/// same generation again over B's pages. Every row either writer acked must restore, and
+/// `pages/G/*`, `manifest/G` and the head must be exactly what B's seal wrote.
+///
+/// A runs in process because the CLI has no way to hold a writer idle and then close it
+/// (soak acks until killed or `--count`, and SIGKILL or SIGTERM skips close).
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
+    let ctx = Ctx::new("idle_old_writer_closing_after_claim_and_seal_loses_nothing");
+    let mut config = Config::new(
+        ctx.dir("a"),
+        &ctx.var("DURABLE_ENDPOINT"),
+        &ctx.var("DURABLE_BUCKET"),
+        &ctx.var("DURABLE_ACCESS_KEY"),
+        &ctx.var("DURABLE_SECRET_KEY"),
+    );
+    config.region = ctx.var("DURABLE_REGION");
+    config.path_style = ctx.var("DURABLE_PATH_STYLE") == "true";
+    config.prefix = ctx.prefix();
+    let db_a = turso_durable::open(config).expect("open A");
+    let ca = db_a.connect().unwrap();
+    ca.execute(
+        "CREATE TABLE IF NOT EXISTS soak(id INTEGER PRIMARY KEY, payload BLOB)",
+        &[],
+    )
+    .unwrap();
+    let mut lines = Vec::new();
+    for id in 1..=50 {
+        ca.execute(
+            "INSERT INTO soak(id, payload) VALUES (?, zeroblob(1024))",
+            &[Value::from_i64(id)],
+        )
+        .unwrap_or_else(|e| panic!("A commit {id}: {e}"));
+        lines.push(format!("ack {id}"));
+    }
+    let gen = ctx.head().generation;
+
+    let b = ctx.dir("b");
+    let inserts: Vec<String> = (1001..=1010)
+        .map(|id| format!("INSERT INTO soak(id, payload) VALUES ({id}, zeroblob(1024))"))
+        .collect();
+    let mut args = vec!["sql", "--claim", "--dir", b.to_str().unwrap()];
+    args.extend(inserts.iter().map(String::as_str));
+    args.push("PRAGMA wal_checkpoint(TRUNCATE)");
+    ctx.ok(&args);
+    lines.extend((1001..=1010).map(|id| format!("ack {id}")));
+    let sealed = ctx.head();
+    assert_eq!(
+        (sealed.generation, sealed.manifest.is_some()),
+        (gen + 1, true),
+        "B sealed generation {gen}: {sealed:?}"
+    );
+    let store = ctx.store();
+    let sealed_objects = || {
+        let mut keys = ctx.list(&format!("pages/{gen:010}/"));
+        keys.push(format!("{}/manifest/{gen:010}", ctx.prefix()));
+        keys.push(format!("{}/head", ctx.prefix()));
+        keys.into_iter()
+            .map(|k| {
+                let body = store.get(&k).expect("get").map(|o| o.body);
+                (k, body)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = sealed_objects();
+
+    let closed = ca.close().and_then(|()| db_a.close());
+    assert!(
+        matches!(closed, Ok(()) | Err(turso_durable::Error::Fenced(_))),
+        "A's close: {closed:?}"
+    );
+    let after = sealed_objects();
+    let changed: Vec<&String> = before
+        .iter()
+        .zip(&after)
+        .filter(|(b, a)| b != a)
+        .map(|(b, _)| &b.0)
+        .collect();
+    assert!(
+        before.len() == after.len() && changed.is_empty(),
+        "A's close changed B's seal: {changed:?} ({} keys before, {} after)",
+        before.len(),
+        after.len()
+    );
+    assert_eq!(ctx.head(), sealed);
+    let v = restore_verify(&ctx, &lines);
+    eprintln!(
+        "idle_old_writer_closing_after_claim_and_seal_loses_nothing: A's close {closed:?}; \
+         acked={} {}",
+        v.acked, v.restored
+    );
+}

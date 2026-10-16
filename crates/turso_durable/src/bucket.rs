@@ -116,9 +116,11 @@ pub(crate) const RESTORE_AGAIN: &str =
 /// so either the old writer's append collides with it and the old writer is fenced for good,
 /// or the old writer got there first and the new writer's open fails `Fenced`. After a
 /// claim, an old writer restarting on its own disk is fenced by the writer-id check at
-/// attach, and a still-running one gets a 412 on its next seal's If-Match. No acked commit
-/// is lost and the log stays linear (stage 3's lease closes the remaining race). Such a
-/// generation holds the old writer's records, then the new one's, which
+/// attach. A still-running one is fenced at its next append, or at the start of its next
+/// seal (`Bucket::seal_start`: its seal-start record collides, or the head moved), before it
+/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed.
+/// The log stays linear; stage 3's lease closes the remaining races (`seal_start` names
+/// one). Such a generation holds the old writer's records, then the new one's, which
 /// `restore::generation_image` accepts.
 pub(crate) fn claim(
     store: &dyn ObjectStore,
@@ -474,8 +476,9 @@ impl Bucket {
         }
     }
 
-    /// Publish generation G: upload its dirty pages, its manifest, then move the head to
-    /// G+1 with a conditional write. Returns G+1.
+    /// Publish generation G: an empty seal-start record and a head check (`seal_start`), then
+    /// its dirty pages, its manifest, then move the head to G+1 with a conditional write.
+    /// Returns G+1.
     pub(crate) fn seal_generation(
         &mut self,
         pages: Vec<(u32, Vec<u8>)>,
@@ -521,6 +524,7 @@ impl Bucket {
             return Ok(self.finish_seal(start, p.head, etag, p.manifest));
         }
         self.settle(start)?;
+        self.seal_start(start)?;
         let gen = self.head.generation;
         self.emit(Event::SealStarted {
             generation: gen,
@@ -528,7 +532,9 @@ impl Bucket {
         });
         // Pages and the manifest are unreferenced until the head moves: plain puts. A failed
         // seal whose head never landed may overwrite them next time (`check_head` above
-        // ensures a published one is adopted instead).
+        // ensures a published one is adopted instead). `seal_start` ensured no other writer
+        // has taken this generation over, so these puts never touch a generation another
+        // writer sealed (apart from the race its comment names).
         self.put_pages(start, gen, &pages)?;
 
         let dirty: BTreeSet<u32> = pages.iter().map(|(p, _)| *p).collect();
@@ -556,6 +562,49 @@ impl Bucket {
         });
         let etag = self.put_head(start, &head)?;
         Ok(self.finish_seal(start, head, etag, manifest))
+    }
+
+    /// The gate before a seal uploads anything: a writer that another writer took over must
+    /// not overwrite `pages/G/*` or `manifest/G`, which are plain puts and which that writer
+    /// may already have sealed. A seal of an old writer that has nothing left to ship sends
+    /// no log record, so the claim record alone would not fence it.
+    ///
+    /// 1. An empty record (zero syncs) goes to this writer's next seq with `put_if_absent`,
+    ///    through `put_log`: a seq taken by another writer's record (a claim record, say)
+    ///    fences this writer and nothing is uploaded; an ambiguous result leaves it in doubt
+    ///    and the seal fails, to be settled at the same seq like any other record. It keeps
+    ///    the seqs contiguous and adds nothing to the generation's image.
+    /// 2. Then a GET of the head, which must still carry this writer's ETag (or be the very
+    ///    head this seal publishes, below). The record cannot collide once the trimmer has
+    ///    deleted `log/G` (another writer sealed G and its grace passed), and a claimer's head
+    ///    write precedes its claim record; a moved head fences.
+    ///
+    /// What remains (stage 3's lease): a claimer that restores and claims after step 2 lands
+    /// its claim record after ours and may seal G while this seal's page puts are in flight.
+    fn seal_start(&mut self, start: Instant) -> Result<()> {
+        let body = encode_record(&LogRecord::Extents {
+            writer_id: self.head.writer_id.clone(),
+            syncs: Vec::new(),
+        });
+        self.put_log(start, body)?;
+        let key = self.keys.head();
+        let stored = retrying(&self.counters, &self.remaining(start), &key, || {
+            self.store.get(&key)
+        })?;
+        let ours = self.sealed_head().encode();
+        match stored {
+            Some(o) if o.etag == self.head_etag => Ok(()),
+            // Our own head for this seal, from an earlier attempt whose PUT landed late (after
+            // a crash and restart, say): `put_head` adopts it, and this seal re-publishes the
+            // generation with every record acked since. Another writer's head names its id.
+            Some(o) if o.body == ours => Ok(()),
+            _ => {
+                self.fenced = true;
+                Err(Error::Fenced(
+                    "the head was changed by another writer".into(),
+                ))
+            }
+        }
     }
 
     /// Upload `pages` of generation `gen`, `concurrency` at a time; the first error wins.

@@ -105,7 +105,8 @@ fn seal_is_ordered_after_queued_logs_and_reports() {
     assert_eq!(
         up.counters(),
         UploaderCounters {
-            log_puts: 4,
+            // The three records, the seal-start record, and one in generation 2.
+            log_puts: 5,
             page_puts: 2,
             seals: 1,
             retries: 0
@@ -131,7 +132,7 @@ fn seal_is_ordered_after_queued_logs_and_reports() {
         .collect();
     assert_eq!(
         kinds,
-        ["log 1/1", "log 1/2", "log 1/3", "seal 1 2", "sealed 1", "log 2/1"]
+        ["log 1/1", "log 1/2", "log 1/3", "log 1/4", "seal 1 2", "sealed 1", "log 2/1"]
     );
     let Event::LogUploaded { bytes, .. } = &seen[0] else {
         unreachable!()
