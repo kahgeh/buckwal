@@ -19,8 +19,19 @@ fn head(generation: u64, manifest: Option<u64>) -> Head {
     }
 }
 
+/// Keys under each root that no parser accepts: the trimmer keeps them.
+fn junk(k: &Keys) -> [String; 3] {
+    [
+        format!("{}junk", k.log_root()),
+        format!("{}0000000001/x", k.page_root()),
+        format!("{}x", k.manifest_root()),
+    ]
+}
+
 /// Generations 1-3 by hand: two logs in 1, one each in 2 and 3, manifests 1 and 2, pages
 /// 1/1, 1/2 and 2/1. Manifest 2 maps page 1 to generation 2 and page 2 to generation 1.
+/// Generation 3 is being sealed: `pages/3/1`, `pages/3/5` and `manifest/3` are uploaded but
+/// the head does not reference them yet. Plus one unparseable key under each root.
 fn three_generations() -> (MemStore, Manifest) {
     let k = keys();
     let mem = MemStore::new();
@@ -37,7 +48,13 @@ fn three_generations() -> (MemStore, Manifest) {
         k.page(1, 1),
         k.page(1, 2),
         k.page(2, 1),
-    ] {
+        k.page(3, 1),
+        k.page(3, 5),
+        k.manifest(3),
+    ]
+    .into_iter()
+    .chain(junk(&k))
+    {
         mem.put(&key, b"x").unwrap();
     }
     mem.put(&k.manifest(1), b"m1").unwrap();
@@ -56,13 +73,19 @@ fn trim_deletes_only_unreferenced_older_generations() {
     let (mem, m2) = three_generations();
     let deleted = trim_once(&mem, &k, &head(3, Some(2)), Some(&m2)).unwrap();
     assert_eq!(deleted, 5);
+    // Kept: the current log, manifest 2 and what it references, the in-progress seal of
+    // generation 3 (never touched: generation >= M) and keys no parser accepts.
     let mut want = vec![
         k.head(),
         k.log(3, 1),
         k.manifest(2),
         k.page(1, 2),
         k.page(2, 1),
+        k.page(3, 1),
+        k.page(3, 5),
+        k.manifest(3),
     ];
+    want.extend(junk(&k));
     want.sort();
     assert_eq!(all_keys(&mem), want);
     // Nothing more to do.

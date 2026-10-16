@@ -884,31 +884,35 @@ fn restore_after_many_checkpoints_reads_only_current_generation() {
     let m_gen = h.manifest.unwrap();
     let k = keys();
 
-    // Wait for the trimmer to act on the last seal.
+    // Wait for the trimmer to act on the last seal: older logs, older manifests and every
+    // page object manifest M no longer references are gone (`trim_once` deletes pages last).
+    let (_, m) = manifest(&*mem);
     loop {
         let logs = mem.list(&k.log_root()).unwrap();
         let manifests = mem.list(&k.manifest_root()).unwrap();
+        let stale_pages: Vec<String> = mem
+            .list(&k.page_root())
+            .unwrap()
+            .into_iter()
+            .filter(|key| {
+                let (g, p) = k.parse_page(key).unwrap();
+                g < m_gen && m.pages.get(&p) != Some(&g)
+            })
+            .collect();
         let done = trimmed.lock().unwrap().iter().any(|&n| n > 0)
             && logs
                 .iter()
                 .all(|key| k.parse_log(key).map(|(g, _)| g) == Some(h.generation))
-            && manifests == vec![k.manifest(m_gen)];
+            && manifests == vec![k.manifest(m_gen)]
+            && stale_pages.is_empty();
         if done {
             break;
         }
         assert!(
             t.elapsed() < Duration::from_secs(10),
-            "never trimmed: {logs:?} {manifests:?}"
+            "never trimmed: {logs:?} {manifests:?} unreferenced pages kept: {stale_pages:?}"
         );
         std::thread::sleep(Duration::from_millis(5));
-    }
-    let (_, m) = manifest(&*mem);
-    for key in mem.list(&k.page_root()).unwrap() {
-        let (g, p) = k.parse_page(&key).unwrap();
-        assert!(
-            g >= m_gen || m.pages.get(&p) == Some(&g),
-            "{key} is unreferenced and was kept"
-        );
     }
 
     let r = tempfile::tempdir().unwrap();

@@ -72,7 +72,9 @@ impl IO for DurableIo {
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         // The engine deletes a WAL holding frames next to an empty database file as an orphan
         // (database.rs:2223-2246). Our flows never leave that state, and acknowledged frames
-        // must never be deleted silently.
+        // must never be deleted silently. That delete passes the engine's own `wal_path`,
+        // spelled `format!("{db_path}-wal")` as ours is (database.rs:1495), so this compare
+        // catches it.
         if path == self.wal_path {
             return Err(stash(Error::Corrupt(format!(
                 "refusing to delete {path}: it may hold acknowledged frames"
