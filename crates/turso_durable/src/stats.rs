@@ -109,13 +109,11 @@ impl StatsCell {
     }
 
     /// One commit was acked after waiting `wait`.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 5: `Connection` acks
     pub(crate) fn record_ack(&self, wait: Duration) {
         self.acks.lock().unwrap().record(wait);
         self.commits_acked.fetch_add(1, Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // Task 5: `Database::upload_stats`
     pub(crate) fn snapshot(&self) -> UploadStats {
         let acks = self.acks.lock().unwrap().clone();
         let log_puts = self.log_puts.load(Relaxed);

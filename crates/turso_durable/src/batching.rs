@@ -155,5 +155,93 @@ impl Batching {
     }
 }
 
+/// One commit of a `Connection` call, for the call to ack before it returns.
+pub(crate) enum PendingAck {
+    /// Uploaded inside the WAL sync (`Off`, or a Window commit while the uploader is
+    /// degraded): `waited` is how long the upload took.
+    Done {
+        commit: u64,
+        waited: Duration,
+        batching: Batching,
+    },
+    /// Submitted to the uploader's batch; the call waits on the ticket.
+    Waiting {
+        ticket: crate::uploader::Ticket,
+        batching: Batching,
+    },
+}
+
+/// The commit context: the setting a `Connection` call commits with, set on the caller's
+/// thread for the engine call. The WAL sync runs inside it, on the same thread
+/// (`ShippingFile::sync`), reads the setting and leaves its ack here.
+pub(crate) mod ctx {
+    use super::{Batching, PendingAck};
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
+
+    struct CommitCtx {
+        batching: Batching,
+        acks: Vec<PendingAck>,
+    }
+
+    thread_local! {
+        static CTX: RefCell<Option<CommitCtx>> = const { RefCell::new(None) };
+    }
+
+    /// Restores the context that was current before [`enter`] when dropped (none, outside
+    /// a nested call), so neither an early return nor a panic leaks it; acks still in it are
+    /// dropped (not acked).
+    #[must_use]
+    pub(crate) struct CtxGuard {
+        prev: Option<CommitCtx>,
+        /// The context is this thread's.
+        _thread: PhantomData<*const ()>,
+    }
+
+    impl Drop for CtxGuard {
+        fn drop(&mut self) {
+            let prev = self.prev.take();
+            CTX.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+
+    /// Commit with `b`, with no acks yet, until the guard is dropped.
+    pub(crate) fn enter(b: Batching) -> CtxGuard {
+        let fresh = CommitCtx {
+            batching: b,
+            acks: Vec::new(),
+        };
+        CtxGuard {
+            prev: CTX.with(|c| c.borrow_mut().replace(fresh)),
+            _thread: PhantomData,
+        }
+    }
+
+    /// The current call's setting; `None` outside every `Connection` call.
+    pub(crate) fn current() -> Option<Batching> {
+        CTX.with(|c| c.borrow().as_ref().map(|c| c.batching))
+    }
+
+    /// Leave `ack` for the current call; outside every call there is no one to ack, and it
+    /// is dropped.
+    pub(crate) fn push(ack: PendingAck) {
+        CTX.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                c.acks.push(ack);
+            }
+        });
+    }
+
+    /// The current call's acks, in commit order; clears them.
+    pub(crate) fn take() -> Vec<PendingAck> {
+        CTX.with(|c| {
+            c.borrow_mut()
+                .as_mut()
+                .map(|c| std::mem::take(&mut c.acks))
+                .unwrap_or_default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

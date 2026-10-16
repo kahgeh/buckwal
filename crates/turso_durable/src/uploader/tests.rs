@@ -427,15 +427,56 @@ fn failed_off_flush_drops_the_off_sync_but_keeps_window_syncs() {
     assert!(u.degraded());
 
     fault.fail_puts_after(u64::MAX);
-    let p = u.submit_log(op(3), Batching::Off).wait().unwrap();
-    assert_eq!(p, pos(1, 2));
-    assert_eq!(stored_ops(&mem, pos(1, 1)), vec![op(0)]);
+    u.submit_log(op(3), Batching::Off).wait().unwrap();
+    // An idle retry may land op(1) on its own before op(3) arrives, or op(3) carries it.
     assert_eq!(
-        stored_ops(&mem, p),
-        vec![op(1), op(3)],
+        logged_ops(&mem, 1),
+        vec![op(0), op(1), op(3)],
         "op(1) owed, op(2) dropped"
     );
-    assert_eq!(mem.list(&Keys::new("db").log_prefix(1)).unwrap().len(), 2);
+    assert!(!u.degraded());
+}
+
+/// Every sync in generation `generation`'s log, in seq order.
+fn logged_ops(mem: &MemStore, generation: u64) -> Vec<Vec<Op>> {
+    let mut keys = mem.list(&Keys::new("db").log_prefix(generation)).unwrap();
+    keys.sort();
+    keys.iter()
+        .flat_map(|k| {
+            let seq = k.rsplit('/').next().unwrap().parse().unwrap();
+            stored_ops(mem, pos(generation, seq))
+        })
+        .collect()
+}
+
+#[test]
+fn owed_retries_are_not_held_back_by_a_long_window() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let u = Uploader::spawn(
+        bucket_with(fault.clone(), short()),
+        None,
+        None,
+        Arc::default(),
+    );
+    fault.fail_puts_after(0);
+    // op(0) in doubt; settling it fails first, so op(1) is handed back and owed.
+    assert!(u.submit_log(op(0), Batching::Off).wait().is_err());
+    let t1 = u.submit_log(op(1), window(10_000, 64));
+    assert!(u.submit_log(op(2), Batching::Off).wait().is_err());
+    assert!(t1.wait().is_err());
+    // A Window sync with a long max_wait joins the batch while op(1) is owed.
+    let t3 = u.submit_log(op(3), window(60_000, 64));
+    fault.fail_puts_after(u64::MAX);
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || tx.send(t3.wait()));
+    let r = rx
+        .recv_timeout(defaults::MAX_BACKOFF * 3)
+        .expect("the owed retry did not wait for the window");
+    assert!(r.is_ok(), "{r:?}");
+    assert!(started.elapsed() < defaults::MAX_BACKOFF * 3);
+    assert_eq!(logged_ops(&mem, 1), vec![op(0), op(1), op(3)]);
     assert!(!u.degraded());
 }
 

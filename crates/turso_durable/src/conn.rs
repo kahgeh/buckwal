@@ -1,14 +1,20 @@
 //! [`Connection`]: the only way SQL reaches the engine. Every call clears the error stash,
 //! runs the SQL guard, prepares, checks the sync mode (D7), binds, steps to completion, and on
 //! failure returns the typed error the IO layer stashed (D8).
-use crate::db::Shared;
+//!
+//! Every public call runs the engine inside a commit context (`batching::ctx`) holding its
+//! effective batching setting, which the WAL sync reads. A call returns `Ok` only once every
+//! commit it made is confirmed in the bucket (`await_acks`).
+use crate::batching::{ctx, Batching, PendingAck};
+use crate::config::Event;
+use crate::db::{lock, Shared};
 use crate::engine::engine_error;
 use crate::error::{Error, Result};
 use crate::guard;
 use crate::io::db_storage::READ_ONLY;
 use crate::io::stash;
 use std::num::NonZero;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use turso_core::{Statement, StepResult, SyncMode, Value, IO};
 
@@ -44,6 +50,8 @@ pub struct Connection {
     /// None once closed.
     core: Option<Arc<turso_core::Connection>>,
     io: Arc<dyn IO>,
+    /// This connection's own setting; `None` falls back to the database's.
+    batching: Mutex<Option<Batching>>,
     /// Declared last, so dropped last: when this holds the last `Arc<Shared>`, its drop
     /// releases `durable.lock` and the process registry, and every engine file handle (the
     /// connection's, and the IO's `app.db` and `-wal` through its storage) must be closed
@@ -67,8 +75,75 @@ impl Connection {
         Connection {
             core: Some(core),
             io,
+            batching: Mutex::new(None),
             shared,
         }
+    }
+
+    /// Commit with `b` from this connection's next commit on; `None` falls back to the
+    /// database's setting ([`crate::Database::set_batching`]). A commit already waiting keeps
+    /// the setting it was made with. `Config` when `b` is invalid.
+    pub fn set_batching(&self, b: Option<Batching>) -> Result<()> {
+        if let Some(b) = &b {
+            b.validate()?;
+        }
+        *lock(&self.batching) = b;
+        Ok(())
+    }
+
+    /// This connection's own setting ([`Connection::set_batching`]).
+    pub fn batching(&self) -> Option<Batching> {
+        *lock(&self.batching)
+    }
+
+    /// The setting the next commit uses: the connection's, else the database's.
+    fn effective_batching(&self) -> Batching {
+        // Task 6: a transaction's own setting comes first.
+        self.batching().unwrap_or_else(|| self.shared.batching())
+    }
+
+    /// Run `f` (one engine call) committing with `b`. On `Ok`, wait for every commit it
+    /// made; on `Err`, its commits are not acked (their uploads go on) and `f`'s error is
+    /// returned. The context is cleared on every path, a panic included.
+    fn call<T>(&self, b: Batching, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _ctx = ctx::enter(b);
+        let v = f()?;
+        self.await_acks()?;
+        Ok(v)
+    }
+
+    /// Wait, in commit order, for every commit the current call made. Each counts as acked
+    /// (`UploadStats::commits_acked`, the wait histogram, `Event::CommitAcked`) only when all
+    /// of them succeeded; otherwise the first error is returned.
+    fn await_acks(&self) -> Result<()> {
+        let mut acked = Vec::new();
+        let mut first_err = None;
+        for ack in ctx::take() {
+            match ack {
+                PendingAck::Done {
+                    commit,
+                    waited,
+                    batching,
+                } => acked.push((commit, waited, batching)),
+                PendingAck::Waiting { ticket, batching } => {
+                    let (commit, submitted) = (ticket.commit, ticket.submitted);
+                    match ticket.wait() {
+                        Ok(_) => acked.push((commit, submitted.elapsed(), batching)),
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        for (commit, waited, batching) in acked {
+            self.shared.stats.record_ack(waited);
+            self.shared.emit(Event::CommitAcked { commit, batching });
+        }
+        Ok(())
     }
 
     fn core(&self) -> &Arc<turso_core::Connection> {
@@ -140,25 +215,29 @@ impl Connection {
 
     /// Run one statement; returns the number of rows it changed.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        let mut stmt = self.prepare(sql, params, true)?;
-        self.step_all(&mut stmt, |_| {})?;
-        Ok(stmt.n_change().max(0) as u64)
+        self.call(self.effective_batching(), || {
+            let mut stmt = self.prepare(sql, params, true)?;
+            self.step_all(&mut stmt, |_| {})?;
+            Ok(stmt.n_change().max(0) as u64)
+        })
     }
 
     /// Run every statement in `sql`, with no parameters. The whole string is guard-checked
     /// first, so a refused statement anywhere means none of them runs.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        stash::clear();
-        guard::check_sql(sql)?;
-        if self.shared.read_only {
-            return self.execute_batch_read_only(sql);
-        }
-        let r = self.core().prepare_execute_batch(sql).map_err(engine_error);
-        // Defence in depth: the guard above refuses every spelling of a lower `synchronous`,
-        // but the batch prepares and runs its statements in one engine call, so this can
-        // only look afterwards (and put FULL back for the next call).
-        self.check_sync_mode()?;
-        r
+        self.call(self.effective_batching(), || {
+            stash::clear();
+            guard::check_sql(sql)?;
+            if self.shared.read_only {
+                return self.execute_batch_read_only(sql);
+            }
+            let r = self.core().prepare_execute_batch(sql).map_err(engine_error);
+            // Defence in depth: the guard above refuses every spelling of a lower
+            // `synchronous`, but the batch prepares and runs its statements in one engine
+            // call, so this can only look afterwards (and put FULL back for the next call).
+            self.check_sync_mode()?;
+            r
+        })
     }
 
     /// One statement at a time, so each is checked as read-only before it runs.
@@ -175,14 +254,17 @@ impl Connection {
 
     /// Run one statement and collect its rows.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>> {
-        let mut stmt = self.prepare(sql, params, true)?;
-        let mut rows = Vec::new();
-        self.step_all(&mut stmt, |r| rows.push(r))?;
-        Ok(rows)
+        self.call(self.effective_batching(), || {
+            let mut stmt = self.prepare(sql, params, true)?;
+            let mut rows = Vec::new();
+            self.step_all(&mut stmt, |r| rows.push(r))?;
+            Ok(rows)
+        })
     }
 
     /// `BEGIN`, then `f`, then `COMMIT`; `ROLLBACK` when `f` or the commit fails, and `f`'s
-    /// (or the commit's) error is returned.
+    /// (or the commit's) error is returned. Each statement is its own call, so the `COMMIT`
+    /// returns only once the transaction is confirmed in the bucket.
     pub fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         self.execute("BEGIN", &[])?;
         let r = f(&Transaction { conn: self }).and_then(|v| self.execute("COMMIT", &[]).map(|_| v));
@@ -197,14 +279,16 @@ impl Connection {
     /// this call: its pages are uploaded first (a seal). RESTART only resets the WAL in memory,
     /// so the seal happens in the next commit (which also gets any upload error).
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<()> {
-        stash::clear();
-        if self.shared.read_only {
-            return Err(Error::Unsupported(READ_ONLY));
-        }
-        self.core()
-            .checkpoint(mode.core())
-            .map(|_| ())
-            .map_err(engine_error)
+        self.call(Batching::Off, || {
+            stash::clear();
+            if self.shared.read_only {
+                return Err(Error::Unsupported(READ_ONLY));
+            }
+            self.core()
+                .checkpoint(mode.core())
+                .map(|_| ())
+                .map_err(engine_error)
+        })
     }
 
     /// Close the connection. The last connection to close checkpoints the WAL (a writer only).
@@ -216,8 +300,10 @@ impl Connection {
         let Some(core) = self.core.take() else {
             return Ok(());
         };
-        stash::clear();
-        let r = core.close().map_err(engine_error);
+        let r = self.call(Batching::Off, || {
+            stash::clear();
+            core.close().map_err(engine_error)
+        });
         drop(core);
         self.shared.connection_closed();
         r

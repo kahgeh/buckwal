@@ -40,10 +40,8 @@ pub(crate) struct UploaderCounters {
 /// The reply to one `submit_log`.
 pub(crate) struct Ticket {
     /// The commit's number: 1, 2, … in submission order, per open.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 5: `CommitAcked`
     pub commit: u64,
     /// When it was submitted, for the ack wait.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 5: `StatsCell::record_ack`
     pub submitted: Instant,
     rx: Receiver<Result<LogPos>>,
 }
@@ -176,12 +174,10 @@ impl Uploader {
 
     /// The bucket has something to settle (fenced, a record in doubt, a seal's head write
     /// unresolved) or Window syncs are owed. Updated after every job, before its replies.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 5: `ShippingFile::sync`
     pub(crate) fn degraded(&self) -> bool {
         self.degraded.load(SeqCst)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // Task 5: shared with `Shared`
     pub(crate) fn stats(&self) -> Arc<StatsCell> {
         self.stats.clone()
     }
@@ -241,7 +237,11 @@ impl Worker {
     /// Run jobs in order until every sender is gone, then flush what waits and exit.
     fn run(mut self, rx: Receiver<Job>) {
         loop {
-            let next = if let Some(deadline) = self.batch.deadline() {
+            let next = if let Some(mut deadline) = self.batch.deadline() {
+                if !self.owed.is_empty() {
+                    // Owed retries are not held back by a long window.
+                    deadline = deadline.min(Instant::now() + defaults::MAX_BACKOFF);
+                }
                 rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
             } else if !self.owed.is_empty() || self.bucket.degraded() {
                 rx.recv_timeout(defaults::MAX_BACKOFF)
@@ -291,11 +291,12 @@ impl Worker {
         });
     }
 
-    /// A wait ran out: a batch whose deadline passed is flushed; otherwise owed syncs are
-    /// retried, or the bucket catches up on what it has to settle.
+    /// A wait ran out: a batch whose deadline passed is flushed, and owed syncs are retried
+    /// (with the batch, whatever its deadline); otherwise the bucket catches up on what it has
+    /// to settle.
     fn tick(&mut self) {
         match self.batch.deadline() {
-            Some(d) if d <= Instant::now() => {
+            Some(d) if d <= Instant::now() || !self.owed.is_empty() => {
                 let _ = self.flush();
             }
             Some(_) => {}

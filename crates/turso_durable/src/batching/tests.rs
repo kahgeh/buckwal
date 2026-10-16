@@ -84,3 +84,65 @@ fn errors_name_the_bad_text_and_overflow_is_refused() {
     assert_eq!(big.to_string(), "window 18446744073709551615s 1 1");
     assert!(Batching::Off.validate().is_ok());
 }
+
+fn done(commit: u64) -> PendingAck {
+    PendingAck::Done {
+        commit,
+        waited: Duration::ZERO,
+        batching: Batching::Off,
+    }
+}
+
+fn commits(acks: &[PendingAck]) -> Vec<u64> {
+    acks.iter()
+        .map(|a| match a {
+            PendingAck::Done { commit, .. } => *commit,
+            PendingAck::Waiting { ticket, .. } => ticket.commit,
+        })
+        .collect()
+}
+
+#[test]
+fn ctx_holds_the_setting_and_acks_until_the_guard_drops() {
+    let w = "window 5ms 2 3".parse::<Batching>().unwrap();
+    assert_eq!(ctx::current(), None);
+    ctx::push(done(1)); // outside every call: dropped
+    {
+        let _g = ctx::enter(w);
+        assert_eq!(ctx::current(), Some(w));
+        assert!(ctx::take().is_empty(), "a call starts with no acks");
+        ctx::push(done(2));
+        ctx::push(done(3));
+        {
+            let _inner = ctx::enter(Batching::Off);
+            assert_eq!(ctx::current(), Some(Batching::Off));
+            assert!(ctx::take().is_empty(), "a nested call has its own acks");
+        }
+        assert_eq!(ctx::current(), Some(w), "the outer call's context is back");
+        assert_eq!(commits(&ctx::take()), vec![2, 3]);
+        assert!(ctx::take().is_empty());
+        ctx::push(done(4));
+    }
+    assert_eq!(ctx::current(), None);
+    assert!(ctx::take().is_empty(), "the dropped guard dropped its acks");
+}
+
+#[test]
+fn ctx_is_cleared_by_a_panic() {
+    let r = std::panic::catch_unwind(|| {
+        let _g = ctx::enter(Batching::Off);
+        ctx::push(done(1));
+        panic!("inside a call");
+    });
+    assert!(r.is_err());
+    assert_eq!(ctx::current(), None);
+    assert!(ctx::take().is_empty());
+}
+
+#[test]
+fn ctx_is_per_thread() {
+    let _g = ctx::enter(Batching::Off);
+    std::thread::spawn(|| assert_eq!(ctx::current(), None))
+        .join()
+        .unwrap();
+}

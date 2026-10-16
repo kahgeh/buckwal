@@ -1,6 +1,7 @@
 //! [`open`] and [`Database`]: the directory locks (D4), the order of an open, and shutdown.
+use crate::batching::Batching;
 use crate::bucket::{self, Bucket};
-use crate::config::{Config, EngineConfig};
+use crate::config::{Config, EngineConfig, Event, EventHook};
 use crate::conn::Connection;
 use crate::engine::{engine_error, open_engine, Engine};
 use crate::error::{Error, Result};
@@ -8,6 +9,7 @@ use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
 use crate::format::{decode_record, Keys, LocalState, LogRecord, FORMAT};
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, restore_staged};
+use crate::stats::{StatsCell, UploadStats};
 use crate::store::{with_retry, ObjectStore, StatsSnap};
 use crate::trim::spawn_trimmer;
 use crate::uploader::Uploader;
@@ -25,7 +27,7 @@ use turso_core::{File, OpenFlags, PlatformIO, IO};
 /// this process must be refused before it opens any file.
 static OPEN_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -103,6 +105,11 @@ pub(crate) struct Shared {
     /// None once closed.
     open: Mutex<Option<Open>>,
     connections: AtomicUsize,
+    /// The setting a connection without its own commits with ([`Database::set_batching`]).
+    batching: Mutex<Batching>,
+    /// The uploader's counters; connections record their acks in them.
+    pub(crate) stats: Arc<StatsCell>,
+    events: Option<EventHook>,
     /// What the open's reconcile found (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) reconciled: Option<Reconciled>,
@@ -111,6 +118,16 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn connection_closed(&self) {
         self.connections.fetch_sub(1, SeqCst);
+    }
+
+    pub(crate) fn batching(&self) -> Batching {
+        *lock(&self.batching)
+    }
+
+    pub(crate) fn emit(&self, e: Event) {
+        if let Some(h) = &self.events {
+            h(&e);
+        }
     }
 
     /// Drain the uploader, stop the trimmer, drop the engine (and with it the engine's
@@ -261,6 +278,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         shared: Arc::new(Shared {
             read_only,
             store,
+            stats: uploader.stats(),
             uploader,
             open: Mutex::new(Some(Open {
                 engine,
@@ -268,6 +286,8 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
                 guard,
             })),
             connections: AtomicUsize::new(0),
+            batching: Mutex::new(config.batching),
+            events: cfg.events.clone(),
             reconciled,
         }),
     })
@@ -414,6 +434,25 @@ impl Database {
     /// Requests and bytes sent to the bucket so far.
     pub fn bucket_stats(&self) -> StatsSnap {
         self.shared.store.stats()
+    }
+
+    /// How many commits each log PUT carried and how long acks waited, since open.
+    pub fn upload_stats(&self) -> UploadStats {
+        self.shared.stats.snapshot()
+    }
+
+    /// Commit with `b` from the next commit of every connection without a setting of its
+    /// own ([`Connection::set_batching`]); a commit already waiting keeps the setting it was
+    /// made with. Starts as [`Config::batching`]. `Config` when `b` is invalid.
+    pub fn set_batching(&self, b: Batching) -> Result<()> {
+        b.validate()?;
+        *lock(&self.shared.batching) = b;
+        Ok(())
+    }
+
+    /// The database's setting ([`Database::set_batching`]).
+    pub fn batching(&self) -> Batching {
+        self.shared.batching()
     }
 
     /// Close the database: drain the uploader, stop the trimmer, release the directory.

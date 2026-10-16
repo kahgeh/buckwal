@@ -1,11 +1,13 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! The engine's `-wal` file. Every write and truncate is recorded as an op; `sync` ships the
-//! ops as one log record and only then fsyncs (D3). A rewrite of the WAL header with new salts,
-//! or a truncate to 0, starts a new generation: the old one is sealed first (D6).
+//! ops as one log record and only then fsyncs (D3), or, for a Window commit, queues them in
+//! the uploader's batch and fsyncs at once (the commit's call waits for the upload). A
+//! rewrite of the WAL header with new salts, or a truncate to 0, starts a new generation:
+//! the old one is sealed first (D6).
 use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
-use crate::batching::Batching;
+use crate::batching::{ctx, Batching, PendingAck};
 use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::format::Op;
@@ -89,10 +91,15 @@ impl ShippingFile {
         })
     }
 
-    /// Ship the ops written since the last sync as one log record and wait for it. On
-    /// failure they belong to the uploader's in-doubt record, so they are not requeued.
+    fn take_pending(&self) -> Vec<Op> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+
+    /// Ship the ops written since the last sync as one log record and wait for it (a seal
+    /// does; it acks nothing). On failure they belong to the uploader (in doubt, or dropped
+    /// as an `Off` sync), so they are not requeued.
     fn ship_pending(&self) -> Result<()> {
-        let ops = std::mem::take(&mut *self.pending.lock().unwrap());
+        let ops = self.take_pending();
         if ops.is_empty() {
             return Ok(());
         }
@@ -100,6 +107,34 @@ impl ShippingFile {
             .submit_log(ops, Batching::Off)
             .wait()
             .map(|_| ())
+    }
+
+    /// A commit's ops, with the setting of the `Connection` call it runs in (`Off` outside
+    /// any). `Off`, or any commit while the uploader is degraded, blocks until its record is
+    /// in the bucket, so a failure rolls it back. A Window commit only queues: the call waits
+    /// on its ticket after the engine returns (`Connection::await_acks`).
+    fn ship_commit(&self) -> Result<()> {
+        let ops = self.take_pending();
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let b = ctx::current().unwrap_or(Batching::Off);
+        if b == Batching::Off || self.uploader.degraded() {
+            let ticket = self.uploader.submit_log(ops, Batching::Off);
+            let (commit, submitted) = (ticket.commit, ticket.submitted);
+            ticket.wait()?;
+            ctx::push(PendingAck::Done {
+                commit,
+                waited: submitted.elapsed(),
+                batching: b,
+            });
+        } else {
+            ctx::push(PendingAck::Waiting {
+                ticket: self.uploader.submit_log(ops, b),
+                batching: b,
+            });
+        }
+        Ok(())
     }
 
     /// Seal the generation the local file still holds (D6): its last ops, then the pages.
@@ -205,9 +240,10 @@ impl File for ShippingFile {
         self.record_if_ok(ops, self.inner.pwritev(pos, buffers, c))
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
-        // Upload before any completion exists: a failed upload is a synchronous `Err`, which
-        // rolls the commit back, never a failed completion (which would panic, D3).
-        self.ship_pending().map_err(stash)?;
+        // Upload (or queue) before any completion exists: a failed upload is a synchronous
+        // `Err`, which rolls the commit back, never a failed completion (which would panic,
+        // D3). A queued Window commit is fsynced locally now and acked by its call later.
+        self.ship_commit().map_err(stash)?;
         self.inner.sync(c, sync_type)
     }
     fn size(&self) -> turso_core::Result<u64> {
