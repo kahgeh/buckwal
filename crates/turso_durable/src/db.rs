@@ -7,6 +7,7 @@ use crate::engine::{engine_error, open_engine, Engine};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
 use crate::format::{decode_record, Keys, LocalState, LogRecord, FORMAT};
+use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, restore_staged};
 use crate::stats::{StatsCell, UploadStats};
@@ -17,7 +18,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use turso_core::{File, OpenFlags, PlatformIO, IO};
@@ -101,7 +102,14 @@ struct Open {
 pub(crate) struct Shared {
     pub(crate) read_only: bool,
     store: Arc<dyn ObjectStore>,
-    uploader: Arc<Uploader>,
+    pub(crate) uploader: Arc<Uploader>,
+    /// Every public `Connection` call's engine work passes it; maintenance closes it.
+    pub(crate) gate: Arc<Gate>,
+    /// The maintenance thread (a writer open with maintenance on). Stopped in `finish`
+    /// before the engine drops.
+    maintenance: Option<Maintenance>,
+    /// The engine's `-wal` high-water mark (`Engine::wal_bytes`).
+    wal_bytes: Arc<AtomicU64>,
     /// None once closed.
     open: Mutex<Option<Open>>,
     connections: AtomicUsize,
@@ -130,8 +138,30 @@ impl Shared {
         }
     }
 
-    /// Drain the uploader, stop the trimmer, drop the engine (and with it the engine's
-    /// registry entry), unlock `durable.lock` and leave the process registry.
+    /// The current generation's log objects and `-wal` bytes: what maintenance measures.
+    pub(crate) fn maintenance_measures(&self) -> (u64, u64) {
+        (
+            self.uploader.generation_log_objects(),
+            self.wal_bytes.load(SeqCst),
+        )
+    }
+
+    /// After a `Connection` call: wake maintenance if the generation is due (atomic loads
+    /// only, unless it is).
+    pub(crate) fn poke_maintenance(&self) {
+        if let Some(m) = &self.maintenance {
+            let (log_objects, wal_bytes) = self.maintenance_measures();
+            m.poke(log_objects, wal_bytes);
+        }
+    }
+
+    /// The engine, while the database is open (maintenance connects to it).
+    pub(crate) fn engine_db(&self) -> Option<Arc<turso_core::Database>> {
+        lock(&self.open).as_ref().map(|o| o.engine.db.clone())
+    }
+
+    /// Stop maintenance, drop the engine (and with it the engine's registry entry), drain the
+    /// uploader, stop the trimmer, unlock `durable.lock` and leave the process registry.
     fn shutdown(&self) {
         let open = lock(&self.open).take();
         self.finish(open);
@@ -146,6 +176,11 @@ impl Shared {
             trimmer,
             guard,
         } = open;
+        // Before the engine drops: a run in progress ends first (it holds its own engine
+        // connection), and none starts after this.
+        if let Some(m) = &self.maintenance {
+            m.stop();
+        }
         drop(engine);
         // Runs every queued job; the uploader thread's end drops the last trim sender.
         self.uploader.shutdown();
@@ -274,6 +309,8 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         )
     });
     let uploader = engine.uploader.clone();
+    let wal_bytes = engine.wal_bytes.clone();
+    let maintenance = MaintenanceConfig::from_config(&config);
     tracing::info!(
         target: "turso_durable",
         generation = uploader.generation(),
@@ -283,11 +320,16 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         "database opened"
     );
     Ok(Database {
-        shared: Arc::new(Shared {
+        shared: Arc::new_cyclic(|weak| Shared {
             read_only,
             store,
             stats: uploader.stats(),
             uploader,
+            gate: Arc::default(),
+            // It wakes only on a call's poke, so never before this Arc exists.
+            maintenance: (!read_only && maintenance.enabled())
+                .then(|| Maintenance::spawn(weak.clone(), maintenance)),
+            wal_bytes,
             open: Mutex::new(Some(Open {
                 engine,
                 trimmer,

@@ -86,6 +86,8 @@ pub(crate) struct Uploader {
     commits: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
     generation: Arc<AtomicU64>,
+    /// How many log objects the current generation holds (the bucket's next seq − 1).
+    log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
     stats: Arc<StatsCell>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -101,6 +103,7 @@ impl Uploader {
     ) -> Arc<Uploader> {
         bucket.set_event_hook(events.clone());
         let generation = Arc::new(AtomicU64::new(bucket.head().generation));
+        let log_objects = Arc::new(AtomicU64::new(bucket.next_seq().saturating_sub(1)));
         let degraded = Arc::new(AtomicBool::new(bucket.degraded()));
         let counters = bucket.counters();
         let (tx, rx) = mpsc::channel();
@@ -109,6 +112,7 @@ impl Uploader {
             batch: Batch::default(),
             owed: VecDeque::new(),
             generation: generation.clone(),
+            log_objects: log_objects.clone(),
             degraded: degraded.clone(),
             stats: stats.clone(),
             events,
@@ -125,6 +129,7 @@ impl Uploader {
             commits: AtomicU64::new(0),
             thread: Mutex::new(Some(thread)),
             generation,
+            log_objects,
             degraded,
             stats,
             counters,
@@ -188,6 +193,12 @@ impl Uploader {
         self.generation.load(SeqCst)
     }
 
+    /// How many log objects the current generation holds, as of the last job: what a
+    /// restore of it would read. Reset by each seal. The maintenance trigger reads it.
+    pub(crate) fn generation_log_objects(&self) -> u64 {
+        self.log_objects.load(SeqCst)
+    }
+
     /// The bucket has something to settle (fenced, a record in doubt, a seal's head write
     /// unresolved) or Window syncs are owed. Updated after every job, before its replies.
     pub(crate) fn degraded(&self) -> bool {
@@ -243,6 +254,7 @@ struct Worker {
     /// everything newer.
     owed: VecDeque<Pending>,
     generation: Arc<AtomicU64>,
+    log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
     stats: Arc<StatsCell>,
     events: Option<EventHook>,
@@ -299,9 +311,13 @@ impl Worker {
         }
     }
 
+    /// Publish `degraded`, and the generation's log object count (every append and seal
+    /// goes through here before its replies).
     fn publish_degraded(&self) {
         let d = self.bucket.degraded() || !self.owed.is_empty();
         self.degraded.store(d, SeqCst);
+        self.log_objects
+            .store(self.bucket.next_seq().saturating_sub(1), SeqCst);
     }
 
     fn log(&mut self, item: Pending) {

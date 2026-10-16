@@ -13,6 +13,7 @@ use crate::files::io_err;
 use crate::format::Op;
 use crate::uploader::{op_bytes, Ticket, Uploader};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use tracing::field::{display, Empty};
 use tracing::{info_span, Span};
@@ -93,25 +94,32 @@ pub(crate) struct ShippingFile {
     commit: Mutex<Option<CommitSpans>>,
     /// The current generation's WAL header (its first 32 bytes), once one is known.
     header: Mutex<Option<Vec<u8>>>,
+    /// The highest offset + length written since the current generation's header (the
+    /// maintenance trigger's `-wal` measure; shared with `Engine::wal_bytes`). Reset at a
+    /// new generation's header and at `truncate(0)`.
+    high_water: Arc<AtomicU64>,
     /// A read-only open: every write and truncate is refused.
     read_only: bool,
 }
 
 impl ShippingFile {
     /// Wrap the opened `-wal`; an existing header (the file holds at least 32 bytes) is the
-    /// current generation's.
+    /// current generation's, and so is everything the file holds (`high_water`).
     pub(crate) fn new(
         inner: Arc<dyn File>,
         io: Arc<dyn IO>,
         uploader: Arc<Uploader>,
         storage: Arc<BucketDbStorage>,
+        high_water: Arc<AtomicU64>,
         read_only: bool,
     ) -> turso_core::Result<ShippingFile> {
-        let header = if inner.size()? >= WAL_HEADER as u64 {
+        let size = inner.size()?;
+        let header = if size >= WAL_HEADER as u64 {
             Some(read_at(&*inner, &*io, 0, WAL_HEADER)?)
         } else {
             None
         };
+        high_water.store(size, SeqCst);
         Ok(ShippingFile {
             inner,
             io,
@@ -120,6 +128,7 @@ impl ShippingFile {
             pending: Mutex::new(Vec::new()),
             commit: Mutex::new(None),
             header: Mutex::new(header),
+            high_water,
             read_only,
         })
     }
@@ -225,6 +234,7 @@ impl ShippingFile {
         };
         if boundary {
             self.seal().map_err(stash)?;
+            self.high_water.store(0, SeqCst);
         }
         *h = Some(header[..header.len().min(WAL_HEADER)].to_vec());
         Ok(())
@@ -247,6 +257,11 @@ impl ShippingFile {
         r: turso_core::Result<Completion>,
     ) -> turso_core::Result<Completion> {
         if r.is_ok() && !ops.is_empty() {
+            let end = ops.iter().fold(0, |end, op| match op {
+                Op::Write { off, bytes } => end.max(off + bytes.len() as u64),
+                Op::Truncate { .. } => end,
+            });
+            self.high_water.fetch_max(end, SeqCst);
             let mut pending = self.pending.lock().unwrap();
             if pending.is_empty() {
                 *self.commit.lock().unwrap() = Some(CommitSpans::start());
@@ -329,6 +344,7 @@ impl File for ShippingFile {
                 self.seal().map_err(stash)?;
             }
             *h = None;
+            self.high_water.store(0, SeqCst);
         }
         self.record_if_ok(vec![Op::Truncate { len }], self.inner.truncate(len, c))
     }
@@ -392,6 +408,7 @@ mod tests {
             Arc::new(turso_core::PlatformIO::new().unwrap()),
             e.uploader.clone(),
             e.storage.clone(),
+            Arc::default(),
             false,
         )
         .unwrap();

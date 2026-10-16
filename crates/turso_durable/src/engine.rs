@@ -11,7 +11,7 @@ use crate::io::db_storage::StorageParts;
 use crate::io::{stash, BucketDbStorage, DurableIo};
 use crate::uploader::{TrimSnapshot, Uploader};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -25,6 +25,9 @@ pub(crate) struct Engine {
     pub storage: Arc<BucketDbStorage>,
     pub uploader: Arc<Uploader>,
     pub io: Arc<DurableIo>,
+    /// How far the current generation's `-wal` reaches, in bytes (`ShippingFile`'s high-water
+    /// mark): the maintenance trigger's second measure.
+    pub wal_bytes: Arc<AtomicU64>,
     /// The background page fetcher (`EngineConfig::prefetch`); stopped and joined on drop.
     pub prefetch: Option<Prefetch>,
 }
@@ -109,11 +112,13 @@ pub(crate) fn open_engine(
         read_only: cfg.read_only,
     }));
     storage.adopt_persisted_dirty()?;
+    let wal_bytes = Arc::new(AtomicU64::new(0));
     let io = Arc::new(DurableIo::new(
         platform,
         wal_path,
         uploader.clone(),
         storage.clone(),
+        wal_bytes.clone(),
         cfg.read_only,
     ));
     let opts = OpenOptions::new(Arc::new(SqliteDialect))
@@ -152,6 +157,7 @@ pub(crate) fn open_engine(
         storage,
         uploader,
         io,
+        wal_bytes,
         prefetch,
     })
 }

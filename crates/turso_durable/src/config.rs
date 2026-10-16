@@ -35,6 +35,21 @@ pub mod defaults {
     /// Window commit's ack can wait the whole `max_wait` (always, on a single connection),
     /// so a huge one would hang the caller.
     pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(60);
+    /// The maintenance checkpoint runs once the current generation's log holds this many
+    /// objects (`DURABLE_MAINTENANCE_LOG_OBJECTS`; 0 = this measure is off). A restore reads
+    /// about this many log objects at most.
+    pub const MAINTENANCE_LOG_OBJECTS: u64 = 1000;
+    /// ... or once the local `-wal` has grown to this many bytes since the generation began
+    /// (`DURABLE_MAINTENANCE_WAL_MIB`, in MiB; 0 = this measure is off).
+    pub const MAINTENANCE_WAL_BYTES: u64 = 64 << 20;
+    /// How long maintenance waits for in-flight calls (and open transactions) to end, with
+    /// new ones held back, before it gives up and retries later
+    /// (`DURABLE_MAINTENANCE_GATE_WAIT_MS`). It bounds the stall a maintenance run adds to
+    /// a commit.
+    pub const MAINTENANCE_GATE_WAIT: Duration = Duration::from_millis(500);
+    /// After a skipped or failed maintenance run, the next one waits at least this long
+    /// (unless the generation passes twice a threshold). Fixed.
+    pub const MAINTENANCE_RETRY: Duration = Duration::from_secs(1);
     pub const REGION: &str = "us-east-1";
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.
@@ -79,6 +94,17 @@ pub struct Config {
     pub prefetch: bool,
     /// How commits are gathered into one upload (`DURABLE_BATCHING`).
     pub batching: Batching,
+    /// The library checkpoints (TRUNCATE) a writer's generation itself once its log holds
+    /// this many objects, so a generation the engine never restarts (sustained concurrent
+    /// commits) is still sealed and trimmed. 0 turns this measure off; with
+    /// `maintenance_wal_bytes` also 0, maintenance is off.
+    pub maintenance_log_objects: u64,
+    /// ... or once the local `-wal` holds this many bytes of the generation. 0 turns this
+    /// measure off.
+    pub maintenance_wal_bytes: u64,
+    /// How long a maintenance run holds new calls back while it waits for the ones in flight
+    /// (and open transactions) to end; then it gives up and retries later.
+    pub maintenance_gate_wait: Duration,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -101,13 +127,16 @@ impl fmt::Debug for Config {
             .field("trim_grace", &self.trim_grace)
             .field("prefetch", &self.prefetch)
             .field("batching", &self.batching)
+            .field("maintenance_log_objects", &self.maintenance_log_objects)
+            .field("maintenance_wal_bytes", &self.maintenance_wal_bytes)
+            .field("maintenance_gate_wait", &self.maintenance_gate_wait)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 13] = [
+const ENV_VARS: [&str; 16] = [
     "DURABLE_ENDPOINT",
     "DURABLE_REGION",
     "DURABLE_PATH_STYLE",
@@ -121,6 +150,9 @@ const ENV_VARS: [&str; 13] = [
     "DURABLE_TRIM_GRACE_SECS",
     "DURABLE_PREFETCH",
     "DURABLE_BATCHING",
+    "DURABLE_MAINTENANCE_LOG_OBJECTS",
+    "DURABLE_MAINTENANCE_WAL_MIB",
+    "DURABLE_MAINTENANCE_GATE_WAIT_MS",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -192,6 +224,9 @@ impl Config {
             trim_grace: defaults::TRIM_GRACE,
             prefetch: defaults::PREFETCH,
             batching: defaults::BATCHING,
+            maintenance_log_objects: defaults::MAINTENANCE_LOG_OBJECTS,
+            maintenance_wal_bytes: defaults::MAINTENANCE_WAL_BYTES,
+            maintenance_gate_wait: defaults::MAINTENANCE_GATE_WAIT,
             on_event: None,
         }
     }
@@ -250,6 +285,20 @@ impl Config {
                 e => e,
             })?;
         }
+        if let Some(v) = get("DURABLE_MAINTENANCE_LOG_OBJECTS") {
+            c.maintenance_log_objects = parse_num("DURABLE_MAINTENANCE_LOG_OBJECTS", &v)?;
+        }
+        if let Some(v) = get("DURABLE_MAINTENANCE_WAL_MIB") {
+            let var = "DURABLE_MAINTENANCE_WAL_MIB";
+            let mib: u64 = parse_num(var, &v)?;
+            c.maintenance_wal_bytes = mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| Error::Config(format!("{var} is too large: {v:?}")))?;
+        }
+        if let Some(v) = get("DURABLE_MAINTENANCE_GATE_WAIT_MS") {
+            c.maintenance_gate_wait =
+                Duration::from_millis(parse_num("DURABLE_MAINTENANCE_GATE_WAIT_MS", &v)?);
+        }
         Ok(c)
     }
 
@@ -279,6 +328,14 @@ impl Config {
             )));
         }
         self.batching.validate()?;
+        let maintenance = self.maintenance_log_objects > 0 || self.maintenance_wal_bytes > 0;
+        if maintenance && self.maintenance_gate_wait.is_zero() {
+            return Err(Error::Config(
+                "maintenance_gate_wait must be above 0 while maintenance is on (set both \
+                 maintenance thresholds to 0 to turn it off)"
+                    .into(),
+            ));
+        }
         validate_prefix(&self.prefix)
     }
 
@@ -317,7 +374,9 @@ impl Config {
 }
 
 /// Called synchronously, on the thread that did the work, for each [`Event`]. A test and
-/// diagnostics hook, not part of the supported API (hidden from the docs).
+/// diagnostics hook, not part of the supported API (hidden from the docs). It must not call
+/// into the database: the uploader thread emits a seal's events while a maintenance run
+/// holds every new call at its gate.
 #[doc(hidden)]
 pub type EventHook = Arc<dyn Fn(&Event) + Send + Sync>;
 
@@ -349,6 +408,26 @@ pub enum Event {
     SealFinished { generation: u64, elapsed: Duration },
     /// The trimmer deleted `deleted` objects no head can reach any more.
     Trimmed { deleted: u64 },
+    /// A maintenance checkpoint of `generation` began: its log held `log_objects` objects
+    /// and the local `-wal` `wal_bytes` bytes.
+    MaintenanceStarted {
+        generation: u64,
+        log_objects: u64,
+        wal_bytes: u64,
+    },
+    /// A maintenance checkpoint of `generation` ran: `sealed` when it ended the generation.
+    /// `gate_wait` is how long it held new calls back before the checkpoint started;
+    /// `elapsed` is the whole run, the checkpoint (and its seal) included.
+    MaintenanceFinished {
+        generation: u64,
+        sealed: bool,
+        gate_wait: Duration,
+        elapsed: Duration,
+    },
+    /// A maintenance run of `generation` did not checkpoint, and is retried later: `reason`
+    /// is `gate_timeout` (calls or an open transaction still in flight at the gate wait),
+    /// `busy` (the engine refused the checkpoint) or `error: <message>`.
+    MaintenanceSkipped { generation: u64, reason: String },
 }
 
 impl EngineConfig {
@@ -467,6 +546,9 @@ mod tests {
             ("DURABLE_TRIM_GRACE_SECS", "7"),
             ("DURABLE_PREFETCH", "1"),
             ("DURABLE_BATCHING", "window 10ms 8 64KiB"),
+            ("DURABLE_MAINTENANCE_LOG_OBJECTS", "250"),
+            ("DURABLE_MAINTENANCE_WAL_MIB", "3"),
+            ("DURABLE_MAINTENANCE_GATE_WAIT_MS", "75"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads DURABLE_* variables.
@@ -499,6 +581,9 @@ mod tests {
                 max_bytes: 64 << 10
             }
         );
+        assert_eq!(c.maintenance_log_objects, 250);
+        assert_eq!(c.maintenance_wal_bytes, 3 << 20);
+        assert_eq!(c.maintenance_gate_wait, Duration::from_millis(75));
 
         // Only the four required ones: the rest are defaults.
         let env = required();
@@ -549,6 +634,55 @@ mod tests {
             max_bytes: 1,
         };
         assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("max_commits")));
+    }
+
+    #[test]
+    fn maintenance_settings_defaults_env_and_validate() {
+        let c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert_eq!(c.maintenance_log_objects, 1000);
+        assert_eq!(c.maintenance_wal_bytes, 64 << 20);
+        assert_eq!(c.maintenance_gate_wait, Duration::from_millis(500));
+        assert_eq!(defaults::MAINTENANCE_RETRY, Duration::from_secs(1));
+        assert_eq!(c.validate(), Ok(()));
+
+        // A gate wait of 0 would skip every run: refused while maintenance is on.
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.maintenance_gate_wait = Duration::ZERO;
+        assert!(
+            matches!(c.validate(), Err(Error::Config(m)) if m.contains("maintenance_gate_wait"))
+        );
+        c.maintenance_log_objects = 0;
+        assert!(
+            matches!(c.validate(), Err(Error::Config(_))),
+            "one measure is still on"
+        );
+        c.maintenance_wal_bytes = 0;
+        assert_eq!(c.validate(), Ok(()), "maintenance off: the wait is unused");
+
+        let mut env = required();
+        env.insert("DURABLE_MAINTENANCE_LOG_OBJECTS", "0");
+        env.insert("DURABLE_MAINTENANCE_WAL_MIB", "0");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!((c.maintenance_log_objects, c.maintenance_wal_bytes), (0, 0));
+        for var in [
+            "DURABLE_MAINTENANCE_LOG_OBJECTS",
+            "DURABLE_MAINTENANCE_WAL_MIB",
+            "DURABLE_MAINTENANCE_GATE_WAIT_MS",
+        ] {
+            let mut env = required();
+            env.insert(var, "-1");
+            match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+                Err(Error::Config(m)) => assert!(m.contains(var), "{m}"),
+                r => panic!("{var}: {r:?}"),
+            }
+        }
+        // MiB that overflow u64 bytes are refused, not wrapped.
+        let mut env = required();
+        env.insert("DURABLE_MAINTENANCE_WAL_MIB", "18446744073709551615");
+        assert!(matches!(
+            Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())),
+            Err(Error::Config(m)) if m.contains("DURABLE_MAINTENANCE_WAL_MIB")
+        ));
     }
 
     #[test]

@@ -944,3 +944,35 @@ fn restore_after_many_checkpoints_reads_only_current_generation() {
         t.elapsed()
     );
 }
+
+/// The maintenance trigger's WAL measure: the highest byte written since the generation's
+/// header, which is the file's length as the engine appends, and back to 0 at a TRUNCATE
+/// (or near 0 at a RESTART's new header).
+#[test]
+fn wal_high_water_follows_the_generation() {
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    for id in 1..=20 {
+        commit_row(&conn, id).unwrap();
+    }
+    let high = e.wal_bytes.load(SeqCst);
+    assert!(high > 20 * 1000, "{high}");
+    assert_eq!(high, wal_len(d.path()));
+    seal_now(&conn);
+    assert_eq!(e.wal_bytes.load(SeqCst), 0);
+    commit_row(&conn, 21).unwrap();
+    let after = e.wal_bytes.load(SeqCst);
+    assert!(after > 0 && after < high, "{after} vs {high}");
+    assert_eq!(after, wal_len(d.path()));
+    for id in 22..=40 {
+        commit_row(&conn, id).unwrap();
+    }
+    let high = e.wal_bytes.load(SeqCst);
+    stash::clear();
+    conn.checkpoint(CheckpointMode::Restart).unwrap();
+    commit_row(&conn, 41).unwrap();
+    let restarted = e.wal_bytes.load(SeqCst);
+    assert!(restarted < high / 4, "{restarted} vs {high}");
+}

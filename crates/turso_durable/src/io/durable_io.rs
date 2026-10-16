@@ -7,6 +7,7 @@ use super::wal_file::ShippingFile;
 use crate::error::Error;
 use crate::uploader::Uploader;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use turso_core::io::FileId;
@@ -20,6 +21,8 @@ pub(crate) struct DurableIo {
     wal_path: String,
     uploader: Arc<Uploader>,
     storage: Arc<BucketDbStorage>,
+    /// The `-wal`'s high-water mark (`ShippingFile::high_water`).
+    wal_bytes: Arc<AtomicU64>,
     /// A read-only open: the `-wal` refuses every write.
     read_only: bool,
 }
@@ -30,6 +33,7 @@ impl DurableIo {
         wal_path: String,
         uploader: Arc<Uploader>,
         storage: Arc<BucketDbStorage>,
+        wal_bytes: Arc<AtomicU64>,
         read_only: bool,
     ) -> DurableIo {
         DurableIo {
@@ -37,6 +41,7 @@ impl DurableIo {
             wal_path,
             uploader,
             storage,
+            wal_bytes,
             read_only,
         }
     }
@@ -71,6 +76,7 @@ impl IO for DurableIo {
             self.inner.clone(),
             self.uploader.clone(),
             self.storage.clone(),
+            self.wal_bytes.clone(),
             self.read_only,
         )?))
     }

@@ -2,6 +2,7 @@
 //! over one): the setting a commit uses reaches its upload, every ack waits for a confirmed
 //! log PUT holding that commit, and failures, fences and seals behave as in `Off`.
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
@@ -975,4 +976,468 @@ fn a_failed_commit_clears_its_override() {
     c.close().unwrap();
     db.close().unwrap();
     assert_eq!(restore_rows(mem), vec![1, 3]);
+}
+
+// ---- The maintenance checkpoint ----
+
+/// What one sustained run measured (printed whole; some fields are only printed).
+#[derive(Debug)]
+#[allow(dead_code)]
+struct Figures {
+    /// `SealFinished` events while all THREADS connections were still committing (until
+    /// the first one finished): the sustained load.
+    seals_under_load: usize,
+    /// The most log objects the current generation reached under that load (the GETs a
+    /// restore at that moment would need, less 1 to 3).
+    max_log_objects_under_load: u64,
+    /// `SealFinished` events before the database closed (the tail, as connections finish
+    /// one by one, included).
+    seals: usize,
+    maintenance_runs: usize,
+    /// GETs of a restore taken right after the run, with the writer still open (so the
+    /// close-time checkpoint does not seal first).
+    restore_gets: u64,
+    restore_log_objects: u64,
+    /// Inserts the engine refused as busy (retried); Off with 8 writers only.
+    busy_retries: usize,
+    /// The longest `gate_wait` and the longest whole run among the finished runs.
+    max_gate_wait: Duration,
+    max_run: Duration,
+    elapsed: Duration,
+}
+
+/// Each finished maintenance run's (gate_wait, elapsed).
+fn finished(ev: &[Event]) -> impl Iterator<Item = (Duration, Duration)> + '_ {
+    ev.iter().filter_map(|e| match e {
+        Event::MaintenanceFinished {
+            gate_wait, elapsed, ..
+        } => Some((*gate_wait, *elapsed)),
+        _ => None,
+    })
+}
+
+fn seals(ev: &[Event]) -> usize {
+    ev.iter()
+        .filter(|e| matches!(e, Event::SealFinished { .. }))
+        .count()
+}
+
+/// `commits` inserts over THREADS connections committing with `batching` (log PUTs delayed
+/// `put_delay`), maintenance at `log_objects` (0 = off). Every call must succeed, but for
+/// the engine's own busy refusals, which are counted and retried, and every row restore.
+fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Duration) -> Figures {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    fault.only_keys_containing("log/");
+    fault.delay_puts(put_delay);
+    let rec = Recorder::default();
+    let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
+        c.batching = batching;
+        c.maintenance_log_objects = log_objects;
+        c.maintenance_wal_bytes = 0;
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    // One shared counter, so the connections run out together and the tail is short.
+    let next = Arc::new(AtomicUsize::new(0));
+    // How many events there were when the first connection ran out.
+    let load_end = Arc::new(Mutex::new(None::<usize>));
+    let t = Instant::now();
+    let threads: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let (db, next, load_end, rec) =
+                (db.clone(), next.clone(), load_end.clone(), rec.clone());
+            thread::spawn(move || {
+                let c = db.connect().unwrap();
+                let mut busy = 0;
+                loop {
+                    let x = next.fetch_add(1, SeqCst);
+                    if x >= commits {
+                        break;
+                    }
+                    loop {
+                        match insert(&c, x as i64) {
+                            Err(Error::Engine(m)) if m.contains("busy") => busy += 1,
+                            r => {
+                                r.unwrap();
+                                break;
+                            }
+                        }
+                    }
+                }
+                load_end
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| rec.events().len());
+                c.close().unwrap();
+                busy
+            })
+        })
+        .collect();
+    let busy_retries = threads.into_iter().map(|h| h.join().unwrap()).sum();
+    let elapsed = t.elapsed();
+    let ev = rec.events();
+    let under_load = &ev[..load_end.lock().unwrap().expect("a connection ran out")];
+    let restored = tempfile::tempdir().unwrap();
+    let report =
+        restore_with_store(&config(restored.path()), mem.clone(), restored.path()).unwrap();
+    let r = open_read_only_with_store(config(restored.path()), mem.clone()).unwrap();
+    let rc = r.connect().unwrap();
+    let rows = rc
+        .query("SELECT count(*), min(x), max(x) FROM t", &[])
+        .unwrap();
+    let got: Vec<i64> = rows[0].iter().map(|v| v.as_int().unwrap()).collect();
+    assert_eq!(got, vec![commits as i64, 0, commits as i64 - 1]);
+    drop(rc);
+    r.close().unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    Figures {
+        seals_under_load: seals(under_load),
+        max_log_objects_under_load: under_load
+            .iter()
+            .filter_map(|e| match e {
+                Event::LogUploaded { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0),
+        seals: seals(&ev),
+        maintenance_runs: ev
+            .iter()
+            .filter(|e| matches!(e, Event::MaintenanceStarted { .. }))
+            .count(),
+        restore_gets: report.gets,
+        restore_log_objects: report.log_objects,
+        busy_retries,
+        max_gate_wait: finished(&ev).map(|(g, _)| g).max().unwrap_or_default(),
+        max_run: finished(&ev).map(|(_, r)| r).max().unwrap_or_default(),
+        elapsed,
+    }
+}
+
+/// Under sustained Window commits from 8 connections the engine never restarts the WAL, so
+/// without maintenance nothing is sealed while the load lasts (it may seal once at the tail,
+/// as connections finish) and the generation's log grows with the commits. With it, the
+/// generation is sealed every ~200 log objects and a restore reads at most that.
+#[test]
+fn sustained_window_load_seals_and_bounds_restore_gets() {
+    const THRESHOLD: u64 = 200;
+    const COMMITS: usize = 4800;
+    let win = w(1, 64, 1 << 20);
+    let before = sustained(win, 0, COMMITS, Duration::from_millis(1));
+    eprintln!("window before (maintenance off): {before:?}");
+    let after = sustained(win, THRESHOLD, COMMITS, Duration::from_millis(1));
+    eprintln!("window after (maintenance at {THRESHOLD}): {after:?}");
+    assert_eq!(
+        before.seals_under_load, 0,
+        "the baseline sealed: {before:?}"
+    );
+    assert!(
+        before.max_log_objects_under_load > 4 * THRESHOLD,
+        "{before:?}"
+    );
+    assert_eq!((before.busy_retries, after.busy_retries), (0, 0));
+    assert_eq!(before.maintenance_runs, 0);
+    assert!(after.seals_under_load > 0, "{after:?}");
+    // head, manifest, page 1, the generation's log objects (+ 1 in flight).
+    assert!(after.restore_gets <= THRESHOLD + 4, "{after:?}");
+    assert!(after.restore_log_objects <= THRESHOLD + 1, "{after:?}");
+}
+
+/// Off seals by itself (the engine restarts the WAL between commits); the figures with
+/// maintenance off and on, for the record.
+#[test]
+fn off_with_eight_connections_figures() {
+    const COMMITS: usize = 2400;
+    let before = sustained(Batching::Off, 0, COMMITS, Duration::from_millis(1));
+    eprintln!("off before (maintenance off): {before:?}");
+    let after = sustained(Batching::Off, 200, COMMITS, Duration::from_millis(1));
+    eprintln!("off after (maintenance at 200): {after:?}");
+    assert!(after.seals >= 1, "{after:?}");
+}
+
+/// Open transactions count as in flight: maintenance waits at most `gate_wait` for one,
+/// skips, and seals after it ends. Every call succeeds.
+#[test]
+fn maintenance_waits_out_an_open_transaction_and_retries() {
+    let rec = Recorder::default();
+    let store = mem();
+    let (_d, db) = open_with(store.clone(), rec.clone(), |c| {
+        c.maintenance_log_objects = 20;
+        c.maintenance_wal_bytes = 0;
+        c.maintenance_gate_wait = Duration::from_millis(100);
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    // A read transaction left open between statements: it holds the WAL read lock that
+    // TRUNCATE would wait on. (A write transaction would make the other connection's
+    // commits busy, which is the engine's rule, not maintenance's.)
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN", &[]).unwrap();
+    assert_eq!(count(&reader), 0);
+    let mut slowest = Duration::ZERO;
+    for x in 0..40 {
+        let t = Instant::now();
+        insert(&c, x).unwrap();
+        slowest = slowest.max(t.elapsed());
+    }
+    rec.wait_for(
+        |e| matches!(e, Event::MaintenanceSkipped { reason, .. } if reason == "gate_timeout"),
+    );
+    assert_eq!(seals(&rec.events()), 0, "sealed under an open transaction");
+    // A commit waits at the gate only while a run waits for the transaction.
+    assert!(slowest < Duration::from_secs(2), "{slowest:?}");
+    // Statements inside the open transaction still pass a closed gate.
+    assert_eq!(count(&reader), 0);
+    reader.execute("COMMIT", &[]).unwrap();
+    insert(&c, 40).unwrap();
+    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { sealed: true, .. }));
+    assert!(seals(&rec.events()) >= 1);
+    reader.close().unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restore_rows(store), (0..=40).collect::<Vec<_>>());
+}
+
+/// The same with `transaction_with` and BEGIN … COMMIT from 8 connections under a 1 ms
+/// window: the transactions keep passing and the generation is still sealed.
+#[test]
+fn window_transactions_from_eight_connections_still_seal() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    fault.only_keys_containing("log/");
+    fault.delay_puts(Duration::from_millis(1));
+    let rec = Recorder::default();
+    let win = w(1, 64, 1 << 20);
+    let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
+        c.batching = win;
+        c.maintenance_log_objects = 200;
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    const TXNS: usize = 120;
+    const STATEMENTS: usize = 10;
+    let started = Instant::now();
+    let threads: Vec<_> = (0..THREADS)
+        .map(|n| {
+            let db = db.clone();
+            thread::spawn(move || {
+                let c = db.connect().unwrap();
+                for t in 0..TXNS {
+                    let base = ((n * TXNS + t) * STATEMENTS) as i64;
+                    if t % 2 == 0 {
+                        c.transaction_with(win, |tx| {
+                            for i in 0..STATEMENTS as i64 {
+                                tx.execute(
+                                    "INSERT INTO t VALUES (?)",
+                                    &[Value::from_i64(base + i)],
+                                )?;
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                    } else {
+                        c.execute("BEGIN", &[]).unwrap();
+                        for i in 0..STATEMENTS as i64 {
+                            insert(&c, base + i).unwrap();
+                        }
+                        c.execute("COMMIT", &[]).unwrap();
+                    }
+                }
+                c.close().unwrap();
+            })
+        })
+        .collect();
+    for h in threads {
+        h.join().unwrap();
+    }
+    let ev = rec.events();
+    eprintln!(
+        "window transactions: {} seals, {} maintenance runs, {} skipped, max gate wait {:?}, {:?}",
+        seals(&ev),
+        ev.iter()
+            .filter(|e| matches!(e, Event::MaintenanceStarted { .. }))
+            .count(),
+        ev.iter()
+            .filter(|e| matches!(e, Event::MaintenanceSkipped { .. }))
+            .count(),
+        finished(&ev).map(|(g, _)| g).max().unwrap_or_default(),
+        started.elapsed(),
+    );
+    assert!(seals(&ev) > 0);
+    c.close().unwrap();
+    db.close().unwrap();
+    let n = (THREADS * TXNS * STATEMENTS) as i64;
+    assert_eq!(restore_rows(mem), (0..n).collect::<Vec<_>>());
+}
+
+/// A maintenance seal that cannot upload its pages fails the run, never a call: the calls
+/// waiting at the gate, and the commit that then carries the seal (the engine restarted the
+/// WAL in memory before the failed `truncate(0)`), all succeed once the bucket takes pages
+/// again. A later run seals.
+#[test]
+fn maintenance_never_fails_a_commit() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let rec = Recorder::default();
+    let win = w(1, 64, 1 << 20);
+    let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
+        c.batching = win;
+        c.maintenance_log_objects = 20;
+        c.retry_deadline = Duration::from_millis(200);
+        c.request_timeout = Duration::from_millis(50);
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    fault.only_keys_containing("pages/");
+    // The first seal's first page PUT fails for good (no retry): that seal fails.
+    fault.fail_next_puts_permanently(1);
+    let commit_all = |from: usize, n: usize| {
+        let threads: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let db = db.clone();
+                thread::spawn(move || {
+                    let c = db.connect().unwrap();
+                    for i in 0..n {
+                        insert(&c, (from + t * n + i) as i64).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().unwrap();
+        }
+    };
+    commit_all(0, 20);
+    rec.wait_for(
+        |e| matches!(e, Event::MaintenanceSkipped { reason, .. } if reason.starts_with("error")),
+    );
+    let failed_at = rec.events().len();
+    commit_all(160, 20);
+    commit_all(320, 20);
+    rec.wait_for(|e| matches!(e, Event::MaintenanceFinished { sealed: true, .. }));
+    assert!(seals(&rec.events()[failed_at..]) >= 1);
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restore_rows(mem), (0..480).collect::<Vec<_>>());
+}
+
+/// Pins a limit of the engine: a TRUNCATE restarts the WAL in memory before its
+/// `truncate(0)`, so when maintenance's seal fails the next commit writes a new WAL header
+/// and must seal first. While the bucket still refuses pages, that commit gets the seal's
+/// error, exactly as after a failed `checkpoint(Truncate)`. Nothing acked is lost.
+#[test]
+fn failed_maintenance_seal_passes_to_the_next_commit() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let rec = Recorder::default();
+    // Off: each commit's object is in the bucket before its call pokes maintenance.
+    let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
+        c.maintenance_log_objects = 20;
+        c.retry_deadline = Duration::from_millis(200);
+        c.request_timeout = Duration::from_millis(50);
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    fault.only_keys_containing("pages/");
+    fault.fail_puts_after(0);
+    // Up to the call whose poke starts the run, and no further, so no insert of ours races
+    // it.
+    let last_seq = || {
+        rec.events()
+            .iter()
+            .filter_map(|e| match e {
+                Event::LogUploaded { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let mut x = 0;
+    while last_seq() < 20 {
+        insert(&c, x).unwrap();
+        x += 1;
+    }
+    rec.wait_for(
+        |e| matches!(e, Event::MaintenanceSkipped { reason, .. } if reason.starts_with("error")),
+    );
+    let r = insert(&c, x);
+    assert!(
+        matches!(&r, Err(Error::Timeout(m) | Error::UploadFailed(m)) if m.contains("pages/")),
+        "{r:?}"
+    );
+    fault.fail_puts_after(u64::MAX);
+    insert(&c, x + 1).unwrap();
+    assert!(seals(&rec.events()) >= 1);
+    c.close().unwrap();
+    db.close().unwrap();
+    let mut want: Vec<i64> = (0..x).collect();
+    want.push(x + 1);
+    assert_eq!(restore_rows(mem), want);
+}
+
+#[test]
+fn maintenance_off_when_both_thresholds_zero() {
+    let rec = Recorder::default();
+    let (_d, db) = open_with(mem(), rec.clone(), |c| {
+        c.maintenance_log_objects = 0;
+        c.maintenance_wal_bytes = 0;
+        c.maintenance_gate_wait = Duration::ZERO;
+    });
+    let c = db.connect().unwrap();
+    // A second connection keeps a read open, so the engine cannot restart the WAL either.
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN", &[]).unwrap();
+    create(&c);
+    count(&reader);
+    for x in 0..50 {
+        insert(&c, x).unwrap();
+    }
+    thread::sleep(Duration::from_millis(200));
+    let ev = rec.events();
+    assert!(
+        !ev.iter().any(|e| matches!(
+            e,
+            Event::MaintenanceStarted { .. }
+                | Event::MaintenanceSkipped { .. }
+                | Event::MaintenanceFinished { .. }
+        )),
+        "{ev:?}"
+    );
+    reader.execute("COMMIT", &[]).unwrap();
+}
+
+#[test]
+fn read_only_open_runs_no_maintenance() {
+    let store = mem();
+    {
+        let (_d, db) = open(store.clone(), Recorder::default());
+        let c = db.connect().unwrap();
+        create(&c);
+        for x in 0..30 {
+            insert(&c, x).unwrap();
+        }
+        c.close().unwrap();
+        db.close().unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    restore_with_store(&config(dir.path()), store.clone(), dir.path()).unwrap();
+    let rec = Recorder::default();
+    let mut cfg = config(dir.path());
+    cfg.on_event = Some(rec.hook());
+    cfg.maintenance_log_objects = 1;
+    cfg.maintenance_wal_bytes = 1;
+    let db = open_read_only_with_store(cfg, store).unwrap();
+    let c = db.connect().unwrap();
+    for _ in 0..10 {
+        assert_eq!(count(&c), 30);
+    }
+    thread::sleep(Duration::from_millis(200));
+    let ev = rec.events();
+    assert!(
+        !ev.iter()
+            .any(|e| matches!(e, Event::MaintenanceStarted { .. })),
+        "{ev:?}"
+    );
 }

@@ -9,6 +9,10 @@
 //! `PRAGMA durable_batching` is run here, never by the engine: it reads the effective setting,
 //! or sets the current transaction's own (`txn_batching`), which lasts until no transaction
 //! is open.
+//!
+//! Every public call's engine work runs inside the maintenance gate (`maintenance::Gate`),
+//! and so does an explicit transaction for as long as it is open (`txn_gate`); the ack wait
+//! runs outside it. After each call, maintenance is woken if the generation is due.
 use crate::batching::{ctx, record_outcome, Batching, PendingAck};
 use crate::config::Event;
 use crate::db::{lock, Shared};
@@ -17,13 +21,14 @@ use crate::error::{Error, Result};
 use crate::guard::{self, BatchingPragma};
 use crate::io::db_storage::READ_ONLY;
 use crate::io::stash;
+use crate::maintenance::GateGuard;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use turso_core::{Statement, StepResult, SyncMode, Value, IO};
 
 /// How long a statement waits for another connection's lock before it fails.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much a [`Connection::checkpoint`] does; the modes of SQLite's `wal_checkpoint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +65,10 @@ pub struct Connection {
     /// durable_batching`), ahead of `batching`. Cleared by every call (or statement of a split
     /// `execute_batch`) that leaves no transaction open.
     txn_batching: Mutex<Option<Batching>>,
+    /// The gate entry an open explicit transaction holds from the call that leaves it open
+    /// to the call that ends it (or the close): maintenance never checkpoints under it, and
+    /// its statements pass a closed gate.
+    txn_gate: Mutex<Option<GateGuard>>,
     /// Declared last, so dropped last: when this holds the last `Arc<Shared>`, its drop
     /// releases `durable.lock` and the process registry, and every engine file handle (the
     /// connection's, and the IO's `app.db` and `-wal` through its storage) must be closed
@@ -85,6 +94,7 @@ impl Connection {
             io,
             batching: Mutex::new(None),
             txn_batching: Mutex::new(None),
+            txn_gate: Mutex::new(None),
             shared,
         }
     }
@@ -128,17 +138,44 @@ impl Connection {
         }
     }
 
-    /// Run `f` (one engine call) committing with `b`. On `Ok`, wait for every commit it
-    /// made; on `Err`, its commits are not acked (their uploads go on) and `f`'s error is
-    /// returned. The context is cleared on every path, a panic included, and the
-    /// transaction's setting on every path that leaves no transaction open.
+    /// Run `f` (one engine call) committing with `b`, inside the gate. On `Ok`, wait for
+    /// every commit it made (outside the gate); on `Err`, its commits are not acked (their
+    /// uploads go on) and `f`'s error is returned. The context is cleared on every path, a
+    /// panic included, and the transaction's setting on every path that leaves no
+    /// transaction open.
     fn call<T>(&self, b: Batching, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let entered = self.enter_gate();
         let _ctx = ctx::enter(b);
         let r = f();
         self.end_txn_batching();
+        self.leave_gate(entered);
+        self.shared.poke_maintenance();
         let v = r?;
         self.await_acks()?;
         Ok(v)
+    }
+
+    /// Enter the gate, unless this connection's open transaction is already inside (`None`).
+    fn enter_gate(&self) -> Option<GateGuard> {
+        if lock(&self.txn_gate).is_some() {
+            return None;
+        }
+        // Not under `txn_gate`'s lock: this blocks while maintenance runs.
+        Some(self.shared.gate.enter())
+    }
+
+    /// After the engine work: a transaction left open keeps its entry; otherwise the call's
+    /// entry and any transaction's are dropped.
+    fn leave_gate(&self, entered: Option<GateGuard>) {
+        let open_txn = self.core.as_ref().is_some_and(|c| !c.get_auto_commit());
+        let mut held = lock(&self.txn_gate);
+        if open_txn {
+            if held.is_none() {
+                *held = entered;
+            }
+        } else {
+            *held = None;
+        }
     }
 
     /// Wait, in commit order, for every commit the current call made. Each counts as acked
@@ -421,6 +458,8 @@ impl Connection {
             core.close().map_err(engine_error)
         });
         drop(core);
+        // `call` dropped it already (no core is left), unless it panicked.
+        *lock(&self.txn_gate) = None;
         self.shared.connection_closed();
         r
     }

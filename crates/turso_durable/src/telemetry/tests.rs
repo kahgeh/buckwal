@@ -1,5 +1,5 @@
 use super::export_filter;
-use super::testing::{Capture, Spans};
+use super::testing::{Capture, SpanRec, Spans};
 use crate::batching::Batching;
 use crate::config::Config;
 use crate::conn::CheckpointMode;
@@ -665,6 +665,74 @@ fn seal_and_restore_threads_run_under_the_callers_subscriber() {
     };
     assert!(probes("put", "pages/") > 0, "no page PUT seen");
     assert!(probes("get", "log/") > 0, "no log GET seen");
+}
+
+/// The maintenance thread reports under the opening thread's subscriber: a
+/// `durable.maintenance` span with its fields, the seal's `durable.checkpoint_upload` under it.
+#[test]
+fn maintenance_span_carries_its_fields_and_parents_the_seal() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mut c = config(dir.path());
+        c.maintenance_log_objects = 5;
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 0..10 {
+            insert(&conn, i).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let spans = cap.spans();
+            let done = spans
+                .named("durable.maintenance")
+                .iter()
+                .any(|s| s.closed.is_some());
+            if done {
+                break spans;
+            }
+            assert!(Instant::now() < until, "no maintenance span closed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let m = *spans
+        .named("durable.maintenance")
+        .iter()
+        .find(|s| s.closed.is_some())
+        .unwrap();
+    assert_eq!((m.target.as_str(), m.level), ("turso_durable", Level::INFO));
+    assert_eq!(m.field("durable.generation"), Some("1"));
+    assert!(
+        m.field("durable.log_objects")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 5
+    );
+    assert!(
+        m.field("durable.wal_bytes")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+    assert!(m.field("durable.gate_wait_ms").is_some());
+    assert_eq!(m.field("durable.outcome"), Some("sealed"));
+    // Through the engine's own spans (`pager_checkpoint`), which are never exported.
+    let under_m = |s: &SpanRec| {
+        let mut parent = s.parent;
+        while let Some(p) = parent {
+            if p == m.id {
+                return true;
+            }
+            parent = spans.spans[p].parent;
+        }
+        false
+    };
+    let seals = spans.named("durable.checkpoint_upload");
+    assert!(seals.iter().any(|s| under_m(s)), "{seals:?}");
 }
 
 // --- The export pipeline -------------------------------------------------------------
