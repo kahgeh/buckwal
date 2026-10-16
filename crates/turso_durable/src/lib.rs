@@ -1,5 +1,10 @@
 //! turso_durable: make a tursodb database durable in an S3 bucket.
 
+pub mod error;
+pub mod store;
+
+pub use error::{Error, Result};
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
