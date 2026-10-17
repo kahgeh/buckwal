@@ -16,6 +16,8 @@ pub struct S3Config {
     pub secret_key: String,
     pub path_style: bool,
     pub request_timeout: Duration,
+    /// PEM file of the CAs that sign the endpoint's certificate; replaces the system trust store.
+    pub ca_bundle: Option<std::path::PathBuf>,
 }
 
 pub struct S3Store {
@@ -233,26 +235,91 @@ fn status_error(what: &str, r: &Reply) -> StoreError {
     }
 }
 
+/// `scheme://host[:port]` with the scheme in lower case and a default port (443 for https,
+/// 80 for http) dropped, so the signed host header is what clients send.
+fn normalize_endpoint(endpoint: &str) -> crate::Result<String> {
+    let bad = || {
+        crate::Error::Config(format!(
+            "endpoint {endpoint:?} must be http(s)://host[:port]"
+        ))
+    };
+    let e = endpoint.trim_end_matches('/');
+    let (scheme, authority) = e.split_once("://").ok_or_else(bad)?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(bad());
+    }
+    if authority.contains(['/', '?', '#']) {
+        return Err(bad());
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.contains(']') => (h, Some(p)),
+        _ => (authority, None),
+    };
+    if host.is_empty() {
+        return Err(bad());
+    }
+    let default = if scheme == "https" { "443" } else { "80" };
+    Ok(match port {
+        Some(p) if p != default => format!("{scheme}://{authority}"),
+        _ => format!("{scheme}://{host}"),
+    })
+}
+
+fn http_client(cfg: &S3Config) -> crate::Result<reqwest::blocking::Client> {
+    // reqwest's rustls backend panics at build() without a process crypto provider; a host app's earlier install wins.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut b = reqwest::blocking::Client::builder().timeout(cfg.request_timeout);
+    if let Some(path) = &cfg.ca_bundle {
+        let shown = path.display();
+        let pem = std::fs::read(path)
+            .map_err(|e| crate::Error::Config(format!("CA bundle {shown}: {e}")))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| crate::Error::Config(format!("CA bundle {shown}: {e}")))?;
+        if certs.is_empty() {
+            return Err(crate::Error::Config(format!(
+                "CA bundle {shown} holds no PEM certificate"
+            )));
+        }
+        b = b.tls_certs_only(certs);
+    }
+    b.build()
+        .map_err(|e| crate::Error::Config(format!("http client: {e}")))
+}
+
+/// The certificate-trust failure in `e`'s cause chain, if any. `io::Error::source` skips
+/// the error it wraps, so each `io::Error` is descended by `get_ref`.
+fn tls_failure(e: &reqwest::Error) -> Option<String> {
+    use rustls::Error as Tls;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        let mut inner = Some(err);
+        while let Some(i) = inner {
+            if let Some(t) = i.downcast_ref::<Tls>() {
+                if matches!(
+                    t,
+                    Tls::InvalidCertificate(_)
+                        | Tls::NoCertificatesPresented
+                        | Tls::InvalidCertRevocationList(_)
+                ) {
+                    return Some(t.to_string());
+                }
+            }
+            inner = i
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .map(|g| g as &(dyn std::error::Error + 'static));
+        }
+        cur = err.source();
+    }
+    None
+}
+
 impl S3Store {
     pub fn new(cfg: S3Config) -> crate::Result<Self> {
         let mut cfg = cfg;
-        cfg.endpoint = cfg.endpoint.trim_end_matches('/').to_string();
-        match cfg.endpoint.split_once("://") {
-            Some(("https", _)) => return Err(crate::Error::Unsupported("https")),
-            Some(("http", a)) if !a.is_empty() => {}
-            _ => {
-                return Err(crate::Error::Config(format!(
-                    "endpoint {:?} must be http://host[:port]",
-                    cfg.endpoint
-                )))
-            }
-        }
-        // reqwest's rustls backend panics at build() without a process crypto provider; a host app's earlier install wins.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::blocking::Client::builder()
-            .timeout(cfg.request_timeout)
-            .build()
-            .map_err(|e| crate::Error::Config(format!("http client: {e}")))?;
+        cfg.endpoint = normalize_endpoint(&cfg.endpoint)?;
+        let http = http_client(&cfg)?;
         Ok(Self {
             cfg,
             http,
@@ -318,7 +385,14 @@ impl S3Store {
         for (k, v) in extra {
             req = req.header(*k, *v);
         }
-        let net = |e: reqwest::Error| StoreError::Transient(format!("{method} {key}: {e}"));
+        let net = |e: reqwest::Error| {
+            match tls_failure(&e) {
+            Some(why) => StoreError::Permanent(format!(
+                "{method} {key}: TLS certificate not trusted: {why}; set DURABLE_CA_BUNDLE to the CA that signed the endpoint's certificate"
+            )),
+            None => StoreError::Transient(format!("{method} {key}: {e}")),
+        }
+        };
         let resp = req.body(body.to_vec()).send().map_err(net)?;
         let status = resp.status().as_u16();
         // The bucket span this request runs in shows its last response's status.
@@ -734,6 +808,7 @@ mod tests {
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
             path_style: false,
             request_timeout: Duration::from_secs(5),
+            ca_bundle: None,
         };
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let headers = vec![
@@ -818,6 +893,7 @@ mod tests {
             secret_key: "s".into(),
             path_style: true,
             request_timeout: Duration::from_secs(5),
+            ca_bundle: None,
         };
         assert_eq!(
             object_url(&cfg, "p/1"),
@@ -839,20 +915,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn https_endpoint_is_unsupported() {
-        let cfg = S3Config {
-            endpoint: "https://s3.example.com".into(),
+    fn cfg_for(endpoint: &str) -> S3Config {
+        S3Config {
+            endpoint: endpoint.into(),
             region: "us-east-1".into(),
             bucket: "b".into(),
             access_key: "k".into(),
             secret_key: "s".into(),
             path_style: false,
             request_timeout: Duration::from_secs(5),
+            ca_bundle: None,
+        }
+    }
+
+    #[test]
+    fn https_endpoint_builds_a_client() {
+        assert!(S3Store::new(cfg_for("https://s3.example.com")).is_ok());
+    }
+
+    #[test]
+    fn default_ports_are_dropped_from_the_signed_host() {
+        let host = |endpoint: &str, path_style: bool| {
+            let mut cfg = cfg_for(endpoint);
+            cfg.path_style = path_style;
+            let store = S3Store::new(cfg).unwrap();
+            object_url(&store.cfg, "k").1
         };
-        assert!(matches!(
-            S3Store::new(cfg),
-            Err(crate::Error::Unsupported("https"))
-        ));
+        assert_eq!(host("https://s3.example.com:443", true), "s3.example.com");
+        assert_eq!(host("HTTP://h:80/", true), "h");
+        assert_eq!(host("https://h:8443", true), "h:8443");
+        assert_eq!(
+            host("https://s3.example.com:443", false),
+            "b.s3.example.com"
+        );
+        assert_eq!(
+            object_url(&S3Store::new(cfg_for("HTTP://h:80/")).unwrap().cfg, "k").0,
+            "http://b.h/k"
+        );
+    }
+
+    #[test]
+    fn endpoint_with_a_path_is_refused() {
+        for e in [
+            "https://h/x",
+            "https://h?q=1",
+            "https://h#f",
+            "https://",
+            "ftp://h",
+            "h:9000",
+        ] {
+            assert!(
+                matches!(S3Store::new(cfg_for(e)), Err(crate::Error::Config(_))),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn ca_bundle_must_hold_a_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg_for("https://s3.example.com");
+
+        let missing = dir.path().join("missing.pem");
+        cfg.ca_bundle = Some(missing.clone());
+        match S3Store::new(cfg.clone()) {
+            Err(crate::Error::Config(m)) => {
+                assert!(m.contains(missing.to_str().unwrap()), "{m}")
+            }
+            r => panic!("{:?}", r.err()),
+        }
+
+        for (name, body) in [("empty.pem", &b""[..]), ("junk.pem", &b"not pem"[..])] {
+            let f = dir.path().join(name);
+            std::fs::write(&f, body).unwrap();
+            cfg.ca_bundle = Some(f);
+            match S3Store::new(cfg.clone()) {
+                Err(crate::Error::Config(m)) => assert!(m.contains("no PEM certificate"), "{m}"),
+                r => panic!("{name}: {:?}", r.err()),
+            }
+        }
     }
 }

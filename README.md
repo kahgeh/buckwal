@@ -4,7 +4,7 @@ Make a tursodb database durable in an S3 bucket. A Rust library (`turso_durable`
 
 Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
 
-This is stage 3: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export, and uses plain HTTP. It is tested against RustFS on a laptop (not on AWS S3).
+This is stage 3: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export, and speaks HTTPS or plain HTTP. It is tested against RustFS on a laptop (not on AWS S3).
 
 ## How it works
 
@@ -170,7 +170,7 @@ Errors are `turso_durable::Error`:
 | `Timeout` | A bucket operation kept failing transiently for the whole retry deadline. An `Off` commit that fails this way is rolled back locally; a `Window` commit stays in the local database (see Batching). |
 | `UploadFailed` | The bucket refused an upload permanently, or the uploader stopped. |
 | `NotFound` | A key that must exist is missing: no database at this prefix (restore, read-only open), or a page the manifest names. |
-| `Unsupported` | A refused feature: `https`, `MVCC`, `journal_mode other than WAL`, `synchronous below FULL`, `ATTACH`. |
+| `Unsupported` | A refused feature: `MVCC`, `journal_mode other than WAL`, `synchronous below FULL`, `ATTACH`. |
 | `Locked` | Another process has the directory open. |
 | `AlreadyOpen` | This process already has the directory open. |
 | `Corrupt` | A bucket object or local file failed its checks. |
@@ -328,7 +328,8 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 
 | Variable | `Config` field | Default | Notes |
 |---|---|---|---|
-| `DURABLE_ENDPOINT` | `endpoint` | required | `http://host[:port]`. `https://` fails with `Unsupported("https")` until stage 4. |
+| `DURABLE_ENDPOINT` | `endpoint` | required | `http(s)://host[:port]`, with no path. The scheme is case-insensitive, and a default port (`:443` for https, `:80` for http) is dropped so the signed host is what clients send. |
+| `DURABLE_CA_BUNDLE` | `ca_bundle` | unset (empty = unset) | A PEM file of the CA certificates that sign the endpoint's certificate. They replace the system trust store, so the endpoint's certificate must chain to one of them. Refused with an `http://` endpoint (`Config`), and when the file is missing or holds no certificate. Unset, the platform's verifier and trust store are used. |
 | `DURABLE_BUCKET` | `bucket` | required | |
 | `DURABLE_ACCESS_KEY` | `access_key` | required | |
 | `DURABLE_SECRET_KEY` | `secret_key` | required | Redacted from `Debug`. |
@@ -492,7 +493,7 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 | `GET` | Restore, lazy page reads. |
 | `ListObjectsV2` (`list-type=2`, continuation tokens) | Listing a generation's log, and trimming. |
 | `DELETE` | Trimming. |
-| Plain HTTP | Only plain HTTP until stage 4 (no TLS). |
+| HTTPS (TLS 1.2+, rustls/ring) or plain HTTP | `https://` verifies the endpoint's certificate against the system store, or against `DURABLE_CA_BUNDLE`. A certificate failure is `Permanent` (the error names `DURABLE_CA_BUNDLE`), so `open` fails at once instead of retrying to the deadline. |
 
 Stores known to support both conditional PUTs (`If-None-Match: *` and `If-Match`): AWS S3 (`If-None-Match` since August 2024, `If-Match` since November 2024), and RustFS 1.0.0, which passed this repo's gate (`results/rustfs-gate.txt`). Fencing depends on them, so check any other store with the gate first.
 
@@ -627,7 +628,7 @@ A is fenced at its next request, but the object it overwrote stays. A possible f
 - `close` ignores a failed close-time checkpoint (pager.rs:5458-5472). Nothing acked is lost: the log already holds every acked commit, and the next open or restore replays it.
 - If the local fsync fails, the engine panics (pager.rs:4723-4733). This is a local disk failure. For an Off commit the upload was already confirmed, so the commit is in the bucket; restore the database elsewhere. A Window commit is queued before its fsync, so its upload may not have happened yet: after a restore elsewhere it may or may not be there, and it was never acked.
 - VACUUM is untested.
-- Plain HTTP only until stage 4. The figures here are from RustFS on a laptop; nothing has been measured on real S3.
+- The figures here are from RustFS on a laptop; nothing has been measured on real S3.
 - Closing during a bucket outage can block for up to the retry deadline.
 
 ## Costs (measured)
@@ -696,7 +697,7 @@ Restoring the 5000-commit database (generation 12, 1673 pages, 6.9 MB):
 
 ## Decisions
 
-D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0.8.3 from crates.io, with paths relative to its crate root. D11–D14 are stage 3's; their evidence is this repository's code.
+D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0.8.3 from crates.io, with paths relative to its crate root. D11–D14 are stage 3's, and D15 is stage 4's; their evidence is this repository's code, except D15's, which is reqwest 0.13.2, hyper-rustls 0.27.10 and tokio-rustls 0.26.6 from crates.io.
 
 | # | Decision | Evidence |
 |---|---|---|
@@ -714,6 +715,7 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
 | D12 | The head carries an epoch (absent = 0). A new database starts at 1; a takeover writes the next one with its new writer id; every other writer open, and a writer that finds its ambiguous seal head write did not land, raises it keeping its id. A late head PUT then fails its `If-Match`. A writer open is refused while the head names another writer or an epoch below the directory's. Cost: one head PUT per writer open. | `crates/turso_durable/src/format/head.rs`; `bucket.rs` (`raise_epoch`, `check_head`, `attach`) |
 | D13 | A lease replaces stage 2's idle check: 30 s on the larger of the monotonic and the wall clock. Past it, an append GETs the head first; a seal sends each page and manifest PUT attempt only inside it (checked just before the send, so a pause between the check and the send gets one request out late; see the residual under Guarantees); a record that lands more than `lease` + `retry_deadline` after the last confirmation counts only after a head GET. Seal PUTs are conditional. A fence before which another writer's last record is a seal-start record starts the takeover quiet (`lease` + `request_timeout`), persisted in the directory with its length, waited again in full at a reopen that finds it pending, and waited out on the monotonic clock only. A lapsed lease before a seal's head PUT GETs the head first (one GET; it does not stop a late head, see GC under Guarantees). | `crates/turso_durable/src/clock.rs`; `bucket.rs` (`check_lease`, `confirm_landed`, `retrying_in_lease`, `seal_put_step`, `set_seal_not_before`); `db.rs` (`set_quiet`) |
 | D14 | GC runs on the bucket's clock: it ages manifests by HEAD (`Date` − `Last-Modified`), takes the newest one up to the head's that is `trim_grace` + `retry_deadline` + `request_timeout` + 1 s old, and trims against the head that followed it. It runs in `gc`, and on the writer's thread at open, after seals and when the next manifest comes of age. `trim_grace` must exceed `lease` + `retry_deadline` + `request_timeout`, with no exception for 0. | `crates/turso_durable/src/gc.rs`, `trim.rs`, `store/s3.rs` (`stat`), `config.rs` (`validate`) |
+| D15 | HTTPS goes through reqwest's `rustls-no-provider` with the ring provider installed by `http_client` (a host app's earlier install wins), because reqwest panics at `build()` without a provider. Without `DURABLE_CA_BUNDLE` it uses the platform verifier; with it, `tls_certs_only` makes the bundle the only roots (webpki). `http://` passes through the same connector. A certificate failure sits two `io::Error`s deep in the cause chain (`io::Error::source` skips the error it wraps), so `tls_failure` descends them with `get_ref`; `InvalidCertificate`, `NoCertificatesPresented` and `InvalidCertRevocationList` are `Permanent`. | reqwest-0.13.2 Cargo.toml:169,174; async_impl/client.rs:2458-2464 (no-provider panic), :751-753 (platform verifier), :780-783 (certs-only webpki); blocking/client.rs:812; tls.rs:195; hyper-rustls-0.27.10 src/connector.rs:88-92,126-132 (http passes through); tokio-rustls-0.26.6 src/common/mod.rs:115 |
 
 ## Test command
 

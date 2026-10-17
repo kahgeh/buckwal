@@ -214,6 +214,15 @@ impl Ctx {
         v.unwrap_or_else(|| panic!("{k} not set")).1.clone()
     }
 
+    /// Like `var`, but `None` when unset.
+    fn opt_var(&self, k: &str) -> Option<String> {
+        self.vars
+            .iter()
+            .rev()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    }
+
     fn prefix(&self) -> String {
         self.var("DURABLE_PREFIX")
     }
@@ -274,6 +283,10 @@ impl Ctx {
             secret_key: self.var("DURABLE_SECRET_KEY"),
             path_style: self.var("DURABLE_PATH_STYLE") == "true",
             request_timeout: Duration::from_secs(30),
+            ca_bundle: self
+                .opt_var("DURABLE_CA_BUNDLE")
+                .filter(|v| !v.is_empty())
+                .map(Into::into),
         })
     }
 

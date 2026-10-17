@@ -9,6 +9,14 @@ fn env(k: &str) -> String {
     })
 }
 
+/// `DURABLE_CA_BUNDLE` (None when unset or empty): the CA of the TLS pass.
+fn ca_bundle() -> Option<std::path::PathBuf> {
+    std::env::var("DURABLE_CA_BUNDLE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(Into::into)
+}
+
 /// The store from the `DURABLE_*` variables, without creating the bucket; never panics.
 fn try_s3() -> Result<S3Store, String> {
     let v = |k: &str| std::env::var(k).map_err(|_| format!("{k} is not set"));
@@ -20,6 +28,7 @@ fn try_s3() -> Result<S3Store, String> {
         secret_key: v("DURABLE_SECRET_KEY")?,
         path_style: v("DURABLE_PATH_STYLE")? == "true",
         request_timeout: Duration::from_secs(30),
+        ca_bundle: ca_bundle(),
     })
     .map_err(|e| format!("store: {e}"))
 }
@@ -99,8 +108,12 @@ fn prefix(test: &str) -> Prefix {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn rustfs_conditional_create_and_match() {
+    conditional_create_and_match("cond");
+}
+
+fn conditional_create_and_match(test: &str) {
     let s = store();
-    let p = prefix("cond");
+    let p = prefix(test);
     let k = format!("{p}k");
     let CondPut::Created { etag: e1 } = s.put_if_absent(&k, b"one").unwrap() else {
         panic!("first put_if_absent must create");
@@ -170,6 +183,7 @@ fn rustfs_if_match_on_missing_bucket_is_permanent() {
         secret_key: env("DURABLE_SECRET_KEY"),
         path_style: env("DURABLE_PATH_STYLE") == "true",
         request_timeout: Duration::from_secs(30),
+        ca_bundle: ca_bundle(),
     })
     .expect("store");
     match s.put_if_match("k", b"x", "\"0\"") {
@@ -297,4 +311,58 @@ fn stat_reports_etag_and_age() {
     std::thread::sleep(Duration::from_secs(2));
     let st = s.stat(&k).unwrap().unwrap();
     assert!(st.age >= Duration::from_secs(1), "{:?}", st.age);
+}
+
+fn require_tls() {
+    assert!(
+        env("DURABLE_ENDPOINT").starts_with("https://"),
+        "tls_* tests run in the TLS pass of ./scripts/test.sh"
+    );
+}
+
+#[test]
+#[ignore = "needs RustFS in TLS mode: ./scripts/test.sh"]
+fn tls_round_trip_with_ca_bundle() {
+    require_tls();
+    assert!(ca_bundle().is_some(), "DURABLE_CA_BUNDLE is not set");
+    conditional_create_and_match("tls-cond");
+}
+
+/// `open` with `ca_bundle` as given must fail as a certificate error, and not by exhausting
+/// the retry deadline.
+fn open_fails_on_certificate(ca_bundle: Option<std::path::PathBuf>) {
+    use turso_durable::{Config, Error};
+    require_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::from_env(dir.path()).expect("config");
+    cfg.ca_bundle = ca_bundle;
+    cfg.prefix = prefix("tls-fail").trim_end_matches('/').to_string();
+    let t = std::time::Instant::now();
+    let r = turso_durable::open(cfg);
+    let took = t.elapsed();
+    match r {
+        Err(Error::Bucket(m)) => {
+            assert!(
+                m.contains("certificate") && m.contains("DURABLE_CA_BUNDLE"),
+                "{m}"
+            )
+        }
+        Err(e) => panic!("expected Error::Bucket, got {e:?}"),
+        Ok(_) => panic!("open succeeded without a trusted CA"),
+    }
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    eprintln!("failed after {took:?}");
+}
+
+#[test]
+#[ignore = "needs RustFS in TLS mode: ./scripts/test.sh"]
+fn tls_without_ca_bundle_fails_fast_as_certificate_error() {
+    open_fails_on_certificate(None);
+}
+
+#[test]
+#[ignore = "needs RustFS in TLS mode: ./scripts/test.sh"]
+fn tls_wrong_ca_bundle_fails_fast() {
+    let ca = ca_bundle().expect("DURABLE_CA_BUNDLE is not set");
+    open_fails_on_certificate(Some(ca.with_file_name("other-ca.pem")));
 }

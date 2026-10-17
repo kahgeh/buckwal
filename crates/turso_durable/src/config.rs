@@ -95,8 +95,11 @@ pub mod defaults {
 pub struct Config {
     /// The local directory: `app.db`, its `-wal` and turso_durable's own files.
     pub dir: PathBuf,
-    /// `http://host[:port]`; https is not supported yet.
+    /// `http(s)://host[:port]`, with no path.
     pub endpoint: String,
+    /// A PEM file of the CA certificates that sign the endpoint's certificate; they replace
+    /// the system trust store. Only with an `https://` endpoint (`Config` otherwise).
+    pub ca_bundle: Option<PathBuf>,
     pub region: String,
     /// Path-style addressing (`endpoint/bucket/key`) rather than virtual-hosted.
     pub path_style: bool,
@@ -149,6 +152,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("dir", &self.dir)
             .field("endpoint", &self.endpoint)
+            .field("ca_bundle", &self.ca_bundle)
             .field("region", &self.region)
             .field("path_style", &self.path_style)
             .field("bucket", &self.bucket)
@@ -172,8 +176,9 @@ impl fmt::Debug for Config {
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 18] = [
+const ENV_VARS: [&str; 19] = [
     "DURABLE_ENDPOINT",
+    "DURABLE_CA_BUNDLE",
     "DURABLE_REGION",
     "DURABLE_PATH_STYLE",
     "DURABLE_BUCKET",
@@ -250,6 +255,7 @@ impl Config {
         Config {
             dir: dir.into(),
             endpoint: endpoint.to_string(),
+            ca_bundle: None,
             region: defaults::REGION.to_string(),
             path_style: defaults::PATH_STYLE,
             bucket: bucket.to_string(),
@@ -295,6 +301,9 @@ impl Config {
             &required("DURABLE_ACCESS_KEY")?,
             &required("DURABLE_SECRET_KEY")?,
         );
+        if let Some(v) = get("DURABLE_CA_BUNDLE").filter(|v| !v.is_empty()) {
+            c.ca_bundle = Some(PathBuf::from(v));
+        }
         if let Some(v) = get("DURABLE_REGION") {
             c.region = v;
         }
@@ -350,13 +359,16 @@ impl Config {
 
     /// The checks `open` and `restore` make before touching anything.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self
-            .endpoint
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("https://")
+        if self.ca_bundle.is_some()
+            && self
+                .endpoint
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("http://")
         {
-            return Err(Error::Unsupported("https"));
+            return Err(Error::Config(
+                "DURABLE_CA_BUNDLE is set but the endpoint is http://".into(),
+            ));
         }
         if self.bucket.is_empty() {
             return Err(Error::Config("bucket is empty".into()));
@@ -422,6 +434,7 @@ impl Config {
             secret_key: self.secret_key.clone(),
             path_style: self.path_style,
             request_timeout: self.request_timeout,
+            ca_bundle: self.ca_bundle.clone(),
         })?))
     }
 }
@@ -672,6 +685,7 @@ mod tests {
     fn config_from_env_reads_every_setting() {
         let all = [
             ("DURABLE_ENDPOINT", "http://127.0.0.1:9000"),
+            ("DURABLE_CA_BUNDLE", "/etc/ca.pem"),
             ("DURABLE_REGION", "eu-west-2"),
             ("DURABLE_PATH_STYLE", "false"),
             ("DURABLE_BUCKET", "bkt"),
@@ -702,6 +716,7 @@ mod tests {
         let c = c.unwrap();
         assert_eq!(c.dir, PathBuf::from("/data/db"));
         assert_eq!(c.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(c.ca_bundle, Some(PathBuf::from("/etc/ca.pem")));
         assert_eq!(c.region, "eu-west-2");
         assert!(!c.path_style);
         assert_eq!(c.bucket, "bkt");
@@ -829,13 +844,44 @@ mod tests {
 
     #[test]
     fn config_validation() {
-        let c = Config::new("/d", "https://s3.example.com", "b", "ak", "sk");
-        assert_eq!(c.validate(), Err(Error::Unsupported("https")));
         let c = Config::new("/d", "http://e", "", "ak", "sk");
         assert!(matches!(c.validate(), Err(Error::Config(_))));
         assert!(matches!(crate::open(c), Err(Error::Config(_))));
-        let c = Config::new("/d", "https://e", "b", "ak", "sk");
-        assert!(matches!(crate::open(c), Err(Error::Unsupported("https"))));
+    }
+
+    #[test]
+    fn https_endpoint_is_accepted() {
+        let c = Config::new("/d", "https://s3.example.com", "b", "ak", "sk");
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn ca_bundle_with_http_endpoint_is_refused() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.ca_bundle = Some("/ca.pem".into());
+        assert_eq!(
+            c.validate(),
+            Err(Error::Config(
+                "DURABLE_CA_BUNDLE is set but the endpoint is http://".into()
+            ))
+        );
+        c.endpoint = "https://e".into();
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn from_env_reads_ca_bundle() {
+        let mut env = required();
+        let read = |env: &HashMap<&str, &str>| {
+            Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap()
+        };
+        assert_eq!(read(&env).ca_bundle, None);
+        env.insert("DURABLE_CA_BUNDLE", "");
+        assert_eq!(read(&env).ca_bundle, None);
+        env.insert("DURABLE_CA_BUNDLE", "/etc/ca.pem");
+        let c = read(&env);
+        assert_eq!(c.ca_bundle, Some(PathBuf::from("/etc/ca.pem")));
+        assert!(format!("{c:?}").contains("/etc/ca.pem"));
     }
 
     /// A prefix is limited to `[A-Za-z0-9._/-]` with no empty segment: anything else (XML

@@ -32,6 +32,7 @@ fn store(config: &Config) -> R<Arc<FaultStore>> {
         secret_key: config.secret_key.clone(),
         path_style: config.path_style,
         request_timeout: config.request_timeout,
+        ca_bundle: config.ca_bundle.clone(),
     })
     .map_err(err)?;
     Ok(Arc::new(FaultStore::new(Arc::new(s3))))
