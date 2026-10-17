@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::field::Empty;
 use tracing::{info_span, Span};
 
@@ -94,6 +94,9 @@ pub(crate) struct Uploader {
     /// `MAX_BACKOFF` to probe the bucket, so an idle database clears it once the bucket
     /// answers.
     last_failed: Arc<AtomicBool>,
+    /// The end of the current generation's takeover quiet in unix ms
+    /// (`Bucket::quiet_until_ms`), 0 for none; set by the worker after every job.
+    quiet_until: Arc<AtomicU64>,
     stats: Arc<StatsCell>,
     #[cfg_attr(not(test), allow(dead_code))]
     counters: Arc<Counters>,
@@ -111,6 +114,7 @@ impl Uploader {
         let log_objects = Arc::new(AtomicU64::new(bucket.next_seq().saturating_sub(1)));
         let degraded = Arc::new(AtomicBool::new(bucket.degraded()));
         let last_failed = Arc::new(AtomicBool::new(false));
+        let quiet_until = Arc::new(AtomicU64::new(bucket.quiet_until_ms()));
         let counters = bucket.counters();
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
@@ -121,6 +125,7 @@ impl Uploader {
             log_objects: log_objects.clone(),
             degraded: degraded.clone(),
             last_failed: last_failed.clone(),
+            quiet_until: quiet_until.clone(),
             stats: stats.clone(),
             events,
             trim_tx,
@@ -139,6 +144,7 @@ impl Uploader {
             log_objects,
             degraded,
             last_failed,
+            quiet_until,
             stats,
             counters,
         })
@@ -219,6 +225,15 @@ impl Uploader {
         }
     }
 
+    /// How long the current generation's takeover quiet still lasts (`Bucket::
+    /// set_seal_not_before`): a seal started now would wait that long first, with the
+    /// uploader thread held. Zero when there is none. Maintenance does not start a run then.
+    pub(crate) fn seal_quiet_remaining(&self) -> Duration {
+        let until = self.quiet_until.load(SeqCst);
+        let now = crate::bucket::unix_ms(SystemTime::now());
+        Duration::from_millis(until.saturating_sub(now))
+    }
+
     /// The bucket has something to settle (fenced, a record in doubt, a seal's head write
     /// unresolved) or Window syncs are owed. Updated after every job, before its replies.
     pub(crate) fn degraded(&self) -> bool {
@@ -277,6 +292,7 @@ struct Worker {
     log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
     last_failed: Arc<AtomicBool>,
+    quiet_until: Arc<AtomicU64>,
     stats: Arc<StatsCell>,
     events: Option<EventHook>,
     trim_tx: Option<Sender<TrimSnapshot>>,
@@ -338,13 +354,14 @@ impl Worker {
         }
     }
 
-    /// Publish `degraded`, and the generation's log object count (every append and seal
-    /// goes through here before its replies).
+    /// Publish `degraded`, the generation's log object count and its takeover quiet (every
+    /// append and seal goes through here before its replies).
     fn publish_degraded(&self) {
         let d = self.bucket.degraded() || !self.owed.is_empty();
         self.degraded.store(d, SeqCst);
         self.log_objects
             .store(self.bucket.next_seq().saturating_sub(1), SeqCst);
+        self.quiet_until.store(self.bucket.quiet_until_ms(), SeqCst);
     }
 
     fn log(&mut self, item: Pending) {

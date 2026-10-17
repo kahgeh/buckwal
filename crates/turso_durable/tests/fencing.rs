@@ -3,11 +3,14 @@
 //! Window setting (`window 5ms 64 1MiB`): a fence must fail every waiting batched commit too.
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
-use turso_durable::store::{FaultStore, MemStore, ObjectStore};
+use turso_durable::store::{
+    CondPut, FaultStore, MemStore, Object, ObjectStore, StatsSnap, StoreError,
+};
 use turso_durable::{
     open_read_only_with_store, open_with_store, takeover_with_store, Batching, CheckpointMode,
     Config, Connection, Database, Error, TakeoverReport, Value,
@@ -318,6 +321,112 @@ fn concurrent_takeovers_take_distinct_epochs() {
         drop(db_a);
         let mut want: BTreeSet<i64> = (1..=20).collect();
         want.insert(2001);
+        assert_eq!(restored_ids(mem.clone(), b), want, "{b:?}");
+    });
+}
+
+/// A `MemStore` that makes the old writer seal right before a takeover's head check, `left`
+/// times: a list (the restore reading the log) arms it, and the next GET of the head (the
+/// claim's) first asks the old writer to seal and waits for it.
+struct SealsBeforeClaim {
+    inner: Arc<MemStore>,
+    listed: AtomicBool,
+    left: AtomicU64,
+    /// Ask the old writer to seal; its reply.
+    seal: Mutex<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+}
+
+impl ObjectStore for SealsBeforeClaim {
+    fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
+        let claim = key == format!("{PREFIX}/head") && self.listed.swap(false, SeqCst);
+        if claim
+            && self
+                .left
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            let ch = self.seal.lock().unwrap();
+            ch.0.send(()).unwrap();
+            ch.1.recv().unwrap();
+        }
+        self.inner.get(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.listed.store(true, SeqCst);
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> StatsSnap {
+        self.inner.stats()
+    }
+}
+
+/// A takeover that failed "restore again" three times (the old writer sealed between each
+/// restore and the claim) leaves its directory holding only `durable.lock`. A retry into the
+/// same directory is accepted and, the head now stable, takes the database over.
+#[test]
+fn takeover_retried_into_its_own_leftover_dir_succeeds() {
+    for_each_batching(|b| {
+        let mem = Arc::new(MemStore::new());
+        let (_fault, _a, db_a) = writer_a(&mem, b, 5);
+        let (req_tx, req_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let old = thread::spawn(move || {
+            let c = db_a.connect().unwrap();
+            for id in 101.. {
+                if req_rx.recv().is_err() {
+                    break;
+                }
+                insert(&c, id).unwrap();
+                c.checkpoint(CheckpointMode::Truncate).unwrap();
+                done_tx.send(()).unwrap();
+            }
+            drop(c);
+            drop(db_a);
+        });
+        let store = Arc::new(SealsBeforeClaim {
+            inner: mem.clone(),
+            listed: AtomicBool::new(false),
+            left: AtomicU64::new(3),
+            seal: Mutex::new((req_tx, done_rx)),
+        });
+        let bt = tempdir();
+        let dir = fresh(&bt);
+        let r = takeover_with_store(config(&dir, b), store.clone());
+        match r {
+            Err(Error::Fenced(m)) => assert!(m.contains("restore again"), "{b:?}: {m}"),
+            r => panic!("{b:?}: expected Fenced(restore again), got {r:?}"),
+        }
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["durable.lock".to_string()], "{b:?}");
+
+        let rep = takeover_with_store(config(&dir, b), store.clone())
+            .unwrap_or_else(|e| panic!("{b:?}: the retry into the same directory: {e:?}"));
+        assert_eq!(head_field(&mem, "writer_id"), rep.writer_id, "{b:?}");
+        // The old writer is told to stop; its seal requests channel closes.
+        drop(store);
+        old.join().unwrap();
+        let db = open_with_store(config(&dir, b), mem.clone()).unwrap();
+        let c = db.connect().unwrap();
+        insert(&c, 1001).unwrap();
+        c.close().unwrap();
+        db.close().unwrap();
+        let mut want: BTreeSet<i64> = (1..=5).chain(101..=103).collect();
+        want.insert(1001);
         assert_eq!(restored_ids(mem.clone(), b), want, "{b:?}");
     });
 }

@@ -14,7 +14,7 @@ use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreE
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use tracing::Span;
 
@@ -91,6 +91,32 @@ enum Raise {
     Published(String),
 }
 
+/// The takeover quiet (`Bucket::set_seal_not_before`): no seal of `generation` starts before
+/// both clocks have passed their deadline.
+#[derive(Debug, Clone, Copy)]
+struct SealQuiet {
+    generation: u64,
+    at: Instant,
+    wall: SystemTime,
+}
+
+impl SealQuiet {
+    /// How long until both deadlines have passed (zero once they have).
+    fn remaining(&self) -> Duration {
+        let wall = self
+            .wall
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        self.at.saturating_duration_since(Instant::now()).max(wall)
+    }
+}
+
+/// `t` in unix ms (0 before the epoch).
+pub(crate) fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// What a GET of the head says about a pending seal.
 enum HeadCheck {
     /// No seal is pending, or the head is unchanged: carry on in this generation.
@@ -123,6 +149,8 @@ pub(crate) struct Bucket {
     last_confirmed: Stamp,
     /// See `set_lease`.
     lease: Duration,
+    /// See `set_seal_not_before`.
+    quiet: Option<SealQuiet>,
     counters: Arc<Counters>,
     events: Option<EventHook>,
 }
@@ -170,6 +198,12 @@ fn retry_rest<T>(
         op()
     })
 }
+
+/// What a takeover's `Timeout` advises: the claim id is persisted (and the head may already
+/// name it), so the next open of the directory resumes the takeover; `takeover` itself
+/// refuses a directory that holds one.
+const RESUME_TAKEOVER: &str =
+    "open this directory to resume the takeover (`open`, or `turso-durable sql --claim --dir DIR`)";
 
 /// What `take_over` tells a restored directory whose generation is no longer the head's.
 pub(crate) const RESTORE_AGAIN: &str =
@@ -255,7 +289,7 @@ pub(crate) fn take_over_counted(
         let elapsed = start.elapsed();
         if elapsed >= retry.deadline {
             return Err(Error::Timeout(format!(
-                "takeover: the head kept changing for {elapsed:?}; retry the takeover"
+                "takeover: the head kept changing for {elapsed:?}; {RESUME_TAKEOVER}"
             )));
         }
     }
@@ -286,8 +320,8 @@ pub(crate) struct FenceOutcome {
     pub pos: LogPos,
     /// The record just before the fence is another writer's Extents record with no syncs:
     /// that writer's last act may have been a seal-start record, so its seal's page PUTs may
-    /// still be in flight. Also true when that record could not be read.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// still be in flight. Also true when that record could not be read. The new writer then
+    /// waits out a takeover quiet before it seals this generation (`set_seal_not_before`).
     pub after_foreign_empty: bool,
 }
 
@@ -318,6 +352,7 @@ impl Bucket {
         Bucket {
             last_confirmed: Stamp::now(),
             lease: crate::config::defaults::LEASE,
+            quiet: None,
             store,
             keys,
             retry,
@@ -485,6 +520,70 @@ impl Bucket {
     /// every append and every round of page PUTs.
     pub(crate) fn set_lease(&mut self, lease: Duration) {
         self.lease = lease;
+    }
+
+    /// The takeover quiet: no seal of `generation` starts before `at` (monotonic) and `wall`
+    /// (wall clock) have both passed. `db::attach_existing` sets it when this writer's fence
+    /// landed right after another writer's seal-start record (`FenceOutcome::
+    /// after_foreign_empty`), to `lease + request_timeout` after the fence, and a later open
+    /// passes on the persisted wall-clock deadline (with `at` already passed). A seal of
+    /// `generation` clears it.
+    ///
+    /// Why: that writer's page and manifest PUTs are plain PUTs and may still be in flight;
+    /// landing after this writer's seal of the same generation, they would overwrite it. The
+    /// old writer sends each such PUT attempt only within `lease` of its last head check
+    /// (`seal`), which came before this writer's head write, and an attempt ends within
+    /// `request_timeout`. This holds when the old writer's lease and request timeout are at
+    /// most this writer's: nothing in the bucket records another process's settings.
+    pub(crate) fn set_seal_not_before(&mut self, generation: u64, at: Instant, wall: SystemTime) {
+        self.quiet = Some(SealQuiet {
+            generation,
+            at,
+            wall,
+        });
+    }
+
+    /// The takeover quiet's end for the current generation in unix ms, the later of its two
+    /// deadlines (the monotonic one read as wall time now); 0 when there is none.
+    pub(crate) fn quiet_until_ms(&self) -> u64 {
+        match &self.quiet {
+            Some(q) if q.generation == self.head.generation => {
+                let now = SystemTime::now();
+                let at = now + q.at.saturating_duration_since(Instant::now());
+                unix_ms(at.max(q.wall))
+            }
+            _ => 0,
+        }
+    }
+
+    /// Before a seal of the current generation: wait out its takeover quiet, if any, emitting
+    /// `Event::SealQuiet` first. The uploader thread waits here, so later commits queue
+    /// behind the seal meanwhile.
+    fn wait_quiet(&self) {
+        let Some(q) = self.quiet.filter(|q| q.generation == self.head.generation) else {
+            return;
+        };
+        let wait = q.remaining();
+        if wait.is_zero() {
+            return;
+        }
+        self.emit(Event::SealQuiet {
+            generation: q.generation,
+            wait,
+        });
+        tracing::info!(
+            target: "turso_durable",
+            generation = q.generation,
+            ms = wait.as_millis() as u64,
+            "seal waits out the takeover quiet"
+        );
+        loop {
+            let left = q.remaining();
+            if left.is_zero() {
+                return;
+            }
+            std::thread::sleep(left);
+        }
     }
 
     /// Move the last confirmation back by `instant_by` on the monotonic clock and `wall_by`
@@ -681,7 +780,7 @@ impl Bucket {
                     {
                         return Err(Error::Timeout(format!(
                             "takeover: the old writer kept appending past {steps} log \
-                             positions; retry the takeover"
+                             positions; {RESUME_TAKEOVER}"
                         )));
                     }
                     steps += 1;
@@ -1029,6 +1128,10 @@ impl Bucket {
     /// its dirty pages, its manifest, then move the head to G+1 with a conditional write.
     /// Returns G+1.
     ///
+    /// A seal of a generation under a takeover quiet (`set_seal_not_before`) first waits it
+    /// out (`wait_quiet`); its retry deadline starts after the wait. That includes the
+    /// close-time TRUNCATE seal: closing during the quiet waits too.
+    ///
     /// It records `durable.generation` (G), `durable.pages` and `durable.retries` on the
     /// current span, and `durable.seq`: the seq of the seal-start record (written now, or by
     /// the earlier attempt whose head this seal adopts) once the seal reaches it. It logs the
@@ -1039,6 +1142,9 @@ impl Bucket {
         page_size: u32,
         page_count: u32,
     ) -> Result<u64> {
+        if !self.fenced {
+            self.wait_quiet();
+        }
         let start = Instant::now();
         let (generation, n) = (self.head.generation, pages.len() as u64);
         let retries = self.counters.retries.load(Relaxed);
@@ -1073,6 +1179,7 @@ impl Bucket {
         self.manifest = Some(manifest);
         self.seq = 1;
         self.pending_seal = None;
+        self.quiet = None;
         self.counters.seals.fetch_add(1, Relaxed);
         self.emit(Event::SealFinished {
             generation: gen - 1,

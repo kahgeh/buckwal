@@ -1666,7 +1666,7 @@ fn append_fence_gives_up_after_the_step_bound() {
     let mut b = Bucket::attach(store.clone(), keys(), fast(), 4, "w2", 2).unwrap();
     let r = b.append_fence();
     assert!(
-        matches!(&r, Err(Error::Timeout(m)) if m.contains("retry the takeover")),
+        matches!(&r, Err(Error::Timeout(m)) if m.contains(RESUME)),
         "{r:?}"
     );
     assert_eq!(
@@ -1964,4 +1964,31 @@ fn raise_finding_the_pending_seal_head_reports_it_published() {
     // The next seal adopts it.
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
     assert_eq!(b.head(), &pending);
+}
+
+/// What a takeover `Timeout` must say: the retry is an open of the directory.
+const RESUME: &str =
+    "open this directory to resume the takeover (`open`, or `turso-durable sql --claim --dir DIR`)";
+
+/// The head moved under the takeover's head write and the deadline has passed: `Timeout`,
+/// with the same advice as the fence's.
+#[test]
+fn take_over_timeout_says_to_open_the_directory() {
+    let mem = Arc::new(MemStore::new());
+    Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
+    let store = Interpose {
+        mem: mem.clone(),
+        ..Interpose::default()
+    };
+    *store.before_head_cas.lock().unwrap() =
+        Some(Box::new(|m: &MemStore| rival_takeover(m, "rival", None)));
+    let once = RetryPolicy {
+        deadline: Duration::ZERO,
+        ..fast()
+    };
+    let r = take_over(&store, &keys(), &once, 1, "w2");
+    assert!(
+        matches!(&r, Err(Error::Timeout(m)) if m.contains("the head kept changing") && m.contains(RESUME)),
+        "{r:?}"
+    );
 }

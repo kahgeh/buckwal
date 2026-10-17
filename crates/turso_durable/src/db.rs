@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use turso_core::{File, OpenFlags, PlatformIO, IO};
 
@@ -429,6 +430,8 @@ pub(crate) struct Attached {
     /// The fence record this open appended: a takeover's, or the one a writer open appends
     /// when its generation's last record is another writer's.
     pub fence: Option<FenceOutcome>,
+    /// The takeover quiet this open's fence set (`ZERO` for none, and without a fence).
+    pub quiet: Duration,
 }
 
 /// The directory's own database, in this order:
@@ -449,7 +452,11 @@ pub(crate) struct Attached {
 ///    a still-running old writer's next append collides with it and is fenced for good, so
 ///    it can never ack into a generation this writer will seal. Records the old writer
 ///    landed first are stepped over.
-/// 5. Reconcile, after the fence: whatever the old writer acked before the fence (after the
+/// 5. The takeover quiet (`set_quiet`): a fence that landed right after another writer's
+///    seal-start record keeps this writer from sealing the generation for `lease +
+///    request_timeout`, persisted as `seal_not_before_ms`; without a fence, a persisted
+///    deadline of the generation is passed on to the bucket.
+/// 6. Reconcile, after the fence: whatever the old writer acked before the fence (after the
 ///    restore) comes in as `Behind`.
 pub(crate) fn attach_existing(
     dir: &Path,
@@ -458,6 +465,7 @@ pub(crate) fn attach_existing(
     cfg: &EngineConfig,
     mut state: LocalState,
 ) -> Result<Attached> {
+    let generation = state.generation;
     let (mut bucket, fence) = if !state.claimed && !cfg.read_only {
         let (bucket, fence) = claim(dir, store, keys, cfg, &mut state)?;
         (bucket, Some(fence))
@@ -468,10 +476,24 @@ pub(crate) fn attach_existing(
             state.epoch = raise_at_open(store, keys, cfg, &state, &mut bucket)?;
             state.write_atomic(dir)?;
             if last_record_is_foreign(&bucket, &state.writer_id, cfg)? {
+                state.seal_not_before_ms = provisional_quiet_ms(cfg);
+                state.write_atomic(dir)?;
                 fence = Some(bucket.append_fence()?);
             }
         }
         (bucket, fence)
+    };
+    let quiet = if cfg.read_only {
+        Duration::ZERO
+    } else {
+        set_quiet(
+            dir,
+            cfg,
+            &mut state,
+            &mut bucket,
+            fence.as_ref(),
+            generation,
+        )?
     };
     let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
     Ok(Attached {
@@ -479,7 +501,74 @@ pub(crate) fn attach_existing(
         state,
         reconciled,
         fence,
+        quiet,
     })
+}
+
+/// The takeover quiet: how long a writer whose fence follows another writer's seal-start
+/// record must not seal that generation (`Bucket::set_seal_not_before`).
+fn quiet_of(cfg: &EngineConfig) -> Duration {
+    cfg.lease.saturating_add(cfg.request_timeout)
+}
+
+/// `seal_not_before_ms` persisted before a fence is appended, in case the open crashes
+/// between the fence and `set_quiet`: the next open then finds its own fence as the last
+/// record (no fence again) and passes this deadline on. It ends no later than the one
+/// `set_quiet` writes, and starts after the head write, as the quiet must.
+fn provisional_quiet_ms(cfg: &EngineConfig) -> u64 {
+    bucket::unix_ms(SystemTime::now() + quiet_of(cfg))
+}
+
+/// Step 5 of `attach_existing`. With a `fence` from this open: when it landed right after
+/// another writer's empty Extents record (`FenceOutcome::after_foreign_empty`), the quiet is
+/// `lease + request_timeout` from now, persisted as `state.seal_not_before_ms` (unix ms) and
+/// set on the bucket on both clocks; otherwise 0 is persisted (replacing the provisional
+/// deadline). Returns the quiet set.
+///
+/// Without a fence: a `seal_not_before_ms` persisted for `generation` (the local state's at
+/// open), when the head is still at it, is passed on on the wall clock only (a quiet already
+/// passed changes nothing). One of an older generation is dropped (0). The seal of the
+/// generation writes 0 (`BucketDbStorage::seal`).
+fn set_quiet(
+    dir: &Path,
+    cfg: &EngineConfig,
+    state: &mut LocalState,
+    bucket: &mut Bucket,
+    fence: Option<&FenceOutcome>,
+    generation: u64,
+) -> Result<Duration> {
+    let Some(fence) = fence else {
+        let ms = state.seal_not_before_ms;
+        if ms != 0 && bucket.head().generation == generation {
+            let wall = UNIX_EPOCH + Duration::from_millis(ms);
+            bucket.set_seal_not_before(generation, Instant::now(), wall);
+        } else {
+            state.seal_not_before_ms = 0;
+        }
+        return Ok(Duration::ZERO);
+    };
+    let quiet = if fence.after_foreign_empty {
+        quiet_of(cfg)
+    } else {
+        Duration::ZERO
+    };
+    let (at, wall) = (Instant::now() + quiet, SystemTime::now() + quiet);
+    state.seal_not_before_ms = if quiet.is_zero() {
+        0
+    } else {
+        bucket::unix_ms(wall)
+    };
+    state.write_atomic(dir)?;
+    if !quiet.is_zero() {
+        bucket.set_seal_not_before(fence.pos.generation, at, wall);
+        tracing::info!(
+            target: "turso_durable",
+            generation = fence.pos.generation,
+            ms = quiet.as_millis() as u64,
+            "takeover quiet: the old writer's seal may still be uploading"
+        );
+    }
+    Ok(quiet)
 }
 
 /// `Bucket::attach` as `state`'s writer id, with its epoch as the least accepted, and the
@@ -537,6 +626,9 @@ fn raise_at_open(
 ///    claimed state `{writer_id: claim_id, claimed: true, head_etag, epoch, claim_id: ""}`.
 /// 3. Attach, and the fence record (`Bucket::append_fence`).
 ///
+/// `durable.epoch` is recorded as soon as the head write has landed, so a takeover that fails
+/// after it (a fence `Timeout`) still reports the epoch it took.
+///
 /// It emits `Event::TookOver` and logs the takeover.
 fn claim(
     dir: &Path,
@@ -556,12 +648,11 @@ fn claim(
         durable.outcome = Empty,
     );
     let retries = AtomicU64::new(0);
-    let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries));
+    let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries, &span));
     span.record("durable.retries", retries.load(SeqCst));
     match &r {
         Ok((bucket, fence)) => {
             let (generation, epoch) = (bucket.head().generation, bucket.head().epoch);
-            span.record("durable.epoch", epoch);
             span.record("durable.seq", fence.pos.seq);
             span.record("durable.outcome", "ok");
             span.in_scope(|| {
@@ -596,6 +687,7 @@ fn claim_in_span(
     cfg: &EngineConfig,
     state: &mut LocalState,
     retries: &AtomicU64,
+    span: &tracing::Span,
 ) -> Result<(Bucket, FenceOutcome)> {
     if state.claim_id.is_empty() {
         state.claim_id = new_writer_id()?;
@@ -609,6 +701,7 @@ fn claim_in_span(
         &state.claim_id,
         retries,
     )?;
+    span.record("durable.epoch", head.epoch);
     #[cfg(test)]
     if FAIL_AFTER_CLAIM_HEAD.with(|f| f.get()) {
         return Err(Error::Io(
@@ -619,10 +712,15 @@ fn claim_in_span(
     state.claimed = true;
     state.head_etag = etag;
     state.epoch = head.epoch;
+    state.seal_not_before_ms = provisional_quiet_ms(cfg);
     state.write_atomic(dir)?;
     let mut bucket = attach(store, keys, cfg, state)?;
     let fence = bucket.append_fence();
     retries.fetch_add(bucket.counters().retries.load(SeqCst), SeqCst);
+    #[cfg(test)]
+    if fence.is_ok() && FAIL_AFTER_CLAIM_FENCE.with(|f| f.get()) {
+        return Err(Error::Io("injected: crash after the claim's fence".into()));
+    }
     Ok((bucket, fence?))
 }
 
@@ -632,6 +730,9 @@ thread_local! {
     /// the claimed local state is written (a crash mid-claim). Per thread, so parallel tests
     /// do not see it.
     pub(crate) static FAIL_AFTER_CLAIM_HEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: `attach_existing` fails with `Io` right after the claim's fence landed, before
+    /// the takeover quiet is persisted (a crash mid-claim).
+    pub(crate) static FAIL_AFTER_CLAIM_FENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The last record of the head's generation (an Extents or a fence record) was written by a
@@ -699,6 +800,10 @@ impl Database {
     /// Close the database: drain the uploader, stop the trimmer, release the directory.
     /// Every [`Connection`] must be closed first (`Config` otherwise). Other `Database`
     /// handles see a closed database afterwards.
+    ///
+    /// Right after a takeover of a generation whose old writer was sealing it
+    /// ([`crate::TakeoverReport::quiet`]), the close-time checkpoint's seal first waits out
+    /// that quiet (`lease + request_timeout` after the takeover), so close can take that long.
     pub fn close(self) -> Result<()> {
         // Checked under the lock `connect` holds, so no connection appears in between.
         let mut guard = lock(&self.shared.open);

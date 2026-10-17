@@ -1601,7 +1601,8 @@ fn stage2_head_and_local_state_reopen() {
 }
 
 /// A seal writes the new generation to the local state and keeps the keys it does not own:
-/// the epoch, the claim id and the seal-not-before time.
+/// the epoch and the claim id. The seal-not-before time belonged to the generation just
+/// sealed, so it is cleared to 0.
 #[test]
 fn seal_keeps_the_epoch_and_claim_keys_in_the_local_state() {
     let store = mem();
@@ -1625,7 +1626,7 @@ fn seal_keeps_the_epoch_and_claim_keys_in_the_local_state() {
             after.claim_id.as_str(),
             after.seal_not_before_ms
         ),
-        (2, s.claim_id.as_str(), 12_345)
+        (2, s.claim_id.as_str(), 0)
     );
     c.close().unwrap();
     db.close().unwrap();
@@ -1911,4 +1912,262 @@ fn old_writer_seal_after_the_restore_makes_the_claim_restore_again() {
         db_a.close().unwrap();
         assert_eq!(restored_ids(&store), (1..=7).collect::<Vec<_>>(), "{b:?}");
     }
+}
+
+/// Task 6's settings: lease 300 ms and request timeout 500 ms (a takeover quiet of 800 ms),
+/// retry deadline 2 s, trim grace 10 s (above the 2.8 s they add up to), one page PUT at a
+/// time, and `events`.
+fn quiet_config(dir: &Path, events: Option<EventHook>) -> Config {
+    let mut c = config(dir);
+    c.lease = Duration::from_millis(300);
+    c.request_timeout = Duration::from_millis(500);
+    c.retry_deadline = Duration::from_secs(2);
+    c.trim_grace = Duration::from_secs(10);
+    c.upload_concurrency = 1;
+    c.on_event = events;
+    c
+}
+
+/// `lease + request_timeout` of `quiet_config`.
+const QUIET: Duration = Duration::from_millis(800);
+
+/// An event hook that keeps every event.
+fn recorder() -> (EventHook, Arc<Mutex<Vec<Event>>>) {
+    let seen: Arc<Mutex<Vec<Event>>> = Arc::default();
+    let s = seen.clone();
+    (
+        Arc::new(move |e: &Event| s.lock().unwrap().push(e.clone())),
+        seen,
+    )
+}
+
+/// The `SealQuiet` events seen: (generation, wait).
+fn seal_quiets(seen: &Mutex<Vec<Event>>) -> Vec<(u64, Duration)> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::SealQuiet { generation, wait } => Some((*generation, *wait)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every key whose body differs between `a` and `b`, or that only one of them holds.
+fn changed_keys(a: &BTreeMap<String, Vec<u8>>, b: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .cloned()
+        .collect()
+}
+
+/// A writer that committed `1..=n` and closed, then its seal-start record (an empty Extents
+/// record of its writer id) at the next seq of the head's generation: as if its next seal had
+/// started and its process were gone with the page PUTs in flight.
+fn writer_left_in_a_seal(store: &Arc<MemStore>, n: i64) -> TempDir {
+    let a = closed_writer(store, n);
+    let gen = head(&**store).generation;
+    let next = log_seqs(&**store, gen).last().map_or(1, |s| s + 1);
+    let rec = LogRecord::Extents {
+        writer_id: state(a.path()).writer_id,
+        syncs: Vec::new(),
+    };
+    let r = store
+        .put_if_absent(&keys().log(gen, next), &crate::format::encode_record(&rec))
+        .unwrap();
+    assert!(matches!(r, CondPut::Created { .. }), "{r:?}");
+    a
+}
+
+/// A row of 1 KB.
+fn insert_kb(c: &Connection, id: i64) {
+    c.execute(
+        "INSERT INTO t(id, v) VALUES (?, ?)",
+        &[Value::from_i64(id), Value::build_text("x".repeat(1024))],
+    )
+    .unwrap();
+}
+
+/// The takeover quiet. Old writer A seals generation G with its page PUTs slowed to 400 ms
+/// each (one at a time, lease 300 ms); on A's `SealStarted`, B takes G over (its fence lands
+/// right after A's seal-start record), commits 1001..=1010 and seals G itself. A's page PUT
+/// already in flight lands after B's seal began; without the quiet it overwrites B's
+/// `pages/G/*`. With it, B's seal waits `lease + request_timeout` (800 ms) after the
+/// takeover, so B's pages and manifest land last and stay as B wrote them. A is fenced at its
+/// next lease check, and a restore holds both writers' rows.
+#[test]
+fn old_writer_page_puts_in_flight_cannot_overwrite_the_new_seal() {
+    let store = mem();
+    let fault = Arc::new(FaultStore::new(store.clone()));
+    let (started_tx, started_rx) = mpsc::channel::<u64>();
+    let started_tx = Mutex::new(started_tx);
+    let a_hook: EventHook = Arc::new(move |e: &Event| {
+        if let Event::SealStarted { generation, .. } = e {
+            let _ = started_tx.lock().unwrap().send(*generation);
+        }
+    });
+    let a = tempdir();
+    let db_a = open_with_store(quiet_config(a.path(), Some(a_hook)), fault.clone()).unwrap();
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    for id in 1..=30 {
+        insert_kb(&ca, id);
+    }
+    let gen = db_a.generation();
+    fault.only_keys_containing("/pages/");
+    fault.delay_puts(Duration::from_millis(400));
+    let a_seal = std::thread::spawn(move || {
+        let r = ca.checkpoint(CheckpointMode::Truncate);
+        (r, ca, db_a)
+    });
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        gen,
+        "A's seal started"
+    );
+
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let took = Instant::now();
+    let rep = crate::takeover_with_store(quiet_config(&b_dir, None), store.clone()).unwrap();
+    assert_eq!(rep.generation, gen);
+    let (hook, seen) = recorder();
+    let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    // B's rows grow the database, so B's page 1 (the header's page count) differs from A's.
+    for id in 1001..=1010 {
+        insert_kb(&cb, id);
+    }
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    let sealed_after = took.elapsed();
+    assert_eq!(head(&*store).generation, gen + 1, "B sealed G");
+    let first = sealed_objects(&bucket_objects(&store), gen);
+    assert!(!first.is_empty());
+
+    let (a_result, ca, db_a) = a_seal.join().unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    let second = sealed_objects(&bucket_objects(&store), gen);
+    let changed = changed_keys(&first, &second);
+    assert!(
+        changed.is_empty(),
+        "A's page PUTs overwrote B's seal of generation {gen}: {changed:?} \
+         (B's seal returned {sealed_after:?} after the takeover started)"
+    );
+    assert!(matches!(a_result, Err(Error::Fenced(_))), "{a_result:?}");
+    assert_eq!(rep.quiet, QUIET, "{rep:?}");
+    assert!(
+        sealed_after >= QUIET,
+        "B's seal returned {sealed_after:?} after the takeover started"
+    );
+    let quiets = seal_quiets(&seen);
+    assert!(
+        matches!(quiets[..], [(g, wait)] if g == gen && wait <= QUIET),
+        "{quiets:?}"
+    );
+    crash(db_a, vec![ca]);
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=30).collect();
+    want.extend(1001..=1010);
+    assert_eq!(restored_ids(&store), want);
+}
+
+/// The record before the fence is the old writer's commit, not a seal-start record: no quiet,
+/// nothing persisted, and B's first seal does not wait.
+#[test]
+fn takeover_after_a_commit_has_no_quiet() {
+    let store = mem();
+    let a = tempdir();
+    let db_a = open_with_store(quiet_config(a.path(), None), store.clone()).unwrap();
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    for id in 1..=5 {
+        insert(&ca, id).unwrap();
+    }
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let rep = crate::takeover_with_store(quiet_config(&b_dir, None), store.clone()).unwrap();
+    assert_eq!(rep.quiet, Duration::ZERO, "{rep:?}");
+    assert_eq!(state(&b_dir).seal_not_before_ms, 0);
+    let (hook, seen) = recorder();
+    let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    insert(&cb, 1001).unwrap();
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert_eq!(head(&*store).generation, rep.generation + 1);
+    assert_eq!(seal_quiets(&seen), vec![]);
+    crash(db_a, vec![ca]);
+    cb.close().unwrap();
+    db_b.close().unwrap();
+}
+
+/// The quiet's deadline is persisted as wall-clock unix ms, so a later open of the directory
+/// keeps it; the seal of that generation clears it to 0.
+#[test]
+fn quiet_deadline_is_persisted() {
+    let store = mem();
+    let _a = writer_left_in_a_seal(&store, 5);
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let rep = crate::takeover_with_store(quiet_config(&b_dir, None), store.clone()).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(rep.quiet, QUIET, "{rep:?}");
+    let s = state(&b_dir);
+    let want = now_ms + QUIET.as_millis() as u64;
+    assert!(
+        s.seal_not_before_ms.abs_diff(want) <= 100,
+        "seal_not_before_ms {} is not within 100 ms of now + 800 ms ({want})",
+        s.seal_not_before_ms
+    );
+    let (hook, seen) = recorder();
+    let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    insert(&cb, 1001).unwrap();
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert_eq!(seal_quiets(&seen).len(), 1, "the reopen kept the quiet");
+    assert_eq!(state(&b_dir).seal_not_before_ms, 0, "the seal cleared it");
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=5).collect();
+    want.push(1001);
+    assert_eq!(restored_ids(&store), want);
+}
+
+/// A claim that crashed after its fence landed, before the takeover quiet was persisted: the
+/// claimed state already holds a provisional deadline, so the next open (whose last record is
+/// now its own fence, so no fence and no `after_foreign_empty`) still waits out the quiet.
+#[test]
+fn crash_after_the_fence_keeps_the_quiet() {
+    let store = mem();
+    let _a = writer_left_in_a_seal(&store, 5);
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    FAIL_AFTER_CLAIM_FENCE.with(|f| f.set(true));
+    let first = open_with_store(quiet_config(r.path(), None), store.clone());
+    FAIL_AFTER_CLAIM_FENCE.with(|f| f.set(false));
+    assert!(matches!(first, Err(Error::Io(_))), "{:?}", first.err());
+    let now_ms = crate::bucket::unix_ms(std::time::SystemTime::now());
+    let s = state(r.path());
+    assert!(
+        s.seal_not_before_ms > now_ms + QUIET.as_millis() as u64 / 2,
+        "seal_not_before_ms {} (now {now_ms})",
+        s.seal_not_before_ms
+    );
+    let (hook, seen) = recorder();
+    let db = open_with_store(quiet_config(r.path(), Some(hook)), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    insert(&c, 1001).unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let gen = head(&*store).generation - 1;
+    assert!(
+        matches!(seal_quiets(&seen)[..], [(g, _)] if g == gen),
+        "{:?}",
+        seal_quiets(&seen)
+    );
+    c.close().unwrap();
+    db.close().unwrap();
 }

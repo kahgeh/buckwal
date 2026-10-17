@@ -26,8 +26,12 @@ pub struct TakeoverReport {
     pub writer_id: String,
     /// The last restore (a takeover restores again when the generation moved meanwhile).
     pub restore: RestoreReport,
-    /// How long the new writer's first seal must wait for the old writer's page PUTs that may
-    /// still be in flight. Always zero for now.
+    /// The takeover quiet: how long after the takeover the new writer's seal of this
+    /// generation waits, because the record before the fence is the old writer's seal-start
+    /// record and its page and manifest PUTs may still be in flight (`lease +
+    /// request_timeout`). Zero otherwise. It is persisted in the directory, so the
+    /// [`crate::open`] that follows keeps it; a checkpoint or close in the quiet waits for
+    /// its end, and maintenance does not start meanwhile.
     pub quiet: Duration,
     pub elapsed: Duration,
 }
@@ -36,7 +40,8 @@ pub struct TakeoverReport {
 const ATTEMPTS: u32 = 3;
 
 /// Take the database `config` names over into `config.dir`, which must be missing or empty
-/// (`Config` otherwise, before any request is sent): restore it there, then write the head
+/// (`Config` otherwise, before any request is sent; a `durable.lock` alone counts as empty, so
+/// a takeover that failed "restore again" can be retried into the same directory): restore it there, then write the head
 /// with a new writer id at the next epoch and append a fence record. A writer still running
 /// elsewhere is fenced for good: its next commit or seal fails `Fenced`. Every commit it
 /// acked before the fence is in the directory.
@@ -55,10 +60,12 @@ pub fn takeover(config: Config) -> Result<TakeoverReport> {
 pub fn takeover_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Result<TakeoverReport> {
     let start = Instant::now();
     config.validate()?;
-    refuse_entries(&config.dir, &[])?;
+    // The lock file: a failed takeover leaves it (`DirGuard` never deletes it); the lock
+    // itself still excludes a live holder.
+    refuse_entries(&config.dir, &[LOCK_FILE])?;
     let guard = DirGuard::acquire(&config.dir)?;
     let dir = guard.dir().to_path_buf();
-    // Checked again under the lock: only the lock file may have appeared.
+    // Checked again under the lock: nothing else may have appeared.
     refuse_entries(&dir, &[LOCK_FILE])?;
     let cfg = config.engine(false);
     let keys = config.keys();
@@ -78,7 +85,7 @@ pub fn takeover_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Resul
                     fence_seq: fence.pos.seq,
                     writer_id: a.state.writer_id,
                     restore,
-                    quiet: Duration::ZERO,
+                    quiet: a.quiet,
                     elapsed: start.elapsed(),
                 });
             }

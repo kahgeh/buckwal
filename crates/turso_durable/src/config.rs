@@ -454,8 +454,8 @@ pub enum Event {
         elapsed: Duration,
     },
     /// A maintenance run of `generation` did not seal, and is retried later: `reason` is
-    /// `bucket degraded` or `last bucket operation failed` (it did not start: no
-    /// `MaintenanceStarted`, the gate stayed open), `gate_timeout` (calls or an open
+    /// `bucket degraded`, `last bucket operation failed` or `takeover quiet` (it did not
+    /// start: no `MaintenanceStarted`, the gate stayed open), `gate_timeout` (calls or an open
     /// transaction still in flight at the gate wait), `busy` (the engine refused the
     /// checkpoint), `closed` (the database was closing), `panic` (the run panicked; the
     /// span's outcome is `error`) or `error: <message>`.
@@ -468,6 +468,10 @@ pub enum Event {
         epoch: u64,
         fence_seq: u64,
     },
+    /// A seal of `generation` waits `wait` before it starts: the takeover quiet. This writer
+    /// took `generation` over right after another writer's seal-start record, so that
+    /// writer's page and manifest PUTs may still be in flight.
+    SealQuiet { generation: u64, wait: Duration },
 }
 
 /// How the engine talks to the bucket.
@@ -483,8 +487,7 @@ pub(crate) struct EngineConfig {
     /// The writer's lease (`Bucket::set_lease`, `Bucket::check_lease`).
     pub lease: Duration,
     /// How long one HTTP request may take: the S3 store's own setting, here for the waits
-    /// that must outlast a request in flight.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// that must outlast a request in flight (the takeover quiet).
     pub request_timeout: Duration,
     pub events: Option<EventHook>,
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are

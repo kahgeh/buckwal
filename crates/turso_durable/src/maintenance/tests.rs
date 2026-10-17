@@ -383,3 +383,86 @@ fn backoff_doubles_up_to_the_cap() {
     assert_eq!(got, vec![1, 2, 4, 8, 16, 30, 30, 30]);
     assert_eq!(backoff(r, u32::MAX, cap), cap);
 }
+
+/// During a takeover quiet, a due generation is not sealed: the run is skipped with reason
+/// `takeover quiet` before it closes the gate, so statements on other connections never wait
+/// at it. Once the quiet has passed, maintenance seals.
+#[test]
+fn maintenance_skips_during_takeover_quiet() {
+    use crate::config::{Config, Event};
+    use crate::format::{encode_record, LocalState, LogRecord};
+    use crate::store::{MemStore, ObjectStore};
+    use crate::Value;
+
+    let store = Arc::new(MemStore::new());
+    // The old writer: rows, closed, then its seal-start record at the next seq, as if its
+    // next seal had started and its process were gone with the page PUTs in flight.
+    let a = tempfile::tempdir().unwrap();
+    let ca = Config::new(a.path(), "http://127.0.0.1:1", "b", "k", "s");
+    let db = crate::open_with_store(ca.clone(), store.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+    conn.close().unwrap();
+    db.close().unwrap();
+    let keys = ca.keys();
+    let gen = db_generation(&*store, &keys);
+    let next = store.list(&keys.log_prefix(gen)).unwrap().len() as u64 + 1;
+    let rec = LogRecord::Extents {
+        writer_id: LocalState::read(a.path()).unwrap().unwrap().writer_id,
+        syncs: Vec::new(),
+    };
+    store
+        .put_if_absent(&keys.log(gen, next), &encode_record(&rec))
+        .unwrap();
+
+    // B: a quiet of lease 2 s + request timeout 500 ms.
+    let bt = tempfile::tempdir().unwrap();
+    let b_dir = bt.path().join("db");
+    let mut cb = Config::new(&b_dir, "http://127.0.0.1:1", "b", "k", "s");
+    cb.lease = Duration::from_secs(2);
+    cb.request_timeout = Duration::from_millis(500);
+    let rep = crate::takeover_with_store(cb.clone(), store.clone()).unwrap();
+    assert_eq!(rep.quiet, Duration::from_millis(2500), "{rep:?}");
+    let (hook, seen) = recorder();
+    cb.on_event = Some(hook);
+    cb.maintenance_log_objects = 5;
+    let db = crate::open_with_store(cb, store.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    for x in 0..10 {
+        conn.execute("INSERT INTO t VALUES (?)", &[Value::from_i64(x)])
+            .unwrap();
+    }
+    wait_event(
+        &seen,
+        |e| matches!(e, Event::MaintenanceSkipped { reason, .. } if reason == "takeover quiet"),
+    );
+    let other = db.connect().unwrap();
+    for x in 100..110 {
+        let t = Instant::now();
+        other
+            .execute("INSERT INTO t VALUES (?)", &[Value::from_i64(x)])
+            .unwrap();
+        assert!(t.elapsed() < BLOCKED, "held {:?}", t.elapsed());
+        assert!(!db.shared.gate.is_closed(), "the gate closed in the quiet");
+    }
+    {
+        let ev = seen.lock().unwrap();
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::MaintenanceStarted { .. })),
+            "a run started in the quiet: {ev:?}"
+        );
+    }
+    // After the quiet, maintenance seals (the generation is still due).
+    wait_event(&seen, |e| matches!(e, Event::MaintenanceFinished { .. }));
+    assert_eq!(db.generation(), gen + 1);
+    other.close().unwrap();
+    conn.close().unwrap();
+    db.close().unwrap();
+}
+
+/// The head's generation.
+fn db_generation(store: &dyn crate::store::ObjectStore, keys: &crate::format::Keys) -> u64 {
+    let body = store.get(&keys.head()).unwrap().unwrap().body;
+    crate::format::Head::decode(&body).unwrap().generation
+}

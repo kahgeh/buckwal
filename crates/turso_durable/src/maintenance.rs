@@ -14,7 +14,8 @@
 //!
 //! No run starts while the bucket looks unable to take a seal (the uploader is degraded or
 //! its last upload failed): the gate would stay closed for the seal's whole retry deadline.
-//! A run that is skipped, cannot drain the gate, finds the engine busy or fails backs off
+//! Nor during a takeover quiet (`Uploader::seal_quiet_remaining`): the seal would wait it out
+//! with the gate closed; that run is retried once the quiet has passed. A run that is skipped, cannot drain the gate, finds the engine busy or fails backs off
 //! for `retry`; repeated gate timeouts and busy refusals double it up to `retry_max`
 //! (growth does not fix their cause), and a failed run is retried sooner only once the
 //! generation has grown by another threshold. Its outcome is an event, a
@@ -238,6 +239,8 @@ enum Outcome {
     Sealed,
     /// Not started: the bucket looked unable to take a seal.
     BucketFailing,
+    /// Not started: a seal now would wait out this much of a takeover quiet.
+    TakeoverQuiet(Duration),
     Busy,
     GateTimeout,
     /// The database was closing.
@@ -250,6 +253,7 @@ impl Outcome {
         match self {
             Outcome::Sealed => "sealed",
             Outcome::BucketFailing => "bucket_failing",
+            Outcome::TakeoverQuiet(_) => "takeover_quiet",
             Outcome::Busy => "busy",
             Outcome::GateTimeout => "gate_timeout",
             Outcome::Closed => "closed",
@@ -436,6 +440,8 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                 Some(cfg.retry)
             }
             Some(Outcome::BucketFailing | Outcome::Closed) => Some(cfg.retry),
+            // Retried once the quiet has passed, not every `retry` meanwhile.
+            Some(Outcome::TakeoverQuiet(left)) => Some(cfg.retry.max(left)),
         };
         signal.bypass_log.store(bypass_log, SeqCst);
         signal.bypass_wal.store(bypass_wal, SeqCst);
@@ -461,7 +467,8 @@ struct Measured<'a> {
     wal_bytes: u64,
 }
 
-/// One run: unless the bucket is failing, close and drain the gate, checkpoint, reopen.
+/// One run: unless the bucket is failing or a takeover quiet lasts, close and drain the gate,
+/// checkpoint, reopen.
 ///
 /// It runs inside its `durable.maintenance` `span`, which the caller made (for
 /// `generation`, `log_objects` and `wal_bytes`) and entered, so a panic's outcome is
@@ -479,8 +486,13 @@ fn run_once(
         log_objects,
         wal_bytes,
     } = run;
-    if let Some(reason) = shared.uploader.bucket_failing() {
-        let outcome = Outcome::BucketFailing;
+    let quiet = shared.uploader.seal_quiet_remaining();
+    let skip = match shared.uploader.bucket_failing() {
+        Some(reason) => Some((Outcome::BucketFailing, reason)),
+        None if !quiet.is_zero() => Some((Outcome::TakeoverQuiet(quiet), "takeover quiet")),
+        None => None,
+    };
+    if let Some((outcome, reason)) = skip {
         span.record("durable.outcome", outcome.as_str());
         tracing::info!(
             target: "turso_durable",

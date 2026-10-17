@@ -1088,3 +1088,35 @@ fn takeover_exports_takeover_and_fence_spans() {
     assert_eq!(f.field("durable.retries"), Some("0"));
     assert_eq!(f.field("s3.status"), Some("200"));
 }
+
+/// A takeover whose head write landed and whose fence then failed still exports the new
+/// epoch on its `durable.takeover` span (the outcome is `error`, and no fence seq).
+#[test]
+fn takeover_failing_at_the_fence_exports_its_epoch() {
+    let cap = Capture::new();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mem = Arc::new(MemStore::new());
+    let (spans, r) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let db = crate::open_with_store(config(a.path()), mem.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        insert(&conn, 1).unwrap();
+        let fault = Arc::new(FaultStore::new(mem.clone()));
+        fault.only_keys_containing("log/");
+        fault.fail_next_puts_permanently(1);
+        let r = crate::takeover_with_store(config(b.path()), fault);
+        (cap.spans(), r)
+    });
+    assert!(matches!(r, Err(crate::Error::UploadFailed(_))), "{r:?}");
+    let body = mem.get("head").unwrap().unwrap().body;
+    let epoch = crate::format::Head::decode(&body)
+        .unwrap()
+        .epoch
+        .to_string();
+    let takeovers = spans.named("durable.takeover");
+    assert_eq!(takeovers.len(), 1, "{takeovers:?}");
+    let t = takeovers[0];
+    assert_eq!(t.field("durable.outcome"), Some("error"));
+    assert_eq!(t.field("durable.epoch"), Some(epoch.as_str()));
+}
