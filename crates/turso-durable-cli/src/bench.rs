@@ -100,13 +100,22 @@ fn since(before: &UploadStats, after: &UploadStats) -> UploadStats {
     }
 }
 
+/// The engine refused the statement as busy: with several Off writers it sometimes does
+/// so before its busy timeout (with or without maintenance). Nothing was committed; the
+/// statement is retried.
+fn is_busy(e: &turso_durable::Error) -> bool {
+    matches!(e, turso_durable::Error::Engine(m) if m.starts_with("database is busy"))
+}
+
 /// Commit until `next` passes `commits` or another thread failed; returns (commit index,
-/// latency) for each commit.
+/// latency) for each commit. A commit the engine refuses as busy is retried (counted in
+/// `busy`); its latency runs from its first attempt.
 fn commit_loop(
     db: &Database,
     commits: u64,
     next: &AtomicU64,
     failed: &AtomicBool,
+    busy: &AtomicU64,
 ) -> CliResult<Vec<(u64, Duration)>> {
     let conn = db.connect().map_err(err)?;
     let payload = Value::from_slice(&[0xabu8; 1024]).map_err(err)?;
@@ -117,10 +126,18 @@ fn commit_loop(
             break Ok(());
         }
         let t = Instant::now();
-        let r = conn.execute(
-            "INSERT OR REPLACE INTO bench(id, payload) VALUES (?, ?)",
-            &[Value::from_i64(i as i64), payload.clone()],
-        );
+        let r = loop {
+            let r = conn.execute(
+                "INSERT OR REPLACE INTO bench(id, payload) VALUES (?, ?)",
+                &[Value::from_i64(i as i64), payload.clone()],
+            );
+            match r {
+                Err(e) if is_busy(&e) => {
+                    busy.fetch_add(1, SeqCst);
+                }
+                r => break r,
+            }
+        };
         if let Err(e) = r {
             failed.store(true, SeqCst);
             break Err(err(e));
@@ -164,10 +181,11 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
     let before = db.upload_stats();
     let next = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
+    let busy = AtomicU64::new(0);
     let started = Instant::now();
     let results: Vec<CliResult<Vec<(u64, Duration)>>> = std::thread::scope(|s| {
         let threads: Vec<_> = (0..a.connections)
-            .map(|_| s.spawn(|| commit_loop(&db, commits, &next, &failed)))
+            .map(|_| s.spawn(|| commit_loop(&db, commits, &next, &failed, &busy)))
             .collect();
         let joined = threads.into_iter().map(|t| t.join());
         joined
@@ -197,6 +215,7 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
     say(&format!("commit_p99_ms={}", ms(pct(&sorted, 0.99))));
     say(&format!("commit_max_ms={}", ms(max)));
     say(&format!("commit_max_at={}", slowest + 1));
+    say(&format!("busy_retries={}", busy.load(SeqCst)));
     say(&format!(
         "commits_per_sec={:.1}",
         commits as f64 / total.as_secs_f64()
@@ -225,6 +244,14 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_engine_busy_refusal_is_retried() {
+        use turso_durable::Error;
+        assert!(is_busy(&Error::Engine("database is busy (locked)".into())));
+        assert!(!is_busy(&Error::Engine("no such table: bench".into())));
+        assert!(!is_busy(&Error::Timeout("database is busy".into())));
+    }
 
     #[test]
     fn maintenance_figures_count_runs_seals_skips_and_the_longest_gate_wait() {
