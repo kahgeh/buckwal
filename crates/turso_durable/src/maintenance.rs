@@ -204,6 +204,9 @@ struct Signal {
     /// Tests: the next run panics.
     #[cfg(test)]
     panic_next: std::sync::atomic::AtomicBool,
+    /// Tests: the next run panics inside the checkpoint, with the gate closed.
+    #[cfg(test)]
+    checkpoint_panic_next: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Signal {
@@ -216,6 +219,8 @@ impl Default for Signal {
             bypass_wal: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             panic_next: Default::default(),
+            #[cfg(test)]
+            checkpoint_panic_next: Default::default(),
         }
     }
 }
@@ -307,6 +312,12 @@ impl Maintenance {
         self.signal.panic_next.store(true, SeqCst);
     }
 
+    /// Tests: the next run panics inside the checkpoint, once the gate is closed and drained.
+    #[cfg(test)]
+    pub(crate) fn panic_next_checkpoint(&self) {
+        self.signal.checkpoint_panic_next.store(true, SeqCst);
+    }
+
     /// Wake the thread for a run (it checks the thresholds again first).
     pub(crate) fn wake(&self) {
         lock(&self.signal.wake).woken = true;
@@ -372,6 +383,10 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
             let inject_panic = signal.panic_next.swap(false, SeqCst);
             #[cfg(not(test))]
             let inject_panic = false;
+            #[cfg(test)]
+            let inject_checkpoint_panic = signal.checkpoint_panic_next.swap(false, SeqCst);
+            #[cfg(not(test))]
+            let inject_checkpoint_panic = false;
             let generation = shared.uploader.generation();
             let span = tracing::info_span!(
                 target: "turso_durable",
@@ -390,7 +405,7 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                     log_objects,
                     wal_bytes,
                 };
-                run_once(&shared, cfg, run, inject_panic)
+                run_once(&shared, cfg, run, inject_panic, inject_checkpoint_panic)
             }))
             .unwrap_or_else(|_| {
                 // The run may have emitted `MaintenanceStarted`: it gets an end event too.
@@ -460,6 +475,7 @@ fn run_once(
     cfg: &MaintenanceConfig,
     run: Measured<'_>,
     inject_panic: bool,
+    inject_checkpoint_panic: bool,
 ) -> Outcome {
     let Measured {
         span,
@@ -496,6 +512,9 @@ fn run_once(
     span.record("durable.gate_wait_ms", gate_wait.as_millis() as u64);
     let r = if drained {
         let _reopen = Reopen(&shared.gate);
+        if inject_checkpoint_panic {
+            panic!("injected checkpoint panic");
+        }
         checkpoint(shared)
     } else {
         Err((Outcome::GateTimeout, "gate_timeout".to_string()))

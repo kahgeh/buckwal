@@ -78,7 +78,7 @@ fn parse_level(var: &str, v: &str) -> Result<Level> {
 }
 
 impl TelemetryConfig {
-    /// Read `DURABLE_OTEL` (0/1/true/false), `DURABLE_OTEL_ENDPOINT`, `DURABLE_OTEL_LEVEL`
+    /// Read `DURABLE_OTEL` (0/1, true/false or on/off), `DURABLE_OTEL_ENDPOINT`, `DURABLE_OTEL_LEVEL`
     /// (trace|debug|info|warn|error) and `DURABLE_TEST_RUN_ID`; an unset one keeps its
     /// [`defaults`] value. A bad value is a `Config` error.
     pub fn from_env() -> Result<TelemetryConfig> {

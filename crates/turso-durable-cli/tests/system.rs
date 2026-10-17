@@ -658,7 +658,11 @@ fn crash_matrix(mode: &str, batching: Option<&str>) {
             );
         }
         let seals = soak.count("event seal-finished");
-        if mode != "auto" {
+        // Under Window with four connections, PASSIVE and FULL cannot restart the WAL (the
+        // other connections' frames stay live), so they end no generation; only maintenance
+        // (past its log-object threshold) seals those runs. RESTART, TRUNCATE and a reopen do.
+        let checkpoint_seals = batching.is_none() || !matches!(mode, "passive" | "full");
+        if mode != "auto" && checkpoint_seals {
             // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
             assert!(
                 seals >= 1 && seals >= kill_after / 100 - 1,
@@ -758,6 +762,24 @@ fn crash_window_truncate() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_window_reopen() {
     crash_matrix("reopen", Some(WINDOW));
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_passive() {
+    crash_matrix("passive", Some(WINDOW));
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_full() {
+    crash_matrix("full", Some(WINDOW));
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_window_restart() {
+    crash_matrix("restart", Some(WINDOW));
 }
 
 /// The batch now waiting, when the soak's last event line says two or more commits wait in

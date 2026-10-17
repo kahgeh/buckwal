@@ -161,10 +161,10 @@ const ENV_VARS: [&str; 16] = [
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
         _ => Err(Error::Config(format!(
-            "{var} must be 0/1 or true/false, not {v:?}"
+            "{var} must be 0/1, true/false or on/off, not {v:?}"
         ))),
     }
 }

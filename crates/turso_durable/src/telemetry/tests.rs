@@ -972,6 +972,23 @@ fn from_env_parses_and_refuses_bad_values() {
     }
 }
 
+#[test]
+fn otel_accepts_on_and_off() {
+    let lookup = |v: &'static str| {
+        TelemetryConfig::from_lookup(|k| (k == "DURABLE_OTEL").then(|| v.to_string()))
+    };
+    for v in ["on", "On", "ON", "1", "true"] {
+        assert!(lookup(v).unwrap().enabled, "{v}");
+    }
+    for v in ["off", "OFF", "0", "false"] {
+        assert!(!lookup(v).unwrap().enabled, "{v}");
+    }
+    match lookup("yes") {
+        Err(Error::Config(m)) => assert!(m.contains("on/off"), "{m}"),
+        r => panic!("yes: {r:?}"),
+    }
+}
+
 /// Disabled, `init` installs nothing; an https endpoint is refused before anything is.
 /// (Enabled `init` installs a global subscriber, so it is tested in `tests/otel_down.rs`.)
 #[test]

@@ -148,6 +148,37 @@ mod tests {
         );
     }
 
+    /// A later, looser item never loosens the limits an earlier one set: each limit is the
+    /// smallest among the items.
+    #[test]
+    fn a_looser_commit_keeps_the_smallest_limit() {
+        let w = |ms, n, b| Batching::Window {
+            max_wait: Duration::from_millis(ms),
+            max_commits: n,
+            max_bytes: b,
+        };
+        let t0 = Instant::now();
+        let mut b = Batch::default();
+        assert!(!b.push(item(w(10_000, 2, 1 << 20), 1), t0));
+        assert!(
+            b.push(item(w(10_000, 64, 1 << 20), 1), t0),
+            "max_commits stays 2"
+        );
+        b.take();
+        assert!(!b.push(item(w(10_000, 64, 100), 10), t0));
+        assert!(
+            b.push(item(w(10_000, 64, 1 << 20), 95), t0),
+            "105 bytes reach max_bytes 100, which the looser item did not raise"
+        );
+        b.take();
+        b.push(item(w(10, 64, 1 << 20), 1), t0);
+        b.push(
+            item(w(10_000, 64, 1 << 20), 1),
+            t0 + Duration::from_millis(1),
+        );
+        assert_eq!(b.deadline(), Some(t0 + Duration::from_millis(10)));
+    }
+
     #[test]
     fn degenerate_limits_flush_immediately() {
         let t0 = Instant::now();

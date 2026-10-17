@@ -249,6 +249,89 @@ fn a_panicking_run_backs_off_and_maintenance_goes_on() {
     );
 }
 
+/// A panic inside the checkpoint, gate closed, still reopens the gate (`Reopen`): the run
+/// is a `panic` skip and a new connection's write goes through.
+#[test]
+fn gate_reopens_when_the_checkpoint_panics() {
+    use crate::config::Event;
+    let dir = tempfile::tempdir().unwrap();
+    let (hook, seen) = recorder();
+    let db = open_small(dir.path(), hook);
+    db.shared.maintenance().unwrap().panic_next_checkpoint();
+    // Everything that could block on a gate left closed runs on this thread, so a failure
+    // is an assertion, not a hang.
+    let (loaded_tx, loaded_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+        for x in 0..10 {
+            conn.execute("INSERT INTO t VALUES (?)", &[crate::Value::from_i64(x)])
+                .unwrap();
+        }
+        loaded_tx.send(()).unwrap();
+        wait_event(
+            &seen,
+            |e| matches!(e, Event::MaintenanceSkipped { reason, .. } if reason == "panic"),
+        );
+        let c = db.connect().unwrap();
+        let started = Instant::now();
+        let r = c.execute("INSERT INTO t VALUES (99)", &[]);
+        tx.send((r.map(|_| ()), started.elapsed())).unwrap();
+        drop((c, conn, db));
+    });
+    loaded_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the gate stayed closed after the checkpoint panicked");
+    let (r, took) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("no `panic` skip, or the gate stayed closed");
+    r.unwrap();
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+/// A commit's ack wait happens after it leaves the gate (`Connection::call`), so a Window
+/// commit waiting out a slow upload does not hold maintenance off. Moving `await_acks`
+/// inside the gate makes the drain below fail.
+#[test]
+fn ack_wait_runs_outside_the_gate() {
+    use crate::batching::Batching;
+    let dir = tempfile::tempdir().unwrap();
+    let fault = Arc::new(crate::store::FaultStore::new(Arc::new(
+        crate::store::MemStore::new(),
+    )));
+    let mut c = crate::config::Config::new(dir.path(), "http://127.0.0.1:1", "b", "k", "s");
+    c.maintenance_log_objects = 0;
+    c.maintenance_wal_bytes = 0;
+    c.batching = Batching::Window {
+        max_wait: Duration::from_millis(1),
+        max_commits: 64,
+        max_bytes: 1 << 20,
+    };
+    let db = crate::open_with_store(c, fault.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+    fault.only_keys_containing("log/");
+    fault.delay_puts(Duration::from_secs(1));
+    let handle = thread::spawn(move || {
+        let r = conn.execute("INSERT INTO t VALUES (1)", &[]);
+        (r.map(|_| ()), conn)
+    });
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !handle.is_finished(),
+        "the commit finished before the delayed put"
+    );
+    let drained = db.shared.gate.close_and_drain(Duration::from_millis(100));
+    db.shared.gate.open();
+    assert!(
+        drained,
+        "the gate could not drain while the commit awaited its ack"
+    );
+    let (r, _conn) = handle.join().unwrap();
+    r.unwrap();
+}
+
 /// A run that finds the database closing (`Database::close` took the engine) is a skip,
 /// `closed`, not an error.
 #[test]

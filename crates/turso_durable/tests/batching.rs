@@ -1158,6 +1158,8 @@ fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Du
 fn sustained_window_load_seals_and_bounds_restore_gets() {
     const THRESHOLD: u64 = 200;
     const COMMITS: usize = 4800;
+    // 8 connections' in-flight commits, the seal-start record and the WAL-header record.
+    const SLACK: u64 = 16;
     let win = w(1, 64, 1 << 20);
     let before = sustained(win, 0, COMMITS, Duration::from_millis(1));
     eprintln!("window before (maintenance off): {before:?}");
@@ -1174,6 +1176,10 @@ fn sustained_window_load_seals_and_bounds_restore_gets() {
     assert_eq!((before.busy_retries, after.busy_retries), (0, 0));
     assert_eq!(before.maintenance_runs, 0);
     assert!(after.seals_under_load > 0, "{after:?}");
+    assert!(
+        after.max_log_objects_under_load <= THRESHOLD + SLACK,
+        "{after:?}"
+    );
     // head, manifest, page 1, the generation's log objects (+ 1 in flight).
     assert!(after.restore_gets <= THRESHOLD + 4, "{after:?}");
     assert!(after.restore_log_objects <= THRESHOLD + 1, "{after:?}");
