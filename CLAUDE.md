@@ -9,7 +9,7 @@ Rust library `turso_durable` (crates/turso_durable) plus CLI `turso-durable` (cr
 - Pass 2's TLS material and key are made in a `mktemp -d` dir (`turso-durable-tls.*`) and removed on exit; it exports `TURSO_DURABLE_TLS_DIR` and `DURABLE_ENCRYPTION_KEY_FILE`.
 - Each pass ends with `turso-durable scan --all` over every object: pass 1 must find `CREATE TABLE`, pass 2 no plaintext needle (the key is never printed). Tests keep their prefixes (`DURABLE_KEEP_PREFIXES=1`) for it.
 - `./scripts/test.sh` runs the ignored tests with `DURABLE_OTEL=1` and ends with `scripts/otel-check.sh`, the ClickHouse check of that run's telemetry; it prints `otel check SKIPPED: observability stack not running` and passes when the stack is down.
-- `./scripts/test.sh` empties RustFS (`scripts/rustfs.sh reset`) before each pass and on exit, and prints each pass's `peak turso-durable-objects` (about 663 MB and 713 MB). Outside it, each RustFS test deletes its prefix, and `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix (name on stderr).
+- `./scripts/test.sh` empties RustFS (`scripts/rustfs.sh reset`) before each pass and on exit, and prints each pass's `peak turso-durable-objects` (about 673 MB and 711 MB). Outside it, each RustFS test deletes its prefix, and `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix (name on stderr).
 - Always pass `--locked` to cargo. The script sets `SDKROOT` on macOS (newest CLT SDK does not link) and `SOURCE_DATE_EPOCH`.
 
 ## RustFS resource rules

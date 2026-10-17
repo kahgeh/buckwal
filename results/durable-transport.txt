@@ -1,0 +1,352 @@
+# turso_durable stage 4 (durable-transport) measurements
+# date: 2026-10-18
+# git: 5215309 (durable-transport; the measured code, before this file was committed)
+# engine: turso_core 0.8.3 (features fs, json, uuid, encryption)
+# RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+# build: cargo build --release --locked -p turso-durable-cli --bins --examples (rustc 1.97.1),
+#   target/release/turso-durable and target/release/examples/stage3_costs
+# machine: Apple M4 Max, macOS 27.0.1
+# laptop figures (Apple M4 Max, RustFS in podman on the same Mac, loopback), not production
+# numbers and not S3. TLS here is rustls/ring to a RustFS on 127.0.0.1 with a test CA.
+# telemetry: DURABLE_OTEL unset (off). One run per configuration; no repeats, so treat small
+# differences as noise.
+#
+# Setups:
+#   (a) plain HTTP, no encryption
+#   (b) HTTPS (DURABLE_CA_BUNDLE = the test CA), no encryption
+#   (c) HTTPS + encryption (DURABLE_ENCRYPTION_KEY_FILE, default cipher aegis256)
+# Between setups RustFS was reset (scripts/rustfs.sh reset), so each setup ran on an empty
+# bucket. HTTPS setups: TURSO_DURABLE_TLS_DIR = <T>/m made by scripts/tls-material.sh, <T> from
+# mktemp -d. Key material is not recorded here.
+#
+# Commands (DURABLE_* from `eval "$(scripts/rustfs.sh env)"`; <P> a distinct DURABLE_PREFIX per
+# run, t7/<setup>-<off|win>-<pid>; <W> a scratch directory, deleted afterwards):
+#   T=$(mktemp -d <scratchpad>/tls.XXXXXX); scripts/tls-material.sh $T/m          (b, c)
+#   unset TURSO_DURABLE_TLS_DIR DURABLE_ENCRYPTION_KEY_FILE DURABLE_CA_BUNDLE
+#   export TURSO_DURABLE_TLS_DIR=$T/m                                              (b, c)
+#   export DURABLE_ENCRYPTION_KEY_FILE=<the key file tls-material.sh made>   (c)
+#   scripts/rustfs.sh reset; eval "$(scripts/rustfs.sh env)"
+#   DURABLE_PREFIX=<P> turso-durable bench --dir <W>/bench-off --commits 1000 --batching off
+#   DURABLE_PREFIX=<P> turso-durable bench --dir <W>/bench-win --commits 1000 \
+#     --batching 'window 10ms 64 1MiB'
+#   DURABLE_PREFIX=<P> turso-durable restore --dir <W>/restored-<off|win>          (a, c)
+#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/restored-<off|win>  (a, c)
+# Stage 3's costs, re-measured on plain RustFS (setup a):
+#   DURABLE_PREFIX=<P> turso-durable bench --dir <W>/bench --commits 5000
+#   DURABLE_PREFIX=<P> stage3_costs takeover <W>/took-ex
+#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/took-ex     (twice)
+#   DURABLE_PREFIX=<P> turso-durable restore --dir <W>/restored
+#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/restored
+#
+# Workload (bench): CREATE TABLE bench(id INTEGER PRIMARY KEY, payload BLOB), then 1000
+# autocommit INSERT OR REPLACE statements of a 1024-byte blob on one connection, then close
+# (see results/batching-knob.txt for the key definitions). "Log PUTs per acked commit" is
+# bench's log_puts_per_commit (log_puts / 1000 bench commits); upload_stats counts 1003
+# commits because each WAL restart's header record counts as one.
+#
+# Summary: commit latency, 1000 commits, one connection
+#   setup                 batching             p50 / p95 / p99 (ms)       commits/s  log PUTs/commit
+#   (a) HTTP              off                  1.268 / 1.842 / 2.682      663.0      1.003
+#   (b) HTTPS             off                  1.203 / 1.726 / 2.308      704.4      1.003
+#   (c) HTTPS+encryption  off                  1.212 / 1.679 / 2.294      702.2      1.003
+#   (a) HTTP              window 10ms 64 1MiB  16.650 / 19.908 / 21.082   60.0       1.001
+#   (b) HTTPS             window 10ms 64 1MiB  16.691 / 19.672 / 20.536   60.6       1.001
+#   (c) HTTPS+encryption  window 10ms 64 1MiB  16.552 / 19.978 / 21.439   60.8       1.001
+# Seals (ms, pages): in-run seals of 170 and 169 pages, and the setup close's seal of 2 pages
+#   (a) off  21.6 (2), 53.2 (170), 51.7 (169)    window  22.9 (2), 60.4 (170), 65.7 (169)
+#   (b) off   6.5 (2), 65.7 (170), 44.0 (169)    window   6.8 (2), 60.1 (170), 65.0 (169)
+#   (c) off   6.8 (2), 50.6 (170), 56.1 (169)    window   7.5 (2), 52.9 (170), 68.4 (169)
+#   (a) was the first run after the build and its 2-page seal was slower; not investigated.
+# Restore of the 1000-commit database (generation 4): 4 GETs (3 + 1 log object), 1 LIST,
+#   4404 bytes, in every case below. Encrypted pages are the size of plaintext ones.
+#   (a) off 21 ms, window 21 ms;  (c) off 21 ms, window 23 ms.
+# Writer open of that restored directory (the first writer open takes it over):
+#   (a) and (c), off and window: open_puts=2, open_gets=11, open_lists=3, 37-73 ms
+#   ((a) off 73, (a) window 37, (c) off 38, (c) window 46).
+#   No difference in requests between plain and encrypted.
+#
+# Stage 3's costs, re-measured (5000-commit bench database, generation 13, plain RustFS):
+#   takeover (stage3_costs): ms=74, restore_gets=4, restore_lists=1, restore_ms=26,
+#     total_puts=2, total_gets=11, total_lists=4. (Stage 3, run 2: ms=67, 10 GETs, 3 LISTs.)
+#   first writer open of the taken-over directory: open_puts=1, open_gets=9, open_lists=2,
+#     open_ms=18. (Stage 3: 7 GETs, 2 LISTs.) Stage 4's page-1 check GETs the head, the
+#     manifest and page 1 when the directory holds no page 1 (here, the first open after a
+#     takeover): 9 = 6 + 3.
+#   second writer open: open_puts=1, open_gets=6, open_lists=2, open_ms=16.
+#     (Stage 3 measured 7 for both opens; the 6 is one GET less than stage 3, from the
+#     stage-3 final fix wave or later; not itemised.)
+#   bench itself: p50 1.278 ms, p99 2.278 ms, 678.6 commits/s (stage 3: 1.289 / 2.086, 678.9).
+#   restore of the database after the opens (generation 13, 2 log objects): gets=5, lists=1,
+#     bytes=4747, ms=20.
+#   open of a directory restored by `restore` (never opened): open_puts=2, open_gets=13,
+#     open_lists=3, open_ms=43 (the takeover mechanism plus the three page-1 GETs).
+#
+# Final ./scripts/test.sh run (the canonical figures; commit 5215309, same code as measured)
+# (./scripts/test.sh, with `time`, in the background; rc=0; wall time 11:30.6 (11.5 min).)
+#   pass 1 (plain HTTP, no encryption; the tls_* tests skipped): 38 system tests + 8 S3 tests, all ok
+#     scan: 41942 objects, 514365239 bytes
+#     CREATE TABLE: found in 12864 objects; SQLite header: found in 12864; bench payload: found in 1998
+#     peak turso-durable-objects: 673 MB (plain)
+#   pass 2 (HTTPS + encryption, every test): 38 system tests + 11 S3 tests, all ok
+#     scan: 44604 objects, 543608616 bytes
+#     CREATE TABLE: not found; SQLite header: not found; bench payload: not found;
+#     marker 1: not found; the encryption key: not found
+#     peak turso-durable-objects: 711 MB (https+encryption)
+#   otel check PASSED: durable.ack_wait=83096 durable.checkpoint_upload=516 durable.commit=83090
+#     durable.fence=21 durable.gc=794 durable.local_fsync=83251 durable.local_write=83297
+#     durable.maintenance=111 durable.restore=144 durable.takeover=21 durable.upload=50331 logs=1010
+#   (Task 6's run of the same code: 11.5 min, peaks 663 and 713 MB, 12614 of 41196 objects with
+#   CREATE TABLE in pass 1, 44362 objects in pass 2; the figures above are the canonical ones.)
+#
+# Raw bench output of the six runs (setup a, b, c; off then window) follows.
+
+## setup (a) raw
+=== setup a batching 'off' prefix-run
+commits=1000
+commit_p50_ms=1.268
+commit_p95_ms=1.842
+commit_p99_ms=2.682
+commit_max_ms=77.540
+commit_max_at=503
+busy_retries=0
+commits_per_sec=663.0
+commits_acked=1003
+commits_uploaded=1003
+log_puts=1003
+log_put_bytes=8344221
+commits_per_log_put=1.000
+bytes_per_log_put=8319.3
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=2.304
+log_puts_per_commit=1.003
+bucket_puts=1357
+page_puts=341
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=21.625 seal_1_pages=2
+seal_2_ms=53.198 seal_2_pages=170
+seal_3_ms=51.655 seal_3_pages=169
+--- restore (a off)
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4404 ms=21
+real 0.03
+user 0.00
+sys 0.00
+--- stage3_costs open on the restored dir (a off)
+open_ms=73
+generation=4
+open_puts=2
+open_gets=11
+open_lists=3
+open_deletes=0
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+=== setup a batching 'window 10ms 64 1MiB' prefix-run
+commits=1000
+commit_p50_ms=16.650
+commit_p95_ms=19.908
+commit_p99_ms=21.082
+commit_max_ms=91.690
+commit_max_at=503
+busy_retries=0
+commits_per_sec=60.0
+commits_acked=1003
+commits_uploaded=1003
+log_puts=1001
+log_put_bytes=8344065
+commits_per_log_put=1.002
+bytes_per_log_put=8335.7
+ack_wait_p50_ms=17.408
+ack_wait_p95_ms=20.480
+ack_wait_p99_ms=21.504
+log_puts_per_commit=1.001
+bucket_puts=1354
+page_puts=341
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=504
+seal_1_ms=22.938 seal_1_pages=2
+seal_2_ms=60.425 seal_2_pages=170
+seal_3_ms=65.698 seal_3_pages=169
+--- restore (a win)
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4404 ms=21
+real 0.04
+user 0.00
+sys 0.00
+--- stage3_costs open on the restored dir (a win)
+open_ms=37
+generation=4
+open_puts=2
+open_gets=11
+open_lists=3
+open_deletes=0
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+
+## setup (b) raw
+=== setup b batching 'off' prefix-run
+commits=1000
+commit_p50_ms=1.203
+commit_p95_ms=1.726
+commit_p99_ms=2.308
+commit_max_ms=85.316
+commit_max_at=503
+busy_retries=0
+commits_per_sec=704.4
+commits_acked=1003
+commits_uploaded=1003
+log_puts=1003
+log_put_bytes=8344221
+commits_per_log_put=1.000
+bytes_per_log_put=8319.3
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.344
+ack_wait_p99_ms=1.600
+log_puts_per_commit=1.003
+bucket_puts=1357
+page_puts=341
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=6.455 seal_1_pages=2
+seal_2_ms=65.742 seal_2_pages=170
+seal_3_ms=44.033 seal_3_pages=169
+=== setup b batching 'window 10ms 64 1MiB' prefix-run
+commits=1000
+commit_p50_ms=16.691
+commit_p95_ms=19.672
+commit_p99_ms=20.536
+commit_max_ms=94.362
+commit_max_at=503
+busy_retries=0
+commits_per_sec=60.6
+commits_acked=1003
+commits_uploaded=1003
+log_puts=1001
+log_put_bytes=8344065
+commits_per_log_put=1.002
+bytes_per_log_put=8335.7
+ack_wait_p50_ms=17.408
+ack_wait_p95_ms=20.480
+ack_wait_p99_ms=20.480
+log_puts_per_commit=1.001
+bucket_puts=1354
+page_puts=341
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=504
+seal_1_ms=6.830 seal_1_pages=2
+seal_2_ms=60.067 seal_2_pages=170
+seal_3_ms=64.973 seal_3_pages=169
+
+## setup (c) raw
+=== setup c batching 'off' prefix-run
+commits=1000
+commit_p50_ms=1.212
+commit_p95_ms=1.679
+commit_p99_ms=2.294
+commit_max_ms=69.147
+commit_max_at=503
+busy_retries=0
+commits_per_sec=702.2
+commits_acked=1003
+commits_uploaded=1003
+log_puts=1003
+log_put_bytes=8344221
+commits_per_log_put=1.000
+bytes_per_log_put=8319.3
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.408
+ack_wait_p99_ms=1.728
+log_puts_per_commit=1.003
+bucket_puts=1357
+page_puts=341
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=6.756 seal_1_pages=2
+seal_2_ms=50.631 seal_2_pages=170
+seal_3_ms=56.096 seal_3_pages=169
+--- restore (c off)
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4404 ms=21
+real 0.04
+user 0.00
+sys 0.00
+--- stage3_costs open on the restored dir (c off)
+open_ms=38
+generation=4
+open_puts=2
+open_gets=11
+open_lists=3
+open_deletes=0
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+=== setup c batching 'window 10ms 64 1MiB' prefix-run
+commits=1000
+commit_p50_ms=16.552
+commit_p95_ms=19.978
+commit_p99_ms=21.439
+commit_max_ms=83.778
+commit_max_at=503
+busy_retries=0
+commits_per_sec=60.8
+commits_acked=1003
+commits_uploaded=1003
+log_puts=1001
+log_put_bytes=8344065
+commits_per_log_put=1.002
+bytes_per_log_put=8335.7
+ack_wait_p50_ms=17.408
+ack_wait_p95_ms=20.480
+ack_wait_p99_ms=21.504
+log_puts_per_commit=1.001
+bucket_puts=1354
+page_puts=341
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=504
+seal_1_ms=7.487 seal_1_pages=2
+seal_2_ms=52.868 seal_2_pages=170
+seal_3_ms=68.388 seal_3_pages=169
+--- restore (c win)
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4404 ms=23
+real 0.04
+user 0.00
+sys 0.00
+--- stage3_costs open on the restored dir (c win)
+open_ms=46
+generation=4
+open_puts=2
+open_gets=11
+open_lists=3
+open_deletes=0
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+
