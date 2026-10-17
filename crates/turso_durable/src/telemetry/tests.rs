@@ -1142,6 +1142,69 @@ fn takeover_failing_at_the_fence_exports_its_epoch() {
     assert_eq!(t.field("durable.epoch"), Some(epoch.as_str()));
 }
 
+/// M3: a takeover resumed through `open` (its fence failed, so the generation's last record is
+/// still the old writer's) is a takeover too: the open's fence runs in a `durable.takeover`
+/// span with outcome `ok`, the fence's seq and the head's epoch, and emits `Event::TookOver`.
+#[test]
+fn a_takeover_resumed_through_open_exports_a_takeover_span() {
+    let cap = Capture::new();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mem = Arc::new(MemStore::new());
+    let took: Arc<Mutex<Vec<crate::Event>>> = Arc::default();
+    let (spans, db) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let db = crate::open_with_store(config(a.path()), mem.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        insert(&conn, 1).unwrap();
+        let fault = Arc::new(FaultStore::new(mem.clone()));
+        fault.only_keys_containing("log/");
+        fault.fail_next_puts_permanently(1);
+        let r = crate::takeover_with_store(config(b.path()), fault);
+        assert!(matches!(r, Err(crate::Error::UploadFailed(_))), "{r:?}");
+        let mut c = config(b.path());
+        let t = took.clone();
+        c.on_event = Some(Arc::new(move |e: &crate::Event| {
+            if let crate::Event::TookOver { .. } = e {
+                t.lock().unwrap().push(e.clone());
+            }
+        }));
+        let resumed = crate::open_with_store(c, mem.clone()).unwrap();
+        (cap.spans(), resumed)
+    });
+    let head = crate::format::Head::decode(&mem.get("head").unwrap().unwrap().body).unwrap();
+    let takeovers = spans.named("durable.takeover");
+    assert_eq!(
+        takeovers.len(),
+        2,
+        "the takeover, then its resumption: {takeovers:?}"
+    );
+    let t = takeovers[1];
+    assert_eq!(t.field("durable.outcome"), Some("ok"));
+    assert_eq!(
+        t.field("durable.generation"),
+        Some(head.generation.to_string().as_str())
+    );
+    assert_eq!(
+        t.field("durable.epoch"),
+        Some(head.epoch.to_string().as_str())
+    );
+    let f = spans.with_parent(t.id, "durable.fence");
+    assert_eq!(f.field("durable.seq"), t.field("durable.seq"));
+    let events = took.lock().unwrap().clone();
+    assert!(
+        matches!(
+            &events[..],
+            [crate::Event::TookOver { generation, epoch, fence_seq }]
+                if *generation == head.generation
+                    && *epoch == head.epoch
+                    && Some(fence_seq.to_string().as_str()) == t.field("durable.seq")
+        ),
+        "{events:?}"
+    );
+    db.close().unwrap();
+}
+
 /// `gc` runs in a `durable.gc` span: the head's generation, the manifest trimmed against and
 /// its age, what was deleted, and the outcome.
 #[test]

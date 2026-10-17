@@ -27,9 +27,10 @@ pub struct TakeoverReport {
     /// The last restore (a takeover restores again when the generation moved meanwhile).
     pub restore: RestoreReport,
     /// The takeover quiet: how long after the takeover the new writer's seal of this
-    /// generation waits, because the record before the fence is the old writer's seal-start
-    /// record and its page and manifest PUTs may still be in flight (`lease +
-    /// request_timeout`). Zero otherwise. It is persisted in the directory, so the
+    /// generation waits (`lease + request_timeout`), because some earlier writer's last record
+    /// before the fence is a seal-start record (that writer may be several takeovers back),
+    /// or a record before the fence could not be read, so that writer's page and manifest
+    /// PUTs may still be in flight. Zero otherwise. It is persisted in the directory, so the
     /// [`crate::open`] that follows keeps it; a checkpoint or close in the quiet waits for
     /// its end, and maintenance does not start meanwhile.
     pub quiet: Duration,

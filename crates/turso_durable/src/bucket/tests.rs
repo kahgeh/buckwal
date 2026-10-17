@@ -584,9 +584,42 @@ fn seal_renews_the_lease_between_page_puts() {
     assert_eq!(f.stored_head().generation, 2);
 }
 
+/// M1: the seal's head PUT is lease-checked too. With a 200 ms lease and the manifest PUT
+/// taking 300 ms, the lease has lapsed by the time the head goes out: the seal GETs the head
+/// first (renewing the lease, or fencing this writer) and only then PUTs it. Without the
+/// check, a writer paused between its manifest and head PUTs could land its head late, after
+/// GC had trimmed what the previous head referenced.
+#[test]
+fn a_lapsed_lease_before_the_head_put_gets_the_head_first() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.set_lease(Duration::from_millis(200));
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/manifest/");
+    f.fault.delay_puts(Duration::from_millis(300));
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
+    let k = keys();
+    let ev = f.fault.events()[before..].to_vec();
+    let manifest = ev
+        .iter()
+        .rposition(|e| e.ends_with(&k.manifest(1)) && e.starts_with("put"))
+        .unwrap();
+    let head_put = ev
+        .iter()
+        .rposition(|e| e.starts_with("put") && e.ends_with(&format!(" {}", k.head())))
+        .unwrap();
+    assert!(
+        ev[manifest + 1..head_put].contains(&format!("get {}", k.head())),
+        "no head GET between the manifest PUT and the head PUT: {:?}",
+        &ev[manifest..]
+    );
+    assert_eq!(f.stored_head().generation, 2);
+}
+
 /// A zero lease (tests) would refuse every attempt: instead each worker sends one PUT
 /// attempt after each head check, so with one worker every page and the manifest follow
-/// their own head GET.
+/// their own head GET, and the head PUT follows one too (`check_lease`).
 #[test]
 fn a_zero_lease_seal_checks_the_head_before_each_put() {
     let f = Fixture::new();
@@ -597,7 +630,10 @@ fn a_zero_lease_seal_checks_the_head_before_each_put() {
     assert_eq!(b.seal_generation(pages(3), 4096, 3), Ok(2));
     assert_eq!(
         seal_events(&f.fault.events()[before..]),
-        ["get head", "page", "get head", "page", "get head", "page", "get head", "manifest"]
+        [
+            "get head", "page", "get head", "page", "get head", "page", "get head", "manifest",
+            "get head"
+        ]
     );
     assert_eq!(f.stored_head().generation, 2);
 }
@@ -624,7 +660,9 @@ fn a_long_seal_that_keeps_uploading_outlasts_the_deadline() {
         let before = f.fault.events().len();
         let r = b.seal_generation(pages(n), 4096, n);
         let ev = seal_events(&f.fault.events()[before..]);
-        let manifest_last = ev.last() == Some(&"manifest");
+        // The manifest is the last PUT before the head's (a zero lease GETs the head before
+        // that PUT too).
+        let manifest_last = ev.iter().rev().find(|e| **e != "get head") == Some(&"manifest");
         got.push((lease, r, manifest_last, f.stored_head().generation, ev));
     }
     for (lease, r, manifest_last, generation, ev) in &got {
@@ -1661,7 +1699,7 @@ fn append_fence_steps_over_an_old_writer_record() {
     a.append_log(syncs(2)).unwrap();
     let out = b.append_fence().unwrap();
     assert_eq!(
-        (out.pos, out.after_foreign_empty),
+        (out.pos, out.seal_may_be_in_flight),
         (
             LogPos {
                 generation: 1,
@@ -1720,12 +1758,75 @@ fn append_fence_after_an_empty_old_writer_record_reports_it() {
         .put(&keys().log(1, 2), &encode_record(&empty("w1")))
         .unwrap();
     let out = b.append_fence().unwrap();
-    assert_eq!((out.pos.seq, out.after_foreign_empty), (3, true));
+    assert_eq!((out.pos.seq, out.seal_may_be_in_flight), (3, true));
     // Right after the old writer's commit record: false.
     let f = Fixture::new();
     let (_a, mut b) = taken_over(&f);
     let out = b.append_fence().unwrap();
-    assert_eq!((out.pos.seq, out.after_foreign_empty), (2, false));
+    assert_eq!((out.pos.seq, out.seal_may_be_in_flight), (2, false));
+}
+
+/// C1: the quiet looks at every other writer's last record before the fence, not only the
+/// record just before it. w1 is left mid-seal (its last record is its seal-start record);
+/// w2 takes over (its fence follows that record), and w3 takes over after it. Each case's
+/// records before w3's fence are listed; `true` means some other writer's last record there
+/// is a seal-start record (or a record cannot be read).
+#[test]
+fn a_chained_fence_reports_a_seal_in_flight_further_back() {
+    // [w1 commit, w1 seal-start, F(w2)] then w2's `b_commits` commits, then F(w3).
+    for b_commits in [0u8, 2] {
+        let f = Fixture::new();
+        let (_a, mut b) = taken_over(&f);
+        f.mem
+            .put(&keys().log(1, 2), &encode_record(&empty("w1")))
+            .unwrap();
+        assert!(
+            b.append_fence().unwrap().seal_may_be_in_flight,
+            "w2's fence"
+        );
+        for t in 0..b_commits {
+            b.append_log(syncs(10 + t)).unwrap();
+        }
+        take_over(&*f.store(), &keys(), &fast(), 1, "w3").unwrap();
+        let mut c = Bucket::attach(f.store(), keys(), fast(), 4, "w3", 3).unwrap();
+        let out = c.append_fence().unwrap();
+        assert_eq!(out.pos.seq, 4 + u64::from(b_commits));
+        assert!(
+            out.seal_may_be_in_flight,
+            "w2 committed {b_commits}: w1's seal-start record is w1's last, before w3's fence"
+        );
+    }
+
+    // Concurrent takeovers: w3's fence steps over w2's (a lower epoch), which landed after
+    // w1's seal-start record.
+    let f = Fixture::new();
+    let (_a, _b) = taken_over(&f);
+    f.mem
+        .put(&keys().log(1, 2), &encode_record(&empty("w1")))
+        .unwrap();
+    take_over(&*f.store(), &keys(), &fast(), 1, "w3").unwrap();
+    let mut c = Bucket::attach(f.store(), keys(), fast(), 4, "w3", 3).unwrap();
+    f.mem
+        .put(&keys().log(1, 3), &encode_record(&fence("w2", 2)))
+        .unwrap();
+    let out = c.append_fence().unwrap();
+    assert_eq!(out.pos.seq, 4);
+    assert!(out.seal_may_be_in_flight, "stepped over w2's fence");
+
+    // No seal in flight: [w1 commit, F(w2), w2 commit, F(w3)].
+    let f = Fixture::new();
+    let (_a, mut b) = taken_over(&f);
+    assert!(!b.append_fence().unwrap().seal_may_be_in_flight);
+    b.append_log(syncs(10)).unwrap();
+    take_over(&*f.store(), &keys(), &fast(), 1, "w3").unwrap();
+    let mut c = Bucket::attach(f.store(), keys(), fast(), 4, "w3", 3).unwrap();
+    assert!(!c.append_fence().unwrap().seal_may_be_in_flight);
+
+    // A record before the fence that cannot be read counts as a seal in flight.
+    let f = Fixture::new();
+    let (_a, mut b) = taken_over(&f);
+    f.mem.put(&keys().log(1, 1), b"not a record").unwrap();
+    assert!(b.append_fence().unwrap().seal_may_be_in_flight);
 }
 
 #[test]
@@ -2127,11 +2228,11 @@ fn stale_writers_late_put_is_refused(held: &str) {
         let mut b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
         let fo = b.append_fence().unwrap();
         assert!(
-            fo.after_foreign_empty,
+            fo.seal_may_be_in_flight,
             "B's fence follows A's seal-start record"
         );
         let quiet = Duration::from_millis(300);
-        b.set_seal_not_before(1, Instant::now() + quiet, SystemTime::now() + quiet);
+        b.set_seal_not_before(1, Instant::now() + quiet);
         b.append_log(syncs(2)).unwrap();
         assert_eq!(b.seal_generation(pages_of(3, 0xB), 4096, 3), Ok(2));
         let published = sealed(&f.mem, 1);
@@ -2364,9 +2465,9 @@ fn residual_content_equal_etag_lets_a_stale_put_through() {
         assert_eq!(key, k.page(1, 1));
         take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
         let mut b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
-        assert!(b.append_fence().unwrap().after_foreign_empty);
+        assert!(b.append_fence().unwrap().seal_may_be_in_flight);
         let quiet = Duration::from_millis(300);
-        b.set_seal_not_before(1, Instant::now() + quiet, SystemTime::now() + quiet);
+        b.set_seal_not_before(1, Instant::now() + quiet);
         b.append_log(syncs(2)).unwrap();
         let b_pages = vec![(1, vec![0xA; 16]), (2, vec![0xB; 16])];
         assert_eq!(b.seal_generation(b_pages, 4096, 2), Ok(2));

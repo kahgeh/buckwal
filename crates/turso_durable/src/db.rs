@@ -453,10 +453,11 @@ pub(crate) struct Attached {
 ///    a still-running old writer's next append collides with it and is fenced for good, so
 ///    it can never ack into a generation this writer will seal. Records the old writer
 ///    landed first are stepped over.
-/// 5. The takeover quiet (`set_quiet`): a fence that landed right after another writer's
-///    seal-start record keeps this writer from sealing the generation for `lease +
-///    request_timeout`, persisted as `seal_not_before_ms`; without a fence, a persisted
-///    deadline of the generation is passed on to the bucket.
+/// 5. The takeover quiet (`set_quiet`): a fence before which another writer's last record is a
+///    seal-start record (`FenceOutcome::seal_may_be_in_flight`) keeps this writer from sealing
+///    the generation for `lease + request_timeout`, persisted as `seal_not_before_ms`;
+///    without a fence, a persisted deadline of the generation is passed on to the bucket,
+///    capped at that length from now.
 /// 6. Reconcile, after the fence: whatever the old writer acked before the fence (after the
 ///    restore) comes in as `Behind`.
 pub(crate) fn attach_existing(
@@ -479,7 +480,7 @@ pub(crate) fn attach_existing(
             if last_record_is_foreign(&bucket, &state.writer_id, cfg)? {
                 state.seal_not_before_ms = provisional_quiet_ms(cfg);
                 state.write_atomic(dir)?;
-                fence = Some(bucket.append_fence()?);
+                fence = Some(resume_takeover(cfg, &state.writer_id, &mut bucket)?);
             }
         }
         (bucket, fence)
@@ -506,8 +507,8 @@ pub(crate) fn attach_existing(
     })
 }
 
-/// The takeover quiet: how long a writer whose fence follows another writer's seal-start
-/// record must not seal that generation (`Bucket::set_seal_not_before`).
+/// The takeover quiet: how long a writer whose fence may follow another writer's seal still in
+/// flight must not seal that generation (`Bucket::set_seal_not_before`).
 fn quiet_of(cfg: &EngineConfig) -> Duration {
     cfg.lease.saturating_add(cfg.request_timeout)
 }
@@ -520,16 +521,19 @@ fn provisional_quiet_ms(cfg: &EngineConfig) -> u64 {
     bucket::unix_ms(SystemTime::now() + quiet_of(cfg))
 }
 
-/// Step 5 of `attach_existing`. With a `fence` from this open: when it landed right after
-/// another writer's empty Extents record (`FenceOutcome::after_foreign_empty`), the quiet is
-/// `lease + request_timeout` from now, persisted as `state.seal_not_before_ms` (unix ms) and
-/// set on the bucket on both clocks; otherwise 0 is persisted (replacing the provisional
+/// Step 5 of `attach_existing`. With a `fence` from this open: when another writer may still
+/// have a seal of the generation in flight (`FenceOutcome::seal_may_be_in_flight`), the quiet
+/// is `lease + request_timeout` from now, persisted as `state.seal_not_before_ms` (unix ms)
+/// and set on the bucket as an `Instant`; otherwise 0 is persisted (replacing the provisional
 /// deadline). Returns the quiet set.
 ///
 /// Without a fence: a `seal_not_before_ms` persisted for `generation` (the local state's at
-/// open), when the head is still at it, is passed on on the wall clock only (a quiet already
-/// passed changes nothing). One of an older generation is dropped (0). The seal of the
-/// generation writes 0 (`BucketDbStorage::seal`).
+/// open), when the head is still at it, is what is left of it on the wall clock now, capped at
+/// `lease + request_timeout` from now (and persisted capped): a wall clock stepped back since
+/// the deadline was written cannot stretch the quiet past its length. The rest is set on the
+/// bucket as an `Instant`, so a wall clock step after the open changes nothing (a quiet
+/// already passed changes nothing either). One of an older generation is dropped (0). The
+/// seal of the generation writes 0 (`BucketDbStorage::seal`).
 fn set_quiet(
     dir: &Path,
     cfg: &EngineConfig,
@@ -540,20 +544,28 @@ fn set_quiet(
 ) -> Result<Duration> {
     let Some(fence) = fence else {
         let ms = state.seal_not_before_ms;
-        if ms != 0 && bucket.head().generation == generation {
-            let wall = UNIX_EPOCH + Duration::from_millis(ms);
-            bucket.set_seal_not_before(generation, Instant::now(), wall);
-        } else {
+        if ms == 0 || bucket.head().generation != generation {
             state.seal_not_before_ms = 0;
+            return Ok(Duration::ZERO);
         }
+        let now = SystemTime::now();
+        let left = (UNIX_EPOCH + Duration::from_millis(ms))
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let capped = left.min(quiet_of(cfg));
+        if capped < left {
+            state.seal_not_before_ms = bucket::unix_ms(now + capped);
+            state.write_atomic(dir)?;
+        }
+        bucket.set_seal_not_before(generation, Instant::now() + capped);
         return Ok(Duration::ZERO);
     };
-    let quiet = if fence.after_foreign_empty {
+    let quiet = if fence.seal_may_be_in_flight {
         quiet_of(cfg)
     } else {
         Duration::ZERO
     };
-    let (at, wall) = (Instant::now() + quiet, SystemTime::now() + quiet);
+    let (until, wall) = (Instant::now() + quiet, SystemTime::now() + quiet);
     state.seal_not_before_ms = if quiet.is_zero() {
         0
     } else {
@@ -561,7 +573,7 @@ fn set_quiet(
     };
     state.write_atomic(dir)?;
     if !quiet.is_zero() {
-        bucket.set_seal_not_before(fence.pos.generation, at, wall);
+        bucket.set_seal_not_before(fence.pos.generation, until);
         tracing::info!(
             target: "turso_durable",
             generation = fence.pos.generation,
@@ -638,46 +650,80 @@ fn claim(
     cfg: &EngineConfig,
     state: &mut LocalState,
 ) -> Result<(Bucket, FenceOutcome)> {
-    let span = tracing::info_span!(
+    let span = takeover_span(state.generation);
+    let retries = AtomicU64::new(0);
+    let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries, &span));
+    span.record("durable.retries", retries.load(SeqCst));
+    let ended = r.as_ref().map(|(bucket, fence)| (bucket, fence));
+    took_over(&span, cfg, &state.writer_id, ended);
+    r
+}
+
+/// A `durable.takeover` span for `generation`, its other fields filled in as the takeover
+/// goes.
+fn takeover_span(generation: u64) -> tracing::Span {
+    tracing::info_span!(
         target: "turso_durable",
         "durable.takeover",
-        durable.generation = state.generation,
+        durable.generation = generation,
         durable.epoch = Empty,
         durable.seq = Empty,
         durable.retries = Empty,
         s3.status = Empty,
         durable.outcome = Empty,
-    );
-    let retries = AtomicU64::new(0);
-    let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries, &span));
-    span.record("durable.retries", retries.load(SeqCst));
-    match &r {
-        Ok((bucket, fence)) => {
-            let (generation, epoch) = (bucket.head().generation, bucket.head().epoch);
-            span.record("durable.seq", fence.pos.seq);
-            span.record("durable.outcome", "ok");
-            span.in_scope(|| {
-                tracing::info!(
-                    target: "turso_durable",
-                    generation,
-                    epoch,
-                    fence_seq = fence.pos.seq,
-                    writer_id = %state.writer_id,
-                    "took over"
-                )
-            });
-            if let Some(h) = &cfg.events {
-                h(&Event::TookOver {
-                    generation,
-                    epoch,
-                    fence_seq: fence.pos.seq,
-                });
-            }
-        }
-        Err(_) => {
-            span.record("durable.outcome", "error");
-        }
+    )
+}
+
+/// The end of a takeover in `span`: its outcome, and on success the fence's seq, the "took
+/// over" log line and `Event::TookOver`.
+fn took_over(
+    span: &tracing::Span,
+    cfg: &EngineConfig,
+    writer_id: &str,
+    ended: std::result::Result<(&Bucket, &FenceOutcome), &Error>,
+) {
+    let Ok((bucket, fence)) = ended else {
+        span.record("durable.outcome", "error");
+        return;
+    };
+    let (generation, epoch) = (bucket.head().generation, bucket.head().epoch);
+    span.record("durable.seq", fence.pos.seq);
+    span.record("durable.outcome", "ok");
+    span.in_scope(|| {
+        tracing::info!(
+            target: "turso_durable",
+            generation,
+            epoch,
+            fence_seq = fence.pos.seq,
+            writer_id,
+            "took over"
+        )
+    });
+    if let Some(h) = &cfg.events {
+        h(&Event::TookOver {
+            generation,
+            epoch,
+            fence_seq: fence.pos.seq,
+        });
     }
+}
+
+/// The fence of a takeover resumed through `open`: the head already names this writer (its
+/// claim's head write landed, and this open raised the epoch again), but the generation's
+/// last record is still another writer's, because the claim's fence never landed. The fence
+/// completes the takeover, so it runs in a `durable.takeover` span like `claim`'s (the head's
+/// generation and epoch, the fence's seq, the open's retries so far) and emits
+/// `Event::TookOver`.
+fn resume_takeover(
+    cfg: &EngineConfig,
+    writer_id: &str,
+    bucket: &mut Bucket,
+) -> Result<FenceOutcome> {
+    let span = takeover_span(bucket.head().generation);
+    span.record("durable.epoch", bucket.head().epoch);
+    let r = span.in_scope(|| bucket.append_fence());
+    span.record("durable.retries", bucket.counters().retries.load(SeqCst));
+    took_over(&span, cfg, writer_id, r.as_ref().map(|f| (&*bucket, f)));
     r
 }
 

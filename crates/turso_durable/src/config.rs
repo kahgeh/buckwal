@@ -480,17 +480,19 @@ pub enum Event {
     /// checkpoint), `closed` (the database was closing), `panic` (the run panicked; the
     /// span's outcome is `error`) or `error: <message>`.
     MaintenanceSkipped { generation: u64, reason: String },
-    /// This directory took the database over (a takeover, or the first writer open of a
-    /// restored directory): the head names its writer at `epoch`, and its fence record is at
+    /// This directory took the database over (a takeover, the first writer open of a
+    /// restored directory, or an open that resumes a takeover whose fence never landed): the
+    /// head names its writer at `epoch`, and its fence record is at
     /// `log/<generation>/<fence_seq>`.
     TookOver {
         generation: u64,
         epoch: u64,
         fence_seq: u64,
     },
-    /// A seal of `generation` waits `wait` before it starts: the takeover quiet. This writer
-    /// took `generation` over right after another writer's seal-start record, so that
-    /// writer's page and manifest PUTs may still be in flight.
+    /// A seal of `generation` waits `wait` before it starts: the takeover quiet. When this
+    /// writer took `generation` over, another writer's last record before its fence was a
+    /// seal-start record (or a record could not be read), so that writer's page and manifest
+    /// PUTs may still be in flight.
     SealQuiet { generation: u64, wait: Duration },
 }
 

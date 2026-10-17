@@ -125,22 +125,23 @@ enum Raise {
 }
 
 /// The takeover quiet (`Bucket::set_seal_not_before`): no seal of `generation` starts before
-/// both clocks have passed their deadline.
+/// `until`, on the monotonic clock.
+///
+/// Why only that clock: the quiet is `lease + request_timeout` from when it is set, and a
+/// wall deadline capped at that length from the same moment can never end later than
+/// `until`, so it would add nothing. Uncapped, a wall clock stepped back would stall every
+/// commit and close for the size of the step. A machine that sleeps through the quiet only
+/// makes the wait longer (`Instant` stands still), which is the safe side.
 #[derive(Debug, Clone, Copy)]
 struct SealQuiet {
     generation: u64,
-    at: Instant,
-    wall: SystemTime,
+    until: Instant,
 }
 
 impl SealQuiet {
-    /// How long until both deadlines have passed (zero once they have).
+    /// How long until the quiet has passed (zero once it has).
     fn remaining(&self) -> Duration {
-        let wall = self
-            .wall
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
-        self.at.saturating_duration_since(Instant::now()).max(wall)
+        self.until.saturating_duration_since(Instant::now())
     }
 }
 
@@ -376,11 +377,12 @@ pub(crate) fn take_over(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FenceOutcome {
     pub pos: LogPos,
-    /// The record just before the fence is another writer's Extents record with no syncs:
-    /// that writer's last act may have been a seal-start record, so its seal's page PUTs may
-    /// still be in flight. Also true when that record could not be read. The new writer then
-    /// waits out a takeover quiet before it seals this generation (`set_seal_not_before`).
-    pub after_foreign_empty: bool,
+    /// Another writer may still have a seal of this generation in flight: some other
+    /// writer's last record before the fence is an Extents record with no syncs (a
+    /// seal-start record: nothing else goes to the log once a seal has started), or a record
+    /// before the fence could not be read (`seal_may_be_in_flight`). The new writer then waits
+    /// out a takeover quiet before it seals this generation (`set_seal_not_before`).
+    pub seal_may_be_in_flight: bool,
 }
 
 /// What a fence PUT found at its seq.
@@ -389,13 +391,25 @@ enum FencePut {
     Landed,
     /// Another writer's record the fence steps over: an old writer's Extents record, or a
     /// fence of a lower epoch (a losing concurrent takeover).
-    Occupied(LogRecord),
+    Occupied,
 }
 
-/// Another writer's Extents record with no syncs: a seal-start record (or a stage-2 claim
-/// record).
-fn foreign_empty(rec: &LogRecord, writer_id: &str) -> bool {
-    matches!(rec, LogRecord::Extents { writer_id: w, syncs } if w != writer_id && syncs.is_empty())
+/// Whether some writer other than `ours` has, as its last record in `records` (a
+/// generation's log, in seq order), an Extents record with no syncs: a seal-start record (or
+/// a stage-2 claim record), so that writer's seal may still be uploading.
+///
+/// Each writer's last record counts, not only the last record overall: a writer left
+/// mid-seal can sit several records back, behind another takeover's fence and that writer's
+/// commits (`[A seal-start, F(B), B's commits, F(C)]`), and its page PUTs are still in flight.
+fn other_writer_mid_seal(records: &[LogRecord], ours: &str) -> bool {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    records.iter().rev().any(|rec| {
+        let (writer, seal_start) = match rec {
+            LogRecord::Extents { writer_id, syncs } => (writer_id.as_str(), syncs.is_empty()),
+            LogRecord::Fence { writer_id, .. } => (writer_id.as_str(), false),
+        };
+        writer != ours && seen.insert(writer) && seal_start
+    })
 }
 
 impl Bucket {
@@ -581,12 +595,12 @@ impl Bucket {
         self.lease = lease;
     }
 
-    /// The takeover quiet: no seal of `generation` starts before `at` (monotonic) and `wall`
-    /// (wall clock) have both passed. `db::attach_existing` sets it when this writer's fence
-    /// landed right after another writer's seal-start record (`FenceOutcome::
-    /// after_foreign_empty`), to `lease + request_timeout` after the fence, and a later open
-    /// passes on the persisted wall-clock deadline (with `at` already passed). A seal of
-    /// `generation` clears it.
+    /// The takeover quiet: no seal of `generation` starts before `until` (monotonic).
+    /// `db::attach_existing` sets it when another writer may still have a seal of the
+    /// generation in flight at this writer's fence (`FenceOutcome::seal_may_be_in_flight`),
+    /// to `lease + request_timeout` after the fence. A later open turns the persisted
+    /// wall-clock deadline back into an `Instant`, capped at `lease + request_timeout` from
+    /// that open (`db::set_quiet`). A seal of `generation` clears it.
     ///
     /// Why: that writer's page and manifest requests may still be in flight. Its PUTs are
     /// conditional (`seal_put_step`): one conditioned on what it saw before this writer wrote
@@ -594,7 +608,9 @@ impl Bucket {
     /// writer wrote it and conditioning a PUT on that ETag. The old writer sends each request
     /// only within `lease` of its last head check (`seal`), which came before this writer's
     /// head write, and a request ends within `request_timeout`: after the quiet, none of its
-    /// stats can see an object of this writer's. This holds when the old writer's lease and
+    /// stats can see an object of this writer's. The same holds when that writer is several
+    /// takeovers back (`[A seal-start, F(B), B's commits, F(C)]`): its last head check came
+    /// before the first of them. This holds when the old writer's lease and
     /// request timeout are at most this writer's: nothing in the bucket records another
     /// process's settings.
     ///
@@ -603,25 +619,16 @@ impl Bucket {
     /// send of a `put_if_match` on an ETag it already held, and this writer's page (or
     /// manifest) at that key is byte-identical to what it conditioned on, the PUT lands. That
     /// is the known residual described at `seal_put_step`, with its possible future fix.
-    pub(crate) fn set_seal_not_before(&mut self, generation: u64, at: Instant, wall: SystemTime) {
-        self.quiet = Some(SealQuiet {
-            generation,
-            at,
-            wall,
-        });
+    pub(crate) fn set_seal_not_before(&mut self, generation: u64, until: Instant) {
+        self.quiet = Some(SealQuiet { generation, until });
     }
 
-    /// The takeover quiet's end for the current generation in unix ms, the later of its two
-    /// deadlines (the monotonic one read as wall time now); 0 when there is none.
-    pub(crate) fn quiet_until_ms(&self) -> u64 {
-        match &self.quiet {
-            Some(q) if q.generation == self.head.generation => {
-                let now = SystemTime::now();
-                let at = now + q.at.saturating_duration_since(Instant::now());
-                unix_ms(at.max(q.wall))
-            }
-            _ => 0,
-        }
+    /// The end of the current generation's takeover quiet, the very deadline `wait_quiet`
+    /// waits for; `None` when there is none.
+    pub(crate) fn quiet_until(&self) -> Option<Instant> {
+        self.quiet
+            .filter(|q| q.generation == self.head.generation)
+            .map(|q| q.until)
     }
 
     /// Before a seal of the current generation: wait out its takeover quiet, if any, emitting
@@ -821,8 +828,6 @@ impl Bucket {
             epoch: self.head.epoch,
         });
         let mut steps = 0u64;
-        // The record at `self.seq - 1`, once a step has read it.
-        let mut previous: Option<LogRecord> = None;
         loop {
             let pos = LogPos {
                 generation: self.head.generation,
@@ -842,16 +847,13 @@ impl Bucket {
                     self.seq += 1;
                     self.counters.log_puts.fetch_add(1, Relaxed);
                     self.emit_uploaded(pos, body.len() as u64);
-                    let after_foreign_empty = match previous {
-                        Some(rec) => foreign_empty(&rec, &self.head.writer_id),
-                        None => self.foreign_empty_before(start, pos),
-                    };
+                    let seal_may_be_in_flight = self.seal_may_be_in_flight(start, pos);
                     return Ok(FenceOutcome {
                         pos,
-                        after_foreign_empty,
+                        seal_may_be_in_flight,
                     });
                 }
-                Ok(FencePut::Occupied(rec)) => {
+                Ok(FencePut::Occupied) => {
                     if steps == crate::config::defaults::FENCE_MAX_STEPS
                         || start.elapsed() >= self.retry.deadline
                     {
@@ -862,7 +864,6 @@ impl Bucket {
                     }
                     steps += 1;
                     self.seq += 1;
-                    previous = Some(rec);
                 }
                 Err(e @ Error::Fenced(_)) => return Err(self.fence(e)),
                 // The seq holds a record that is not one: not ambiguous, nothing owed.
@@ -896,10 +897,8 @@ impl Bucket {
         let rec = decode_record(&o.body)?;
         let (ours, epoch) = (&self.head.writer_id, self.head.epoch);
         match &rec {
-            LogRecord::Extents { writer_id, .. } if writer_id != ours => {
-                Ok(FencePut::Occupied(rec))
-            }
-            LogRecord::Fence { epoch: k, .. } if *k < epoch => Ok(FencePut::Occupied(rec)),
+            LogRecord::Extents { writer_id, .. } if writer_id != ours => Ok(FencePut::Occupied),
+            LogRecord::Fence { epoch: k, .. } if *k < epoch => Ok(FencePut::Occupied),
             LogRecord::Extents { .. } => Err(Error::Fenced(format!(
                 "{key} holds a record of this writer id, not its fence"
             ))),
@@ -913,20 +912,33 @@ impl Bucket {
         }
     }
 
-    /// Whether the record before `pos` is another writer's empty Extents record. A record
-    /// that cannot be read counts as one (the caller then assumes the more cautious case).
-    fn foreign_empty_before(&self, start: Instant, pos: LogPos) -> bool {
+    /// `FenceOutcome::seal_may_be_in_flight` for the fence at `pos`: every record of the
+    /// generation is read (a list, then a GET each, `upload_concurrency` at a time, under what
+    /// is left of the call's deadline), and those before `pos` are checked with
+    /// `other_writer_mid_seal`. A list or a record that cannot be read, or a gap, counts as a
+    /// seal in flight: the caller then takes the more cautious path (the quiet).
+    ///
+    /// Only records before the fence count: after it, the log holds this writer's records
+    /// alone (a later takeover's fence fences this writer). Reconcile reads the generation
+    /// again right after (`restore::generation_image`); a takeover is rare enough that the
+    /// second read is kept rather than threading the records through.
+    fn seal_may_be_in_flight(&self, start: Instant, pos: LogPos) -> bool {
         if pos.seq <= 1 {
             return false;
         }
-        let key = self.keys.log(pos.generation, pos.seq - 1);
-        match retrying(&self.counters, &self.remaining(start), &key, || {
-            self.store.get(&key)
-        }) {
-            Ok(Some(o)) => {
-                decode_record(&o.body).map_or(true, |rec| foreign_empty(&rec, &self.head.writer_id))
+        let records = crate::restore::fetch_generation(
+            &*self.store,
+            &self.keys,
+            pos.generation,
+            self.concurrency,
+            &self.remaining(start),
+            &self.counters.retries,
+        );
+        match records {
+            Ok(r) if r.len() as u64 >= pos.seq - 1 => {
+                other_writer_mid_seal(&r[..(pos.seq - 1) as usize], &self.head.writer_id)
             }
-            Ok(None) | Err(_) => true,
+            Ok(_) | Err(_) => true,
         }
     }
 
@@ -1378,6 +1390,12 @@ impl Bucket {
             free = self.lease.is_zero();
         }
 
+        // The head PUT is lease-checked like every page and manifest PUT: past the lease, GET
+        // the head first (renewing the lease, or fencing this writer). A head landing long
+        // after the lease would let GC (in any process) trim at once what the previous head
+        // referenced, while a restore or lazy read of that head may still be reading it. This
+        // narrows the gap to a pause between this check and the send (README, Guarantees).
+        self.check_lease(start)?;
         let head = self.sealed_head();
         // From the first head attempt until a definite answer, the head may be published.
         self.pending_seal = Some(PendingSeal {

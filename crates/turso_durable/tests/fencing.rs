@@ -186,6 +186,13 @@ fn takeover_fences_the_old_writer() {
             }
         }
         eprintln!("{b:?}: in flight at the takeover: ok {ok:?}, fenced {fenced:?}");
+        // Off sends one 300 ms PUT at a time: most of the 8 are still waiting at the fence.
+        if b == Batching::Off {
+            assert!(
+                !fenced.is_empty(),
+                "{b:?}: no waiting commit was fenced: ok {ok:?}"
+            );
+        }
         let c = db_a.connect().unwrap();
         let next = insert(&c, 300);
         assert!(matches!(next, Err(Error::Fenced(_))), "{b:?}: {next:?}");
