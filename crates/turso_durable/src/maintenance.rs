@@ -383,10 +383,6 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
             let inject_panic = signal.panic_next.swap(false, SeqCst);
             #[cfg(not(test))]
             let inject_panic = false;
-            #[cfg(test)]
-            let inject_checkpoint_panic = signal.checkpoint_panic_next.swap(false, SeqCst);
-            #[cfg(not(test))]
-            let inject_checkpoint_panic = false;
             let generation = shared.uploader.generation();
             let span = tracing::info_span!(
                 target: "turso_durable",
@@ -405,7 +401,7 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                     log_objects,
                     wal_bytes,
                 };
-                run_once(&shared, cfg, run, inject_panic, inject_checkpoint_panic)
+                run_once(&shared, cfg, run, inject_panic, signal)
             }))
             .unwrap_or_else(|_| {
                 // The run may have emitted `MaintenanceStarted`: it gets an end event too.
@@ -475,7 +471,7 @@ fn run_once(
     cfg: &MaintenanceConfig,
     run: Measured<'_>,
     inject_panic: bool,
-    inject_checkpoint_panic: bool,
+    signal: &Signal,
 ) -> Outcome {
     let Measured {
         span,
@@ -506,13 +502,16 @@ fn run_once(
     if inject_panic {
         panic!("injected maintenance panic");
     }
+    #[cfg(not(test))]
+    let _ = signal;
     let start = Instant::now();
     let drained = shared.gate.close_and_drain(cfg.gate_wait);
     let gate_wait = start.elapsed();
     span.record("durable.gate_wait_ms", gate_wait.as_millis() as u64);
     let r = if drained {
         let _reopen = Reopen(&shared.gate);
-        if inject_checkpoint_panic {
+        #[cfg(test)]
+        if signal.checkpoint_panic_next.swap(false, SeqCst) {
             panic!("injected checkpoint panic");
         }
         checkpoint(shared)

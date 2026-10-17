@@ -627,13 +627,22 @@ fn restore_verify(ctx: &Ctx, lines: &[String]) -> Verified {
     v
 }
 
+/// 150 acks under 4 Window connections write about 39 log objects, so 100 would not seal before
+/// the first kill; 20 does, and yields the `kill_after / 100 - 1` seals the later kills need.
+const WINDOW_SEAL_LOG_OBJECTS: &str = "20";
+
 /// The crash matrix for one mode: three runs, killed after `150`, `600` and `1500` acks.
 /// `auto` is the engine's own checkpoint (no `--checkpoint`). With `batching`, soak runs four
 /// connections under it.
 fn crash_matrix(mode: &str, batching: Option<&str>) {
     let tag = if batching.is_some() { "window_" } else { "" };
     for kill_after in [150, 600, 1500] {
-        let ctx = Ctx::new(&format!("crash_{tag}{mode}_{kill_after}"));
+        let mut ctx = Ctx::new(&format!("crash_{tag}{mode}_{kill_after}"));
+        // Under 4 Window connections the engine never restarts the WAL after PASSIVE/FULL, so
+        // the maintenance checkpoint ends the generation (README "Maintenance checkpoint").
+        if batching.is_some() && matches!(mode, "passive" | "full") {
+            ctx = ctx.set("DURABLE_MAINTENANCE_LOG_OBJECTS", WINDOW_SEAL_LOG_OBJECTS);
+        }
         let dir = ctx.dir("db");
         let mut args = Vec::new();
         if mode != "auto" {
@@ -658,11 +667,12 @@ fn crash_matrix(mode: &str, batching: Option<&str>) {
             );
         }
         let seals = soak.count("event seal-finished");
-        // Under Window with four connections, PASSIVE and FULL cannot restart the WAL (the
-        // other connections' frames stay live), so they end no generation; only maintenance
-        // (past its log-object threshold) seals those runs. RESTART, TRUNCATE and a reopen do.
-        let checkpoint_seals = batching.is_none() || !matches!(mode, "passive" | "full");
-        if mode != "auto" && checkpoint_seals {
+        if mode != "auto" {
+            assert!(
+                soak.lines.iter().any(|l| l.starts_with("event checkpoint ")),
+                "{mode}: the soak's own checkpoint never ran before the kill after {kill_after} acks\n{}",
+                soak.tail()
+            );
             // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
             assert!(
                 seals >= 1 && seals >= kill_after / 100 - 1,

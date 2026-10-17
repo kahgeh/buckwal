@@ -217,6 +217,11 @@ impl Soak<'_> {
 
     /// Checkpoint on connection `i`, or close everything and reopen, with no commit running.
     fn checkpoint(&self, i: usize, cp: Checkpoint) {
+        self.checkpoint_inner(i, cp);
+        say(&format!("event checkpoint {}", name(cp)));
+    }
+
+    fn checkpoint_inner(&self, i: usize, cp: Checkpoint) {
         let mut pool = self.write();
         match mode(cp) {
             Some(m) => {
@@ -283,6 +288,16 @@ impl Soak<'_> {
                 self.checkpoint(i, cp);
             }
         }
+    }
+}
+
+fn name(c: Checkpoint) -> &'static str {
+    match c {
+        Checkpoint::Passive => "passive",
+        Checkpoint::Full => "full",
+        Checkpoint::Restart => "restart",
+        Checkpoint::Truncate => "truncate",
+        Checkpoint::Reopen => "reopen",
     }
 }
 
