@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Local RustFS harness for turso_durable. Usage: rustfs.sh up|down|stop|start|pause|unpause|env
+# Local RustFS harness for turso_durable. Usage: rustfs.sh up|down|reset|stop|start|pause|unpause|env
+#   reset: down, then up: the volume is recreated, so the bucket is empty.
 set -euo pipefail
 
 IMAGE="docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
@@ -94,10 +95,11 @@ cmd_down() {
 case "${1:-}" in
   up) cmd_up ;;
   down) cmd_down ;;
+  reset) cmd_down; cmd_up ;;
   stop) podman stop "$NAME" >/dev/null ;;
   start) podman start "$NAME" >/dev/null; wait_ready ;;
   pause) podman pause "$NAME" >/dev/null ;;
   unpause) podman unpause "$NAME" >/dev/null ;;
   env) print_env ;;
-  *) die "usage: rustfs.sh up|down|stop|start|pause|unpause|env" ;;
+  *) die "usage: rustfs.sh up|down|reset|stop|start|pause|unpause|env" ;;
 esac

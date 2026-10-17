@@ -9,27 +9,91 @@ fn env(k: &str) -> String {
     })
 }
 
-fn store() -> S3Store {
-    let s = S3Store::new(S3Config {
-        endpoint: env("DURABLE_ENDPOINT"),
-        region: env("DURABLE_REGION"),
-        bucket: env("DURABLE_BUCKET"),
-        access_key: env("DURABLE_ACCESS_KEY"),
-        secret_key: env("DURABLE_SECRET_KEY"),
-        path_style: env("DURABLE_PATH_STYLE") == "true",
+/// The store from the `DURABLE_*` variables, without creating the bucket; never panics.
+fn try_s3() -> Result<S3Store, String> {
+    let v = |k: &str| std::env::var(k).map_err(|_| format!("{k} is not set"));
+    S3Store::new(S3Config {
+        endpoint: v("DURABLE_ENDPOINT")?,
+        region: v("DURABLE_REGION")?,
+        bucket: v("DURABLE_BUCKET")?,
+        access_key: v("DURABLE_ACCESS_KEY")?,
+        secret_key: v("DURABLE_SECRET_KEY")?,
+        path_style: v("DURABLE_PATH_STYLE")? == "true",
         request_timeout: Duration::from_secs(30),
     })
-    .expect("store");
+    .map_err(|e| format!("store: {e}"))
+}
+
+fn store() -> S3Store {
+    env("DURABLE_ENDPOINT"); // the hint when the variables are missing
+    let s = try_s3().expect("store");
     s.create_bucket().expect("bucket");
     s
 }
 
-fn prefix(test: &str) -> String {
+/// Delete every key under `prefix` (which ends in `/`): the number deleted, or what failed.
+fn delete_prefix(s: &S3Store, prefix: &str) -> Result<usize, String> {
+    let keys = s.list(prefix).map_err(|e| format!("list {prefix}: {e}"))?;
+    let failed: Vec<String> = keys
+        .iter()
+        .filter_map(|k| s.delete(k).err().map(|e| format!("{k}: {e}")))
+        .collect();
+    match failed.first() {
+        None => Ok(keys.len()),
+        Some(first) => Err(format!(
+            "{} of {} deletes under {prefix} failed, the first: {first}",
+            failed.len(),
+            keys.len()
+        )),
+    }
+}
+
+/// A test's prefix, `t/<test>-<nanos>/`.
+struct Prefix {
+    p: String,
+    /// Keep the prefix when the test fails (`DURABLE_KEEP_FAILED=1`).
+    keep_failed: bool,
+}
+
+impl std::ops::Deref for Prefix {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.p
+    }
+}
+
+impl std::fmt::Display for Prefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.p)
+    }
+}
+
+impl Drop for Prefix {
+    /// Delete every key under the prefix, also after a failure unless `keep_failed`, which
+    /// prints the prefix instead. Never panics: errors are printed.
+    fn drop(&mut self) {
+        if std::thread::panicking() && self.keep_failed {
+            eprintln!(
+                "failed; bucket prefix {} kept (DURABLE_KEEP_FAILED=1)",
+                self.p
+            );
+            return;
+        }
+        if let Err(e) = try_s3().and_then(|s| delete_prefix(&s, &self.p)) {
+            eprintln!("cleanup of bucket prefix {}: {e}", self.p);
+        }
+    }
+}
+
+fn prefix(test: &str) -> Prefix {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("t/{test}-{n}/")
+    Prefix {
+        p: format!("t/{test}-{n}/"),
+        keep_failed: std::env::var("DURABLE_KEEP_FAILED").as_deref() == Ok("1"),
+    }
 }
 
 #[test]
@@ -120,7 +184,8 @@ fn rustfs_if_match_on_missing_bucket_is_permanent() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn rustfs_get_missing_is_none() {
     let s = store();
-    let k = format!("{}nope", prefix("getmissing"));
+    let p = prefix("getmissing");
+    let k = format!("{p}nope");
     assert_eq!(s.get(&k).unwrap(), None);
 }
 
@@ -128,7 +193,8 @@ fn rustfs_get_missing_is_none() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn rustfs_delete() {
     let s = store();
-    let k = format!("{}k", prefix("delete"));
+    let p = prefix("delete");
+    let k = format!("{p}k");
     s.put(&k, b"v").unwrap();
     s.delete(&k).unwrap();
     assert_eq!(s.get(&k).unwrap(), None);
@@ -172,4 +238,47 @@ fn rustfs_open_commit_close_restore() {
         .query("SELECT count(*) FROM t", &[])
         .unwrap();
     assert_eq!(rows[0][0].as_int(), Some(20));
+}
+
+/// A test thread that fills its prefix and panics: its prefix, and whether it panicked.
+fn failed_test_prefix(test: &'static str, keep_failed: bool) -> (String, bool) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let joined = std::thread::spawn(move || {
+        let s = store();
+        let mut p = prefix(test);
+        p.keep_failed = keep_failed;
+        s.put(&format!("{p}k"), b"x").unwrap();
+        tx.send(p.p.clone()).unwrap();
+        panic!("{test}: a deliberate failure (the cleanup test)");
+    })
+    .join();
+    (rx.recv().unwrap(), joined.is_err())
+}
+
+/// Dropping a `Prefix` deletes every key under it: after a pass, and after a failure unless
+/// `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps it.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn rustfs_prefix_is_deleted_unless_a_failure_is_kept() {
+    let s = store();
+    let passed = {
+        let p = prefix("cleanup_passed");
+        for i in 0..5 {
+            s.put(&format!("{p}{i}"), b"x").unwrap();
+        }
+        assert_eq!(s.list(&p).unwrap().len(), 5);
+        p.p.clone()
+    };
+    assert_eq!(s.list(&passed).unwrap(), Vec::<String>::new(), "passed");
+    let (failed, panicked) = failed_test_prefix("cleanup_failed", false);
+    assert!(panicked);
+    assert_eq!(s.list(&failed).unwrap(), Vec::<String>::new(), "failed");
+    let (kept, panicked) = failed_test_prefix("cleanup_failed_kept", true);
+    assert!(panicked);
+    assert_eq!(
+        s.list(&kept).unwrap().len(),
+        1,
+        "failed, DURABLE_KEEP_FAILED=1"
+    );
+    assert_eq!(delete_prefix(&s, &kept), Ok(1));
 }

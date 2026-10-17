@@ -602,11 +602,13 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 ## Test command
 
 - `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests.
-- `./scripts/test.sh`: the above, then starts RustFS (`scripts/rustfs.sh up`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs).
+- `./scripts/test.sh`: the above, then empties and starts RustFS (`scripts/rustfs.sh reset`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs).
   - It runs them with `DURABLE_OTEL=1` under one `DURABLE_TEST_RUN_ID` (`turso-durable-<timestamp>-<pid>`, printed as `test run id: …`).
   - Then it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then a `restore`), so every span kind except `durable.maintenance` is exported.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
-- `scripts/rustfs.sh up|down|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it.
+  - On exit, pass or fail, it empties RustFS's storage again (`scripts/rustfs.sh reset`). A failed reset is reported on stderr and the exit code stays the tests'.
+  - Each RustFS-backed test deletes its bucket prefix when it ends. `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
+- `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `down` removes the container and its volume `turso-durable-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it.
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
 
 ## Layout

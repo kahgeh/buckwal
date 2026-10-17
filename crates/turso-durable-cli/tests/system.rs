@@ -115,6 +115,34 @@ impl Drop for Outage {
     }
 }
 
+/// Delete every key under `<prefix>/`, from 8 threads: the number deleted, or what failed.
+fn delete_prefix(store: &S3Store, prefix: &str) -> Result<usize, String> {
+    let root = format!("{prefix}/");
+    let keys = store.list(&root).map_err(|e| format!("list {root}: {e}"))?;
+    let failed = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|sc| {
+        for chunk in keys.chunks(keys.len().div_ceil(8).max(1)) {
+            let failed = &failed;
+            sc.spawn(move || {
+                for k in chunk {
+                    if let Err(e) = store.delete(k) {
+                        failed.lock().unwrap().push(format!("{k}: {e}"));
+                    }
+                }
+            });
+        }
+    });
+    let failed = failed.into_inner().unwrap();
+    match failed.first() {
+        None => Ok(keys.len()),
+        Some(first) => Err(format!(
+            "{} of {} deletes under {root} failed, the first: {first}",
+            failed.len(),
+            keys.len()
+        )),
+    }
+}
+
 /// The parts of the bucket's `head` the tests look at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Head {
@@ -149,6 +177,8 @@ struct Ctx {
     name: String,
     vars: Vec<(String, String)>,
     tmp: TempDir,
+    /// Keep the prefix when the test fails (`DURABLE_KEEP_FAILED=1`).
+    keep_failed: bool,
 }
 
 /// A finished command.
@@ -166,6 +196,7 @@ impl Ctx {
             name: name.to_string(),
             vars,
             tmp: tempfile::tempdir().unwrap(),
+            keep_failed: std::env::var("DURABLE_KEEP_FAILED").as_deref() == Ok("1"),
         }
     }
 
@@ -227,6 +258,10 @@ impl Ctx {
     }
 
     fn store(&self) -> S3Store {
+        self.try_store().expect("S3 store")
+    }
+
+    fn try_store(&self) -> Result<S3Store, turso_durable::Error> {
         S3Store::new(S3Config {
             endpoint: self.var("DURABLE_ENDPOINT"),
             region: self.var("DURABLE_REGION"),
@@ -236,7 +271,6 @@ impl Ctx {
             path_style: self.var("DURABLE_PATH_STYLE") == "true",
             request_timeout: Duration::from_secs(30),
         })
-        .expect("S3 store")
     }
 
     /// Every key under `<prefix>/<sub>`.
@@ -271,6 +305,38 @@ impl Ctx {
         let want: Vec<u64> = (1..=seqs.len() as u64).collect();
         assert_eq!(seqs, want, "{}: log/{generation:010}/ seqs", self.name);
         seqs.len() as u64
+    }
+}
+
+impl Drop for Ctx {
+    /// Delete every key under the prefix, also after a failure unless `keep_failed`, which
+    /// prints the prefix instead. Never panics (it may run while a failed assertion unwinds):
+    /// errors are printed. Tests declare `Ctx` first, so their `Soak` (killed) and `Outage`
+    /// (RustFS restored) drop before it.
+    fn drop(&mut self) {
+        let prefix = self.prefix();
+        if std::thread::panicking() && self.keep_failed {
+            eprintln!(
+                "{}: failed; bucket prefix {prefix}/ kept (DURABLE_KEEP_FAILED=1)",
+                self.name
+            );
+            return;
+        }
+        // Retried for up to 30 s: right after an `Outage` restarts RustFS, it answers 503
+        // ("waiting for iam") for a few seconds.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let deleted = match self.try_store() {
+                Ok(store) => delete_prefix(&store, &prefix),
+                Err(e) => Err(format!("S3 store: {e}")),
+            };
+            let Err(e) = deleted else { return };
+            if Instant::now() >= deadline {
+                eprintln!("{}: cleanup of bucket prefix {prefix}/: {e}", self.name);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 }
 
@@ -1782,4 +1848,62 @@ fn telemetry_collector_down_and_blackhole() {
         "telemetry_collector_down_and_blackhole: off p50={base_p50} wall={base_wall:?}; \
          blackhole accepted {accepted} connections"
     );
+}
+
+/// Every key under `<prefix>/`.
+fn keys_under(ctx: &Ctx, prefix: &str) -> Vec<String> {
+    ctx.store().list(&format!("{prefix}/")).expect("list")
+}
+
+/// Put 20 keys under the context's prefix.
+fn put_keys(ctx: &Ctx) {
+    let s = ctx.store();
+    for i in 0..20 {
+        s.put(&format!("{}/k/{i:03}", ctx.prefix()), b"x").unwrap();
+    }
+}
+
+/// The prefix of a context made, filled and dropped by a test thread that panics, and
+/// whether that thread panicked.
+fn failed_test_prefix(name: &'static str, keep_failed: bool) -> (String, bool) {
+    let (tx, rx) = channel();
+    let joined = std::thread::spawn(move || {
+        let mut ctx = Ctx::new(name);
+        ctx.keep_failed = keep_failed;
+        put_keys(&ctx);
+        tx.send(ctx.prefix()).unwrap();
+        panic!("{name}: a deliberate failure (the cleanup test)");
+    })
+    .join();
+    (rx.recv().unwrap(), joined.is_err())
+}
+
+/// A test's `Ctx` deletes every key under its prefix when it is dropped: after a pass, and
+/// after a failure unless `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps the prefix.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn ctx_deletes_its_prefix_unless_a_failure_is_kept() {
+    let probe = Ctx::new("cleanup_probe");
+    let passed = {
+        let ctx = Ctx::new("cleanup_passed");
+        put_keys(&ctx);
+        assert_eq!(keys_under(&probe, &ctx.prefix()).len(), 20);
+        ctx.prefix()
+    };
+    assert_eq!(keys_under(&probe, &passed), Vec::<String>::new(), "passed");
+
+    let (failed, panicked) = failed_test_prefix("cleanup_failed", false);
+    assert!(panicked);
+    assert_eq!(keys_under(&probe, &failed), Vec::<String>::new(), "failed");
+
+    let (kept, panicked) = failed_test_prefix("cleanup_failed_kept", true);
+    assert!(panicked);
+    let left = keys_under(&probe, &kept);
+    assert_eq!(
+        left.len(),
+        20,
+        "failed with DURABLE_KEEP_FAILED=1: {left:?}"
+    );
+    delete_prefix(&probe.store(), &kept).unwrap();
+    eprintln!("ctx cleanup: deleted {passed}/ and {failed}/, kept {kept}/ (then deleted)");
 }
