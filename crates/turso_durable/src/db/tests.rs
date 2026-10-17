@@ -2146,33 +2146,45 @@ fn quiet_deadline_is_persisted() {
 /// A claim that crashed after its fence landed, before the takeover quiet was persisted: the
 /// claimed state already holds a provisional deadline, so the next open (whose last record is
 /// now its own fence, so no fence and no `after_foreign_empty`) still waits out the quiet.
+///
+/// Only the wall clock decides, so the test does too: the deadline is at least `QUIET` after
+/// the first open began, and the seal of the generation ends no earlier than it. A reopen that
+/// lost the deadline would seal at once. Whether the seal had to wait (`SealQuiet`) depends on
+/// how long the reopen took: under load the deadline may have passed already.
 #[test]
 fn crash_after_the_fence_keeps_the_quiet() {
+    let now_ms = || crate::bucket::unix_ms(std::time::SystemTime::now());
     let store = mem();
     let _a = writer_left_in_a_seal(&store, 5);
     let r = tempdir();
     restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let began = now_ms();
     FAIL_AFTER_CLAIM_FENCE.with(|f| f.set(true));
     let first = open_with_store(quiet_config(r.path(), None), store.clone());
     FAIL_AFTER_CLAIM_FENCE.with(|f| f.set(false));
+    let ended = now_ms();
     assert!(matches!(first, Err(Error::Io(_))), "{:?}", first.err());
-    let now_ms = crate::bucket::unix_ms(std::time::SystemTime::now());
-    let s = state(r.path());
+    let deadline = state(r.path()).seal_not_before_ms;
+    let quiet = QUIET.as_millis() as u64;
     assert!(
-        s.seal_not_before_ms > now_ms + QUIET.as_millis() as u64 / 2,
-        "seal_not_before_ms {} (now {now_ms})",
-        s.seal_not_before_ms
+        (began + quiet..=ended + quiet).contains(&deadline),
+        "seal_not_before_ms {deadline} not within the open ({began}..={ended}) + {quiet} ms"
     );
     let (hook, seen) = recorder();
     let db = open_with_store(quiet_config(r.path(), Some(hook)), store.clone()).unwrap();
     let c = db.connect().unwrap();
     insert(&c, 1001).unwrap();
     c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let sealed = now_ms();
     let gen = head(&*store).generation - 1;
     assert!(
-        matches!(seal_quiets(&seen)[..], [(g, _)] if g == gen),
-        "{:?}",
-        seal_quiets(&seen)
+        sealed >= deadline,
+        "the seal of {gen} ended at {sealed}, before the quiet's end {deadline}"
+    );
+    let quiets = seal_quiets(&seen);
+    assert!(
+        quiets.iter().all(|&(g, _)| g == gen) && quiets.len() <= 1,
+        "{quiets:?}"
     );
     c.close().unwrap();
     db.close().unwrap();
