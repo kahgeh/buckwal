@@ -36,7 +36,7 @@ impl Fixture {
         Bucket::create(self.store(), keys(), retry, concurrency, "w1".into()).unwrap()
     }
     fn attach(&self, writer_id: &str) -> Result<Bucket> {
-        Bucket::attach(self.store(), keys(), fast(), 4, writer_id)
+        Bucket::attach(self.store(), keys(), fast(), 4, writer_id, 0)
     }
     fn body(&self, key: &str) -> Option<Vec<u8>> {
         self.mem.get(key).unwrap().map(|o| o.body)
@@ -106,7 +106,7 @@ fn create_then_attach_round_trip() {
         generation: 1,
         manifest: None,
         writer_id: "w1".into(),
-        epoch: 0,
+        epoch: 1,
     };
     assert_eq!(b.head(), &want);
     assert_eq!(f.stored_head(), want);
@@ -348,7 +348,7 @@ fn seal_start_accepts_our_own_late_head() {
         generation: 2,
         manifest: Some(1),
         writer_id: "w1".into(),
-        epoch: 0,
+        epoch: 1,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
@@ -758,7 +758,7 @@ fn lapsed_append_with_our_head_proceeds() {
         generation: 3,
         manifest: Some(2),
         writer_id: "w1".into(),
-        epoch: 0,
+        epoch: 1,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(
@@ -1283,12 +1283,14 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
     let other_pages = vec![(1, vec![7u8; 16]), (2, vec![8u8; 16])];
     let before = f.fault.events().len();
     assert_eq!(b.seal_generation(other_pages, 4096, 2), Ok(2));
-    // The head GET finds the ETag unchanged; the seal then starts like any other, with a
+    // The head GET finds the ETag unchanged, and the epoch is raised on it (a late PUT of
+    // the failed head write gets a 412); the seal then starts like any other, with a
     // seal-start record after the failed attempt's.
     assert_eq!(
-        f.fault.events()[before..before + 3],
+        f.fault.events()[before..before + 4],
         [
             format!("get {}", k.head()),
+            format!("put_if_match {}", k.head()),
             format!("put_if_absent {}", k.log(1, 2)),
             format!("get {}", k.head()),
         ]
@@ -1545,4 +1547,174 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
     assert_eq!(f.unsent, Some(vec![op(2)]));
     assert_eq!(mem.stats().since(&before).requests(), 0);
     assert!(mem.list(&keys().log_prefix(1)).unwrap().is_empty());
+}
+
+#[test]
+fn create_starts_at_epoch_1() {
+    let f = Fixture::new();
+    let b = f.create(fast(), 4);
+    assert_eq!(b.head().epoch, 1);
+    assert_eq!(f.stored_head().epoch, 1);
+}
+
+/// A seal's head write that never landed may still be in flight (If-Match on the pre-seal
+/// ETag). The next append finds the head unchanged and raises the epoch on that ETag before it
+/// carries on, so the late PUT can no longer land.
+#[test]
+fn ambiguous_head_write_not_landed_raises_the_epoch() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    let old = f.stored_head();
+    let pre_seal = f.mem.get(&keys().head()).unwrap().unwrap().etag;
+    f.fault.only_keys_containing("/head");
+    f.fault.fail_next_puts(100_000);
+    assert!(b.seal_generation(pages(1), 4096, 1).is_err());
+    f.fault.fail_next_puts(0);
+    assert_eq!(
+        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        Ok(LogPos {
+            generation: 1,
+            seq: 2
+        })
+    );
+    let raised = Head {
+        epoch: old.epoch + 1,
+        ..old.clone()
+    };
+    assert_eq!(f.stored_head(), raised);
+    assert_eq!(b.head(), &raised);
+    // The head the failed seal meant to publish, arriving late on the pre-seal ETag.
+    let late = Head {
+        generation: 2,
+        manifest: Some(1),
+        ..old
+    };
+    let r = f
+        .mem
+        .put_if_match(&keys().head(), &late.encode(), &pre_seal);
+    assert!(matches!(r, Ok(CondPut::PreconditionFailed)), "{r:?}");
+    assert_eq!(f.stored_head(), raised);
+    // The writer holds the raised head's ETag: its next seal publishes.
+    assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
+    assert_eq!(f.stored_head().epoch, raised.epoch);
+}
+
+/// A head whose epoch is below the directory's is older than one this directory already saw:
+/// attaching to it is refused. Equal or above is accepted.
+#[test]
+fn attach_refuses_a_head_epoch_below_the_directorys() {
+    let f = Fixture::new();
+    f.create(fast(), 4);
+    let r = Bucket::attach(f.store(), keys(), fast(), 4, "w1", 2);
+    assert!(
+        matches!(&r, Err(Error::Fenced(m)) if m.contains("epoch 1") && m.contains("epoch 2")),
+        "{:?}",
+        r.err()
+    );
+    assert!(Bucket::attach(f.store(), keys(), fast(), 4, "w1", 1).is_ok());
+    assert!(Bucket::attach(f.store(), keys(), fast(), 4, "w1", 0).is_ok());
+}
+
+/// `raise_epoch` rewrites the head with the epoch one higher and nothing else changed, adopts
+/// its ETag (the next seal's conditional write succeeds), and accepts its own write whose
+/// reply was lost. A head another writer moved fences.
+#[test]
+fn raise_epoch_keeps_writer_generation_and_manifest() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.seal_generation(pages(1), 4096, 1).unwrap();
+    let before = f.stored_head();
+    assert_eq!(b.raise_epoch(), Ok(before.epoch + 1));
+    let want = Head {
+        epoch: before.epoch + 1,
+        ..before.clone()
+    };
+    assert_eq!((f.stored_head(), b.head()), (want.clone(), &want));
+
+    f.fault.only_keys_containing("/head");
+    f.fault.store_then_fail_next_puts(1);
+    assert_eq!(b.raise_epoch(), Ok(want.epoch + 1), "landed, reply lost");
+    assert_eq!(f.stored_head().epoch, want.epoch + 1);
+    f.fault.only_keys_containing("");
+    assert_eq!(b.seal_generation(vec![], 4096, 1), Ok(3));
+    assert_eq!(
+        f.stored_head().epoch,
+        want.epoch + 1,
+        "a seal keeps the epoch"
+    );
+
+    let other = Head {
+        writer_id: "w2".into(),
+        ..f.stored_head()
+    };
+    f.mem.put(&keys().head(), &other.encode()).unwrap();
+    assert!(matches!(b.raise_epoch(), Err(Error::Fenced(_))));
+    assert_eq!(f.stored_head(), other);
+    assert!(matches!(b.raise_epoch(), Err(Error::Fenced(_))), "for good");
+}
+
+/// The raise after an unlanded seal head write was itself ambiguous: it landed, every reply
+/// was an error. The next append finds the raised head and adopts it instead of fencing.
+#[test]
+fn check_head_adopts_its_own_raise_whose_reply_was_lost() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    let old = f.stored_head();
+    f.fault.only_keys_containing("/head");
+    f.fault.fail_next_puts(100_000);
+    assert!(b.seal_generation(pages(1), 4096, 1).is_err());
+    f.fault.fail_next_puts(0);
+    f.fault.store_then_fail_next_puts(1);
+    f.fault.fail_puts_after(0);
+    let r = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
+    let raised = Head {
+        epoch: old.epoch + 1,
+        ..old
+    };
+    assert_eq!(f.stored_head(), raised, "the raise landed");
+    assert_eq!(b.head().epoch, raised.epoch - 1, "its reply was lost");
+    f.fault.fail_puts_after(u64::MAX);
+    assert_eq!(
+        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        Ok(LogPos {
+            generation: 1,
+            seq: 2
+        })
+    );
+    assert_eq!(b.head(), &raised);
+    assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
+}
+
+/// The pending seal's late head PUT lands between `check_head`'s GET and its raise: the raise
+/// gets a 412, finds the pending head, and reports it published (nothing fenced).
+#[test]
+fn raise_finding_the_pending_seal_head_reports_it_published() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    f.fault.only_keys_containing("/head");
+    f.fault.fail_next_puts(100_000);
+    assert!(b.seal_generation(pages(1), 4096, 1).is_err());
+    f.fault.fail_next_puts(0);
+    let pending = b.pending_seal.as_ref().unwrap().head.clone();
+    f.mem.put(&keys().head(), &pending.encode()).unwrap();
+    let r = b.raise_epoch_at(Instant::now(), Some(&pending.encode()));
+    assert!(matches!(r, Ok(Raise::Published(_))), "not published");
+    assert!(!b.fenced);
+    assert_eq!(f.stored_head(), pending);
+    // The next seal adopts it.
+    assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
+    assert_eq!(b.head(), &pending);
 }

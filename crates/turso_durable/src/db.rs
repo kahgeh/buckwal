@@ -380,7 +380,8 @@ fn new_writer_id() -> Result<String> {
     Ok(hex::encode(id))
 }
 
-/// A new database: a new writer id, the head at generation 1, then the local state.
+/// A new database: a new writer id, the head at generation 1 and epoch 1, then the local
+/// state.
 fn create_new(
     dir: &Path,
     store: &Arc<dyn ObjectStore>,
@@ -403,7 +404,7 @@ fn create_new(
         complete: true,
         claimed: true,
         head_etag: String::new(),
-        epoch: 0,
+        epoch: bucket.head().epoch,
         claim_id: String::new(),
         seal_not_before_ms: 0,
     };
@@ -414,6 +415,13 @@ fn create_new(
 /// The directory's own database: a writer claims a restored copy first, then attaches and
 /// reconciles against the current log (a record acked by the old writer since the restore
 /// comes in as `Behind`). A read-only open attaches as the directory's writer id, unclaimed.
+/// Every open attaches with the directory's epoch as the least it accepts in the head.
+///
+/// A writer open that did not claim raises the head's epoch (`Bucket::raise_epoch`) after
+/// attaching and before reconcile, then records the new epoch in the local state (after the
+/// raise, so the local epoch never exceeds the head's). A head PUT that an earlier process of
+/// this writer still had in flight then gets a 412 instead of landing on a generation this
+/// process appends to. A read-only open never raises it: it writes nothing to the bucket.
 ///
 /// A writer that just claimed, or whose generation's last record is another writer's (a
 /// claim whose record never landed), appends one empty record at its next seq before the
@@ -442,9 +450,14 @@ fn attach_existing(
         cfg.retry.clone(),
         cfg.upload_concurrency,
         &state.writer_id,
+        state.epoch,
     )?;
     // Before reconcile's catch-up record and the claim (or foreign-tail) record below.
     bucket.set_lease(cfg.lease);
+    if !cfg.read_only && !claiming {
+        state.epoch = bucket.raise_epoch()?;
+        state.write_atomic(dir)?;
+    }
     let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
     if !cfg.read_only && (claiming || last_record_is_foreign(&bucket, &state.writer_id, cfg)?) {
         bucket.append_log(vec![]).map_err(|f| f.error)?;

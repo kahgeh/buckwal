@@ -106,9 +106,8 @@ pub(crate) fn open_engine(
         retry: cfg.retry.clone(),
         uploader: uploader.clone(),
         dir: dir.to_path_buf(),
-        writer_id: state.writer_id.clone(),
+        state: state.clone(),
         manifest,
-        complete: state.complete,
         read_only: cfg.read_only,
     }));
     storage.adopt_persisted_dirty()?;

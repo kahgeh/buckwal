@@ -64,6 +64,7 @@ pub(crate) fn writer_trimmed(
                 cfg.retry.clone(),
                 cfg.upload_concurrency,
                 &s.writer_id,
+                s.epoch,
             )
             .unwrap();
             (b, s)
@@ -87,7 +88,7 @@ pub(crate) fn writer_trimmed(
                 complete: true,
                 claimed: true,
                 head_etag: String::new(),
-                epoch: 0,
+                epoch: b.head().epoch,
                 claim_id: String::new(),
                 seal_not_before_ms: 0,
             };

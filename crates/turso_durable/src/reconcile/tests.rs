@@ -25,6 +25,7 @@ fn attach(store: Arc<dyn ObjectStore>, dir: &Path, cfg: &EngineConfig) -> (Bucke
         cfg.retry.clone(),
         cfg.upload_concurrency,
         &state.writer_id,
+        state.epoch,
     )
     .unwrap();
     (b, state)
@@ -340,7 +341,7 @@ fn foreign_writer_id_is_fenced() {
     mem.put(&keys().head(), &foreign.encode()).unwrap();
 
     let c = cfg();
-    let mut b = Bucket::attach(mem.clone(), keys(), c.retry.clone(), 1, &other).unwrap();
+    let mut b = Bucket::attach(mem.clone(), keys(), c.retry.clone(), 1, &other, 0).unwrap();
     let mut s = LocalState::read(crashed.path()).unwrap().unwrap();
     let r = reconcile(crashed.path(), &mut b, &mut s, &c);
     assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");

@@ -560,7 +560,7 @@ fn attaching_as_another_writer_logs_one_error_with_the_library_target() {
         let keys = Keys::new("db");
         let policy = RetryPolicy::default();
         Bucket::create(mem.clone(), keys.clone(), policy.clone(), 1, "w1".into()).unwrap();
-        assert!(Bucket::attach(mem, keys, policy, 1, "w2").is_err());
+        assert!(Bucket::attach(mem, keys, policy, 1, "w2", 0).is_err());
     });
     let errors: Vec<_> = cap
         .spans()

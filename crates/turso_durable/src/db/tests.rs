@@ -3,7 +3,7 @@ use crate::engine::tests::{head, keys, log_seqs, PREFIX};
 use crate::format::{decode_record, Head, LocalState, LogRecord};
 use crate::reconcile::Reconciled;
 use crate::restore::restore_with_store;
-use crate::store::{FaultStore, MemStore};
+use crate::store::{CondPut, FaultStore, MemStore};
 use crate::{CheckpointMode, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -1480,4 +1480,166 @@ fn read_only_io_refuses_engine_writes() {
     db.close().unwrap();
     assert_eq!(head(&*store), h0);
     assert_eq!(store.stats().puts, puts);
+}
+
+/// The head's ETag right now.
+fn head_etag(store: &Arc<MemStore>) -> String {
+    store.get(&keys().head()).unwrap().unwrap().etag
+}
+
+/// Every id a fresh read-only open (a restore into a new directory) sees.
+fn restored_ids(store: &Arc<MemStore>) -> Vec<i64> {
+    let v = tempdir();
+    let db = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    let ids = ids(&c);
+    c.close().unwrap();
+    db.close().unwrap();
+    ids
+}
+
+/// A new database starts at epoch 1; each writer open raises it by one in the head and the
+/// local state. A read-only open writes nothing and raises nothing.
+#[test]
+fn writer_open_raises_the_epoch() {
+    let store = mem();
+    let t = tempdir();
+    let dir = fresh(&t);
+    open_mem(&store, &dir).close().unwrap();
+    assert_eq!((head(&*store).epoch, state(&dir).epoch), (1, 1));
+    open_mem(&store, &dir).close().unwrap();
+    assert_eq!((head(&*store).epoch, state(&dir).epoch), (2, 2));
+    let puts = store.stats().puts;
+    let db = open_read_only_with_store(config(&dir), store.clone()).unwrap();
+    db.close().unwrap();
+    assert_eq!((head(&*store).epoch, state(&dir).epoch), (2, 2));
+    assert_eq!(store.stats().puts, puts, "a read-only open writes nothing");
+}
+
+/// README race 2: a head PUT that was in flight when the writer crashed (If-Match on the
+/// head's ETag then) must not land after the writer restarted and acked more commits: the
+/// head would publish the generation without them, so a restore (and the writer's own next
+/// open, which takes the published generation in) would miss them. The restart's epoch raise
+/// moves the ETag first. The late PUT is sent once the reopen returned (an open slower than
+/// a fixed sleep would see it land before its own head read, which is the case reconcile
+/// already handles) and runs alongside the new commits; it is joined before the close, whose
+/// seal would otherwise move the head first and hide the race.
+#[test]
+fn late_head_put_after_restart_cannot_land() {
+    let store = mem();
+    let a = closed_writer(&store, 10);
+    let e = head_etag(&store);
+    let h = head(&*store);
+    let late = Head {
+        generation: h.generation + 1,
+        manifest: Some(h.generation),
+        ..h
+    };
+    // The crashed seal uploaded its manifest before its head PUT: the generation's pages
+    // are unchanged since the last seal, so it maps them as that one did.
+    let m = store
+        .get(&keys().manifest(h.generation - 1))
+        .unwrap()
+        .unwrap();
+    store.put(&keys().manifest(h.generation), &m.body).unwrap();
+    let (s2, body) = (store.clone(), late.encode());
+    let (opened, wait) = mpsc::channel::<()>();
+    let put = std::thread::spawn(move || {
+        wait.recv().unwrap();
+        s2.put_if_match(&keys().head(), &body, &e)
+    });
+    let db = open_mem(&store, a.path());
+    opened.send(()).unwrap();
+    let c = db.connect().unwrap();
+    for id in 11..=20 {
+        insert(&c, id).unwrap();
+    }
+    let r = put.join().unwrap();
+    assert!(matches!(r, Ok(CondPut::PreconditionFailed)), "{r:?}");
+    assert_ne!(head(&*store), late);
+    assert_eq!(restored_ids(&store), (1..=20).collect::<Vec<_>>());
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restored_ids(&store), (1..=20).collect::<Vec<_>>());
+}
+
+/// A stage-2 database upgraded in place: a head without `epoch` and a local state without the
+/// stage-3 keys open as before, and the open raises the epoch to 1.
+#[test]
+fn stage2_head_and_local_state_reopen() {
+    let store = mem();
+    let a = closed_writer(&store, 5);
+    let h = head(&*store);
+    let body = String::from_utf8(h.encode())
+        .unwrap()
+        .replace(&format!(",\"epoch\":{}", h.epoch), "");
+    assert!(!body.contains("epoch"), "{body}");
+    store.put(&keys().head(), body.as_bytes()).unwrap();
+    let s = state(a.path());
+    let stage2 = String::from_utf8(s.encode()).unwrap().replace(
+        &format!(
+            ",\"epoch\":{},\"claim_id\":\"\",\"seal_not_before_ms\":0",
+            s.epoch
+        ),
+        "",
+    );
+    assert!(!stage2.contains("epoch"), "{stage2}");
+    std::fs::write(a.path().join(crate::files::STATE_FILE), stage2).unwrap();
+
+    let db = open_mem(&store, a.path());
+    assert_eq!((head(&*store).epoch, state(a.path()).epoch), (1, 1));
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), (1..=5).collect::<Vec<_>>());
+    c.close().unwrap();
+    db.close().unwrap();
+}
+
+/// A seal writes the new generation to the local state and keeps the keys it does not own:
+/// the epoch, the claim id and the seal-not-before time.
+#[test]
+fn seal_keeps_the_epoch_and_claim_keys_in_the_local_state() {
+    let store = mem();
+    let a = closed_writer(&store, 1);
+    let mut s = state(a.path());
+    s.claim_id = "c".repeat(32);
+    s.seal_not_before_ms = 12_345;
+    s.write_atomic(a.path()).unwrap();
+
+    let db = open_mem(&store, a.path());
+    let gen = db.generation();
+    let c = db.connect().unwrap();
+    insert(&c, 2).unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert_eq!(db.generation(), gen + 1);
+    let after = state(a.path());
+    assert_eq!(after.generation, gen + 1);
+    assert_eq!(
+        (
+            after.epoch,
+            after.claim_id.as_str(),
+            after.seal_not_before_ms
+        ),
+        (2, s.claim_id.as_str(), 12_345)
+    );
+    c.close().unwrap();
+    db.close().unwrap();
+}
+
+/// The seal does not read the local state file: one that went bad while the database was open
+/// cannot fail a seal whose head is already published. The seal writes it whole again.
+#[test]
+fn seal_does_not_read_the_local_state_file() {
+    let store = mem();
+    let a = closed_writer(&store, 1);
+    let db = open_mem(&store, a.path());
+    let gen = db.generation();
+    let c = db.connect().unwrap();
+    insert(&c, 2).unwrap();
+    std::fs::write(a.path().join(crate::files::STATE_FILE), b"not json").unwrap();
+    let r = c.checkpoint(CheckpointMode::Truncate);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(head(&*store).generation, gen + 1);
+    assert_eq!(state(a.path()).generation, gen + 1);
+    c.close().unwrap();
+    db.close().unwrap();
 }

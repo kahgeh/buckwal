@@ -10,7 +10,7 @@ use crate::clock::Stamp;
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
 use crate::format::{encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
-use crate::store::{with_retry, CondPut, ObjectStore, RetryPolicy, StoreError};
+use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -81,6 +81,15 @@ enum Lapse {
     Remaining(Vec<usize>),
 }
 
+/// How an epoch raise (`Bucket::raise_epoch_at`) ended.
+enum Raise {
+    /// The raised head is published and adopted.
+    Raised,
+    /// The head holds the pending seal's head instead (its late PUT landed first), with this
+    /// ETag: nothing was raised.
+    Published(String),
+}
+
 /// What a GET of the head says about a pending seal.
 enum HeadCheck {
     /// No seal is pending, or the head is unchanged: carry on in this generation.
@@ -106,9 +115,10 @@ pub(crate) struct Bucket {
     fenced: bool,
     /// The lease (`check_lease`): when the request behind the last confirmation was sent, on
     /// both clocks. It is renewed by a confirmed log record (`put_log`), a confirmed head
-    /// write (`put_head`, and `create`'s), open's head read (`attach`), and a head GET that
-    /// passes `check_head` (unchanged) or `verify_head`. A failed or ambiguous request renews
-    /// nothing, and neither do page and manifest PUTs (which only makes the check run sooner).
+    /// write (`put_head`, `raise_epoch`, and `create`'s), open's head read (`attach`), and a
+    /// head GET that passes `check_head` (finding its own raised head) or `verify_head`. A
+    /// failed or ambiguous request renews nothing, and neither do page and manifest PUTs
+    /// (which only makes the check run sooner).
     last_confirmed: Stamp,
     /// See `set_lease`.
     lease: Duration,
@@ -246,7 +256,8 @@ impl Bucket {
         }
     }
 
-    /// Start a new database: `put_if_absent(head)` at generation 1 with no manifest.
+    /// Start a new database: `put_if_absent(head)` at generation 1 and epoch 1, with no
+    /// manifest.
     ///
     /// A create that times out may still have stored its head. A later `create` then finds a
     /// head and returns `Config` (its first attempt gets a 412, which is never compared);
@@ -268,7 +279,7 @@ impl Bucket {
             generation: 1,
             manifest: None,
             writer_id,
-            epoch: 0,
+            epoch: 1,
         };
         let body = head.encode();
         let key = keys.head();
@@ -300,12 +311,17 @@ impl Bucket {
 
     /// Continue an existing database as `writer_id`, after the last log object of the
     /// current generation.
+    ///
+    /// `Fenced` when the head names another writer, or an epoch below `min_epoch` (the epoch
+    /// the directory's local state holds): such a head is older than one this directory
+    /// already saw, so the bucket is not the one the directory continues.
     pub(crate) fn attach(
         store: Arc<dyn ObjectStore>,
         keys: Keys,
         retry: RetryPolicy,
         concurrency: usize,
         writer_id: &str,
+        min_epoch: u64,
     ) -> Result<Bucket> {
         let counters = Counters::default();
         let key = keys.head();
@@ -313,11 +329,21 @@ impl Bucket {
         let obj = retrying(&counters, &retry, &key, || store.get(&key))?
             .ok_or_else(|| Error::NotFound("head".into()))?;
         let head = Head::decode(&obj.body)?;
-        if head.writer_id != writer_id {
-            let e = Error::Fenced(format!(
+        let refused = if head.writer_id != writer_id {
+            Some(format!(
                 "head names writer {:?}, not {writer_id:?}",
                 head.writer_id
-            ));
+            ))
+        } else if head.epoch < min_epoch {
+            Some(format!(
+                "head is at epoch {}, below this directory's epoch {min_epoch}",
+                head.epoch
+            ))
+        } else {
+            None
+        };
+        if let Some(m) = refused {
+            let e = Error::Fenced(m);
             tracing::error!(
                 target: "turso_durable",
                 generation = head.generation,
@@ -573,16 +599,23 @@ impl Bucket {
         self.verify_head(start)
     }
 
-    /// With a seal pending, GET the head. Unchanged ETag: the head write never landed, so the
-    /// pending seal is dropped. The pending head: it is published. Anything else: fenced.
+    /// With a seal pending, GET the head. The pending head: it is published.
     ///
-    /// Accepted limit for stage 1: a delayed, still in-flight head PUT from the failed attempt
-    /// could land after an "unchanged" answer here. Stage 3's epoch fencing closes this.
+    /// Unchanged ETag: the head write has not landed, but a PUT of the failed attempt may
+    /// still be in flight and could land later, on that same ETag, publishing the generation
+    /// without whatever this writer appends next. So the epoch is raised on that ETag first
+    /// (`raise_epoch_at`): the late PUT then gets a 412. Only then is the pending seal
+    /// dropped. If the late PUT lands first, the raise finds the pending head instead, and
+    /// it is published after all.
+    ///
+    /// The raised head itself (a raise of an earlier call landed, and its reply was lost): it
+    /// is adopted, and the pending seal dropped. Anything else: fenced.
     fn check_head(&mut self, start: Instant) -> Result<HeadCheck> {
         let Some(pending) = &self.pending_seal else {
             return Ok(HeadCheck::Unmoved);
         };
         let pending_body = pending.head.encode();
+        let raised = self.raised_head();
         let key = self.keys.head();
         let sent = Stamp::now();
         let stored = retrying(&self.counters, &self.remaining(start), &key, || {
@@ -590,12 +623,71 @@ impl Bucket {
         })?;
         match stored {
             Some(o) if o.etag == self.head_etag => {
-                self.last_confirmed = sent;
+                if let Raise::Published(etag) = self.raise_epoch_at(start, Some(&pending_body))? {
+                    return Ok(HeadCheck::Published(etag));
+                }
                 self.pending_seal = None;
                 Ok(HeadCheck::Unmoved)
             }
             Some(o) if o.body == pending_body => Ok(HeadCheck::Published(o.etag)),
+            Some(o) if o.body == raised.encode() => {
+                self.adopt_head(raised, o.etag, sent);
+                self.pending_seal = None;
+                Ok(HeadCheck::Unmoved)
+            }
             _ => Err(self.fence(Error::Fenced(
+                "the head was changed by another writer".into(),
+            ))),
+        }
+    }
+
+    /// The current head with its epoch raised by one: same writer, generation and manifest.
+    fn raised_head(&self) -> Head {
+        Head {
+            epoch: self.head.epoch + 1,
+            ..self.head.clone()
+        }
+    }
+
+    /// `head` is published with `etag`, by a request sent at `sent`: adopt it, renewing the
+    /// lease.
+    fn adopt_head(&mut self, head: Head, etag: String, sent: Stamp) {
+        self.head = head;
+        self.head_etag = etag;
+        self.last_confirmed = sent;
+    }
+
+    /// Raise the head's epoch by one, keeping writer, generation and manifest: a
+    /// `put_if_match` on the head's ETag, every retry under one deadline. A 412 whose stored
+    /// head is exactly the raised one counts as landed; any other head fences this writer.
+    /// It renews the lease and returns the new epoch.
+    ///
+    /// Every writer open calls it (`db::attach_existing`): a head PUT that a crashed
+    /// process of this writer still had in flight carries the ETag from before the raise, so
+    /// it can no longer land after the restarted writer acked more records. A failure leaves
+    /// the open failed; the next open reads whatever the head is then.
+    pub(crate) fn raise_epoch(&mut self) -> Result<u64> {
+        let start = Instant::now();
+        self.check_fenced()?;
+        match self.raise_epoch_at(start, None).map_err(upload_error)? {
+            Raise::Raised => Ok(self.head.epoch),
+            // Only a pending seal's head is reported as published, and none was given.
+            Raise::Published(_) => unreachable!("no pending seal head to find"),
+        }
+    }
+
+    /// `raise_epoch` within the call that started at `start`. A 412 whose stored head is
+    /// `pending` (a pending seal's head, encoded) is `Raise::Published`.
+    fn raise_epoch_at(&mut self, start: Instant, pending: Option<&[u8]>) -> Result<Raise> {
+        let head = self.raised_head();
+        let sent = Stamp::now();
+        match self.put_head_if_match(start, &head)? {
+            Ok(etag) => {
+                self.adopt_head(head, etag, sent);
+                Ok(Raise::Raised)
+            }
+            Err(Some(o)) if pending == Some(o.body.as_slice()) => Ok(Raise::Published(o.etag)),
+            Err(_) => Err(self.fence(Error::Fenced(
                 "the head was changed by another writer".into(),
             ))),
         }
@@ -871,10 +963,12 @@ impl Bucket {
                 self.last_confirmed = sent;
                 Ok(())
             }
-            // Our own head for this seal, from an earlier attempt whose PUT landed late (after
-            // a crash and restart, say): `put_head` adopts it at the next seal, which
-            // re-publishes the generation with every record acked since (README, item 1).
-            // Another writer's head names its id.
+            // Our own head for this seal, from an earlier attempt whose PUT landed late:
+            // `put_head` adopts it at the next seal, which re-publishes the generation with
+            // every record acked since (README, item 1). Kept as a defence: such a PUT carries
+            // the ETag from before an epoch raise, which every writer open and every
+            // unchanged `check_head` sends, so it gets a 412 instead. Another writer's head
+            // names its id.
             Some(o) if o.body == ours => {
                 self.last_confirmed = sent;
                 Ok(())
@@ -992,26 +1086,41 @@ impl Bucket {
     /// Move the head with `put_if_match`; returns its new ETag. A 412 is ours only when the
     /// stored head is exactly the one we meant to write (an earlier attempt landed).
     fn put_head(&mut self, start: Instant, head: &Head) -> Result<String> {
+        let sent = Stamp::now();
+        match self.put_head_if_match(start, head)? {
+            Ok(etag) => {
+                self.last_confirmed = sent;
+                Ok(etag)
+            }
+            Err(_) => Err(self.fence(Error::Fenced(
+                "the head was changed by another writer".into(),
+            ))),
+        }
+    }
+
+    /// `put_if_match` of `head` on `head_etag`, then on a 412 a GET: `Ok(etag)` when `head`
+    /// is stored (created, or an earlier attempt landed), else `Err` with what is stored.
+    /// Changes nothing in `self`.
+    fn put_head_if_match(
+        &self,
+        start: Instant,
+        head: &Head,
+    ) -> Result<std::result::Result<String, Option<Object>>> {
         let key = self.keys.head();
         let body = head.encode();
         let c = &self.counters;
-        let sent = Stamp::now();
         let r = retrying(c, &self.remaining(start), &key, || {
             self.store.put_if_match(&key, &body, &self.head_etag)
         })?;
         if let CondPut::Created { etag } = r {
-            self.last_confirmed = sent;
-            return Ok(etag);
+            return Ok(Ok(etag));
         }
-        match retrying(c, &self.remaining(start), &key, || self.store.get(&key))? {
-            Some(o) if o.body == body => {
-                self.last_confirmed = sent;
-                Ok(o.etag)
-            }
-            _ => Err(self.fence(Error::Fenced(
-                "the head was changed by another writer".into(),
-            ))),
-        }
+        Ok(
+            match retrying(c, &self.remaining(start), &key, || self.store.get(&key))? {
+                Some(o) if o.body == body => Ok(o.etag),
+                other => Err(other),
+            },
+        )
     }
 }
 

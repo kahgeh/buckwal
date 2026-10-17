@@ -6,7 +6,7 @@ use super::stash::stash;
 use super::{read_at, sync_file, write_at};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DIRTY_FILE};
-use crate::format::{Keys, LocalState, Manifest, FORMAT};
+use crate::format::{Keys, LocalState, Manifest};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
 use crate::uploader::Uploader;
 use std::collections::{BTreeSet, HashSet};
@@ -17,7 +17,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64,
     Ordering::{Relaxed, SeqCst},
 };
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use turso_core::io::FileSyncType;
 use turso_core::{Buffer, Completion, DatabaseStorage, File, IOContext, IO};
 
@@ -58,12 +58,15 @@ fn read_dirty_file(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
-#[derive(Default)]
+/// What the dirty mutex guards.
 struct Dirty {
     /// Pages written since the last seal.
     memory: BTreeSet<u32>,
     /// Pages written since the last append to the dirty file.
     unpersisted: BTreeSet<u32>,
+    /// The local state as this process last wrote it (or found it at open): every later write
+    /// starts from it, so none reads `app.db-durable` back. Only `write_state` changes it.
+    state: LocalState,
 }
 
 pub(crate) struct BucketDbStorage {
@@ -75,7 +78,6 @@ pub(crate) struct BucketDbStorage {
     retry: RetryPolicy,
     uploader: Arc<Uploader>,
     dir: PathBuf,
-    writer_id: String,
     /// The manifest at open: where pages that are not local yet come from. Every page a
     /// later seal maps elsewhere was written locally in this process first.
     manifest: Option<Manifest>,
@@ -102,9 +104,10 @@ pub(crate) struct StorageParts {
     pub retry: RetryPolicy,
     pub uploader: Arc<Uploader>,
     pub dir: PathBuf,
-    pub writer_id: String,
+    /// The local state at open, as written to `app.db-durable` (a read-only open's may never
+    /// be written).
+    pub state: LocalState,
     pub manifest: Option<Manifest>,
-    pub complete: bool,
     pub read_only: bool,
 }
 
@@ -123,13 +126,16 @@ impl BucketDbStorage {
             retry: p.retry,
             uploader: p.uploader,
             dir: p.dir,
-            writer_id: p.writer_id,
             manifest: p.manifest,
             bucket_pages: AtomicU32::new(page_count),
-            complete: AtomicBool::new(p.complete),
+            complete: AtomicBool::new(p.state.complete),
             page_size: AtomicU32::new(page_size),
             local: Mutex::new(HashSet::new()),
-            dirty: Mutex::new(Dirty::default()),
+            dirty: Mutex::new(Dirty {
+                memory: BTreeSet::new(),
+                unpersisted: BTreeSet::new(),
+                state: p.state,
+            }),
             lazy_gets: AtomicU64::new(0),
             read_only: p.read_only,
         }
@@ -240,32 +246,33 @@ impl BucketDbStorage {
     /// pages must then be fetched. The in-memory flag is set even if persisting fails (the
     /// pages are local in this process).
     fn mark_complete(&self) -> Result<()> {
-        let dirty = self.dirty.lock().unwrap();
+        let mut dirty = self.dirty.lock().unwrap();
         if self.read_only {
             self.complete.store(true, SeqCst);
             return Ok(());
         }
         let r = sync_file(&*self.file, &*self.io)
             .map_err(|e| io_err("fsync db", e))
-            .and_then(|_| match LocalState::read(&self.dir)? {
-                Some(state) => self.write_state(
-                    &dirty,
-                    &LocalState {
-                        complete: true,
-                        ..state
-                    },
-                ),
-                None => Ok(()),
+            .and_then(|_| {
+                let state = LocalState {
+                    complete: true,
+                    ..dirty.state.clone()
+                };
+                self.write_state(&mut dirty, state)
             });
         self.complete.store(true, SeqCst);
         r
     }
 
-    /// The one way this process writes `app.db-durable` once the engine is open: under the
-    /// dirty mutex (`_held`), which the seal holds for its whole run, so the seal and
-    /// `mark_complete` never write it at the same time or from stale reads.
-    fn write_state(&self, _held: &MutexGuard<'_, Dirty>, state: &LocalState) -> Result<()> {
-        state.write_atomic(&self.dir)
+    /// The one way this process writes `app.db-durable` once the engine is open. Every writer
+    /// must hold the dirty mutex (the `&mut Dirty` proves it), which the seal holds for its
+    /// whole run, so the seal and `mark_complete` never write it at the same time or from a
+    /// stale copy. `state` is built from `Dirty::state` and becomes it once written; the file
+    /// is never read back.
+    fn write_state(&self, dirty: &mut Dirty, state: LocalState) -> Result<()> {
+        state.write_atomic(&self.dir)?;
+        dirty.state = state;
+        Ok(())
     }
 
     fn record_written(&self, first: u32, count: usize, page_size: usize) {
@@ -343,24 +350,17 @@ impl BucketDbStorage {
         let generation = self.uploader.seal_generation(pages, ps, page_count)?;
         sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
         // Only a claimed writer seals (a read-only open never writes), and the head's ETag
-        // changed with this seal, so none is kept.
-        // The lease keys are not this seal's to change: carry them over.
-        let prev = LocalState::read(&self.dir)?;
+        // changed with this seal, so none is kept. The writer id and the lease keys (epoch,
+        // claim id, seal-not-before) are not this seal's to change: they carry over from the
+        // state in memory, so nothing here reads the file after the head is published.
         let state = LocalState {
-            format: FORMAT,
-            writer_id: self.writer_id.clone(),
             generation,
             complete: self.complete.load(SeqCst),
             claimed: true,
             head_etag: String::new(),
-            epoch: prev.as_ref().map_or(0, |p| p.epoch),
-            claim_id: prev
-                .as_ref()
-                .map(|p| p.claim_id.clone())
-                .unwrap_or_default(),
-            seal_not_before_ms: prev.as_ref().map_or(0, |p| p.seal_not_before_ms),
+            ..dirty.state.clone()
         };
-        self.write_state(&dirty, &state)?;
+        self.write_state(&mut dirty, state)?;
         truncate_dirty_file(&self.dirty_path())?;
         dirty.memory.clear();
         dirty.unpersisted.clear();
