@@ -728,9 +728,14 @@ fn last_failed_is_probed_until_the_bucket_answers() {
     ));
     assert!(!u.degraded(), "nothing owed, nothing in doubt");
     assert_eq!(u.bucket_failing(), Some("last bucket operation failed"));
-    // While the head GETs keep failing, the probes fail too.
+    let gets = store.head_gets.load(SeqCst);
+    // While the head GETs keep failing, the probes (head GETs) fail too.
     std::thread::sleep(defaults::MAX_BACKOFF + Duration::from_millis(500));
     assert_eq!(u.bucket_failing(), Some("last bucket operation failed"));
+    assert!(
+        store.head_gets.load(SeqCst) > gets,
+        "no probe was sent while failing"
+    );
 
     store.failing.store(false, SeqCst);
     wait_not_failing(&u, defaults::MAX_BACKOFF * 3);

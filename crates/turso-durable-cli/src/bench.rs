@@ -28,18 +28,18 @@ struct Maintenance {
 
 impl Maintenance {
     fn record(&self, e: &Event) {
-        let mut c = self.counts.lock().unwrap();
+        let counts = || self.counts.lock().unwrap();
         match e {
             Event::LogUploaded { seq, .. } => {
                 self.log_objects_max.fetch_max(*seq, SeqCst);
             }
-            Event::MaintenanceStarted { .. } => c.0 += 1,
+            Event::MaintenanceStarted { .. } => counts().0 += 1,
             Event::MaintenanceFinished { gate_wait, .. } => {
-                c.1 += 1;
+                counts().1 += 1;
                 let mut m = self.gate_wait_max.lock().unwrap();
                 *m = (*m).max(*gate_wait);
             }
-            Event::MaintenanceSkipped { .. } => c.2 += 1,
+            Event::MaintenanceSkipped { .. } => counts().2 += 1,
             _ => {}
         }
     }
@@ -107,9 +107,35 @@ fn is_busy(e: &turso_durable::Error) -> bool {
     matches!(e, turso_durable::Error::Engine(m) if m.starts_with("database is busy"))
 }
 
+/// How long one commit may keep being refused as busy before bench gives up with the error.
+const BUSY_GIVE_UP: Duration = Duration::from_secs(10);
+/// The pause before retrying a commit refused as busy.
+const BUSY_PAUSE: Duration = Duration::from_millis(10);
+
+/// Run `op`; while it is refused as busy, pause and run it again (counting each retry in
+/// `busy`), until `give_up` has passed since the first attempt. Then, or on any other
+/// error, return the error.
+fn retry_busy<T>(
+    busy: &AtomicU64,
+    give_up: Duration,
+    pause: Duration,
+    mut op: impl FnMut() -> Result<T, turso_durable::Error>,
+) -> Result<T, turso_durable::Error> {
+    let start = Instant::now();
+    loop {
+        match op() {
+            Err(e) if is_busy(&e) && start.elapsed() < give_up => {
+                busy.fetch_add(1, SeqCst);
+                std::thread::sleep(pause);
+            }
+            r => return r,
+        }
+    }
+}
+
 /// Commit until `next` passes `commits` or another thread failed; returns (commit index,
-/// latency) for each commit. A commit the engine refuses as busy is retried (counted in
-/// `busy`); its latency runs from its first attempt.
+/// latency) for each commit. A commit the engine refuses as busy is retried after a pause
+/// (counted in `busy`) for up to `BUSY_GIVE_UP`; its latency runs from its first attempt.
 fn commit_loop(
     db: &Database,
     commits: u64,
@@ -126,18 +152,12 @@ fn commit_loop(
             break Ok(());
         }
         let t = Instant::now();
-        let r = loop {
-            let r = conn.execute(
+        let r = retry_busy(busy, BUSY_GIVE_UP, BUSY_PAUSE, || {
+            conn.execute(
                 "INSERT OR REPLACE INTO bench(id, payload) VALUES (?, ?)",
                 &[Value::from_i64(i as i64), payload.clone()],
-            );
-            match r {
-                Err(e) if is_busy(&e) => {
-                    busy.fetch_add(1, SeqCst);
-                }
-                r => break r,
-            }
-        };
+            )
+        });
         if let Err(e) = r {
             failed.store(true, SeqCst);
             break Err(err(e));
@@ -251,6 +271,51 @@ mod tests {
         assert!(is_busy(&Error::Engine("database is busy (locked)".into())));
         assert!(!is_busy(&Error::Engine("no such table: bench".into())));
         assert!(!is_busy(&Error::Timeout("database is busy".into())));
+    }
+
+    #[test]
+    fn busy_is_retried_with_a_pause_until_a_cap() {
+        use turso_durable::Error;
+        let busy_err = || Error::Engine("database is busy (locked)".into());
+        // Busy twice, then Ok: two retries counted.
+        let n = AtomicU64::new(0);
+        let mut left = 2;
+        let r = retry_busy(&n, Duration::from_secs(5), Duration::from_millis(1), || {
+            if left > 0 {
+                left -= 1;
+                Err(busy_err())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!((r, n.load(SeqCst)), (Ok(7), 2));
+        // Busy for good: gives up with the error once the cap has passed, pausing between.
+        let n = AtomicU64::new(0);
+        let t = Instant::now();
+        let r: Result<(), Error> = retry_busy(
+            &n,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            || Err(busy_err()),
+        );
+        assert_eq!(r, Err(busy_err()));
+        assert!(
+            t.elapsed() >= Duration::from_millis(50),
+            "{:?}",
+            t.elapsed()
+        );
+        let tries = n.load(SeqCst);
+        assert!(
+            (1..=11).contains(&tries),
+            "{tries} retries in 50 ms at 5 ms"
+        );
+        // Any other error is returned at once.
+        let n = AtomicU64::new(0);
+        let r: Result<(), Error> = retry_busy(&n, Duration::from_secs(5), Duration::ZERO, || {
+            Err(Error::Engine("no such table: bench".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(n.load(SeqCst), 0);
     }
 
     #[test]

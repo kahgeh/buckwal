@@ -286,11 +286,13 @@ impl Worker {
     /// Run jobs in order until every sender is gone, then flush what waits and exit.
     ///
     /// While syncs are owed, the bucket is degraded or its last operation failed, it wakes
-    /// every `MAX_BACKOFF` (2 s) to retry them, or probe the bucket (`tick`). One degraded state can last: a seal whose head write was
-    /// ambiguous and whose head turns out to be published stays pending until the next seal
-    /// adopts it (`Bucket::before_record` refuses appends meanwhile), so each wake GETs the
-    /// head again (`catch_up`), one GET every 2 s, until that seal. That is rare (an
-    /// ambiguous head PUT that landed) and ends at the next seal.
+    /// every `MAX_BACKOFF` (2 s) to retry them, or probe the bucket (`tick`).
+    ///
+    /// One degraded state can last: a seal whose head write was ambiguous and whose head
+    /// turns out to be published stays pending until the next seal adopts it
+    /// (`Bucket::before_record` refuses appends meanwhile), so each wake GETs the head again
+    /// (`catch_up`), one GET every 2 s, until that seal. That is rare (an ambiguous head PUT
+    /// that landed) and ends at the next seal.
     fn run(mut self, rx: Receiver<Job>) {
         loop {
             let next = if let Some(mut deadline) = self.batch.deadline() {

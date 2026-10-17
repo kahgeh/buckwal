@@ -809,11 +809,35 @@ fn is_maintenance_end(l: &str) -> bool {
     l.starts_with("event maintenance-finished ") || l.starts_with("event maintenance-skipped ")
 }
 
+/// How far past the threshold a run's `log_objects` may be. The run reads its measures
+/// right after the poke of the call whose commit crossed the threshold; only the few log
+/// objects the uploader appends in between can land first. (bench at threshold 200 saw at
+/// most 202-209 objects in a generation, and that also counts those landing while a run
+/// drains and seals.)
+const MAINTENANCE_START_SLACK: usize = 10;
+
+/// The `log_objects=<n>` of each `event maintenance-started` line, with the number of acks
+/// printed before it.
+fn maintenance_starts(lines: &[String]) -> Vec<(usize, usize)> {
+    let mut acks = 0;
+    let mut starts = Vec::new();
+    for l in lines {
+        if l.starts_with("ack ") {
+            acks += 1;
+        } else if l.starts_with("event maintenance-started ") {
+            starts.push((field(l, "log_objects"), acks));
+        }
+    }
+    starts
+}
+
 /// Sustained Window load (8 connections, `window 1ms`, at least 3000 acks). Without
 /// maintenance the generation never ends (the "before" run reports its seals and restore
-/// GETs, and asserts only that every ack restores). With it (threshold 200), maintenance
-/// seals during the load, and a restore right after a maintenance seal reads at most
-/// 200 + 4 objects. Both: every acked id restores, integrity ok, the log contiguous.
+/// GETs, and asserts only that every ack restores). With it (log-object threshold 200, the
+/// `-wal` measure off), every run starts at 200 to 200 + `MAINTENANCE_START_SLACK` log
+/// objects, at least 2 runs start within the first 3000 acks, and a restore right after a
+/// maintenance seal reads at most 200 + 4 objects. Both: every acked id restores,
+/// integrity ok, the log contiguous.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn maintenance_bounds_generations_under_window_load() {
@@ -824,10 +848,13 @@ fn maintenance_bounds_generations_under_window_load() {
             if on { "on" } else { "off" }
         );
         let ctx = if on {
-            Ctx::new(&name).set(
-                "DURABLE_MAINTENANCE_LOG_OBJECTS",
-                &MAINTENANCE_LOG_OBJECTS.to_string(),
-            )
+            // Only the log-object threshold can trigger a run.
+            Ctx::new(&name)
+                .set(
+                    "DURABLE_MAINTENANCE_LOG_OBJECTS",
+                    &MAINTENANCE_LOG_OBJECTS.to_string(),
+                )
+                .set("DURABLE_MAINTENANCE_WAL_MIB", "0")
         } else {
             Ctx::new(&name)
                 .set("DURABLE_MAINTENANCE_LOG_OBJECTS", "0")
@@ -865,6 +892,18 @@ fn maintenance_bounds_generations_under_window_load() {
             v.acked, head.generation, v.restored
         );
         if on {
+            let starts = maintenance_starts(&soak.lines);
+            eprintln!("{name}: maintenance runs started at (log_objects, acks before): {starts:?}");
+            let range = MAINTENANCE_LOG_OBJECTS..=MAINTENANCE_LOG_OBJECTS + MAINTENANCE_START_SLACK;
+            assert!(
+                starts.iter().all(|(n, _)| range.contains(n)),
+                "{name}: a run started outside {range:?} log objects: {starts:?}"
+            );
+            let early = starts.iter().filter(|(_, a)| *a < acks).count();
+            assert!(
+                early >= 2,
+                "{name}: {early} runs started within {acks} acks: {starts:?}"
+            );
             assert!(
                 finished >= 1,
                 "{name}: no maintenance seal\n{}",
