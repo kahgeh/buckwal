@@ -259,6 +259,7 @@ impl Bucket {
             generation: 1,
             manifest: None,
             writer_id,
+            epoch: 0,
         };
         let body = head.encode();
         let key = keys.head();
@@ -602,6 +603,7 @@ impl Bucket {
             generation: self.head.generation + 1,
             manifest: Some(self.head.generation),
             writer_id: self.head.writer_id.clone(),
+            epoch: self.head.epoch,
         }
     }
 

@@ -16,6 +16,7 @@ fn head(generation: u64, manifest: Option<u64>) -> Head {
         generation,
         manifest,
         writer_id: "w".into(),
+        epoch: 0,
     }
 }
 

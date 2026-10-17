@@ -22,6 +22,7 @@ pub(crate) enum LogRecord {
     },
     Fence {
         writer_id: String,
+        epoch: u64,
     },
 }
 
@@ -63,10 +64,11 @@ pub(crate) fn encode_record(r: &LogRecord) -> Vec<u8> {
                 }
             }
         }
-        LogRecord::Fence { writer_id } => {
+        LogRecord::Fence { writer_id, epoch } => {
             out.push(KIND_FENCE);
             put_writer_id(&mut out, writer_id);
             out.extend(0u32.to_le_bytes()); // sync_count, always 0
+            out.extend(epoch.to_le_bytes());
         }
     }
     let sha = Sha256::digest(&out);
@@ -116,8 +118,15 @@ pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
     }
     let writer_id = String::from_utf8_lossy(writer_id).into_owned();
     let rec = match kind {
-        // Bytes after the writer id are ignored so later stages can extend fences.
-        KIND_FENCE => return Ok(LogRecord::Fence { writer_id }),
+        KIND_FENCE => {
+            if r.u32()? != 0 {
+                return Err(corrupt("fence with syncs"));
+            }
+            LogRecord::Fence {
+                writer_id,
+                epoch: r.u64()?,
+            }
+        }
         KIND_EXTENTS => {
             let sync_count = r.u32()?;
             let mut syncs = Vec::new();

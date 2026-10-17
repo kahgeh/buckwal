@@ -344,6 +344,8 @@ impl BucketDbStorage {
         sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
         // Only a claimed writer seals (a read-only open never writes), and the head's ETag
         // changed with this seal, so none is kept.
+        // The lease keys are not this seal's to change: carry them over.
+        let prev = LocalState::read(&self.dir)?;
         let state = LocalState {
             format: FORMAT,
             writer_id: self.writer_id.clone(),
@@ -351,6 +353,12 @@ impl BucketDbStorage {
             complete: self.complete.load(SeqCst),
             claimed: true,
             head_etag: String::new(),
+            epoch: prev.as_ref().map_or(0, |p| p.epoch),
+            claim_id: prev
+                .as_ref()
+                .map(|p| p.claim_id.clone())
+                .unwrap_or_default(),
+            seal_not_before_ms: prev.as_ref().map_or(0, |p| p.seal_not_before_ms),
         };
         self.write_state(&dirty, &state)?;
         truncate_dirty_file(&self.dirty_path())?;

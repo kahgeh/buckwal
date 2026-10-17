@@ -504,6 +504,7 @@ fn a_fenced_writer_logs_one_error() {
         .unwrap();
         let foreign = encode_record(&LogRecord::Fence {
             writer_id: "w2".into(),
+            epoch: 1,
         });
         mem.put(&keys.log(1, 1), &foreign).unwrap();
         let sync = || {

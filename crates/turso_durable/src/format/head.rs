@@ -27,6 +27,8 @@ pub(crate) struct Head {
     pub generation: u64,
     pub manifest: Option<u64>,
     pub writer_id: String,
+    /// The writer-lease epoch; a head without the key reads as 0.
+    pub epoch: u64,
 }
 
 impl Head {
@@ -36,11 +38,12 @@ impl Head {
             None => "null".to_string(),
         };
         format!(
-            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{}}}",
+            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{},\"epoch\":{}}}",
             self.format,
             self.generation,
             manifest,
-            escape(&self.writer_id)
+            escape(&self.writer_id),
+            self.epoch
         )
         .into_bytes()
     }
@@ -67,6 +70,7 @@ impl Head {
             generation: o.num("generation")?,
             manifest,
             writer_id: o.str("writer_id")?.to_string(),
+            epoch: if o.has("epoch") { o.num("epoch")? } else { 0 },
         })
     }
 }
@@ -83,18 +87,27 @@ pub(crate) struct LocalState {
     /// The ETag of the head a restore read; a claim writes the new head only if it still
     /// matches. Empty when unknown (files written before this key existed decode as "").
     pub head_etag: String,
+    /// The epoch this copy holds (0 before the key existed).
+    pub epoch: u64,
+    /// The claim this copy made (empty before the key existed).
+    pub claim_id: String,
+    /// Earliest time, in ms, a seal may run (0 before the key existed).
+    pub seal_not_before_ms: u64,
 }
 
 impl LocalState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         format!(
-            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{}}}",
+            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{}}}",
             self.format,
             escape(&self.writer_id),
             self.generation,
             self.complete,
             self.claimed,
-            escape(&self.head_etag)
+            escape(&self.head_etag),
+            self.epoch,
+            escape(&self.claim_id),
+            self.seal_not_before_ms
         )
         .into_bytes()
     }
@@ -115,6 +128,17 @@ impl LocalState {
                 o.str("head_etag")?.to_string()
             } else {
                 String::new()
+            },
+            epoch: if o.has("epoch") { o.num("epoch")? } else { 0 },
+            claim_id: if o.has("claim_id") {
+                o.str("claim_id")?.to_string()
+            } else {
+                String::new()
+            },
+            seal_not_before_ms: if o.has("seal_not_before_ms") {
+                o.num("seal_not_before_ms")?
+            } else {
+                0
             },
         })
     }

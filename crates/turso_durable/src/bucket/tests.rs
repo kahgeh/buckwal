@@ -106,6 +106,7 @@ fn create_then_attach_round_trip() {
         generation: 1,
         manifest: None,
         writer_id: "w1".into(),
+        epoch: 0,
     };
     assert_eq!(b.head(), &want);
     assert_eq!(f.stored_head(), want);
@@ -229,6 +230,7 @@ fn foreign_object_fences_and_stops() {
     let mut b = f.create(fast(), 4);
     let foreign = encode_record(&LogRecord::Fence {
         writer_id: "w2".into(),
+        epoch: 1,
     });
     f.mem.put(&keys().log(1, 2), &foreign).unwrap();
     assert_eq!(
@@ -317,6 +319,7 @@ fn seal_start_with_moved_head_fences_before_any_upload() {
         generation: 2,
         manifest: Some(1),
         writer_id: "w2".into(),
+        epoch: 0,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -345,6 +348,7 @@ fn seal_start_accepts_our_own_late_head() {
         generation: 2,
         manifest: Some(1),
         writer_id: "w1".into(),
+        epoch: 0,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
@@ -471,6 +475,7 @@ fn idle_append_with_moved_head_is_fenced_and_writes_nothing() {
         generation: 2,
         manifest: Some(1),
         writer_id: "w2".into(),
+        epoch: 0,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     f.mem.delete(&keys().log(1, 1)).unwrap();
@@ -519,6 +524,7 @@ fn idle_append_with_our_head_proceeds() {
         generation: 3,
         manifest: Some(2),
         writer_id: "w1".into(),
+        epoch: 0,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(
@@ -945,6 +951,7 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
         generation: 1,
         manifest: None,
         writer_id: "w2".into(),
+        epoch: 0,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -1069,6 +1076,7 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
         generation: 1,
         manifest: None,
         writer_id: "w2".into(),
+        epoch: 0,
     };
     f.mem.put(&k.head(), &other.encode()).unwrap();
     let before = f.fault.events().len();
@@ -1146,6 +1154,7 @@ fn head_conflict_fences() {
         generation: 1,
         manifest: None,
         writer_id: "w2".into(),
+        epoch: 0,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -1288,6 +1297,7 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
         generation: 1,
         manifest: None,
         writer_id: "w2".into(),
+        epoch: 0,
     };
     mem.put(&keys().head(), &other.encode()).unwrap();
     let f = b.append_log(vec![op(1)]).unwrap_err();

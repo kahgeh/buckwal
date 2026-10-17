@@ -403,6 +403,9 @@ fn create_new(
         complete: true,
         claimed: true,
         head_etag: String::new(),
+        epoch: 0,
+        claim_id: String::new(),
+        seal_not_before_ms: 0,
     };
     state.write_atomic(dir)?;
     Ok((bucket, state))
@@ -461,7 +464,7 @@ fn last_record_is_foreign(bucket: &Bucket, writer_id: &str, cfg: &EngineConfig) 
         return Ok(false);
     };
     Ok(match decode_record(&obj.body)? {
-        LogRecord::Extents { writer_id: w, .. } | LogRecord::Fence { writer_id: w } => {
+        LogRecord::Extents { writer_id: w, .. } | LogRecord::Fence { writer_id: w, .. } => {
             w != writer_id
         }
     })

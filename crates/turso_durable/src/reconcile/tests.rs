@@ -654,3 +654,104 @@ fn claimed_generation_accepts_old_writer_prefix_only() {
         "{r:?}"
     );
 }
+
+/// Hand-built log images for the fence reading rule.
+mod fence_image {
+    use super::*;
+    use crate::format::Op;
+
+    enum R {
+        Ext(&'static str, u64),
+        Fence(&'static str, u64),
+    }
+
+    /// Image and count of `log/1` holding `recs` (an extents record writes its number at offset
+    /// 0 of its own byte), with the head naming `head_writer`.
+    fn image(recs: &[R], head_writer: &str) -> crate::Result<(Vec<u8>, u64)> {
+        let mem = MemStore::new();
+        for (i, r) in recs.iter().enumerate() {
+            let rec = match r {
+                R::Ext(w, n) => LogRecord::Extents {
+                    writer_id: w.to_string(),
+                    syncs: vec![vec![Op::Write {
+                        off: *n - 1,
+                        bytes: vec![*n as u8],
+                    }]],
+                },
+                R::Fence(w, e) => LogRecord::Fence {
+                    writer_id: w.to_string(),
+                    epoch: *e,
+                },
+            };
+            mem.put(&keys().log(1, i as u64 + 1), &encode_record(&rec))
+                .unwrap();
+        }
+        let head = Head {
+            format: 1,
+            generation: 1,
+            manifest: None,
+            writer_id: head_writer.to_string(),
+            epoch: 0,
+        };
+        generation_image(&mem, &keys(), &head, &cfg())
+    }
+
+    #[test]
+    fn image_accepts_old_records_then_fence_then_fencer_records() {
+        let r = image(
+            &[
+                R::Ext("A", 1),
+                R::Ext("A", 2),
+                R::Fence("B", 1),
+                R::Ext("B", 3),
+            ],
+            "B",
+        )
+        .unwrap();
+        assert_eq!(r, (vec![1, 2, 3], 4));
+    }
+
+    #[test]
+    fn image_accepts_a_fence_with_nothing_after() {
+        let r = image(&[R::Ext("A", 1), R::Ext("A", 2), R::Fence("B", 1)], "B").unwrap();
+        assert_eq!(r, (vec![1, 2], 3));
+    }
+
+    #[test]
+    fn image_accepts_rising_fences() {
+        let r = image(
+            &[
+                R::Ext("A", 1),
+                R::Fence("B", 1),
+                R::Ext("B", 2),
+                R::Fence("C", 2),
+                R::Ext("C", 3),
+            ],
+            "C",
+        )
+        .unwrap();
+        assert_eq!(r, (vec![1, 2, 3], 5));
+        let r = image(&[R::Ext("A", 1), R::Fence("B", 1), R::Fence("B", 1)], "B").unwrap();
+        assert_eq!(r, (vec![1], 3));
+    }
+
+    #[test]
+    fn image_refuses_another_writer_after_a_fence() {
+        let r = image(&[R::Ext("A", 1), R::Fence("B", 1), R::Ext("A", 2)], "B");
+        assert!(
+            matches!(&r, Err(Error::Fenced(m)) if m.contains("seq 3")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn image_refuses_a_fence_epoch_that_does_not_rise() {
+        for second in [R::Fence("C", 2), R::Fence("C", 1)] {
+            let r = image(&[R::Fence("B", 2), second], "C");
+            assert!(
+                matches!(&r, Err(Error::Fenced(m)) if m.contains("seq 2")),
+                "{r:?}"
+            );
+        }
+    }
+}

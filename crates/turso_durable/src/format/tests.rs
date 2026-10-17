@@ -77,6 +77,7 @@ fn record_rejects_flipped_byte() {
 fn fence_record_round_trips() {
     let r = LogRecord::Fence {
         writer_id: "ff00".into(),
+        epoch: 9,
     };
     assert_eq!(decode_record(&encode_record(&r)).unwrap(), r);
 }
@@ -156,20 +157,27 @@ fn head_json_round_trip_and_null_manifest() {
             format: 1,
             generation: 3,
             manifest: Some(2),
-            writer_id: "0123456789abcdef0123456789abcdef".into()
+            writer_id: "0123456789abcdef0123456789abcdef".into(),
+            epoch: 0,
         }
     );
-    assert_eq!(h.encode(), json.to_vec());
+    // A head without `epoch` reads as 0 and is written back with it.
+    let with_epoch = json.strip_suffix(b"}").unwrap().to_vec();
+    assert_eq!(
+        h.encode(),
+        [with_epoch, br#","epoch":0}"#.to_vec()].concat()
+    );
 
     let n = Head {
         format: 1,
         generation: 0,
         manifest: None,
         writer_id: "w".into(),
+        epoch: 0,
     };
     assert_eq!(
         String::from_utf8(n.encode()).unwrap(),
-        r#"{"format":1,"generation":0,"manifest":null,"writer_id":"w"}"#
+        r#"{"format":1,"generation":0,"manifest":null,"writer_id":"w","epoch":0}"#
     );
     assert_eq!(Head::decode(&n.encode()).unwrap(), n);
 
@@ -225,12 +233,15 @@ fn local_state_atomic_write() {
         complete: true,
         claimed: false,
         head_etag: "\"e1\"".into(),
+        epoch: 0,
+        claim_id: String::new(),
+        seal_not_before_ms: 0,
     };
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s.clone()));
     assert_eq!(
         String::from_utf8(s.encode()).unwrap(),
-        r#"{"format":1,"writer_id":"w1","generation":3,"complete":true,"claimed":false,"head_etag":"\"e1\""}"#
+        r#"{"format":1,"writer_id":"w1","generation":3,"complete":true,"claimed":false,"head_etag":"\"e1\"","epoch":0,"claim_id":"","seal_not_before_ms":0}"#
     );
     // A file written before `claimed` and `head_etag` existed: claimed, no ETag.
     let old =
@@ -307,22 +318,6 @@ fn golden_truncate_op() {
         syncs: vec![vec![Op::Truncate { len: 5 }]],
     };
     assert_eq!(encode_record(&r), seal(body));
-}
-
-#[test]
-fn golden_fence_record() {
-    let body = hex::decode(concat!("54444c4f47000001", "02", "02", "7732", "00000000")).unwrap();
-    let r = LogRecord::Fence {
-        writer_id: "w2".into(),
-    };
-    assert_eq!(encode_record(&r), seal(body.clone()));
-    // bytes after the writer id are ignored (sha still verified)
-    let mut ext = hex::decode(concat!("54444c4f47000001", "02", "02", "7732", "deadbeef")).unwrap();
-    assert_eq!(decode_record(&seal(ext.clone())).unwrap(), r);
-    let mut bad = seal(ext.clone());
-    bad[10] ^= 1;
-    assert!(is_corrupt(decode_record(&bad)));
-    ext.clear();
 }
 
 #[test]
@@ -456,8 +451,106 @@ fn json_escapes_decode_and_encode() {
         generation: 0,
         manifest: None,
         writer_id: "q\"\\\u{0}\u{1f}\n\t\u{7f}é😀".into(),
+        epoch: 0,
     };
     let enc = nasty.encode();
     assert!(enc.iter().all(|b| *b >= 0x20));
     assert_eq!(Head::decode(&enc).unwrap(), nasty);
+}
+
+#[test]
+fn head_encodes_epoch_last() {
+    let h = Head {
+        format: 1,
+        generation: 3,
+        manifest: Some(2),
+        writer_id: "ab".into(),
+        epoch: 7,
+    };
+    let want =
+        br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab","epoch":7}"#;
+    assert_eq!(h.encode(), want.to_vec());
+    assert_eq!(Head::decode(want).unwrap(), h);
+}
+
+#[test]
+fn stage2_head_reads_as_epoch_0() {
+    let h = Head::decode(
+        br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab"}"#,
+    )
+    .unwrap();
+    assert_eq!(h.epoch, 0);
+}
+
+#[test]
+fn fence_record_golden_bytes() {
+    let mut body = b"TDLOG\0\0\x01".to_vec();
+    body.push(2);
+    body.extend([2, b'a', b'b']);
+    body.extend(0u32.to_le_bytes());
+    body.extend(5u64.to_le_bytes());
+    let r = LogRecord::Fence {
+        writer_id: "ab".into(),
+        epoch: 5,
+    };
+    assert_eq!(encode_record(&r), seal(body));
+    assert_eq!(decode_record(&encode_record(&r)).unwrap(), r);
+}
+
+fn fence_body(syncs: u32, epoch: Option<u64>, trailing: &[u8]) -> Vec<u8> {
+    let mut body = b"TDLOG\0\0\x01".to_vec();
+    body.extend([2, 2, b'a', b'b']);
+    body.extend(syncs.to_le_bytes());
+    if let Some(e) = epoch {
+        body.extend(e.to_le_bytes());
+    }
+    body.extend(trailing);
+    seal(body)
+}
+
+#[test]
+fn fence_record_with_syncs_is_corrupt() {
+    assert!(is_corrupt(decode_record(&fence_body(1, Some(5), &[]))));
+}
+
+#[test]
+fn fence_record_without_epoch_is_corrupt() {
+    assert!(is_corrupt(decode_record(&fence_body(0, None, &[]))));
+}
+
+#[test]
+fn fence_record_with_trailing_bytes_is_corrupt() {
+    assert!(is_corrupt(decode_record(&fence_body(
+        0,
+        Some(5),
+        &[0xde, 0xad]
+    ))));
+}
+
+#[test]
+fn stage2_local_state_reads_with_defaults() {
+    let s = LocalState::decode(
+        br#"{"format":1,"writer_id":"w","generation":3,"complete":true,"claimed":true,"head_etag":"e"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        (s.epoch, s.claim_id.as_str(), s.seal_not_before_ms),
+        (0, "", 0)
+    );
+    let full = LocalState {
+        format: 1,
+        writer_id: "w".into(),
+        generation: 3,
+        complete: true,
+        claimed: true,
+        head_etag: "e".into(),
+        epoch: 4,
+        claim_id: "c1".into(),
+        seal_not_before_ms: 99,
+    };
+    assert_eq!(
+        String::from_utf8(full.encode()).unwrap(),
+        r#"{"format":1,"writer_id":"w","generation":3,"complete":true,"claimed":true,"head_etag":"e","epoch":4,"claim_id":"c1","seal_not_before_ms":99}"#
+    );
+    assert_eq!(LocalState::decode(&full.encode()).unwrap(), full);
 }

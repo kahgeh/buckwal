@@ -153,9 +153,10 @@ fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
 /// writer's. Each writer's next seq is its own counter and the first `put_if_absent`
 /// collision fences the loser for good, so bucket fencing can only produce "the old writer's
 /// records, then the claimer's" (a claim of a claimed copy adds one more run). A record of
-/// another writer after a record of `head.writer_id`, a writer whose records resume after
-/// another writer's, or any fence record means two writers interleaved (the replay would be
-/// inconsistent): `Fenced`.
+/// another writer after a record of `head.writer_id`, or a writer whose records resume after
+/// another writer's, means two writers interleaved (the replay would be inconsistent): `Fenced`.
+/// A fence record `F(w, k)` ends that rule: after it every Extents record must be by `w`, and a
+/// later fence needs an epoch above `k`, or `k` from the same writer (a resumed claim).
 pub(crate) fn generation_image(
     store: &dyn ObjectStore,
     keys: &Keys,
@@ -191,10 +192,21 @@ fn generation_image_counted(
     // Writers whose run of records has ended; each writer's records are one run.
     let mut ended: Vec<&str> = Vec::new();
     let mut current: Option<&str> = None;
-    for rec in &records {
+    // The latest fence (writer, epoch), once the log holds one.
+    let mut fence: Option<(&str, u64)> = None;
+    for (i, rec) in records.iter().enumerate() {
+        let seq = i + 1;
         match rec {
             LogRecord::Extents { writer_id, syncs } => {
-                if current != Some(writer_id.as_str()) {
+                if let Some((fencer, epoch)) = fence {
+                    if writer_id != fencer {
+                        return Err(Error::Fenced(format!(
+                            "log/{} seq {seq}: a record of writer {writer_id:?} after the \
+                             fence of writer {fencer:?} (epoch {epoch})",
+                            head.generation
+                        )));
+                    }
+                } else if current != Some(writer_id.as_str()) {
                     if let Some(prev) = current {
                         if prev == head.writer_id {
                             return Err(fenced(writer_id));
@@ -214,11 +226,20 @@ fn generation_image_counted(
                     apply_ops(&mut wal, ops)?;
                 }
             }
-            LogRecord::Fence { writer_id } => {
-                return Err(Error::Fenced(format!(
-                    "log/{} holds a fence record of writer {writer_id:?}",
-                    head.generation
-                )));
+            LogRecord::Fence { writer_id, epoch } => {
+                if let Some((prev_writer, prev_epoch)) = fence {
+                    let rises =
+                        *epoch > prev_epoch || (*epoch == prev_epoch && writer_id == prev_writer);
+                    if !rises {
+                        return Err(Error::Fenced(format!(
+                            "log/{} seq {seq}: fence of writer {writer_id:?} (epoch {epoch}) \
+                             does not follow the fence of writer {prev_writer:?} (epoch \
+                             {prev_epoch})",
+                            head.generation
+                        )));
+                    }
+                }
+                fence = Some((writer_id, *epoch));
             }
         }
     }
@@ -343,6 +364,9 @@ fn restore_files(
         // this ETag) under a new writer id.
         claimed: false,
         head_etag: head_obj.etag,
+        epoch: head.epoch,
+        claim_id: String::new(),
+        seal_not_before_ms: 0,
     }
     .write_atomic(dir)?;
     let delta = store.stats().since(&before);
