@@ -69,12 +69,17 @@
 #   takeover (stage3_costs): ms=74, restore_gets=4, restore_lists=1, restore_ms=26,
 #     total_puts=2, total_gets=11, total_lists=4. (Stage 3, run 2: ms=67, 10 GETs, 3 LISTs.)
 #   first writer open of the taken-over directory: open_puts=1, open_gets=9, open_lists=2,
-#     open_ms=18. (Stage 3: 7 GETs, 2 LISTs.) Stage 4's page-1 check GETs the head, the
-#     manifest and page 1 when the directory holds no page 1 (here, the first open after a
-#     takeover): 9 = 6 + 3.
-#   second writer open: open_puts=1, open_gets=6, open_lists=2, open_ms=16.
-#     (Stage 3 measured 7 for both opens; the 6 is one GET less than stage 3, from the
-#     stage-3 final fix wave or later; not itemised.)
+#     open_ms=18. (Stage 3: 7 GETs, 2 LISTs.) The request lines (re-run, appended below as
+#     "Request lines") show the first open starting with get head, get manifest, get page 1
+#     (the page-1 check: the takeover's restore left no page 1 in app.db), then the same
+#     requests as the second open. 9 = 6 + 3.
+#   second writer open: open_puts=1, open_gets=6, open_lists=2, open_ms=16 (17 in the re-run).
+#     Stage 3 measured 7 for both opens. The GET that disappeared is a log GET: compare
+#     results/writer-lease.txt:152-183 (log/13 records 1, 2 and 3: a get of 3, then gets of 1,
+#     2, 3) with the lines below (records 1 and 2: a get of 2, then gets of 1, 2). Stage 3's
+#     directory had been taken over twice (fence_seq 3), this one once (fence_seq 2), so the
+#     generation held one record fewer. It is not page 1 and not the encryption check (pages/..1
+#     is fetched once per open in both stages).
 #   bench itself: p50 1.278 ms, p99 2.278 ms, 678.6 commits/s (stage 3: 1.289 / 2.086, 678.9).
 #   restore of the database after the opens (generation 13, 2 log objects): gets=5, lists=1,
 #     bytes=4747, ms=20.
@@ -350,3 +355,79 @@ close_gets=0
 close_lists=0
 close_deletes=0
 
+
+## Request lines (fix round 1): bench --commits 5000, then stage3_costs takeover, open, open on plain RustFS (prefix t7/req-<pid>, same code)
+## takeover
+generation=13
+epoch=2
+fence_seq=2
+quiet_ms=0
+ms=65
+restore_log_objects=1
+restore_gets=4
+restore_lists=1
+restore_ms=18
+total_puts=2
+total_gets=11
+total_lists=4
+total_deletes=0
+request get t7/req-23788/head
+request get t7/req-23788/manifest/0000000012
+request get t7/req-23788/pages/0000000012/0000000001
+request list t7/req-23788/log/0000000013/
+request get t7/req-23788/log/0000000013/00000000000000000001
+request get t7/req-23788/head
+request put_if_match t7/req-23788/head
+request get t7/req-23788/head
+request get t7/req-23788/manifest/0000000012
+request list t7/req-23788/log/0000000013/
+request put_if_absent t7/req-23788/log/0000000013/00000000000000000002
+request list t7/req-23788/log/0000000013/
+request get t7/req-23788/log/0000000013/00000000000000000001
+request get t7/req-23788/log/0000000013/00000000000000000002
+request list t7/req-23788/log/0000000013/
+request get t7/req-23788/log/0000000013/00000000000000000001
+request get t7/req-23788/log/0000000013/00000000000000000002
+## open 1
+open_ms=16
+generation=13
+open_puts=1
+open_gets=9
+open_lists=2
+open_deletes=0
+request get t7/req-23788/head
+request get t7/req-23788/manifest/0000000012
+request get t7/req-23788/pages/0000000012/0000000001
+request get t7/req-23788/head
+request get t7/req-23788/manifest/0000000012
+request list t7/req-23788/log/0000000013/
+request put_if_match t7/req-23788/head
+request get t7/req-23788/log/0000000013/00000000000000000002
+request list t7/req-23788/log/0000000013/
+request get t7/req-23788/log/0000000013/00000000000000000001
+request get t7/req-23788/log/0000000013/00000000000000000002
+request get t7/req-23788/pages/0000000012/0000000001
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+## open 2
+open_ms=17
+generation=13
+open_puts=1
+open_gets=6
+open_lists=2
+open_deletes=0
+request get t7/req-23788/head
+request get t7/req-23788/manifest/0000000012
+request list t7/req-23788/log/0000000013/
+request put_if_match t7/req-23788/head
+request get t7/req-23788/log/0000000013/00000000000000000002
+request list t7/req-23788/log/0000000013/
+request get t7/req-23788/log/0000000013/00000000000000000001
+request get t7/req-23788/log/0000000013/00000000000000000002
+request get t7/req-23788/pages/0000000012/0000000001
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
