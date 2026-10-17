@@ -1505,6 +1505,12 @@ impl ObjectStore for Interpose {
     fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
         self.mem.delete(key)
     }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.mem.stat(key)
+    }
     fn stats(&self) -> crate::store::StatsSnap {
         self.mem.stats()
     }

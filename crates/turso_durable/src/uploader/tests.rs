@@ -645,6 +645,12 @@ impl ObjectStore for HeadGetsFail {
     fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
         self.inner.delete(key)
     }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(key)
+    }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()
     }

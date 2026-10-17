@@ -282,3 +282,19 @@ fn rustfs_prefix_is_deleted_unless_a_failure_is_kept() {
     );
     assert_eq!(delete_prefix(&s, &kept), Ok(1));
 }
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn stat_reports_etag_and_age() {
+    let s = store();
+    let p = prefix("stat");
+    let k = format!("{p}k");
+    assert!(s.stat(&format!("{p}missing")).unwrap().is_none());
+    let etag = s.put(&k, b"x").unwrap();
+    let st = s.stat(&k).unwrap().unwrap();
+    assert_eq!(st.etag, etag);
+    assert!(st.age < Duration::from_secs(5), "{:?}", st.age);
+    std::thread::sleep(Duration::from_secs(2));
+    let st = s.stat(&k).unwrap().unwrap();
+    assert!(st.age >= Duration::from_secs(1), "{:?}", st.age);
+}

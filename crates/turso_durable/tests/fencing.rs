@@ -367,6 +367,15 @@ impl ObjectStore for SealsBeforeClaim {
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete(key)
     }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<
+        Option<turso_durable::store::ObjectStat>,
+        turso_durable::store::StoreError,
+    > {
+        self.inner.stat(key)
+    }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()
     }

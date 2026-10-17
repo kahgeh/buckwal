@@ -1,7 +1,7 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Generic S3 client: SigV4 over reqwest's blocking client. Endpoint, region, path style
 //! and credentials all come from settings; nothing here is specific to RustFS.
-use super::{CondPut, Object, ObjectStore, StatsSnap, StoreError};
+use super::{CondPut, Object, ObjectStat, ObjectStore, StatsSnap, StoreError};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -215,6 +215,8 @@ pub(crate) fn parse_list(xml: &str) -> ListPage {
 struct Reply {
     status: u16,
     etag: Option<String>,
+    last_modified: Option<String>,
+    date: Option<String>,
     body: Vec<u8>,
 }
 
@@ -324,8 +326,22 @@ impl S3Store {
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let last_modified = header("last-modified");
+        let date = header("date");
         let body = resp.bytes().map_err(net)?.to_vec();
-        Ok(Reply { status, etag, body })
+        Ok(Reply {
+            status,
+            etag,
+            last_modified,
+            date,
+            body,
+        })
     }
 
     /// Creates the bucket; an existing bucket we own is fine.
@@ -360,6 +376,74 @@ fn error_code(body: &[u8]) -> Option<String> {
     between(&body, "<Code>", "</Code>")
         .first()
         .map(|c| c.trim().to_string())
+}
+
+/// Seconds since the epoch of a proleptic Gregorian date (days-from-civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// An HTTP IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`); nothing else, `GMT` only.
+pub(crate) fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: Vec<&str> = s.split(' ').collect();
+    let [dow, day, mon, year, time, tz] = parts[..] else {
+        return None;
+    };
+    if !DAYS.contains(&dow.strip_suffix(',')?) || tz != "GMT" {
+        return None;
+    }
+    let num = |t: &str, len: usize| -> Option<i64> {
+        (t.len() == len && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse().ok())
+            .flatten()
+    };
+    let day = num(day, 2)?;
+    let month = MONTHS.iter().position(|m| *m == mon)? as i64 + 1;
+    let year = num(year, 4)?;
+    let hms: Vec<&str> = time.split(':').collect();
+    let [h, mi, se] = hms[..] else { return None };
+    let (h, mi, se) = (num(h, 2)?, num(mi, 2)?, num(se, 2)?);
+    if !(1..=31).contains(&day) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400 + h * 3600 + mi * 60 + se;
+    u64::try_from(secs)
+        .ok()
+        .map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s))
+}
+
+/// The reply to a HEAD: 404 is a missing key; the age is `Date - Last-Modified`, both from
+/// the store, so the caller's clock does not enter. Either header missing is permanent.
+fn stat_reply(what: &str, r: &Reply) -> Result<Option<ObjectStat>, StoreError> {
+    match r.status {
+        200 => {}
+        404 => return Ok(None),
+        _ => return Err(status_error(what, r)),
+    }
+    let date_of = |name: &str, v: &Option<String>| {
+        let v = v
+            .as_deref()
+            .ok_or_else(|| StoreError::Permanent(format!("{what}: no {name} header")))?;
+        parse_http_date(v)
+            .ok_or_else(|| StoreError::Permanent(format!("{what}: bad {name} header {v:?}")))
+    };
+    let etag = r
+        .etag
+        .clone()
+        .ok_or_else(|| StoreError::Permanent(format!("{what}: no ETag")))?;
+    let modified = date_of("Last-Modified", &r.last_modified)?;
+    let now = date_of("Date", &r.date)?;
+    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+    Ok(Some(ObjectStat { etag, age }))
 }
 
 /// The reply to a conditional PUT (`If-None-Match: *` or `If-Match`).
@@ -432,6 +516,12 @@ impl ObjectStore for S3Store {
         }
     }
 
+    fn stat(&self, key: &str) -> Result<Option<ObjectStat>, StoreError> {
+        let r = self.send("HEAD", key, &[], &[], &[])?;
+        self.gets.fetch_add(1, Relaxed);
+        stat_reply(&format!("HEAD {key}"), &r)
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
@@ -488,8 +578,54 @@ mod tests {
         Reply {
             status,
             etag: etag.map(str::to_string),
+            last_modified: None,
+            date: None,
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn parses_imf_fixdate() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(UNIX_EPOCH + Duration::from_secs(784_111_777))
+        );
+        assert_eq!(
+            parse_http_date("Thu, 01 Jan 1970 00:00:10 GMT"),
+            Some(UNIX_EPOCH + Duration::from_secs(10))
+        );
+        for bad in ["06 Nov 1994", "Sun, 06 Nov 1994 08:49:37 PST", ""] {
+            assert_eq!(parse_http_date(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn stat_age_is_date_minus_last_modified() {
+        let mut r = reply(200, Some("\"e\""), "");
+        r.last_modified = Some("Sun, 06 Nov 1994 08:49:37 GMT".into());
+        r.date = Some("Sun, 06 Nov 1994 08:50:07 GMT".into());
+        let st = stat_reply("HEAD k", &r).unwrap().unwrap();
+        assert_eq!(st.etag, "\"e\"");
+        assert_eq!(st.age, std::time::Duration::from_secs(30));
+        // A clock skew that puts Last-Modified after Date saturates at 0.
+        std::mem::swap(&mut r.last_modified, &mut r.date);
+        assert_eq!(
+            stat_reply("HEAD k", &r).unwrap().unwrap().age,
+            std::time::Duration::ZERO
+        );
+        assert!(stat_reply("HEAD k", &reply(404, None, ""))
+            .unwrap()
+            .is_none());
+        r.date = None;
+        assert!(matches!(
+            stat_reply("HEAD k", &r),
+            Err(StoreError::Permanent(_))
+        ));
+        assert!(matches!(
+            stat_reply("HEAD k", &reply(503, None, "")),
+            Err(StoreError::Transient(_))
+        ));
     }
 
     fn s3_error(code: &str) -> String {

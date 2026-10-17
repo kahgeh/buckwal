@@ -1758,6 +1758,12 @@ impl ObjectStore for LateHeadBeforeRaise {
     fn delete(&self, key: &str) -> std::result::Result<(), crate::store::StoreError> {
         self.inner.delete(key)
     }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(key)
+    }
     fn stats(&self) -> crate::store::StatsSnap {
         self.inner.stats()
     }

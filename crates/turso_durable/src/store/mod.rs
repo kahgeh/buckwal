@@ -17,6 +17,13 @@ pub struct Object {
     pub etag: String,
 }
 
+/// An object's ETag and its age by the store's own clock (not the caller's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStat {
+    pub etag: String,
+    pub age: std::time::Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CondPut {
     Created { etag: String },
@@ -81,6 +88,9 @@ pub trait ObjectStore: Send + Sync {
         etag: &str,
     ) -> std::result::Result<CondPut, StoreError>;
     fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError>;
+    /// The object's ETag and age as the store sees it (`None` for a missing key). Counted
+    /// as a GET.
+    fn stat(&self, key: &str) -> std::result::Result<Option<ObjectStat>, StoreError>;
     /// Every key under `prefix`, sorted ascending.
     fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError>;
     fn delete(&self, key: &str) -> std::result::Result<(), StoreError>;

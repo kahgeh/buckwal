@@ -1,7 +1,7 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Wraps any store and injects put failures on demand, to test that a failed upload is never
 //! acknowledged and that ambiguous (stored, then errored) puts are handled.
-use super::{CondPut, Object, ObjectStore, StatsSnap, StoreError};
+use super::{CondPut, Object, ObjectStat, ObjectStore, StatsSnap, StoreError};
 use std::sync::atomic::{
     AtomicU64,
     Ordering::{Relaxed, SeqCst},
@@ -154,6 +154,14 @@ impl ObjectStore for FaultStore {
             std::thread::sleep(d);
         }
         self.inner.get(key)
+    }
+    fn stat(&self, key: &str) -> Result<Option<ObjectStat>, StoreError> {
+        self.record("stat", key);
+        let d = *self.get_delay.lock().unwrap();
+        if !d.is_zero() && key.contains(self.only_keys.lock().unwrap().as_str()) {
+            std::thread::sleep(d);
+        }
+        self.inner.stat(key)
     }
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         self.record("list", prefix);

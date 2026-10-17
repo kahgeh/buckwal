@@ -86,6 +86,12 @@ impl ObjectStore for GateStore {
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete(key)
     }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(key)
+    }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()
     }
@@ -370,6 +376,12 @@ impl ObjectStore for FlakyGets {
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete(key)
     }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(key)
+    }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()
     }
@@ -624,6 +636,12 @@ impl ObjectStore for ProbeStore {
     }
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete(key)
+    }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(key)
     }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()

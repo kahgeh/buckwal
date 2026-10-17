@@ -1,10 +1,11 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! In-process bucket for tests, with real ETags and conditional semantics.
-use super::{CondPut, Object, ObjectStore, StatsSnap, StoreError};
+use super::{CondPut, Object, ObjectStat, ObjectStore, StatsSnap, StoreError};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Record `status` on the current span's `s3.status`, as `S3Store` records each response's.
 fn status(code: u16) {
@@ -22,6 +23,10 @@ fn cond_status(r: &CondPut) -> u16 {
 #[derive(Default)]
 struct Inner {
     objects: BTreeMap<String, Object>,
+    /// When each key was last written (the real clock, before `clock_offset`).
+    written: BTreeMap<String, Instant>,
+    /// Added to the real clock: the test clock `advance_clock` moves.
+    clock_offset: Duration,
     version: u64,
 }
 
@@ -41,6 +46,11 @@ impl MemStore {
         Self::default()
     }
 
+    /// Move this store's clock forward: every object's `stat` age grows by `by`.
+    pub fn advance_clock(&self, by: Duration) {
+        self.inner.lock().unwrap().clock_offset += by;
+    }
+
     fn count_put(&self, n: usize) {
         self.puts.fetch_add(1, Relaxed);
         self.bytes_up.fetch_add(n as u64, Relaxed);
@@ -50,6 +60,7 @@ impl MemStore {
     fn store(inner: &mut Inner, key: &str, body: &[u8]) -> String {
         inner.version += 1;
         let etag = format!("{}-{}", hex::encode(Sha256::digest(body)), inner.version);
+        inner.written.insert(key.to_string(), Instant::now());
         inner.objects.insert(
             key.to_string(),
             Object {
@@ -105,6 +116,23 @@ impl ObjectStore for MemStore {
         Ok(v)
     }
 
+    fn stat(&self, key: &str) -> Result<Option<ObjectStat>, StoreError> {
+        let st = {
+            let inner = self.inner.lock().unwrap();
+            inner.objects.get(key).map(|o| ObjectStat {
+                etag: o.etag.clone(),
+                age: inner
+                    .written
+                    .get(key)
+                    .map_or(Duration::ZERO, |w| w.elapsed())
+                    + inner.clock_offset,
+            })
+        };
+        self.gets.fetch_add(1, Relaxed);
+        status(if st.is_some() { 200 } else { 404 });
+        Ok(st)
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         let keys: Vec<String> = self
             .inner
@@ -123,7 +151,9 @@ impl ObjectStore for MemStore {
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.deletes.fetch_add(1, Relaxed);
-        self.inner.lock().unwrap().objects.remove(key);
+        let mut inner = self.inner.lock().unwrap();
+        inner.objects.remove(key);
+        inner.written.remove(key);
         status(204);
         Ok(())
     }
@@ -202,5 +232,20 @@ mod tests {
         assert!(s.get("k").unwrap().is_none());
         let st = s.stats();
         assert_eq!((st.gets, st.deletes, st.bytes_down), (3, 1, 3));
+    }
+
+    #[test]
+    fn stat_age_follows_the_clock() {
+        use std::time::Duration;
+        let s = MemStore::new();
+        assert!(s.stat("k").unwrap().is_none());
+        s.put("k", b"abc").unwrap();
+        s.advance_clock(Duration::from_secs(5));
+        let st = s.stat("k").unwrap().unwrap();
+        assert!(st.age >= Duration::from_secs(5), "{:?}", st.age);
+        assert_eq!(st.etag, s.get("k").unwrap().unwrap().etag);
+        // A rewrite starts the age again.
+        s.put("k", b"abd").unwrap();
+        assert!(s.stat("k").unwrap().unwrap().age >= Duration::from_secs(5));
     }
 }

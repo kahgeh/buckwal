@@ -91,7 +91,22 @@ done
   && rec PASS etag_header "every 200 PUT carried ETag (e.g. $E1)" \
   || rec FAIL etag_header "200 PUTs without ETag:[$missing]"
 
-# 5 list_delete (informational)
+# 5 head_dates: HEAD returns ETag equal to the PUT's, plus Last-Modified and Date
+K="$BASE/$PREFIX/hd"
+s3 PUT "$K" "$TMP/hp" --data-binary "head-me" >/dev/null
+EP="$(etag_of "$TMP/hp")"
+hc=$(s3 HEAD "$K" "$TMP/hh" -I)
+EH="$(etag_of "$TMP/hh")"
+LM="$(awk -F': ' 'tolower($1)=="last-modified"{gsub(/\r/,"",$2);print $2}' "$TMP/hh.h")"
+DT="$(awk -F': ' 'tolower($1)=="date"{gsub(/\r/,"",$2);print $2}' "$TMP/hh.h")"
+imf='^[A-Z][a-z][a-z], [0-9][0-9] [A-Z][a-z][a-z] [0-9][0-9][0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] GMT$'
+if [ "$hc" = 200 ] && [ -n "$EP" ] && [ "$EH" = "$EP" ] && echo "$LM" | grep -Eq "$imf" && echo "$DT" | grep -Eq "$imf"; then
+  rec PASS head_dates "head=$hc etag=$EH last_modified=[$LM] date=[$DT]"
+else
+  rec FAIL head_dates "head=$hc put_etag=$EP head_etag=$EH last_modified=[$LM] date=[$DT]"
+fi
+
+# 6 list_delete (informational)
 l=$(s3 GET "$BASE?list-type=2&prefix=$PREFIX/" "$TMP/l")
 nkeys=$(grep -o '<Key>' "$TMP/l" | wc -l | tr -d ' ')
 d=$(s3 DELETE "$BASE/$PREFIX/c1" "$TMP/d")
@@ -99,7 +114,7 @@ d=$(s3 DELETE "$BASE/$PREFIX/c1" "$TMP/d")
   && rec PASS list_delete "list=$l keys=$nkeys delete=$d" 0 \
   || rec FAIL list_delete "list=$l keys=$nkeys delete=$d" 0
 
-# 6 pause (informational)
+# 7 pause (informational)
 if podman pause turso-durable-rustfs >/dev/null 2>&1; then
   pu=ok
 else pu=failed; fi
