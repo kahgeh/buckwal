@@ -82,8 +82,10 @@ enum Lapse {
     /// indices (into the seal's pages) are not uploaded yet, and the head check is owed.
     Remaining {
         rest: Vec<usize>,
-        /// The store answered a request of the round (`Bucket::renew_lease`).
-        progressed: bool,
+        /// The round stored a page (or found one of ours overwritten).
+        stored: bool,
+        /// The store answered a request of the round with a 412 or a stat.
+        answered: bool,
     },
 }
 
@@ -140,6 +142,23 @@ impl SealQuiet {
             .unwrap_or(Duration::ZERO);
         self.at.saturating_duration_since(Instant::now()).max(wall)
     }
+}
+
+/// Whether a round of a seal's requests counts as progress for `Bucket::renew_lease`. One
+/// that stored an object (or found one of ours overwritten) does, and resets `answer_only`.
+/// One whose requests the store only answered with 412s and stats does for at most
+/// `defaults::MAX_ANSWER_ONLY_ROUNDS` rounds in a row: a store that answers 412 forever
+/// would otherwise keep the seal going past its deadline for good.
+fn round_progressed(stored: bool, answered: bool, answer_only: &mut u32) -> bool {
+    if stored {
+        *answer_only = 0;
+        return true;
+    }
+    if answered && *answer_only < crate::config::defaults::MAX_ANSWER_ONLY_ROUNDS {
+        *answer_only += 1;
+        return true;
+    }
+    false
 }
 
 /// `t` in unix ms (0 before the epoch).
@@ -1314,10 +1333,14 @@ impl Bucket {
         // another writer wrote the key fails its condition: a stale writer paused between its
         // lease check and its send cannot overwrite a seal that a new writer published.
         let mut todo: Vec<usize> = (0..pages.len()).collect();
-        while let Lapse::Remaining { rest, progressed } =
-            self.put_pages_until_lapse(start, gen, &pages, &todo)?
+        let mut answer_only = 0;
+        while let Lapse::Remaining {
+            rest,
+            stored,
+            answered,
+        } = self.put_pages_until_lapse(start, gen, &pages, &todo)?
         {
-            self.renew_lease(start, progressed)?;
+            self.renew_lease(start, round_progressed(stored, answered, &mut answer_only))?;
             todo = rest;
         }
 
@@ -1337,16 +1360,21 @@ impl Bucket {
         // The page PUTs, not a head check, came just before: no free attempt (a zero lease
         // checks the head first). The first lapse here always renews: the PUTs before it
         // went out after the last head check, and a seal is stuck only when a lapse follows
-        // its own renewal with no answer from the store, which is what `progressed` marks.
+        // its own renewal with nothing stored, which is what `round_progressed` tells.
         let mut free = false;
-        let progressed = AtomicBool::new(true);
+        let mut first = true;
+        let mut answer_only = 0;
         loop {
-            match self.seal_put(start, &key, &body, &mut free, &progressed)? {
-                Step::Done => break,
-                // A lapse, or our manifest was overwritten (the head check is owed): it renews
-                // the lease or fences this writer.
-                _ => self.renew_lease(start, progressed.swap(false, Relaxed))?,
+            let answered = AtomicBool::new(false);
+            let step = self.seal_put(start, &key, &body, &mut free, &answered)?;
+            if let Step::Done = step {
+                break;
             }
+            // A lapse, or our manifest was overwritten (the head check is owed): it renews the
+            // lease or fences this writer.
+            let stored = std::mem::take(&mut first) || matches!(step, Step::Overwritten);
+            let progressed = round_progressed(stored, answered.into_inner(), &mut answer_only);
+            self.renew_lease(start, progressed)?;
             free = self.lease.is_zero();
         }
 
@@ -1527,8 +1555,8 @@ impl Bucket {
     }
 
     /// `seal_put_step` until the object is stored (`Step::Done`), the lease refuses a request
-    /// (`Step::Lapsed`) or our own object was overwritten (`Step::Overwritten`). Every
-    /// definite answer of the store (a stored object, a 412, a stat) sets `answered`.
+    /// (`Step::Lapsed`) or our own object was overwritten (`Step::Overwritten`). A 412 or a
+    /// stat on the way (`Step::Again`) sets `answered`.
     fn seal_put(
         &self,
         start: Instant,
@@ -1539,12 +1567,10 @@ impl Bucket {
     ) -> Result<Step> {
         loop {
             let step = self.seal_put_step(start, key, body, free)?;
-            if !matches!(step, Step::Lapsed) {
-                answered.store(true, Relaxed);
-            }
             if !matches!(step, Step::Again) {
                 return Ok(step);
             }
+            answered.store(true, Relaxed);
         }
     }
 
@@ -1574,15 +1600,16 @@ impl Bucket {
 
     /// The lease lapsed during a seal, or our own object was overwritten: GET the head
     /// (`verify_head`), which renews it or fences this writer. `progressed` says whether the
-    /// store answered any request (a stored object, a 412, a stat) since the last head check.
-    /// A lapse with none (the head check itself outlasted the lease) after the call's deadline
-    /// ends the seal with `Timeout` instead, or the seal would read the head forever.
+    /// round since the last head check counts as progress (`round_progressed`). A lapse with
+    /// none (the head check itself outlasted the lease, or the store only answered 412s and
+    /// stats for `MAX_ANSWER_ONLY_ROUNDS` rounds) after the call's deadline ends the seal with
+    /// `Timeout` instead, or the seal would go on forever.
     fn renew_lease(&mut self, start: Instant, progressed: bool) -> Result<()> {
         let elapsed = start.elapsed();
         if !progressed && elapsed >= self.retry.deadline {
             return Err(Error::Timeout(format!(
-                "seal of generation {}: no PUT went out inside the lease ({:?}) since the last \
-                 head check, {elapsed:?} into the seal",
+                "seal of generation {}: no object stored inside the lease ({:?}) since the \
+                 last head check, {elapsed:?} into the seal",
                 self.head.generation, self.lease
             )));
         }
@@ -1604,6 +1631,7 @@ impl Bucket {
         let failed: Mutex<Option<Error>> = Mutex::new(None);
         let lapsed = AtomicBool::new(false);
         let answered = AtomicBool::new(false);
+        let overwritten = AtomicBool::new(false);
         let refused: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let workers = self.concurrency.min(todo.len());
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -1624,7 +1652,10 @@ impl Bucket {
                             Ok(Step::Done) => {
                                 self.counters.page_puts.fetch_add(1, Relaxed);
                             }
-                            Ok(_) => {
+                            Ok(step) => {
+                                if let Step::Overwritten = step {
+                                    overwritten.store(true, Relaxed);
+                                }
                                 refused.lock().unwrap().push(i);
                                 lapsed.store(true, Relaxed);
                                 return;
@@ -1649,8 +1680,9 @@ impl Bucket {
         rest.extend_from_slice(&todo[next.into_inner().min(todo.len())..]);
         rest.sort_unstable();
         Ok(Lapse::Remaining {
+            stored: overwritten.into_inner() || rest.len() < todo.len(),
+            answered: answered.into_inner(),
             rest,
-            progressed: answered.into_inner(),
         })
     }
 

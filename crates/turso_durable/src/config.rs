@@ -31,6 +31,10 @@ pub mod defaults {
     /// How many log positions a takeover's fence record may step over (positions an old
     /// writer still running took first) before the takeover gives up with `Timeout`. Fixed.
     pub const FENCE_MAX_STEPS: u64 = 64;
+    /// How many rounds in a row of a seal's page or manifest requests that the store answered
+    /// (412s, stats) without storing anything count as progress, letting the seal go on past
+    /// its retry deadline. A round that stores an object resets it. Fixed.
+    pub const MAX_ANSWER_ONLY_ROUNDS: u32 = 3;
     /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
     /// A writer runs GC itself (`DURABLE_GC_AFTER_SEAL`): at open, after each seal and when

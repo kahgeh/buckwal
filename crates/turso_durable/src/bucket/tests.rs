@@ -2387,3 +2387,98 @@ fn residual_content_equal_etag_lets_a_stale_put_through() {
     );
     assert_eq!(f.stored_head().writer_id, "w2");
 }
+
+/// A store over a `MemStore` that answers every PUT of `key` with a 412 and changes that key's
+/// object (so its ETag) each time: a seal's chain for it never ends on its own.
+struct ForeverPreconditionFailed {
+    mem: Arc<MemStore>,
+    key: String,
+    n: AtomicU64,
+}
+
+impl ForeverPreconditionFailed {
+    fn refuse(&self) -> std::result::Result<CondPut, StoreError> {
+        let n = self.n.fetch_add(1, Relaxed);
+        self.mem.put(&self.key, &n.to_le_bytes())?;
+        Ok(CondPut::PreconditionFailed)
+    }
+}
+
+impl ObjectStore for ForeverPreconditionFailed {
+    fn put(&self, key: &str, body: &[u8]) -> std::result::Result<String, StoreError> {
+        self.mem.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> std::result::Result<CondPut, StoreError> {
+        if key == self.key {
+            return self.refuse();
+        }
+        self.mem.put_if_absent(key, body)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> std::result::Result<CondPut, StoreError> {
+        if key == self.key {
+            return self.refuse();
+        }
+        self.mem.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError> {
+        self.mem.get(key)
+    }
+    fn stat(&self, key: &str) -> std::result::Result<Option<crate::store::ObjectStat>, StoreError> {
+        self.mem.stat(key)
+    }
+    fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError> {
+        self.mem.list(prefix)
+    }
+    fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+        self.mem.delete(key)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.mem.stats()
+    }
+}
+
+/// A store that answers every PUT of one page with a 412 (and keeps changing its ETag): the
+/// 412s and stats are answers, but no round stores anything. The seal must still end with
+/// `Timeout` within about the retry deadline plus a few leases, without fencing, and keep
+/// the page uploaded before it. A watchdog fails the test instead of letting it hang.
+#[test]
+fn a_seal_against_a_store_that_answers_412_forever_times_out() {
+    let mem = Arc::new(MemStore::new());
+    let store = Arc::new(ForeverPreconditionFailed {
+        mem: mem.clone(),
+        key: keys().page(1, 2),
+        n: AtomicU64::new(0),
+    });
+    let deadline = Duration::from_millis(300);
+    let lease = Duration::from_millis(50);
+    let retry = RetryPolicy { deadline, ..fast() };
+    let mut b = Bucket::create(store, keys(), retry, 1, "w1".into()).unwrap();
+    b.set_lease(lease);
+    b.append_log(syncs(1)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        let r = b.seal_generation(pages_of(2, 9), 4096, 2);
+        let _ = tx.send((r, t.elapsed(), b.degraded()));
+    });
+    let Ok((r, elapsed, degraded)) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("the seal did not end within 10 s: unbounded against a store answering 412");
+    };
+    assert!(
+        matches!(&r, Err(Error::Timeout(m)) if m.contains("no object stored")),
+        "{r:?}"
+    );
+    let bound = deadline + 4 * lease + Duration::from_millis(500);
+    assert!(elapsed < bound, "{elapsed:?} is past {bound:?}");
+    assert!(!degraded, "not fenced, nothing owed");
+    let k = keys();
+    assert_eq!(mem.get(&k.page(1, 1)).unwrap().unwrap().body, vec![9; 16]);
+    assert!(mem.get(&k.manifest(1)).unwrap().is_none());
+    let head = Head::decode(&mem.get(&k.head()).unwrap().unwrap().body).unwrap();
+    assert_eq!(head.generation, 1);
+}
