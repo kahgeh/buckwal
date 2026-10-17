@@ -25,7 +25,7 @@ const WINDOW: &str = "window 20ms 64 1MiB";
 /// Settings a test may set; every child gets them removed first, so the caller's
 /// environment never leaks into a test. `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not
 /// here: `scripts/test.sh` sets them so the children export under its run id.
-const OPTIONAL: [&str; 7] = [
+const OPTIONAL: [&str; 10] = [
     "DURABLE_PREFIX",
     "DURABLE_RETRY_DEADLINE_MS",
     "DURABLE_REQUEST_TIMEOUT_MS",
@@ -33,6 +33,9 @@ const OPTIONAL: [&str; 7] = [
     "DURABLE_TRIM_GRACE_SECS",
     "DURABLE_PREFETCH",
     "DURABLE_BATCHING",
+    "DURABLE_MAINTENANCE_LOG_OBJECTS",
+    "DURABLE_MAINTENANCE_WAL_MIB",
+    "DURABLE_MAINTENANCE_GATE_WAIT_MS",
 ];
 
 /// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`.
@@ -345,11 +348,14 @@ impl Soak {
     }
 
     /// Read lines until `done` holds (checked after each line), failing on EOF or after
-    /// `WAIT`.
+    /// `WAIT` (also while the soak keeps printing lines).
     fn wait_for(&mut self, what: &str, mut done: impl FnMut(&Soak) -> bool) {
         let deadline = Instant::now() + WAIT;
         while !done(self) {
             let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                panic!("soak: no {what} within {WAIT:?}\n{}", self.tail());
+            }
             match self.rx.recv_timeout(left) {
                 Ok(stamped) => self.push(stamped),
                 Err(RecvTimeoutError::Timeout) => {
@@ -362,8 +368,28 @@ impl Soak {
         }
     }
 
+    /// Wait for one more line starting with `prefix` than the soak has printed so far.
+    /// Each line is looked at once, so a long run stays linear.
+    fn wait_prefixed(&mut self, prefix: &str) {
+        let mut seen = self.lines.len();
+        self.wait_for(prefix, |s| {
+            let fresh = s.lines[seen..].iter().any(|l| l.starts_with(prefix));
+            seen = s.lines.len();
+            fresh
+        });
+    }
+
     fn wait_acks(&mut self, n: usize) {
-        self.wait_for(&format!("{n} acks"), |s| s.acks() >= n);
+        // Counted as lines arrive, so a long run stays linear.
+        let (mut seen, mut acks) = (0, 0);
+        self.wait_for(&format!("{n} acks"), |s| {
+            acks += s.lines[seen..]
+                .iter()
+                .filter(|l| l.starts_with("ack "))
+                .count();
+            seen = s.lines.len();
+            acks >= n
+        });
     }
 
     /// Ack lines the reader thread received at or after `t` (`before` = false), or before it.
@@ -770,6 +796,144 @@ fn crash_during_seal_upload() {
             v.acked, v.restored
         );
     }
+}
+
+/// The soak arguments of the maintenance tests: sustained Window commits from eight
+/// connections, under which the engine never restarts the WAL by itself.
+const MAINTENANCE_ARGS: [&str; 4] = ["--connections", "8", "--batching", "window 1ms 64 1MiB"];
+
+/// The maintenance threshold of the maintenance tests (`DURABLE_MAINTENANCE_LOG_OBJECTS`).
+const MAINTENANCE_LOG_OBJECTS: usize = 200;
+
+fn is_maintenance_end(l: &str) -> bool {
+    l.starts_with("event maintenance-finished ") || l.starts_with("event maintenance-skipped ")
+}
+
+/// Sustained Window load (8 connections, `window 1ms`, at least 3000 acks). Without
+/// maintenance the generation never ends (the "before" run reports its seals and restore
+/// GETs, and asserts only that every ack restores). With it (threshold 200), maintenance
+/// seals during the load, and a restore right after a maintenance seal reads at most
+/// 200 + 4 objects. Both: every acked id restores, integrity ok, the log contiguous.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn maintenance_bounds_generations_under_window_load() {
+    let acks = 3000;
+    for on in [false, true] {
+        let name = format!(
+            "maintenance_bounds_generations_{}",
+            if on { "on" } else { "off" }
+        );
+        let ctx = if on {
+            Ctx::new(&name).set(
+                "DURABLE_MAINTENANCE_LOG_OBJECTS",
+                &MAINTENANCE_LOG_OBJECTS.to_string(),
+            )
+        } else {
+            Ctx::new(&name)
+                .set("DURABLE_MAINTENANCE_LOG_OBJECTS", "0")
+                .set("DURABLE_MAINTENANCE_WAL_MIB", "0")
+        };
+        let dir = ctx.dir("db");
+        let mut soak = Soak::spawn(&ctx, &dir, &MAINTENANCE_ARGS);
+        soak.wait_acks(acks);
+        if on {
+            // Kill right after a maintenance seal: the restore then reads the new
+            // generation, which a run seals again once it holds 200 objects.
+            soak.wait_prefixed("event maintenance-finished ");
+        }
+        soak.kill();
+        assert!(soak.errors().is_empty(), "{name}: {:?}", soak.errors());
+        let seals = soak.count("event seal-finished");
+        let finished = soak
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("event maintenance-finished "))
+            .count();
+        let runs = soak
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("event maintenance-started "))
+            .count();
+        let head = ctx.head();
+        let log_objects = ctx.assert_log_contiguous(head.generation);
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        let gets = field(&v.restored, "gets");
+        eprintln!(
+            "{name}: acked={} seals={seals} maintenance_runs={runs} \
+             maintenance_finished={finished} generation={} log_objects={log_objects} {}",
+            v.acked, head.generation, v.restored
+        );
+        if on {
+            assert!(
+                finished >= 1,
+                "{name}: no maintenance seal\n{}",
+                soak.tail()
+            );
+            assert!(
+                gets <= MAINTENANCE_LOG_OBJECTS + 4,
+                "{name}: the restore read {gets} objects: {}",
+                v.restored
+            );
+        } else {
+            assert_eq!(runs, 0, "{name}: maintenance is off");
+        }
+    }
+}
+
+/// A crash in the middle of a maintenance seal (its page PUTs delayed 200 ms each): killed
+/// after `event maintenance-started` and the seal's `event seal-started`, before the run
+/// ends. Every acked id restores, integrity ok, the log contiguous.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn crash_during_maintenance_checkpoint_restores_every_ack() {
+    let ctx = Ctx::new("crash_during_maintenance_checkpoint").set(
+        "DURABLE_MAINTENANCE_LOG_OBJECTS",
+        &MAINTENANCE_LOG_OBJECTS.to_string(),
+    );
+    let dir = ctx.dir("db");
+    let mut args = MAINTENANCE_ARGS.to_vec();
+    args.extend(["--page-put-delay-ms", "200"]);
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    // A maintenance run whose seal has started and that has not ended yet; each line is
+    // looked at once.
+    let (mut seen, mut run, mut sealing) = (0, None, false);
+    soak.wait_for("a maintenance seal in flight", |s| {
+        for (i, l) in s.lines.iter().enumerate().skip(seen) {
+            if l.starts_with("event maintenance-started ") {
+                (run, sealing) = (Some(i), false);
+            } else if is_maintenance_end(l) {
+                (run, sealing) = (None, false);
+            } else if l == "event seal-started" && run.is_some() {
+                sealing = true;
+            }
+        }
+        seen = s.lines.len();
+        sealing
+    });
+    let started = run.unwrap();
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    assert!(
+        soak.find(started, is_maintenance_end).is_none(),
+        "the run ended before the kill\n{}",
+        soak.tail()
+    );
+    let head = ctx.head();
+    let log_objects = ctx.assert_log_contiguous(head.generation);
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    eprintln!(
+        "crash_during_maintenance_checkpoint: killed in maintenance run {}: acked={} \
+         generation={} log_objects={log_objects} {}",
+        soak.lines
+            .iter()
+            .filter(|l| l.starts_with("event maintenance-started "))
+            .count(),
+        v.acked,
+        head.generation,
+        v.restored
+    );
 }
 
 /// The soak arguments of the batched variant of a test.

@@ -11,6 +11,55 @@ use turso_durable::{Database, Event, UploadStats, Value};
 #[derive(Default)]
 struct Counters {
     seals: Mutex<Vec<(u64, Option<Duration>)>>,
+    maintenance: Maintenance,
+}
+
+/// The maintenance checkpoint's runs, from its events.
+#[derive(Default)]
+struct Maintenance {
+    /// `MaintenanceStarted`, `MaintenanceFinished` (sealed), `MaintenanceSkipped`.
+    counts: Mutex<(u64, u64, u64)>,
+    /// The longest `gate_wait` of a run that sealed.
+    gate_wait_max: Mutex<Duration>,
+    /// The highest log seq seen: the most log objects a generation held, which a restore
+    /// of it would read.
+    log_objects_max: AtomicU64,
+}
+
+impl Maintenance {
+    fn record(&self, e: &Event) {
+        let mut c = self.counts.lock().unwrap();
+        match e {
+            Event::LogUploaded { seq, .. } => {
+                self.log_objects_max.fetch_max(*seq, SeqCst);
+            }
+            Event::MaintenanceStarted { .. } => c.0 += 1,
+            Event::MaintenanceFinished { gate_wait, .. } => {
+                c.1 += 1;
+                let mut m = self.gate_wait_max.lock().unwrap();
+                *m = (*m).max(*gate_wait);
+            }
+            Event::MaintenanceSkipped { .. } => c.2 += 1,
+            _ => {}
+        }
+    }
+
+    fn log_objects_max(&self) -> u64 {
+        self.log_objects_max.load(SeqCst)
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let (runs, sealed, skipped) = *self.counts.lock().unwrap();
+        vec![
+            format!("maintenance_runs={runs}"),
+            format!("maintenance_sealed={sealed}"),
+            format!("maintenance_skipped={skipped}"),
+            format!(
+                "maintenance_gate_wait_max_ms={}",
+                ms(*self.gate_wait_max.lock().unwrap())
+            ),
+        ]
+    }
 }
 
 /// PUTs the store saw whose key contains `needle`.
@@ -98,7 +147,7 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
                 last.1 = Some(*elapsed);
             }
         }
-        _ => {}
+        e => c.maintenance.record(e),
     }));
     let fault = Arc::new(FaultStore::new(s3_store(&cfg)?));
     let db = turso_durable::open_with_store(cfg, fault.clone()).map_err(err)?;
@@ -131,6 +180,8 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
         lat.extend(r?);
     }
     let stats = since(&before, &db.upload_stats());
+    // Before the close-time seal.
+    let log_objects_max = counters.maintenance.log_objects_max();
 
     db.close().map_err(err)?;
     // The seal at close uploads pages, so count them after it.
@@ -158,6 +209,8 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
     say(&format!("bucket_puts={}", puts(&fault, "")));
     say(&format!("page_puts={page_puts}"));
     say(&format!("seals={}", seals.len()));
+    say_all("", &counters.maintenance.lines());
+    say(&format!("generation_log_objects_max={log_objects_max}"));
     for (i, (pages, el)) in seals.iter().enumerate() {
         let t = el.map(ms).unwrap_or_else(|| "unfinished".into());
         say(&format!(
@@ -172,6 +225,65 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_figures_count_runs_seals_skips_and_the_longest_gate_wait() {
+        let m = Maintenance::default();
+        assert_eq!(
+            m.lines(),
+            vec![
+                "maintenance_runs=0",
+                "maintenance_sealed=0",
+                "maintenance_skipped=0",
+                "maintenance_gate_wait_max_ms=0.000",
+            ]
+        );
+        let started = Event::MaintenanceStarted {
+            generation: 1,
+            log_objects: 1000,
+            wal_bytes: 0,
+        };
+        let finished = |gate_ms: u64| Event::MaintenanceFinished {
+            generation: 1,
+            gate_wait: Duration::from_millis(gate_ms),
+            elapsed: Duration::from_millis(100),
+        };
+        let skipped = Event::MaintenanceSkipped {
+            generation: 2,
+            reason: "busy".into(),
+        };
+        let uploaded = |seq: u64| Event::LogUploaded {
+            generation: 1,
+            seq,
+            bytes: 10,
+            commits: vec![seq],
+        };
+        assert_eq!(m.log_objects_max(), 0);
+        for e in [
+            &uploaded(5),
+            &uploaded(9),
+            &uploaded(1),
+            &started,
+            &finished(7),
+            &started,
+            &skipped,
+            &started,
+            &finished(42),
+            &Event::BatchWaiting { commits: 1 },
+        ] {
+            m.record(e);
+        }
+        assert_eq!(
+            m.lines(),
+            vec![
+                "maintenance_runs=3",
+                "maintenance_sealed=2",
+                "maintenance_skipped=1",
+                "maintenance_gate_wait_max_ms=42.000",
+            ]
+        );
+        assert_eq!(m.log_objects_max(), 9, "the highest log seq seen");
+    }
 
     #[test]
     fn since_subtracts_counters_and_keeps_ack_waits() {

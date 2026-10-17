@@ -2,7 +2,7 @@
 //! With `--connections N`, N threads each commit on their own connection; thread `i` commits
 //! ids `start + i + k·N`.
 use crate::args::{self, Checkpoint, SoakArgs};
-use crate::{config, err, say, say_all, stats_lines, store, CliResult};
+use crate::{config, err, ms, say, say_all, stats_lines, store, CliResult};
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
@@ -26,6 +26,29 @@ fn commit_list(commits: &[u64]) -> String {
     }
     let list: Vec<String> = commits.iter().map(u64::to_string).collect();
     list.join(",")
+}
+
+/// The `event maintenance-…` line for a maintenance event (`None` for any other event).
+fn maintenance_line(e: &Event) -> Option<String> {
+    Some(match e {
+        Event::MaintenanceStarted {
+            log_objects,
+            wal_bytes,
+            ..
+        } => format!("event maintenance-started log_objects={log_objects} wal_bytes={wal_bytes}"),
+        Event::MaintenanceFinished {
+            gate_wait, elapsed, ..
+        } => format!(
+            "event maintenance-finished gate_wait_ms={} ms={}",
+            ms(*gate_wait),
+            ms(*elapsed)
+        ),
+        Event::MaintenanceSkipped { reason, .. } => format!(
+            "event maintenance-skipped {}",
+            reason.replace(['\n', '\r'], " ")
+        ),
+        _ => return None,
+    })
 }
 
 /// The open database and one connection per thread.
@@ -88,6 +111,11 @@ impl Soak<'_> {
             }
             Event::LogUploaded { commits, .. } if events => {
                 say(&format!("event log-uploaded {}", commit_list(commits)))
+            }
+            e if events => {
+                if let Some(line) = maintenance_line(e) {
+                    say(&line);
+                }
             }
             _ => {}
         }));
@@ -300,4 +328,48 @@ pub fn run(args: &SoakArgs) -> CliResult<()> {
             .map_err(err)?;
     }
     pool.db.close().map_err(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_events_print_one_line_each() {
+        let g = 3;
+        let started = Event::MaintenanceStarted {
+            generation: g,
+            log_objects: 1000,
+            wal_bytes: 4096,
+        };
+        let finished = Event::MaintenanceFinished {
+            generation: g,
+            gate_wait: Duration::from_micros(12_345),
+            elapsed: Duration::from_micros(250_500),
+        };
+        let skipped = |reason: &str| Event::MaintenanceSkipped {
+            generation: g,
+            reason: reason.into(),
+        };
+        let lines: Vec<Option<String>> = [
+            started,
+            finished,
+            skipped("gate_timeout"),
+            skipped("error: two\nlines"),
+            Event::BatchWaiting { commits: 1 },
+        ]
+        .iter()
+        .map(maintenance_line)
+        .collect();
+        assert_eq!(
+            lines,
+            vec![
+                Some("event maintenance-started log_objects=1000 wal_bytes=4096".into()),
+                Some("event maintenance-finished gate_wait_ms=12.345 ms=250.500".into()),
+                Some("event maintenance-skipped gate_timeout".into()),
+                Some("event maintenance-skipped error: two lines".into()),
+                None,
+            ]
+        );
+    }
 }
