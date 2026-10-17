@@ -1390,11 +1390,12 @@ impl Bucket {
             free = self.lease.is_zero();
         }
 
-        // The head PUT is lease-checked like every page and manifest PUT: past the lease, GET
-        // the head first (renewing the lease, or fencing this writer). A head landing long
-        // after the lease would let GC (in any process) trim at once what the previous head
-        // referenced, while a restore or lazy read of that head may still be reading it. This
-        // narrows the gap to a pause between this check and the send (README, Guarantees).
+        // Past the lease, GET the head before the head PUT (renewing the lease, or fencing this
+        // writer). It costs one GET and does not stop a late head: a moved head already gets a
+        // 412 from the `If-Match` below, and an unchanged one passes this check. So a writer
+        // paused anywhere between its manifest landing and the head PUT's send can still
+        // publish its head late, and GC (in any process) may then at once trim what the
+        // replaced head referenced (README, Guarantees, GC).
         self.check_lease(start)?;
         let head = self.sealed_head();
         // From the first head attempt until a definite answer, the head may be published.

@@ -12,9 +12,9 @@
 //!   `durable.bytes`, `durable.seq`, `durable.retries`, `s3.status`) (`restore.rs`);
 //! - `durable.takeover` (`durable.generation`, `durable.epoch`, `durable.seq` (the fence's),
 //!   `durable.retries`, `s3.status`, `durable.outcome`), around a takeover's head write and
-//!   fence, or around the fence of a takeover an `open` resumes (`db.rs`), and `durable.fence` (`durable.generation`, `durable.seq`,
-//!   `durable.epoch`, `durable.retries`, `s3.status`) around each fence record
-//!   (`bucket.rs`).
+//!   fence, or around the fence of a takeover an `open` resumes (`db.rs`), and
+//!   `durable.fence` (`durable.generation`, `durable.seq`, `durable.epoch`,
+//!   `durable.retries`, `s3.status`) around each fence record (`bucket.rs`).
 //!
 //! Log events have the target `turso_durable` exactly.
 //!

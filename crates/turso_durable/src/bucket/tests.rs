@@ -584,11 +584,10 @@ fn seal_renews_the_lease_between_page_puts() {
     assert_eq!(f.stored_head().generation, 2);
 }
 
-/// M1: the seal's head PUT is lease-checked too. With a 200 ms lease and the manifest PUT
-/// taking 300 ms, the lease has lapsed by the time the head goes out: the seal GETs the head
-/// first (renewing the lease, or fencing this writer) and only then PUTs it. Without the
-/// check, a writer paused between its manifest and head PUTs could land its head late, after
-/// GC had trimmed what the previous head referenced.
+/// The order of a seal's last requests when the lease lapses before its head PUT: with a
+/// 200 ms lease and the manifest PUT taking 300 ms, the seal GETs the head after the manifest
+/// PUT and only then PUTs the head. It pins request order only: the check does not stop a
+/// late head (`Bucket::seal`).
 #[test]
 fn a_lapsed_lease_before_the_head_put_gets_the_head_first() {
     let f = Fixture::new();
