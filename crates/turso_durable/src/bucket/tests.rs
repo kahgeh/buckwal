@@ -2046,8 +2046,8 @@ fn raise_finding_the_pending_seal_head_reports_it_published() {
 }
 
 /// What a takeover `Timeout` must say: the retry is an open of the directory.
-const RESUME: &str =
-    "open this directory to resume the takeover (`open`, or `turso-durable sql --claim --dir DIR`)";
+const RESUME: &str = "open this directory to resume the takeover (`open`, or `turso-durable sql \
+     --claim --dir DIR 'SELECT 1'`)";
 
 /// The head moved under the takeover's head write and the deadline has passed: `Timeout`,
 /// with the same advice as the fence's.

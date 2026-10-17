@@ -57,7 +57,9 @@
 # - lease: a commit right after another: 1 PUT, 0 GETs; a commit after 31 s: 1 PUT + 1 GET
 #   (get head), exactly one extra head GET.
 # - gc: defaults -> outcome=too_young, 6 ms; small settings -> trimmed_against=13
-#   deleted=5095 ms=7035; again -> deleted=0 ms=165; restore + verify ok, 5000 rows.
+#   deleted=5095 ms=7035; again -> deleted=0 ms=165; then a fresh restore passed verify
+#   (integrity check only), and sql on the writer's own directory <T>/took counted 5000 rows
+#   in bench (and 3 in lease_cost).
 # - bench: p50/p99 1.289/2.086 ms, 678.9 commits/s, bucket_puts=6772, page_puts=1720, in-run
 #   seals 44.1-54.4 ms for 170-172 pages (run 1: 1.204/1.762 ms, 723.7/s, 43.7-50.4 ms).
 

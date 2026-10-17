@@ -258,8 +258,8 @@ fn retry_rest<T>(
 /// What a takeover's `Timeout` advises: the claim id is persisted (and the head may already
 /// name it), so the next open of the directory resumes the takeover; `takeover` itself
 /// refuses a directory that holds one.
-const RESUME_TAKEOVER: &str =
-    "open this directory to resume the takeover (`open`, or `turso-durable sql --claim --dir DIR`)";
+const RESUME_TAKEOVER: &str = "open this directory to resume the takeover (`open`, or \
+     `turso-durable sql --claim --dir DIR 'SELECT 1'`)";
 
 /// What `take_over` tells a restored directory whose generation is no longer the head's.
 pub(crate) const RESTORE_AGAIN: &str =
