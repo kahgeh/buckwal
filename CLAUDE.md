@@ -21,5 +21,5 @@ Rust library `turso_durable` (crates/turso_durable) plus CLI `turso-durable` (cr
 
 - Before adding, upgrading or fetching any crate, run the `rust-supply-chain-auditor` subagent and wait for approval.
 - Cargo.lock is the audited lock (see README, Dependency audits). Any change to it needs a re-audit.
-- turso_core is `default-features = false, features = ["fs", "json", "uuid"]`; never enable "encryption".
+- turso_core is `default-features = false, features = ["fs", "json", "uuid", "encryption"]` (audit row 3). Never enable reqwest's `rustls`, `default-tls` or `native-tls` features (aws-lc/openssl); rustls is ring only.
 - Never build with `--cfg antithesis`. Re-audit before targeting wasm.

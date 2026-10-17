@@ -60,4 +60,16 @@ mod tests {
         let rows = stmt.run_collect_rows().expect("rows");
         assert_eq!(rows, vec![vec![Value::Numeric(Numeric::Integer(1))]]);
     }
+
+    #[test]
+    fn encryption_feature_is_compiled_in() {
+        use turso_core::{CipherMode, EncryptionContext, EncryptionKey};
+        let key = EncryptionKey::new_256([7; 32]);
+        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, 4096).unwrap();
+        let mut page = vec![0u8; 4096];
+        page[..6].copy_from_slice(b"marker"); // reserved tail stays zero
+        let enc = ctx.encrypt_page(&page, 2).expect("encryption compiled in");
+        assert!(!enc.windows(6).any(|w| w == b"marker"));
+        assert_eq!(ctx.decrypt_page(&enc, 2).unwrap(), page);
+    }
 }

@@ -247,6 +247,8 @@ impl S3Store {
                 )))
             }
         }
+        // reqwest's rustls backend panics at build() without a process crypto provider; a host app's earlier install wins.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::blocking::Client::builder()
             .timeout(cfg.request_timeout)
             .build()

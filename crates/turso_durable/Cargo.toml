@@ -7,6 +7,7 @@ edition.workspace = true
 turso_core.workspace = true
 turso_parser.workspace = true
 reqwest.workspace = true
+rustls = { workspace = true }
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
