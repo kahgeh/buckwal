@@ -1225,8 +1225,8 @@ What the figures show:
   bigger generation makes a longer seal (467 ms for 2057 pages in window 10ms round a, whose
   slowest commit, 528 ms, was still inside the no-maintenance runs'
   398-566 ms; in two
-  earlier rounds of the same code before bench retried busy commits, raw output in the Task
-  13 report, the slowest window 10ms commit was 562-615 ms with maintenance against 239-282 ms
+  earlier rounds of the same code before bench retried busy commits (Window runs had no
+  busy refusals; their raw output is not in this file), the slowest window 10ms commit was 562-615 ms with maintenance against 239-282 ms
   without).
 - Under Off, the defaults ran at most once per 6000 commits (generation_log_objects_max
   999-1009): p99 4.60 / 2.23 ms on against 3.29 / 2.88 ms off. Every Off run's slowest commit
