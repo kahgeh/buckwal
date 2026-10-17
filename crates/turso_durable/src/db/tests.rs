@@ -3185,3 +3185,75 @@ fn encrypted_damaged_page_fails_authentication() {
         r => panic!("read a damaged page: {r:?}"),
     }
 }
+
+/// A takeover whose key does not fit the database is refused before its claim: the bucket is
+/// unchanged, the directory holds no database, and the running writer keeps committing.
+fn refused_takeover(store: &Arc<MemStore>, cfg: impl Fn(&Path) -> Config) -> String {
+    let before = etags(store);
+    let t = tempdir();
+    let dir = fresh(&t);
+    let m = encryption_err(crate::takeover_with_store(cfg(&dir), store.clone()));
+    assert_eq!(
+        etags(store),
+        before,
+        "the refused takeover wrote to the bucket"
+    );
+    no_database_files(&dir);
+    m
+}
+
+#[test]
+fn takeover_with_a_mismatched_key_is_refused_before_the_claim() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    // The running writer, nothing committed in its generation yet: page 1 is only in the
+    // bucket, so the takeover checks the page its restore fetched.
+    let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+
+    let wrong = tempdir();
+    let m = refused_takeover(&store, |d| enc_config(d, &wrong, &"22".repeat(32)));
+    assert!(m.contains("does not decrypt"), "{m}");
+    assert!(
+        !m.contains(&key_hex()) && !m.contains(&"22".repeat(32)),
+        "{m}"
+    );
+    let m = refused_takeover(&store, |d| {
+        let mut cfg = enc_config(d, &k, &key_hex());
+        cfg.encryption_cipher = "aes256gcm".into();
+        cfg
+    });
+    assert!(m.contains("aegis256") && m.contains("aes256gcm"), "{m}");
+    insert(&c, 61).unwrap();
+
+    // Page 1 now in the log too: still refused.
+    c.execute("CREATE TABLE u(x)", &[]).unwrap();
+    let wrong = tempdir();
+    refused_takeover(&store, |d| enc_config(d, &wrong, &"22".repeat(32)));
+    insert(&c, 62).unwrap();
+
+    // The right key takes over as before.
+    let t = tempdir();
+    let rep =
+        crate::takeover_with_store(enc_config(&fresh(&t), &k, &key_hex()), store.clone()).unwrap();
+    assert!(rep.fence_seq > 0, "{rep:?}");
+    assert!(matches!(insert(&c, 63), Err(Error::Fenced(_))));
+    std::mem::forget(c);
+    std::mem::forget(db);
+    let db = open_with_store(enc_config(&fresh(&t), &k, &key_hex()), store.clone()).unwrap();
+    assert_eq!(ids(&db.connect().unwrap()), (1..=62).collect::<Vec<_>>());
+}
+
+#[test]
+fn takeover_with_a_key_on_a_plaintext_database_is_refused() {
+    let store = mem();
+    let a = closed_writer(&store, 10);
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    let k = tempdir();
+    let m = refused_takeover(&store, |d| enc_config(d, &k, &key_hex()));
+    assert!(m.contains("cannot be encrypted in place"), "{m}");
+    insert(&c, 11).unwrap();
+    assert_eq!(ids(&c), (1..=11).collect::<Vec<_>>());
+}

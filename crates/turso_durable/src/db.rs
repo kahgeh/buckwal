@@ -280,7 +280,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
 
     let (bucket, state, reconciled) = match LocalState::read(&dir)? {
         Some(state) => {
-            refuse_encryption_mismatch(&dir, &store, &keys, &cfg)?;
+            refuse_encryption_mismatch(&dir, &store, &keys, &cfg, None)?;
             attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
         }
         None if dir.join(DB_FILE).exists() => {
@@ -290,10 +290,10 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             )))
         }
         None if head_exists(&*store, &keys, &cfg)? => {
-            restore_staged(store.clone(), &keys, &dir, &cfg)?;
+            let staged = restore_staged(store.clone(), &keys, &dir, &cfg)?;
             let state = LocalState::read(&dir)?
                 .ok_or_else(|| Error::Corrupt("the restore wrote no local state".into()))?;
-            refuse_encryption_mismatch(&dir, &store, &keys, &cfg)?;
+            refuse_encryption_mismatch(&dir, &store, &keys, &cfg, staged.page1)?;
             attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
         }
         None if read_only => {
@@ -386,8 +386,9 @@ fn refuse_mvcc_file(path: &Path) -> Result<()> {
 
 /// Page 1 against the encryption setting (`encryption::check_page_one`) before a writer open
 /// writes anything to the bucket: its claim, epoch raise or fence would otherwise land before
-/// `open_engine`'s check refuses the open. Page 1 comes from the local files; a writer open of
-/// a restored directory that holds none (the bucket's manifest has it) GETs the sealed page 1
+/// `open_engine`'s check refuses the open. Page 1 comes from the local files, else `restored`
+/// (the page this open's own restore saw: no extra GET). A writer open of a directory restored
+/// earlier that holds none (the bucket's manifest has it) GETs the sealed page 1
 /// (`sealed_page_one`). A read-only open writes nothing to the bucket and leaves that case to
 /// `open_engine`.
 fn refuse_encryption_mismatch(
@@ -395,8 +396,9 @@ fn refuse_encryption_mismatch(
     store: &Arc<dyn ObjectStore>,
     keys: &Keys,
     cfg: &EngineConfig,
+    restored: Option<Vec<u8>>,
 ) -> Result<()> {
-    let page1 = match encryption::file_page_one(dir)? {
+    let page1 = match encryption::file_page_one(dir)?.or(restored) {
         Some(p) => Some(p),
         None if cfg.read_only => None,
         None => sealed_page_one(&**store, keys, &cfg.retry)?,

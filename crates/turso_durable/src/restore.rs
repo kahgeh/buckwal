@@ -302,16 +302,30 @@ pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|e| io_err("write", e))
 }
 
-/// Restore the bucket's current state into `dir`, which must hold no database yet. It
-/// writes nothing to the bucket. Runs in a `durable.restore` span, and logs the finished
-/// restore. The span's `durable.seq` is the highest log seq replayed (0 for an empty log), and
-/// `durable.retries` the extra attempts of the restore's requests.
+/// [`restore_into_seen`] without the page (tests; the library restores through
+/// [`restore_staged`]).
+#[cfg(test)]
 pub(crate) fn restore_into(
     store: Arc<dyn ObjectStore>,
     keys: &Keys,
     dir: &Path,
     cfg: &EngineConfig,
 ) -> Result<RestoreReport> {
+    restore_into_seen(store, keys, dir, cfg).map(|(report, _)| report)
+}
+
+/// Restore the bucket's current state into `dir`, which must hold no database yet. It
+/// writes nothing to the bucket. Runs in a `durable.restore` span, and logs the finished
+/// restore. The span's `durable.seq` is the highest log seq replayed (0 for an empty log), and
+/// `durable.retries` the extra attempts of the restore's requests. Also returns page 1 as the
+/// restore saw it: the sealed page 1 it fetched for the MVCC check, or the WAL's page-1 frame
+/// it seeded `app.db` with; None when it saw neither.
+fn restore_into_seen(
+    store: Arc<dyn ObjectStore>,
+    keys: &Keys,
+    dir: &Path,
+    cfg: &EngineConfig,
+) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let span = tracing::info_span!(
         target: "turso_durable",
         "durable.restore",
@@ -327,7 +341,7 @@ pub(crate) fn restore_into(
     let retries = AtomicU64::new(0);
     let r = restore_files(store, keys, dir, cfg, &retries);
     span.record("durable.retries", retries.load(Relaxed));
-    let r = r?;
+    let (r, page1) = r?;
     span.record("durable.generation", r.generation);
     span.record("durable.log_objects", r.log_objects);
     // The seqs replayed run 1..=log_objects.
@@ -343,7 +357,7 @@ pub(crate) fn restore_into(
         ms = r.elapsed.as_millis() as u64,
         "restore finished"
     );
-    Ok(r)
+    Ok((r, page1))
 }
 
 fn restore_files(
@@ -352,7 +366,7 @@ fn restore_files(
     dir: &Path,
     cfg: &EngineConfig,
     retries: &AtomicU64,
-) -> Result<RestoreReport> {
+) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let start = Instant::now();
     let before = store.stats();
     for f in [DB_FILE, WAL_FILE] {
@@ -368,9 +382,14 @@ fn restore_files(
     let head_obj = counted(retries, retry, &head_key, || store.get(&head_key))?
         .ok_or_else(|| Error::NotFound(head_key.clone()))?;
     let head = Head::decode(&head_obj.body)?;
-    if let Some(g) = head.manifest {
-        refuse_mvcc(&manifest_page_one(&*store, keys, g, retry, retries)?)?;
-    }
+    let sealed_page1 = match head.manifest {
+        Some(g) => {
+            let p = manifest_page_one(&*store, keys, g, retry, retries)?;
+            refuse_mvcc(&p)?;
+            Some(p)
+        }
+        None => None,
+    };
     let (wal, log_objects) = generation_image_counted(&*store, keys, &head, cfg, retries)?;
     // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).
     let db = match head.manifest {
@@ -399,14 +418,16 @@ fn restore_files(
     }
     .write_atomic(dir)?;
     let delta = store.stats().since(&before);
-    Ok(RestoreReport {
+    let report = RestoreReport {
         generation: head.generation,
         log_objects,
         gets: delta.gets,
         lists: delta.lists,
         bytes: delta.bytes_down,
         elapsed: start.elapsed(),
-    })
+    };
+    let page1 = sealed_page1.or_else(|| (!db.is_empty()).then_some(db));
+    Ok((report, page1))
 }
 
 /// Restore the bucket `config` names into `dir`, which must hold no database yet. Nothing is
@@ -426,6 +447,15 @@ pub fn restore_with_store(
     config.validate()?;
     let guard = DirGuard::acquire(dir)?;
     restore_staged(store, &config.keys(), guard.dir(), &config.engine(false))
+        .map(|staged| staged.report)
+}
+
+/// What [`restore_staged`] hands on.
+pub(crate) struct Staged {
+    pub report: RestoreReport,
+    /// Page 1 as the restore saw it (`restore_into_seen`), for the encryption check before a
+    /// claim: no extra GET.
+    pub page1: Option<Vec<u8>>,
 }
 
 /// Moved in this order: the local state last, so a directory with a state file is whole.
@@ -441,7 +471,7 @@ pub(crate) fn restore_staged(
     keys: &Keys,
     dir: &Path,
     cfg: &EngineConfig,
-) -> Result<RestoreReport> {
+) -> Result<Staged> {
     clear_interrupted_restore(dir)?;
     for f in [DB_FILE, WAL_FILE, STATE_FILE] {
         if dir.join(f).exists() {
@@ -452,8 +482,8 @@ pub(crate) fn restore_staged(
         }
     }
     let staging = staging_dir(dir)?;
-    let r = restore_into(store, keys, &staging, cfg)
-        .and_then(|report| move_restored(&staging, dir).map(|_| report));
+    let r = restore_into_seen(store, keys, &staging, cfg)
+        .and_then(|(report, page1)| move_restored(&staging, dir).map(|_| Staged { report, page1 }));
     let _ = fs::remove_dir_all(&staging);
     r
 }
@@ -513,7 +543,7 @@ fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
 }
 
 /// Remove what an interrupted restore of `dir` left: staging directories next to it
-/// (`.<name>.restore-*`, a crash during `restore_into`), and, when `app.db-restoring` is
+/// (`.<name>.restore-*`, a crash during `restore_into_seen`), and, when `app.db-restoring` is
 /// present (a crash while moving the files in), the files it moved, so the directory is
 /// empty again. Called with the directory held, so no restore of it is running.
 pub(crate) fn clear_interrupted_restore(dir: &Path) -> Result<()> {
