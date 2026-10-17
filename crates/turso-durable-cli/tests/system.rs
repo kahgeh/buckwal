@@ -25,7 +25,7 @@ const WINDOW: &str = "window 20ms 64 1MiB";
 /// Settings a test may set; every child gets them removed first, so the caller's
 /// environment never leaks into a test. `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not
 /// here: `scripts/test.sh` sets them so the children export under its run id.
-const OPTIONAL: [&str; 11] = [
+const OPTIONAL: [&str; 12] = [
     "DURABLE_PREFIX",
     "DURABLE_RETRY_DEADLINE_MS",
     "DURABLE_REQUEST_TIMEOUT_MS",
@@ -37,6 +37,7 @@ const OPTIONAL: [&str; 11] = [
     "DURABLE_MAINTENANCE_WAL_MIB",
     "DURABLE_MAINTENANCE_GATE_WAIT_MS",
     "DURABLE_LEASE_MS",
+    "DURABLE_GC_AFTER_SEAL",
 ];
 
 /// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`.
@@ -148,6 +149,8 @@ fn delete_prefix(store: &S3Store, prefix: &str) -> Result<usize, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Head {
     generation: u64,
+    /// 0 when the head has no `epoch` (bucket format v1 before takeovers).
+    epoch: u64,
     manifest: Option<String>,
     writer_id: String,
 }
@@ -290,6 +293,11 @@ impl Ctx {
         let json = String::from_utf8(o.body).unwrap();
         Head {
             generation: json_u64(&json, "generation"),
+            epoch: if json.contains("\"epoch\":") {
+                json_u64(&json, "epoch")
+            } else {
+                0
+            },
             manifest: json_str(&json, "manifest"),
             writer_id: json_str(&json, "writer_id").expect("writer_id"),
         }
@@ -546,6 +554,56 @@ impl Soak {
         self.child.kill().expect("SIGKILL soak");
         self.child.wait().expect("reap soak");
         self.drain();
+    }
+
+    /// Send `signal` (`STOP`, `CONT`) to the soak with `kill(1)`: no crate for it.
+    fn signal(&self, signal: &str) {
+        let pid = self.child.id().to_string();
+        let status = Command::new("kill")
+            .args([&format!("-{signal}"), &pid])
+            .status()
+            .unwrap_or_else(|e| panic!("kill -{signal} {pid}: {e}"));
+        assert!(status.success(), "kill -{signal} {pid}: {status}");
+    }
+
+    /// Wait for an `error` line saying the soak was fenced, then for `quiet` with no `ack`
+    /// line (other lines, such as the fenced soak's retries, do not count). Fails after
+    /// `WAIT`, so a soak that keeps acking fails the test. Returns the index of the first
+    /// fenced error.
+    fn wait_fenced_then_no_ack(&mut self, quiet: Duration) -> usize {
+        let mut seen = 0;
+        self.wait_for("a fenced error", |s| {
+            let fresh = s.find(seen, is_fenced).is_some();
+            seen = s.lines.len();
+            fresh
+        });
+        let fenced = self.find(0, is_fenced).expect("a fenced error");
+        let deadline = Instant::now() + WAIT;
+        let mut last_ack = Instant::now();
+        loop {
+            let left = quiet.saturating_sub(last_ack.elapsed());
+            if left.is_zero() {
+                return fenced;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "soak: still acking {WAIT:?} after it was fenced\n{}",
+                    self.tail()
+                );
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(stamped) => {
+                    if stamped.1.starts_with("ack ") {
+                        last_ack = stamped.0;
+                    }
+                    self.push(stamped);
+                }
+                Err(RecvTimeoutError::Timeout) => return fenced,
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("soak exited after it was fenced\n{}", self.tail())
+                }
+            }
+        }
     }
 
     /// Wait for a `--count` soak to finish on its own; it must succeed.
@@ -1429,6 +1487,26 @@ fn mvcc_pragma_refused_then_all_acks_restore() {
     assert!(out.stderr.contains("[201]"), "{}", out.stderr);
 }
 
+/// Run `gc` every second until it trims against `head`'s own manifest (generation - 1), at
+/// most `limit`: its line. Polling for `outcome=trimmed` alone can stop at a trim against an
+/// older manifest (the newest old enough), which leaves the logs above it.
+fn gc_until_trimmed_against_head(ctx: &Ctx, head: &Head, limit: Duration) -> String {
+    let want = format!("trimmed_against={} ", head.generation - 1);
+    let start = Instant::now();
+    loop {
+        let out = ctx.ok(&["gc"]).stdout;
+        if out.contains("outcome=trimmed") && out.contains(&want) {
+            return out.trim().to_string();
+        }
+        assert!(
+            start.elapsed() < limit,
+            "{}: gc never trimmed against the head's manifest ({head:?}) within {limit:?}: {out}",
+            ctx.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn trimming_bounds_restore_gets() {
@@ -1454,21 +1532,8 @@ fn trimming_bounds_restore_gets() {
     // 500 commits at --every 50: a seal per checkpoint (the first at least) plus close.
     assert!(head.generation >= 9, "checkpoints sealed: {head:?}");
     // GC trims against a manifest once the bucket says it is 3.9 s old (2 s + 400 ms +
-    // 500 ms + 1 s). Until the head's own manifest is, an older one may be the newest old
-    // enough, which leaves the logs above it: wait for the head's.
-    let want = format!("trimmed_against={} ", head.generation - 1);
-    let start = Instant::now();
-    let gc = loop {
-        let out = ctx.ok(&["gc"]).stdout;
-        if out.contains("outcome=trimmed") && out.contains(&want) {
-            break out;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "gc never trimmed against the head's manifest: {out}"
-        );
-        std::thread::sleep(Duration::from_secs(1));
-    };
+    // 500 ms + 1 s).
+    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(15));
     let logs = ctx.list("log/");
     let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
     assert!(
@@ -1673,6 +1738,232 @@ fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
         "idle_old_writer_closing_after_claim_and_seal_loses_nothing: A's close {closed:?}; \
          acked={} {}",
         v.acked, v.restored
+    );
+}
+
+/// A soak `error` line saying the writer was fenced (`Error::Fenced`: "fenced by a newer
+/// writer: …").
+fn is_fenced(l: &str) -> bool {
+    l.starts_with("error ") && l.to_ascii_lowercase().contains("fenced")
+}
+
+/// `takeover --dir <dir>`: its `took over …` line. Its epoch, and the head's after it, must
+/// be one above `before`'s.
+fn takeover(ctx: &Ctx, dir: &Path, before: &Head) -> String {
+    let out = ctx.ok(&["takeover", "--dir", dir.to_str().unwrap()]);
+    let line = out.stdout.trim().to_string();
+    assert!(line.starts_with("took over "), "{}: {line}", ctx.name);
+    let want = before.epoch + 1;
+    assert_eq!(field(&line, "epoch") as u64, want, "{}: {line}", ctx.name);
+    assert_eq!(
+        ctx.head().epoch,
+        want,
+        "{}: the head after {line}",
+        ctx.name
+    );
+    line
+}
+
+/// `sql --dir <dir>` inserting `ids` into the soak table, then running `then`: the `ack <id>`
+/// lines of the rows (each INSERT commits on its own and `sql` exits 0 only if all did).
+fn insert_rows(
+    ctx: &Ctx,
+    dir: &Path,
+    ids: std::ops::RangeInclusive<i64>,
+    then: &[&str],
+) -> Vec<String> {
+    let inserts: Vec<String> = ids
+        .clone()
+        .map(|id| format!("INSERT INTO soak(id, payload) VALUES ({id}, zeroblob(1024))"))
+        .collect();
+    let mut args = vec!["sql", "--dir", dir.to_str().unwrap()];
+    args.extend(inserts.iter().map(String::as_str));
+    args.extend_from_slice(then);
+    ctx.ok(&args);
+    ids.map(|id| format!("ack {id}")).collect()
+}
+
+/// A soak in A reaches 200 acks; `takeover --dir B` fences it (epoch + 1) and B commits 10
+/// rows. The soak must print a fenced error and then ack nothing more; every ack of both
+/// writers restores.
+fn takeover_fences_a_running_soak_under(name: &str, extra: &[&str]) {
+    let ctx = Ctx::new(name);
+    let a = ctx.dir("a");
+    let mut soak = Soak::spawn(&ctx, &a, extra);
+    soak.wait_acks(200);
+    let before = ctx.head();
+    let b = ctx.dir("b");
+    let took = takeover(&ctx, &b, &before);
+    let rows = insert_rows(&ctx, &b, 100001..=100010, &[]);
+    let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
+    soak.kill();
+    let acks_after_fence = soak.lines[fenced..]
+        .iter()
+        .filter(|l| l.starts_with("ack "))
+        .count();
+    let mut lines = soak.lines.clone();
+    lines.extend(rows);
+    let v = restore_verify(&ctx, &lines);
+    eprintln!(
+        "{name}: {took}; soak acks={} (after the first fenced error: {acks_after_fence}); \
+         first fenced error {:?}; acked={} {}",
+        soak.acks(),
+        soak.lines[fenced],
+        v.acked,
+        v.restored
+    );
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn takeover_fences_a_running_soak() {
+    takeover_fences_a_running_soak_under("takeover_fences_a_running_soak", &[]);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn takeover_window_fences_a_running_soak() {
+    takeover_fences_a_running_soak_under(
+        "takeover_window_fences_a_running_soak",
+        &["--batching", WINDOW, "--connections", "4"],
+    );
+}
+
+/// A 1 s lease and the smallest valid grace above it (6 s > 1 s + 2 s + 2 s): GC trims
+/// against a manifest the bucket says is 11 s old (6 s + 2 s + 2 s + 1 s).
+fn short_lease_ctx(name: &str) -> Ctx {
+    Ctx::new(name)
+        .set("DURABLE_LEASE_MS", "1000")
+        .set("DURABLE_RETRY_DEADLINE_MS", "2000")
+        .set("DURABLE_REQUEST_TIMEOUT_MS", "2000")
+        .set("DURABLE_TRIM_GRACE_SECS", "6")
+}
+
+/// The generations `log/` holds keys of.
+fn log_generations(ctx: &Ctx) -> std::collections::BTreeSet<u64> {
+    let root = format!("{}/log/", ctx.prefix());
+    ctx.list("log/")
+        .iter()
+        .map(|k| {
+            let rest = k.strip_prefix(&root).unwrap();
+            rest.split('/').next().unwrap().parse().unwrap()
+        })
+        .collect()
+}
+
+/// The lease self-fences a writer that was paused through a takeover and a GC: an Off soak in
+/// A is stopped (SIGSTOP) after 100 acks; B takes over, commits 10 rows and seals, and GC
+/// deletes A's generation's log, so A's next log key is free again. Resumed (SIGCONT), A's
+/// lease has lapsed: its head check must fence it before any append, so it acks nothing.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn paused_old_writer_is_fenced_after_resume() {
+    let ctx = short_lease_ctx("paused_old_writer_is_fenced_after_resume");
+    let a = ctx.dir("a");
+    let mut soak = Soak::spawn(&ctx, &a, &[]);
+    soak.wait_acks(100);
+    soak.signal("STOP");
+    let before = ctx.head();
+    let b = ctx.dir("b");
+    let took = takeover(&ctx, &b, &before);
+    let rows = insert_rows(
+        &ctx,
+        &b,
+        100001..=100010,
+        &["PRAGMA wal_checkpoint(TRUNCATE)"],
+    );
+    let head = ctx.head();
+    assert!(
+        head.generation > before.generation,
+        "B sealed A's generation: {before:?} then {head:?}"
+    );
+    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(20));
+    let a_log = format!("log/{:010}/", before.generation);
+    assert!(
+        ctx.list(&a_log).is_empty(),
+        "GC deleted A's {a_log}: {:?}",
+        ctx.list(&a_log)
+    );
+    // Every line A printed before the STOP was read long ago; any line stamped after this
+    // point was printed after the CONT.
+    let cont = Instant::now();
+    soak.signal("CONT");
+    std::thread::sleep(Duration::from_secs(3));
+    soak.kill();
+    let resumed = soak.stamps.iter().position(|t| *t >= cont);
+    let tail = &soak.lines[resumed.unwrap_or(soak.lines.len())..];
+    // The one connection's commit may have returned before the STOP and print its ack only
+    // after the CONT (the STOP landed between the two); `restore_verify` below requires it
+    // in B's restore. A second ack would be an append after the CONT.
+    let late_acks = soak.acks_around(cont, false);
+    assert!(
+        late_acks <= 1 && tail.iter().skip(1).all(|l| !l.starts_with("ack ")),
+        "A acked after the CONT: {tail:?}"
+    );
+    assert!(
+        tail.iter().any(|l| is_fenced(l)),
+        "A printed no fenced error after the CONT: {tail:?}\n{}",
+        soak.tail()
+    );
+    let mut lines = soak.lines.clone();
+    lines.extend(rows);
+    let v = restore_verify(&ctx, &lines);
+    let shown = &tail[..tail.len().min(4)];
+    eprintln!(
+        "paused_old_writer_is_fenced_after_resume: A stopped after {} acks (generation {}, \
+         epoch {}); {took}; {gc}; after the CONT A printed {} lines ({late_acks} acks), the \
+         first {shown:?}; acked={} {}",
+        soak.acks(),
+        before.generation,
+        before.epoch,
+        tail.len(),
+        v.acked,
+        v.restored
+    );
+}
+
+/// GC from the CLI after five short-lived writers, each claiming a fresh directory, committing
+/// one row and sealing at close: the log of every generation but the head's is deleted once
+/// the head's manifest is old enough, and the five rows restore.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn gc_cli_trims_after_short_lived_processes() {
+    let ctx = short_lease_ctx("gc_cli_trims_after_short_lived_processes");
+    let mut lines = Vec::new();
+    for k in 1..=5 {
+        let d = ctx.dir(&format!("d{k}"));
+        let insert = format!("INSERT INTO soak(id, payload) VALUES ({k}, zeroblob(1024))");
+        ctx.ok(&[
+            "sql",
+            "--claim",
+            "--dir",
+            d.to_str().unwrap(),
+            "CREATE TABLE IF NOT EXISTS soak(id INTEGER PRIMARY KEY, payload BLOB)",
+            &insert,
+        ]);
+        lines.push(format!("ack {k}"));
+    }
+    let head = ctx.head();
+    let before = log_generations(&ctx);
+    assert!(
+        before.len() > 1,
+        "log/ holds more than one generation: {before:?} ({head:?})"
+    );
+    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(20));
+    let logs = ctx.list("log/");
+    let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
+    assert!(
+        logs.iter().all(|k| k.starts_with(&root)),
+        "only generation {} logs remain: {logs:?}",
+        head.generation
+    );
+    let v = restore_verify(&ctx, &lines);
+    eprintln!(
+        "gc_cli_trims_after_short_lived_processes: log/ generations before GC {before:?}, \
+         head {head:?}; {gc}; log/ holds {} keys after; acked={} {}",
+        logs.len(),
+        v.acked,
+        v.restored
     );
 }
 

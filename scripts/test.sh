@@ -47,4 +47,6 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/turso-durable-otel.XXXXXX")"
 cli() { DURABLE_PREFIX="otel/$DURABLE_TEST_RUN_ID" cargo run -q --locked -p turso-durable-cli -- "$@"; }
 cli bench --dir "$WORK/bench" --commits 50 --batching "window 5ms 8 1MiB" --connections 4
 cli restore --dir "$WORK/restored"
+cli takeover --dir "$WORK/took"
+cli gc
 scripts/otel-check.sh "$DURABLE_TEST_RUN_ID"

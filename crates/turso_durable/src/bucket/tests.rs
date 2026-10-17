@@ -426,6 +426,79 @@ fn append_within_the_lease_sends_no_get() {
     );
 }
 
+/// A writer paused between its lease check and its record's PUT (SIGSTOP, a suspended VM),
+/// the PUT delayed 300 ms past a 100 ms lease and a 50 ms retry deadline here. Meanwhile
+/// another writer took the head (and could have sealed and trimmed `log/G`, freeing this
+/// writer's next seq): a landed record proves nothing then. The head is checked after it,
+/// and the writer is fenced instead of acking it.
+#[test]
+fn a_record_landing_past_the_lease_checks_the_head() {
+    let f = Fixture::new();
+    let retry = RetryPolicy {
+        deadline: Duration::from_millis(50),
+        ..fast()
+    };
+    let mut b = f.create(retry, 4);
+    b.set_lease(Duration::from_millis(100));
+    let other = Head {
+        format: 1,
+        generation: 1,
+        manifest: None,
+        writer_id: "w2".into(),
+        epoch: 2,
+    };
+    f.mem.put(&keys().head(), &other.encode()).unwrap();
+    f.fault.only_keys_containing("/log/");
+    f.fault.delay_puts(Duration::from_millis(300));
+    let before = f.fault.events().len();
+    let r = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    assert_eq!(
+        f.fault.events()[before..],
+        [
+            format!("put_if_absent {}", keys().log(1, 1)),
+            format!("get {}", keys().head())
+        ],
+        "inside the lease at the check, past it when the record landed: the head after it"
+    );
+    let r = b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error);
+    assert!(r.is_err(), "fenced for good: {r:?}");
+}
+
+/// The same late landing with the head still ours: the record counts, the head GET renews
+/// the lease, and the next append goes straight to the log.
+#[test]
+fn a_record_landing_past_the_lease_under_our_head_counts() {
+    let f = Fixture::new();
+    let retry = RetryPolicy {
+        deadline: Duration::from_millis(50),
+        ..fast()
+    };
+    let mut b = f.create(retry, 4);
+    b.set_lease(Duration::from_millis(100));
+    f.fault.only_keys_containing("/log/");
+    f.fault.delay_puts(Duration::from_millis(300));
+    let before = f.fault.events().len();
+    let pos = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    assert_eq!(pos.map(|p| p.seq), Ok(1));
+    assert_eq!(
+        f.fault.events()[before..],
+        [
+            format!("put_if_absent {}", keys().log(1, 1)),
+            format!("get {}", keys().head())
+        ]
+    );
+    f.fault.delay_puts(Duration::ZERO);
+    let before = f.fault.events().len();
+    let pos = b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error);
+    assert_eq!(pos.map(|p| p.seq), Ok(2));
+    assert_eq!(
+        f.fault.events()[before..],
+        [format!("put_if_absent {}", keys().log(1, 2))],
+        "the head GET renewed the lease"
+    );
+}
+
 /// A machine that slept: `Instant` stood still but the wall clock moved past the lease. The
 /// append checks the head, finds another writer's, and is fenced without writing.
 #[test]

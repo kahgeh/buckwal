@@ -141,11 +141,12 @@ pub(crate) struct Bucket {
     pending_seal: Option<PendingSeal>,
     fenced: bool,
     /// The lease (`check_lease`): when the request behind the last confirmation was sent, on
-    /// both clocks. It is renewed by a confirmed log record (`put_log`), a confirmed head
-    /// write (`put_head`, `raise_epoch`, and `create`'s), open's head read (`attach`), and a
-    /// head GET that passes `check_head` (finding its own raised head) or `verify_head`. A
-    /// failed or ambiguous request renews nothing, and neither do page and manifest PUTs
-    /// (which only makes the check run sooner).
+    /// both clocks. It is renewed by a confirmed log record (`put_log`, the fence; one that
+    /// landed `lease` + retry deadline after it only through a head GET, `confirm_landed`), a
+    /// confirmed head write (`put_head`, `raise_epoch`, and `create`'s), open's head read
+    /// (`attach`), and a head GET that passes `check_head` (finding its own raised head) or
+    /// `verify_head`. A failed or ambiguous request renews nothing, and neither do page and
+    /// manifest PUTs (which only makes the check run sooner).
     last_confirmed: Stamp,
     /// See `set_lease`.
     lease: Duration,
@@ -604,8 +605,11 @@ impl Bucket {
     }
 
     /// This writer is fenced for good: every later append and seal is refused. Returns `e`.
+    /// Logged once, when it first happens.
     fn fence(&mut self, e: Error) -> Error {
-        self.fenced = true;
+        if std::mem::replace(&mut self.fenced, true) {
+            return e;
+        }
         tracing::error!(
             target: "turso_durable",
             generation = self.head.generation,
@@ -758,10 +762,16 @@ impl Bucket {
                 seq: self.seq,
             };
             let key = self.keys.log(pos.generation, pos.seq);
+            let confirmed = self.last_confirmed;
             let sent = Stamp::now();
-            match self.put_fence_at(start, &key, &body) {
+            let put = self.put_fence_at(start, &key, &body).and_then(|p| match p {
+                FencePut::Landed => self
+                    .confirm_landed(start, confirmed, sent)
+                    .map(|()| FencePut::Landed),
+                occupied => Ok(occupied),
+            });
+            match put {
                 Ok(FencePut::Landed) => {
-                    self.last_confirmed = sent;
                     self.seq += 1;
                     self.counters.log_puts.fetch_add(1, Relaxed);
                     self.emit_uploaded(pos, body.len() as u64);
@@ -920,12 +930,36 @@ impl Bucket {
     ///
     /// An append that skipped the check sends its last attempt within `lease` +
     /// `retry_deadline` of the last confirmation, and that attempt ends within
-    /// `request_timeout`; `Config::validate` requires the trim grace to exceed that sum.
+    /// `request_timeout`; `Config::validate` requires the trim grace to exceed that sum. A
+    /// writer paused between this check and its PUT breaks that bound, so a record that
+    /// lands later than `lease` + `retry_deadline` counts only after a head GET
+    /// (`confirm_landed`).
     /// Against another process this holds only if that process's trim grace exceeds this
     /// writer's sum too (README, Settings): nothing in the bucket records another process's
     /// settings.
     fn check_lease(&mut self, start: Instant) -> Result<()> {
         if self.last_confirmed.age() < self.lease {
+            return Ok(());
+        }
+        self.verify_head(start)
+    }
+
+    /// A record of this writer landed (sent at `sent`, the last confirmation then being
+    /// `confirmed`): renew the lease with `sent`, or, when the record landed `lease` + retry
+    /// deadline or more after `confirmed`, GET the head first (`verify_head`).
+    ///
+    /// `check_lease` runs before the record is built, so a writer paused after it (SIGSTOP, a
+    /// suspended VM) sends its PUT whenever it resumes. Meanwhile another writer may have
+    /// taken over, sealed this generation and trimmed `log/G` (its trim grace after the
+    /// seal), freeing this writer's next seq: the record then lands in a log no restore
+    /// reads, and its success proves nothing. Renewing the lease on it would also let every
+    /// later append skip the check. A record that landed within `lease` + retry deadline of
+    /// `confirmed` landed before any trim (`check_lease`: the trim grace exceeds lease +
+    /// retry deadline + request timeout). Past that, the head decides: ours renews the lease
+    /// and the record counts; anything else fences this writer, and the record is not acked.
+    fn confirm_landed(&mut self, start: Instant, confirmed: Stamp, sent: Stamp) -> Result<()> {
+        if confirmed.age() < self.lease.saturating_add(self.retry.deadline) {
+            self.last_confirmed = sent;
             return Ok(());
         }
         self.verify_head(start)
@@ -1088,10 +1122,13 @@ impl Bucket {
             seq: self.seq,
         };
         let key = self.keys.log(pos.generation, pos.seq);
+        let confirmed = self.last_confirmed;
         let sent = Stamp::now();
-        match self.put_log_at(start, &key, &body) {
+        match self
+            .put_log_at(start, &key, &body)
+            .and_then(|()| self.confirm_landed(start, confirmed, sent))
+        {
             Ok(()) => {
-                self.last_confirmed = sent;
                 self.seq += 1;
                 self.counters.log_puts.fetch_add(1, Relaxed);
                 Ok(pos)
