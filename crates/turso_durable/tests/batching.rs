@@ -585,7 +585,7 @@ fn seal_waits_for_batched_commits() {
         .expect("its PUT");
     let page = ev
         .iter()
-        .position(|e| e.starts_with("put ") && e.contains("pages/"))
+        .position(|e| e.starts_with("put") && e.contains("pages/"))
         .expect("a page PUT");
     assert!(log < page, "{ev:?}");
 }
@@ -608,7 +608,7 @@ fn seal_fails_when_batched_commits_cannot_upload() {
     let ev = fault.events();
     assert!(
         !ev.iter()
-            .any(|e| e.starts_with("put ") && e.contains("pages/")),
+            .any(|e| e.starts_with("put") && e.contains("pages/")),
         "{ev:?}"
     );
 }

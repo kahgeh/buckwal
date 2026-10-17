@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Event;
 use crate::format::decode_record;
+use crate::store::fault::HoldStore;
 use crate::store::{FaultStore, MemStore};
 use std::time::Duration;
 
@@ -529,16 +530,18 @@ fn a_writer_that_slept_checks_the_head() {
 fn seal_events(events: &[String]) -> Vec<&'static str> {
     let k = keys();
     let head = format!("get {}", k.head());
-    let pages = format!("put {}", k.page_root());
-    let manifest = format!("put {}", k.manifest_root());
+    let (pages, manifest) = (k.page_root(), k.manifest_root());
     events
         .iter()
         .filter_map(|e| {
+            let (verb, key) = e.split_once(' ')?;
             if *e == head {
                 Some("get head")
-            } else if e.starts_with(&pages) {
+            } else if !verb.starts_with("put") {
+                None
+            } else if key.starts_with(&pages) {
                 Some("page")
-            } else if e.starts_with(&manifest) {
+            } else if key.starts_with(&manifest) {
                 Some("manifest")
             } else {
                 None
@@ -674,13 +677,9 @@ fn seal_stops_page_puts_when_the_head_moves_mid_seal() {
     f.fault.only_keys_containing("/pages/");
     f.fault.delay_puts(Duration::from_millis(150));
     let before = f.fault.events().len();
-    let page_put = format!("put {}", keys().page_root());
     let r = std::thread::scope(|s| {
         s.spawn(|| {
-            while !f.fault.events()[before..]
-                .iter()
-                .any(|e| e.starts_with(&page_put))
-            {
+            while !seal_events(&f.fault.events()[before..]).contains(&"page") {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let current = f.mem.get(&keys().head()).unwrap().unwrap();
@@ -1016,10 +1015,11 @@ fn seal_uploads_pages_manifest_head_in_order() {
 
     let ev = f.fault.events()[before..].to_vec();
     let k = keys();
-    let is_page = |e: &String| e.starts_with(&format!("put {PREFIX}/pages/"));
+    // Every page and the manifest are new keys: one `put_if_absent` each.
+    let is_page = |e: &String| e.starts_with(&format!("put_if_absent {PREFIX}/pages/"));
     let manifest_at = ev
         .iter()
-        .position(|e| *e == format!("put {}", k.manifest(1)))
+        .position(|e| *e == format!("put_if_absent {}", k.manifest(1)))
         .unwrap();
     let head_at = ev
         .iter()
@@ -2070,4 +2070,266 @@ fn take_over_timeout_says_to_open_the_directory() {
         matches!(&r, Err(Error::Timeout(m)) if m.contains("the head kept changing") && m.contains(RESUME)),
         "{r:?}"
     );
+}
+
+/// `n` pages, each body 16 bytes of `fill`.
+fn pages_of(n: u32, fill: u8) -> Vec<(u32, Vec<u8>)> {
+    (1..=n).map(|p| (p, vec![fill; 16])).collect()
+}
+
+/// The objects of a seal of `gen` in `mem`: `pages/<gen>/*` and `manifest/<gen>`, key → body.
+fn sealed(mem: &MemStore, gen: u64) -> BTreeMap<String, Vec<u8>> {
+    let k = keys();
+    let mut all = mem.list(&format!("{}{gen:010}/", k.page_root())).unwrap();
+    all.push(k.manifest(gen));
+    all.into_iter()
+        .filter_map(|key| mem.get(&key).unwrap().map(|o| (key, o.body)))
+        .collect()
+}
+
+/// The page and manifest requests among `events` (PUTs of any flavour and stats), in order.
+fn object_events(events: &[String]) -> Vec<String> {
+    let k = keys();
+    let (pages, manifest) = (k.page_root(), k.manifest_root());
+    events
+        .iter()
+        .filter(|e| {
+            e.split_once(' ')
+                .is_some_and(|(_, key)| key.starts_with(&pages) || key.starts_with(&manifest))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Old writer A (lease 200 ms, one PUT at a time) seals generation 1, and its next PUT of a
+/// key containing `held` is held after its lease check, as if A were paused (SIGSTOP) right
+/// before the send. Meanwhile B takes over (`take_over`, then `append_fence`, which lands
+/// right after A's seal-start record), waits out its quiet and seals generation 1 itself,
+/// with other page bodies and page count, publishing its head. Then A's PUT goes on. It must
+/// fail its condition and leave B's `pages/1/*` and `manifest/1` byte-identical; A's seal
+/// ends `Fenced`.
+fn stale_writers_late_put_is_refused(held: &str) {
+    let f = Fixture::new();
+    let hold = Arc::new(HoldStore::new(f.mem.clone()));
+    let mut a = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
+    a.set_lease(Duration::from_millis(200));
+    a.append_log(syncs(1)).unwrap();
+    let (held_rx, go) = hold.hold_next_put(held);
+    std::thread::scope(|s| {
+        let a_seal = s.spawn(move || {
+            let r = a.seal_generation(pages_of(2, 0xA), 4096, 2);
+            (r, a)
+        });
+        let key = held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A's PUT is held");
+        take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
+        let mut b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
+        let fo = b.append_fence().unwrap();
+        assert!(
+            fo.after_foreign_empty,
+            "B's fence follows A's seal-start record"
+        );
+        let quiet = Duration::from_millis(300);
+        b.set_seal_not_before(1, Instant::now() + quiet, SystemTime::now() + quiet);
+        b.append_log(syncs(2)).unwrap();
+        assert_eq!(b.seal_generation(pages_of(3, 0xB), 4096, 3), Ok(2));
+        let published = sealed(&f.mem, 1);
+        go.send(()).unwrap();
+        let (r, a) = a_seal.join().unwrap();
+        let after = sealed(&f.mem, 1);
+        assert!(
+            after == published,
+            "A's late PUT of {key} overwrote B's seal of generation 1: {:?}",
+            hold.outcomes()
+        );
+        let outcomes = hold.outcomes();
+        assert!(
+            matches!(&outcomes[..], [o] if o.ends_with(": 412")),
+            "A's held PUT must fail its condition: {outcomes:?}"
+        );
+        assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+        assert!(a.degraded(), "A is fenced for good");
+    });
+    for p in 1..=3 {
+        assert_eq!(f.body(&keys().page(1, p)), Some(vec![0xB; 16]), "page {p}");
+    }
+    let m = Manifest::decode(&f.body(&keys().manifest(1)).unwrap()).unwrap();
+    assert_eq!(m.page_count, 3);
+    let head = f.stored_head();
+    assert_eq!((head.writer_id.as_str(), head.generation), ("w2", 2));
+}
+
+/// A stale writer's page PUT, held between its lease check and its send until a new writer
+/// has sealed and published the generation, cannot overwrite the published page.
+#[test]
+fn a_stale_writers_late_page_put_cannot_overwrite_a_published_seal() {
+    stale_writers_late_put_is_refused("/pages/");
+}
+
+/// The same for the stale writer's manifest PUT, held after its pages went out.
+#[test]
+fn a_stale_writers_late_manifest_put_cannot_overwrite_a_published_seal() {
+    stale_writers_late_put_is_refused("/manifest/");
+}
+
+/// A seal fails after its page PUTs (the manifest PUT fails permanently once); the retry, with
+/// other page bodies, overwrites its own pages with `put_if_match` on the ETags it got back,
+/// with no stat, and the stored bodies are the new ones.
+#[test]
+fn a_retried_seal_overwrites_its_own_pages() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/manifest/");
+    f.fault.fail_next_puts_permanently(1);
+    let r = b.seal_generation(pages_of(2, 1), 4096, 2);
+    assert!(matches!(r, Err(Error::UploadFailed(_))), "{r:?}");
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages_of(2, 2), 4096, 2), Ok(2));
+    let k = keys();
+    assert_eq!(
+        object_events(&f.fault.events()[before..]),
+        [
+            format!("put_if_match {}", k.page(1, 1)),
+            format!("put_if_match {}", k.page(1, 2)),
+            format!("put_if_absent {}", k.manifest(1)),
+        ]
+    );
+    for p in 1..=2 {
+        assert_eq!(f.body(&k.page(1, p)), Some(vec![2; 16]));
+    }
+    assert_eq!(f.stored_head().generation, 2);
+}
+
+/// `pages/1/1` was put by another writer beforehand: the seal's `put_if_absent` gets a 412,
+/// it stats the key and overwrites it with `put_if_match` on that ETag.
+#[test]
+fn a_seal_overwrites_a_foreign_leftover_page() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.append_log(syncs(1)).unwrap();
+    let k = keys();
+    f.mem
+        .put(&k.page(1, 1), b"another writer's leftover")
+        .unwrap();
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages_of(2, 5), 4096, 2), Ok(2));
+    assert_eq!(
+        object_events(&f.fault.events()[before..]),
+        [
+            format!("put_if_absent {}", k.page(1, 1)),
+            format!("stat {}", k.page(1, 1)),
+            format!("put_if_match {}", k.page(1, 1)),
+            format!("put_if_absent {}", k.page(1, 2)),
+            format!("put_if_absent {}", k.manifest(1)),
+        ]
+    );
+    for p in 1..=2 {
+        assert_eq!(f.body(&k.page(1, p)), Some(vec![5; 16]));
+    }
+    assert_eq!(f.stored_head().generation, 2);
+}
+
+/// A page PUT that is stored but whose reply is lost: the retry's `put_if_absent` gets a 412
+/// on our own object, whose ETag we never learnt. The seal stats it and puts the same bytes
+/// with `put_if_match` on that ETag. It is not fenced, and the stored body is ours.
+#[test]
+fn a_lost_reply_on_a_conditional_page_put_counts_as_done() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/pages/");
+    f.fault.store_then_fail_next_puts(1);
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages_of(1, 7), 4096, 1), Ok(2));
+    let k = keys();
+    assert_eq!(
+        object_events(&f.fault.events()[before..]),
+        [
+            format!("put_if_absent {}", k.page(1, 1)),
+            format!("put_if_absent {}", k.page(1, 1)),
+            format!("stat {}", k.page(1, 1)),
+            format!("put_if_match {}", k.page(1, 1)),
+            format!("put_if_absent {}", k.manifest(1)),
+        ]
+    );
+    assert!(!b.degraded());
+    assert_eq!(f.body(&k.page(1, 1)), Some(vec![7; 16]));
+    assert_eq!(b.counters().page_puts.load(Relaxed), 1);
+    let head = f.stored_head();
+    assert_eq!((head.writer_id.as_str(), head.generation), ("w1", 2));
+}
+
+/// A seal fails after its page PUTs. The retry's `put_if_match` of `pages/1/1` on its own
+/// ETag is held, and meanwhile someone else writes that key (a crashed process's late PUT,
+/// say), and in the second case also takes the head over. The PUT then gets a 412, and the
+/// seal GETs the head first. Still ours: it stats the key and overwrites it on the ETag read.
+/// Moved: it is fenced and the other object stays.
+#[test]
+fn a_seal_finding_its_own_page_overwritten_checks_the_head_first() {
+    let k = keys();
+    for moved in [false, true] {
+        let f = Fixture::new();
+        let hold = Arc::new(HoldStore::new(f.store()));
+        let mut b = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
+        b.append_log(syncs(1)).unwrap();
+        f.fault.only_keys_containing("/manifest/");
+        f.fault.fail_next_puts_permanently(1);
+        let r = b.seal_generation(pages_of(2, 1), 4096, 2);
+        assert!(matches!(r, Err(Error::UploadFailed(_))), "{r:?}");
+        let (held_rx, go) = hold.hold_next_put("/pages/");
+        let before = f.fault.events().len();
+        let r = std::thread::scope(|s| {
+            let seal = s.spawn(|| b.seal_generation(pages_of(2, 2), 4096, 2));
+            let key = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(key, k.page(1, 1));
+            f.mem.put(&key, b"someone else").unwrap();
+            if moved {
+                rival_takeover(&f.mem, "w2", None);
+            }
+            go.send(()).unwrap();
+            seal.join().unwrap()
+        });
+        assert_eq!(
+            hold.outcomes(),
+            [format!("put_if_match {}: 412", k.page(1, 1))]
+        );
+        let ev: Vec<String> = f.fault.events()[before..]
+            .iter()
+            .filter(|e| !e.contains("/log/"))
+            .cloned()
+            .collect();
+        let head_check = format!("get {}", k.head());
+        if moved {
+            assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+            assert_eq!(f.body(&k.page(1, 1)), Some(b"someone else".to_vec()));
+            assert_eq!(
+                ev,
+                [
+                    head_check.clone(),
+                    format!("put_if_match {}", k.page(1, 1)),
+                    head_check,
+                ]
+            );
+            continue;
+        }
+        assert_eq!(r, Ok(2));
+        assert_eq!(
+            ev,
+            [
+                head_check.clone(),
+                format!("put_if_match {}", k.page(1, 1)),
+                head_check,
+                format!("stat {}", k.page(1, 1)),
+                format!("put_if_match {}", k.page(1, 1)),
+                format!("put_if_match {}", k.page(1, 2)),
+                format!("put_if_absent {}", k.manifest(1)),
+                format!("put_if_match {}", k.head()),
+            ]
+        );
+        for p in 1..=2 {
+            assert_eq!(f.body(&k.page(1, p)), Some(vec![2; 16]));
+        }
+    }
 }

@@ -2189,3 +2189,155 @@ fn crash_after_the_fence_keeps_the_quiet() {
     c.close().unwrap();
     db.close().unwrap();
 }
+
+/// Old writer A seals G (lease 300 ms, one page PUT at a time) and its next PUT of a key
+/// containing `held` is held after its lease check, as if A were paused (SIGSTOP) right before
+/// the send. B takes over (its fence lands after A's seal-start record, so B's seal waits out
+/// the 800 ms quiet), commits 1001..=1010 and seals G, publishing its head. Then A's PUT goes
+/// on: it fails its condition, B's `pages/G/*` and `manifest/G` stay byte-identical, A is
+/// fenced, and a restore holds both writers' rows.
+fn stale_writers_late_put_after_the_new_seal(batching: crate::Batching, held: &str) {
+    let store = mem();
+    let hold = Arc::new(crate::store::fault::HoldStore::new(store.clone()));
+    let a = tempdir();
+    let mut a_cfg = quiet_config(a.path(), None);
+    a_cfg.batching = batching;
+    let db_a = open_with_store(a_cfg, hold.clone()).unwrap();
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    for id in 1..=30 {
+        insert_kb(&ca, id);
+    }
+    let gen = db_a.generation();
+    let (held_rx, go) = hold.hold_next_put(held);
+    let a_seal = std::thread::spawn(move || {
+        let r = ca.checkpoint(CheckpointMode::Truncate);
+        (r, ca, db_a)
+    });
+    let key = held_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("A's PUT is held");
+
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let mut b_cfg = quiet_config(&b_dir, None);
+    b_cfg.batching = batching;
+    let rep = crate::takeover_with_store(b_cfg.clone(), store.clone()).unwrap();
+    assert_eq!((rep.generation, rep.quiet), (gen, QUIET), "{rep:?}");
+    let db_b = open_with_store(b_cfg, store.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    for id in 1001..=1010 {
+        insert_kb(&cb, id);
+    }
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert_eq!(head(&*store).generation, gen + 1, "B sealed G");
+    let published = sealed_objects(&bucket_objects(&store), gen);
+    assert!(!published.is_empty());
+
+    go.send(()).unwrap();
+    let (a_result, ca, db_a) = a_seal.join().unwrap();
+    let after = sealed_objects(&bucket_objects(&store), gen);
+    let changed = changed_keys(&published, &after);
+    assert!(
+        changed.is_empty(),
+        "{batching:?}: A's late PUT of {key} overwrote B's seal of generation {gen}: \
+         {changed:?}; held PUT: {:?}",
+        hold.outcomes()
+    );
+    let outcomes = hold.outcomes();
+    assert!(
+        matches!(&outcomes[..], [o] if o.ends_with(": 412")),
+        "{batching:?}: A's held PUT must fail its condition: {outcomes:?}"
+    );
+    assert!(
+        matches!(a_result, Err(Error::Fenced(_))),
+        "{batching:?}: {a_result:?}"
+    );
+    crash(db_a, vec![ca]);
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=30).collect();
+    want.extend(1001..=1010);
+    assert_eq!(restored_ids(&store), want, "{batching:?}");
+}
+
+/// A stale writer's late page PUT, under `Off` and a `Window`.
+#[test]
+fn a_stale_writers_late_page_put_cannot_overwrite_a_published_seal() {
+    for b in batchings() {
+        stale_writers_late_put_after_the_new_seal(b, "/pages/");
+    }
+}
+
+/// A stale writer's late manifest PUT (its pages went out), under `Off` and a `Window`.
+#[test]
+fn a_stale_writers_late_manifest_put_cannot_overwrite_a_published_seal() {
+    for b in batchings() {
+        stale_writers_late_put_after_the_new_seal(b, "/manifest/");
+    }
+}
+
+/// The new writer B crashes mid-seal: its page PUTs of G landed, its manifest PUT failed, and
+/// its process is gone. B's next process (its files copied to a new directory) has none of
+/// those ETags: each leftover page is foreign to it, so its seal of G stats it and overwrites
+/// it with `put_if_match` on the ETag it read. A restore holds every row.
+#[test]
+fn a_crash_of_the_new_writer_mid_seal_resumes_over_its_own_leftovers() {
+    let store = mem();
+    let _a = closed_writer(&store, 10);
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    crate::takeover_with_store(config(&b_dir), store.clone()).unwrap();
+    let fault = Arc::new(FaultStore::new(store.clone()));
+    let db_b = open_with_store(config(&b_dir), fault.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    for id in 1001..=1010 {
+        insert(&cb, id).unwrap();
+    }
+    let gen = db_b.generation();
+    fault.only_keys_containing("/manifest/");
+    fault.fail_next_puts_permanently(1);
+    let r = cb.checkpoint(CheckpointMode::Truncate);
+    assert!(r.is_err(), "{r:?}");
+    let k = keys();
+    let leftovers = store.list(&format!("{}{gen:010}/", k.page_root())).unwrap();
+    assert!(!leftovers.is_empty(), "B's pages of {gen} landed");
+    assert!(store.get(&k.manifest(gen)).unwrap().is_none());
+    assert_eq!(head(&*store).generation, gen);
+    crash(db_b, vec![cb]);
+
+    let b2 = copy_db_files(&b_dir);
+    let before = fault.events().len();
+    let db_b = open_with_store(config(b2.path()), fault.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    insert(&cb, 1011).unwrap();
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert!(head(&*store).generation > gen);
+    let events = fault.events()[before..].to_vec();
+    let mut resumed = 0;
+    for key in &leftovers {
+        let on_key: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.strip_suffix(key.as_str()))
+            .map(str::trim_end)
+            .collect();
+        if on_key.is_empty() {
+            continue;
+        }
+        assert_eq!(
+            on_key,
+            ["put_if_absent", "stat", "put_if_match"],
+            "{key}: {events:?}"
+        );
+        resumed += 1;
+    }
+    assert!(
+        resumed > 0,
+        "the reopen sealed G over its leftovers: {events:?}"
+    );
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=10).collect();
+    want.extend(1001..=1011);
+    assert_eq!(restored_ids(&store), want);
+}

@@ -485,7 +485,7 @@ fn owed_retries_are_not_held_back_by_a_long_window() {
 fn seal_flushes_waiting_batch_first_and_fails_if_it_cannot() {
     let keys = Keys::new("db");
     let pages = || vec![(1, vec![1u8; 32])];
-    let is_page_put = |e: &String| e.starts_with("put ") && e.contains("pages/");
+    let is_page_put = |e: &String| e.starts_with("put") && e.contains("pages/");
 
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));

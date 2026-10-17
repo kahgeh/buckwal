@@ -226,7 +226,7 @@ fn old_writer_cannot_seal_after_takeover() {
         assert!(matches!(r, Err(Error::Fenced(_))), "{b:?}: {r:?}");
         let pages: Vec<String> = fault.events()[before..]
             .iter()
-            .filter(|e| e.starts_with("put ") && e.contains("/pages/"))
+            .filter(|e| e.starts_with("put") && e.contains("/pages/"))
             .cloned()
             .collect();
         assert!(pages.is_empty(), "{b:?}: A uploaded pages: {pages:?}");

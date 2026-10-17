@@ -610,7 +610,8 @@ fn an_off_commit_in_a_failed_call_closes_with_outcome_ok() {
     assert_eq!(c.field("durable.outcome"), Some("ok"), "{c:?}");
 }
 
-/// A MemStore that logs every `put` and `get` (as a store with its own logging would).
+/// A MemStore that logs every PUT (of any flavour, as "put") and `get` (as a store with its
+/// own logging would).
 #[derive(Default)]
 struct ProbeStore {
     inner: MemStore,
@@ -622,9 +623,11 @@ impl ObjectStore for ProbeStore {
         self.inner.put(key, body)
     }
     fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
+        tracing::info!(target: "turso_durable::probe", key, op = "put", "probe");
         self.inner.put_if_absent(key, body)
     }
     fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
+        tracing::info!(target: "turso_durable::probe", key, op = "put", "probe");
         self.inner.put_if_match(key, body, etag)
     }
     fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {

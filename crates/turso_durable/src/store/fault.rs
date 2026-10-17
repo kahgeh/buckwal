@@ -176,6 +176,137 @@ impl ObjectStore for FaultStore {
     }
 }
 
+/// Test-only: a store that holds one PUT (any flavour) of a key containing the armed text
+/// until the test releases it, as if its sender were paused (SIGSTOP) after its lease check,
+/// then passes it on and records how it ended.
+/// An armed hold: the key text, where to say a PUT is held, and what lets it go on.
+#[cfg(test)]
+type Hold = (
+    String,
+    std::sync::mpsc::Sender<String>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
+pub(crate) struct HoldStore {
+    inner: Arc<dyn ObjectStore>,
+    armed: Mutex<Option<Hold>>,
+    outcomes: Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl HoldStore {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            armed: Mutex::new(None),
+            outcomes: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Hold the next PUT of a key containing `s`. The first receiver gets its key when it is
+    /// held; a send on the returned sender lets it go on.
+    pub(crate) fn hold_next_put(
+        &self,
+        s: &str,
+    ) -> (
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        *self.armed.lock().unwrap() = Some((s.to_string(), held_tx, go_rx));
+        (held_rx, go_tx)
+    }
+
+    /// How each held PUT ended, e.g. "put_if_absent k: 412" or "put k: stored".
+    pub(crate) fn outcomes(&self) -> Vec<String> {
+        self.outcomes.lock().unwrap().clone()
+    }
+
+    fn held<T>(
+        &self,
+        what: &str,
+        key: &str,
+        op: impl FnOnce() -> Result<T, StoreError>,
+        ended: impl Fn(&T) -> String,
+    ) -> Result<T, StoreError> {
+        let hold = {
+            let mut armed = self.armed.lock().unwrap();
+            match armed.as_ref() {
+                Some((s, _, _)) if key.contains(s.as_str()) => armed.take(),
+                _ => None,
+            }
+        };
+        let Some((_, held_tx, go_rx)) = hold else {
+            return op();
+        };
+        let _ = held_tx.send(key.to_string());
+        let _ = go_rx.recv();
+        let r = op();
+        let how = match &r {
+            Ok(v) => ended(v),
+            Err(e) => format!("{e}"),
+        };
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push(format!("{what} {key}: {how}"));
+        r
+    }
+}
+
+#[cfg(test)]
+fn cond_outcome(r: &CondPut) -> String {
+    match r {
+        CondPut::Created { .. } => "stored".into(),
+        CondPut::PreconditionFailed => "412".into(),
+    }
+}
+
+#[cfg(test)]
+impl ObjectStore for HoldStore {
+    fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
+        self.held(
+            "put",
+            key,
+            || self.inner.put(key, body),
+            |_| "stored".into(),
+        )
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> Result<CondPut, StoreError> {
+        self.held(
+            "put_if_absent",
+            key,
+            || self.inner.put_if_absent(key, body),
+            cond_outcome,
+        )
+    }
+    fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> Result<CondPut, StoreError> {
+        self.held(
+            "put_if_match",
+            key,
+            || self.inner.put_if_match(key, body, etag),
+            cond_outcome,
+        )
+    }
+    fn get(&self, key: &str) -> Result<Option<Object>, StoreError> {
+        self.inner.get(key)
+    }
+    fn stat(&self, key: &str) -> Result<Option<ObjectStat>, StoreError> {
+        self.inner.stat(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> StatsSnap {
+        self.inner.stats()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

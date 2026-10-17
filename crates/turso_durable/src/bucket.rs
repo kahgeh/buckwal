@@ -11,7 +11,7 @@ use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
 use crate::format::{decode_record, encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
 use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreError};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -78,8 +78,39 @@ struct PendingSeal {
 enum Lapse {
     /// Every page of the round is uploaded.
     Done,
-    /// The lease lapsed first: these indices (into the seal's pages) are not uploaded yet.
-    Remaining(Vec<usize>),
+    /// The lease lapsed first, or a page we wrote was overwritten (`Step::Overwritten`): these
+    /// indices (into the seal's pages) are not uploaded yet.
+    Remaining {
+        rest: Vec<usize>,
+        /// A page we wrote was overwritten: the head check that follows is owed, not a lapse.
+        overwritten: bool,
+    },
+}
+
+/// What this process knows of a seal object's current ETag (`Bucket::seal_etags`), which
+/// decides the condition of its next PUT.
+#[derive(Debug, Clone)]
+enum Known {
+    /// This process's last PUT of it returned this ETag: `put_if_match` on it.
+    Own(String),
+    /// A stat read this ETag (another writer's object, or ours whose reply was lost):
+    /// `put_if_match` on it.
+    Seen(String),
+    /// A PUT got a 412: stat it before the next PUT.
+    Stale,
+}
+
+/// How one request of a conditional seal PUT ended (`Bucket::seal_put_step`).
+enum Step {
+    /// The body is stored, under the ETag now in `seal_etags`.
+    Done,
+    /// A definite answer that is not the end (a 412, a stat): the next request follows.
+    Again,
+    /// The lease refused the request: nothing was sent.
+    Lapsed,
+    /// A `put_if_match` on our own last ETag got a 412: someone wrote the key after us. Only a
+    /// head GET can tell whether this writer still holds the head; the key is stat'ed after it.
+    Overwritten,
 }
 
 /// How an epoch raise (`Bucket::raise_epoch_at`) ended.
@@ -148,6 +179,11 @@ pub(crate) struct Bucket {
     /// `verify_head`. A failed or ambiguous request renews nothing, and neither do page and
     /// manifest PUTs (which only makes the check run sooner).
     last_confirmed: Stamp,
+    /// The current generation's seal objects (`pages/G/*`, `manifest/G`) this process has
+    /// PUT or stat'ed, by key: the condition of the next PUT of each (`seal_put_step`). A key
+    /// not here goes with `put_if_absent`. Cleared when the generation changes
+    /// (`finish_seal`). A `Mutex` because the page workers share `&self`.
+    seal_etags: Mutex<HashMap<String, Known>>,
     /// See `set_lease`.
     lease: Duration,
     /// See `set_seal_not_before`.
@@ -242,8 +278,10 @@ pub(crate) const RESTORE_AGAIN: &str =
 /// by then) through the lease's head check before that append (`Bucket::check_lease`, under
 /// the assumption it lists). It is also fenced at the start of its next seal
 /// (`Bucket::seal_start`: its seal-start record collides, or the head moved), before it
-/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed,
-/// and its page and manifest PUTs stop at the first lapse of its lease (`Bucket::seal`).
+/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed;
+/// its page and manifest PUTs stop at the first lapse of its lease (`Bucket::seal`), and are
+/// conditional, so one landing after the new writer wrote its key fails
+/// (`Bucket::seal_put_step`).
 /// The log stays linear: such a generation holds the old writer's records, then the fence,
 /// then the new writer's, which `restore::generation_image` accepts.
 pub(crate) fn take_over_counted(
@@ -352,6 +390,7 @@ impl Bucket {
     ) -> Bucket {
         Bucket {
             last_confirmed: Stamp::now(),
+            seal_etags: Mutex::default(),
             lease: crate::config::defaults::LEASE,
             quiet: None,
             store,
@@ -530,12 +569,15 @@ impl Bucket {
     /// passes on the persisted wall-clock deadline (with `at` already passed). A seal of
     /// `generation` clears it.
     ///
-    /// Why: that writer's page and manifest PUTs are plain PUTs and may still be in flight;
-    /// landing after this writer's seal of the same generation, they would overwrite it. The
-    /// old writer sends each such PUT attempt only within `lease` of its last head check
-    /// (`seal`), which came before this writer's head write, and an attempt ends within
-    /// `request_timeout`. This holds when the old writer's lease and request timeout are at
-    /// most this writer's: nothing in the bucket records another process's settings.
+    /// Why: that writer's page and manifest requests may still be in flight. Its PUTs are
+    /// conditional (`seal_put_step`): one conditioned on what it saw before this writer wrote
+    /// the key fails. It could still overwrite this writer's object by stat'ing it after this
+    /// writer wrote it and conditioning a PUT on that ETag. The old writer sends each request
+    /// only within `lease` of its last head check (`seal`), which came before this writer's
+    /// head write, and a request ends within `request_timeout`: after the quiet, none of its
+    /// stats can see an object of this writer's. This holds when the old writer's lease and
+    /// request timeout are at most this writer's: nothing in the bucket records another
+    /// process's settings.
     pub(crate) fn set_seal_not_before(&mut self, generation: u64, at: Instant, wall: SystemTime) {
         self.quiet = Some(SealQuiet {
             generation,
@@ -1217,6 +1259,7 @@ impl Bucket {
         self.seq = 1;
         self.pending_seal = None;
         self.quiet = None;
+        self.seal_etags.get_mut().unwrap().clear();
         self.counters.seals.fetch_add(1, Relaxed);
         self.emit(Event::SealFinished {
             generation: gen - 1,
@@ -1252,17 +1295,23 @@ impl Bucket {
             generation: gen,
             pages: pages.len() as u64,
         });
-        // Pages and the manifest are unreferenced until the head moves: plain puts. A failed
-        // seal whose head never landed may overwrite them next time (`check_head` above
-        // ensures a published one is adopted instead). `seal_start` ensured no other writer
-        // had taken this generation over, and each PUT attempt is sent only inside the lease:
-        // at a lapse the workers stop, the head is read again (renewing the lease, or fencing
-        // this writer) and the pages not yet uploaded resume. So no page or manifest PUT goes
+        // Pages and the manifest are unreferenced until the head moves. A failed seal whose
+        // head never landed may overwrite them next time (`check_head` above ensures a
+        // published one is adopted instead). `seal_start` ensured no other writer had taken
+        // this generation over, and each request is sent only inside the lease: at a lapse
+        // the workers stop, the head is read again (renewing the lease, or fencing this
+        // writer) and the pages not yet uploaded resume. So no page or manifest request goes
         // out more than `lease` after this writer last saw its own head (a zero lease, for
         // tests, lets each worker send one attempt right after each head check).
+        //
+        // Each PUT is conditional (`seal_put_step`), so a PUT of this writer that lands after
+        // another writer wrote the key fails its condition: a stale writer paused between its
+        // lease check and its send cannot overwrite a seal that a new writer published.
         let mut todo: Vec<usize> = (0..pages.len()).collect();
-        while let Lapse::Remaining(rest) = self.put_pages_until_lapse(start, gen, &pages, &todo)? {
-            self.renew_lease(start, rest.len() < todo.len())?;
+        while let Lapse::Remaining { rest, overwritten } =
+            self.put_pages_until_lapse(start, gen, &pages, &todo)?
+        {
+            self.renew_lease(start, overwritten || rest.len() < todo.len())?;
             todo = rest;
         }
 
@@ -1285,12 +1334,16 @@ impl Bucket {
         // its own renewal with nothing sent, which is what `progressed = false` marks.
         let mut free = false;
         let mut progressed = true;
-        while self
-            .retrying_in_lease(start, &key, &mut free, || self.store.put(&key, &body))?
-            .is_none()
-        {
-            self.renew_lease(start, progressed)?;
-            progressed = false;
+        loop {
+            match self.seal_put(start, &key, &body, &mut free)? {
+                Step::Done => break,
+                // The head check is owed: it renews the lease (or fences this writer).
+                Step::Overwritten => self.renew_lease(start, true)?,
+                _ => {
+                    self.renew_lease(start, progressed)?;
+                    progressed = false;
+                }
+            }
             free = self.lease.is_zero();
         }
 
@@ -1305,8 +1358,9 @@ impl Bucket {
     }
 
     /// The gate before a seal uploads anything: a writer that another writer took over must
-    /// not overwrite `pages/G/*` or `manifest/G`, which are plain puts and which that writer
-    /// may already have sealed. A seal of an old writer that has nothing left to ship sends
+    /// not overwrite `pages/G/*` or `manifest/G`, which that writer may already have sealed
+    /// (its conditional PUTs, `seal_put_step`, do not stop a first PUT of a key it never
+    /// wrote, after a stat). A seal of an old writer that has nothing left to ship sends
     /// no log record, so the fence record alone would not fence it.
     ///
     /// 1. An empty record (zero syncs) goes to this writer's next seq with `put_if_absent`,
@@ -1321,7 +1375,8 @@ impl Bucket {
     ///
     /// A takeover that restores and claims after step 2 lands its fence record after ours and
     /// may seal G while this seal's page PUTs are in flight: those stop at the first lapse of
-    /// the lease, whose head check fences this writer (`seal`).
+    /// the lease, whose head check fences this writer (`seal`), and one landing after that
+    /// writer wrote its key fails its condition.
     fn seal_start(&mut self, start: Instant) -> Result<()> {
         let body = encode_record(&LogRecord::Extents {
             writer_id: self.head.writer_id.clone(),
@@ -1366,7 +1421,103 @@ impl Bucket {
         }
     }
 
-    /// `retrying` for a seal's PUTs: each attempt, retries included, is sent only inside the
+    /// One request of a conditional PUT of `body` at seal object `key`, its condition from
+    /// `seal_etags`, each request through `retrying_in_lease`:
+    ///
+    /// - a key this process has not written or stat'ed: `put_if_absent`;
+    /// - one it wrote: `put_if_match` on the ETag it got back; a 412 there means someone wrote
+    ///   the key after us (a writer that took over, or a stale one of ours), which only a head
+    ///   GET can sort out: `Step::Overwritten`, for the caller to run it;
+    /// - one it stat'ed: `put_if_match` on the ETag read;
+    /// - after a 412: `stat`. No object: `put_if_absent` again. An object: `put_if_match` on
+    ///   its ETag. That object may be ours (a stored PUT whose reply was lost; its ETag is the
+    ///   store's own, so it is not compared; the same bytes replace it), or a leftover of an
+    ///   earlier attempt, a crashed process, or the old writer before a takeover, which ours
+    ///   replace. Neither fences this writer.
+    ///
+    /// Nothing is overwritten without the ETag it is conditioned on having been seen. Why this
+    /// fences a stale writer: once a new writer has written a key, the stale writer's PUT fails
+    /// its condition (absent fails, and its own ETag is no longer current). To overwrite the
+    /// new writer's object it would have to stat it after the new writer wrote it, which is
+    /// at least the takeover quiet (`set_seal_not_before`, `lease` + request timeout) after
+    /// the new writer's head write; its lease check before that stat then lapses, and the head
+    /// GET that follows fences it.
+    fn seal_put_step(
+        &self,
+        start: Instant,
+        key: &str,
+        body: &[u8],
+        free: &mut bool,
+    ) -> Result<Step> {
+        let set = |k: Option<Known>| {
+            let mut m = self.seal_etags.lock().unwrap();
+            match k {
+                Some(k) => m.insert(key.to_string(), k),
+                None => m.remove(key),
+            };
+        };
+        let known = self.seal_etags.lock().unwrap().get(key).cloned();
+        let (etag, own) = match known {
+            None => {
+                let r = self
+                    .retrying_in_lease(start, key, free, || self.store.put_if_absent(key, body))?;
+                return Ok(match r {
+                    None => Step::Lapsed,
+                    Some(CondPut::Created { etag }) => {
+                        set(Some(Known::Own(etag)));
+                        Step::Done
+                    }
+                    Some(CondPut::PreconditionFailed) => {
+                        set(Some(Known::Stale));
+                        Step::Again
+                    }
+                });
+            }
+            Some(Known::Stale) => {
+                let r = self.retrying_in_lease(start, key, free, || self.store.stat(key))?;
+                return Ok(match r {
+                    None => Step::Lapsed,
+                    Some(st) => {
+                        set(st.map(|st| Known::Seen(st.etag)));
+                        Step::Again
+                    }
+                });
+            }
+            Some(Known::Own(etag)) => (etag, true),
+            Some(Known::Seen(etag)) => (etag, false),
+        };
+        let r = self.retrying_in_lease(start, key, free, || {
+            self.store.put_if_match(key, body, &etag)
+        })?;
+        Ok(match r {
+            None => Step::Lapsed,
+            Some(CondPut::Created { etag }) => {
+                set(Some(Known::Own(etag)));
+                Step::Done
+            }
+            Some(CondPut::PreconditionFailed) => {
+                set(Some(Known::Stale));
+                if own {
+                    Step::Overwritten
+                } else {
+                    Step::Again
+                }
+            }
+        })
+    }
+
+    /// `seal_put_step` until the object is stored (`Step::Done`), the lease refuses a request
+    /// (`Step::Lapsed`) or our own object was overwritten (`Step::Overwritten`).
+    fn seal_put(&self, start: Instant, key: &str, body: &[u8], free: &mut bool) -> Result<Step> {
+        loop {
+            match self.seal_put_step(start, key, body, free)? {
+                Step::Again => {}
+                end => return Ok(end),
+            }
+        }
+    }
+
+    /// `retrying` for a seal's requests: each attempt, retries included, is sent only inside the
     /// lease; the first one refused ends the call with `None` (nothing sent, not counted as a
     /// retry). A zero lease (tests) would refuse every attempt, so there one attempt per
     /// worker per round goes out free: each round follows a head check, `free` starts true for
@@ -1390,10 +1541,11 @@ impl Bucket {
         })
     }
 
-    /// The lease lapsed during a seal: GET the head (`verify_head`), which renews it or fences
-    /// this writer. `progressed` says whether any PUT landed since the last head check. A
-    /// lapse with none (the head check itself outlasted the lease) after the call's deadline
-    /// ends the seal with `Timeout` instead, or the seal would read the head forever.
+    /// The lease lapsed during a seal, or our own object was overwritten: GET the head
+    /// (`verify_head`), which renews it or fences this writer. `progressed` says whether any
+    /// object was stored (or found overwritten) since the last head check. A lapse with none
+    /// (the head check itself outlasted the lease) after the call's deadline ends the seal
+    /// with `Timeout` instead, or the seal would read the head forever.
     fn renew_lease(&mut self, start: Instant, progressed: bool) -> Result<()> {
         let elapsed = start.elapsed();
         if !progressed && elapsed >= self.retry.deadline {
@@ -1407,9 +1559,9 @@ impl Bucket {
     }
 
     /// Upload the pages at indices `todo` of `pages` (generation `gen`), `concurrency` at a
-    /// time; the first error wins. Each attempt goes through `retrying_in_lease`: the first
-    /// refused attempt stops every worker, and the indices not uploaded come back as
-    /// `Lapse::Remaining` for the caller to renew the lease and resume.
+    /// time, each with `seal_put`; the first error wins. The first refused request, or the
+    /// first page of ours found overwritten, stops every worker, and the indices not uploaded
+    /// come back as `Lapse::Remaining` for the caller to check the head and resume.
     fn put_pages_until_lapse(
         &self,
         start: Instant,
@@ -1420,6 +1572,7 @@ impl Bucket {
         let next = AtomicUsize::new(0);
         let failed: Mutex<Option<Error>> = Mutex::new(None);
         let lapsed = AtomicBool::new(false);
+        let overwritten = AtomicBool::new(false);
         let refused: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let workers = self.concurrency.min(todo.len());
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -1436,14 +1589,14 @@ impl Bucket {
                         };
                         let (page, body) = &pages[i];
                         let key = self.keys.page(gen, *page);
-                        let r = self.retrying_in_lease(start, &key, &mut free, || {
-                            self.store.put(&key, body)
-                        });
-                        match r {
-                            Ok(Some(_)) => {
+                        match self.seal_put(start, &key, body, &mut free) {
+                            Ok(Step::Done) => {
                                 self.counters.page_puts.fetch_add(1, Relaxed);
                             }
-                            Ok(None) => {
+                            Ok(step) => {
+                                if matches!(step, Step::Overwritten) {
+                                    overwritten.store(true, Relaxed);
+                                }
                                 refused.lock().unwrap().push(i);
                                 lapsed.store(true, Relaxed);
                                 return;
@@ -1467,7 +1620,10 @@ impl Bucket {
         let mut rest = refused.into_inner().unwrap();
         rest.extend_from_slice(&todo[next.into_inner().min(todo.len())..]);
         rest.sort_unstable();
-        Ok(Lapse::Remaining(rest))
+        Ok(Lapse::Remaining {
+            rest,
+            overwritten: overwritten.into_inner(),
+        })
     }
 
     /// Move the head with `put_if_match`; returns its new ETag. A 412 is ours only when the
