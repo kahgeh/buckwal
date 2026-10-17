@@ -86,7 +86,8 @@
 #   open of a directory restored by `restore` (never opened): open_puts=2, open_gets=13,
 #     open_lists=3, open_ms=43 (the takeover mechanism plus the three page-1 GETs).
 #
-# Final ./scripts/test.sh run (the canonical figures; commit 5215309, same code as measured)
+# Earlier ./scripts/test.sh run (commit 5215309, before the final fix wave; superseded by
+# "Final test-command run (after the merge fixes)" below)
 # (./scripts/test.sh, with `time`, in the background; rc=0; wall time 11:30.6 (11.5 min).)
 #   pass 1 (plain HTTP, no encryption; the tls_* tests skipped): 38 system tests + 8 S3 tests, all ok
 #     scan: 41942 objects, 514365239 bytes
@@ -101,7 +102,12 @@
 #     durable.fence=21 durable.gc=794 durable.local_fsync=83251 durable.local_write=83297
 #     durable.maintenance=111 durable.restore=144 durable.takeover=21 durable.upload=50331 logs=1010
 #   (Task 6's run of the same code: 11.5 min, peaks 663 and 713 MB, 12614 of 41196 objects with
-#   CREATE TABLE in pass 1, 44362 objects in pass 2; the figures above are the canonical ones.)
+#   CREATE TABLE in pass 1, 44362 objects in pass 2.)
+#
+# Final test-command run (after the merge fixes)
+# PLACEHOLDER: not yet run. To be filled from the controller's ./scripts/test.sh run of the
+# merge-fix commit: commit, rc and wall time; per pass the test counts, the scan lines and
+# the peak; the otel check line.
 #
 # Raw bench output of the six runs (setup a, b, c; off then window) follows.
 

@@ -182,7 +182,7 @@ Errors are `turso_durable::Error`:
 | `Timeout` | A bucket operation kept failing transiently for the whole retry deadline. An `Off` commit that fails this way is rolled back locally; a `Window` commit stays in the local database (see Batching). |
 | `UploadFailed` | The bucket refused an upload permanently, or the uploader stopped. |
 | `NotFound` | A key that must exist is missing: no database at this prefix (restore, read-only open), or a page the manifest names. |
-| `Unsupported` | A refused feature: `MVCC`, `journal_mode other than WAL`, `synchronous below FULL`, `ATTACH`. |
+| `Unsupported` | A refused feature: `MVCC`, `journal_mode other than WAL`, `synchronous below FULL`, `ATTACH`, `encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)` (`PRAGMA hexkey` or `PRAGMA cipher` set to a value). |
 | `Locked` | Another process has the directory open. |
 | `AlreadyOpen` | This process already has the directory open. |
 | `Corrupt` | A bucket object or local file failed its checks. |
@@ -190,6 +190,7 @@ Errors are `turso_durable::Error`:
 | `Engine` | An error from turso_core, such as an SQL error. |
 | `Io` | A local file error. |
 | `Config` | Bad settings (an invalid batching setting or `PRAGMA durable_batching` misused included), a closed database, or connections still open at `close`. |
+| `Encryption` | The encryption setting does not fit the database: a key on a plaintext database, no key on an encrypted one, another cipher, or a key that does not decrypt page 1 (a wrong key, or a damaged page 1). Checked on page 1 by a writer open before its claim and by `takeover` before its head write, so nothing is written to the bucket, and again by every engine open (`verify` included). The message names the file or the cipher, never the key (see Guarantees, Encryption). |
 
 ## Batching
 
@@ -508,7 +509,7 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 | `GET` | Restore, lazy page reads. |
 | `ListObjectsV2` (`list-type=2`, continuation tokens) | Listing a generation's log, and trimming. |
 | `DELETE` | Trimming. |
-| HTTPS (TLS 1.2+, rustls/ring) or plain HTTP | `https://` verifies the endpoint's certificate against the system store, or only against `DURABLE_CA_BUNDLE`. A certificate failure is `Permanent` (the error names `DURABLE_CA_BUNDLE`), so `open` fails at once instead of retrying to the deadline. |
+| HTTPS (TLS 1.2+, rustls/ring) or plain HTTP | `https://` verifies the endpoint's certificate against the system store, or only against `DURABLE_CA_BUNDLE`. A certificate failure is `Permanent` (the error names `DURABLE_CA_BUNDLE`), so `open` fails at once instead of retrying to the deadline. Redirects are never followed: a 3xx is a permanent error naming the status (`Bucket`, or `UploadFailed` for an upload), so a body or a signature never goes to another server or in clear, and no redirect target's answer is taken as the store's (`redirects_are_not_followed`; over HTTPS, `tls_redirect_to_plain_http_is_not_followed`). |
 
 Stores known to support both conditional PUTs (`If-None-Match: *` and `If-Match`): AWS S3 (`If-None-Match` since August 2024, `If-Match` since November 2024), and RustFS 1.0.0, which passed this repo's gate (`results/rustfs-gate.txt`). Fencing depends on them, so check any other store with the gate first.
 
@@ -543,6 +544,8 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - `restore` needs no key: it copies bytes, and seeds `app.db` with the WAL's encrypted page-1 frame. `open`, `verify`, `sql` and `takeover` need it.
 - `takeover` checks the setting the same way before its head write, on the page 1 its restore fetched or seeded (no extra GET), with or without a key: a missing or wrong key, another cipher, or a key on a plaintext database fails with `Encryption`, nothing is written to the bucket, the restored files are removed, and the running writer is not fenced.
 - A damaged page now fails authentication when it is read (`Engine("Decryption failed for page=…")`) instead of reading as garbage, and a damaged page 1 is refused at open like a wrong key.
+- Confidentiality, not protection against tampering in the bucket. Every page but page 1 is encrypted without associated data (`encrypt_page` → `encrypt_raw`, `AD = b""`: storage/encryption.rs:729-775, 940-943; WAL frames take the same path, storage/page_transform.rs:171-181), so a page's ciphertext is bound neither to its page number nor to a version. Only page 1 authenticates its header as associated data (storage/encryption.rs:819-865). Someone who can write to the bucket can swap one page's ciphertext for another's, or put back an older version of a page or a log record, and it decrypts without an error; turso_durable's own objects (head, manifests, log framing) are not authenticated either. Trust everyone with write access to the bucket.
+- A torn write of page 1 in an encrypted local directory (a crash while a checkpoint writes `app.db`'s page 1) leaves the directory unopenable: page 1 fails authentication and the open is refused with `Encryption` ("… or page 1 is damaged"); turso's own open, past that check, fails the same way (`Decryption failed for page=1`), because it reads the header from `app.db`. A plaintext directory recovers from the WAL's copy of page 1. Nothing acked is lost: a restore into a new directory has every acknowledged commit (`encrypted_torn_page_one_is_unopenable_but_restores`). This is a turso limit.
 - An encrypted page or frame is the size of a plaintext one: the nonce and tag take reserved bytes inside the page. Batching, the maintenance checkpoint, seals, lazy fetches, prefetch, GC and the MVCC refusal work as before; the unit tests run encrypted variants of them.
 
 **One writer.**
@@ -678,7 +681,7 @@ Source: `results/durable-transport.txt`. These are laptop figures (Apple M4 Max,
 - Seals took 44-66 ms for 169-170 pages under Off and 53-68 ms under the window, in all three setups (the setup close's 2-page seal 6.5-7.5 ms in (b) and (c); setup (a)'s, the first run after the build, took 22 ms, not investigated).
 - Restore of the 1000-commit database (generation 4): 4 GETs (`3 + 1` log object), 1 LIST and 4404 bytes, 21-23 ms, with and without encryption. An encrypted page is the size of a plaintext one.
 - The first writer open of a directory restored by `restore` or `takeover` is where stage 4 added requests: the encryption check needs page 1, and a directory that holds none GETs the head, the manifest and page 1 first (this happens without a key too). Opening the restored 1000-commit directory made 2 PUTs, 11 GETs and 3 LISTs (37-73 ms), the same with and without a key. The stage-3 row below, re-measured with its request lines, shows the same 3 extra GETs on the first open after a takeover.
-- The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took 11.5 min (11:30 by `time`), and the larger pass held 711 MB in RustFS at its peak (see Test command).
+- The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took PLACEHOLDER (final run after the merge fixes, not yet recorded) min, and the larger pass held PLACEHOLDER MB in RustFS at its peak (see Test command).
 
 ### Stage 3: takeover, lease and GC
 
@@ -776,7 +779,7 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
   - In pass 2, after the tests, it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then `sql` creating table `marker` with the row `turso-durable-marker-<run id>` and a `wal_checkpoint(TRUNCATE)`, then `restore`, `takeover` and `gc`), so every span kind except `durable.maintenance` is exported, then the scan.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
   - On exit, pass or fail, it empties RustFS's storage again in plain mode (`scripts/rustfs.sh reset`) and removes the TLS material. A failed reset is reported on stderr and the exit code stays the tests'.
-  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured by the final run of stage 4 (`results/durable-transport.txt`): 673 MB (plain) and 711 MB (https+encryption), a whole run 11.5 min (11:30). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
+  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured by the final run of stage 4 (`results/durable-transport.txt`, "Final test-command run (after the merge fixes)"): PLACEHOLDER MB (plain) and PLACEHOLDER MB (https+encryption), a whole run PLACEHOLDER min (not yet recorded). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
   - Outside `test.sh`, each RustFS-backed test deletes its bucket prefix when it ends. `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
 - `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `down` removes the container and its volume `turso-durable-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it. With `TURSO_DURABLE_TLS_DIR` set to a directory from `scripts/tls-material.sh DIR`, it runs RustFS over HTTPS (a container is plain or TLS for its whole life; `reset` switches).
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.

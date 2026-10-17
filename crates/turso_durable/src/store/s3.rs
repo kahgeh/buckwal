@@ -239,10 +239,15 @@ struct Reply {
     body: Vec<u8>,
 }
 
-/// Map an unexpected HTTP status to the error class callers act on.
+/// Map an unexpected HTTP status to the error class callers act on. A 3xx (redirects are
+/// not followed) is permanent.
 fn status_error(what: &str, r: &Reply) -> StoreError {
+    let note = match r.status {
+        300..=399 => " (redirect not followed)",
+        _ => "",
+    };
     let msg = format!(
-        "{what}: HTTP {}: {}",
+        "{what}: HTTP {}{note}: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
     );
@@ -308,7 +313,13 @@ fn normalize_endpoint(endpoint: &str) -> crate::Result<String> {
 fn http_client(cfg: &S3Config) -> crate::Result<reqwest::blocking::Client> {
     // reqwest's rustls backend panics at build() without a process crypto provider; a host app's earlier install wins.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut b = reqwest::blocking::Client::builder().timeout(cfg.request_timeout);
+    // Redirects are never followed: reqwest's default follows up to 10, https to http
+    // included, re-sends a PUT body on 307/308 and keeps `Authorization` on the same host
+    // and port, and the redirect target's answer would be taken as the store's. A 3xx
+    // reaches `status_error` as a permanent error.
+    let mut b = reqwest::blocking::Client::builder()
+        .timeout(cfg.request_timeout)
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(path) = &cfg.ca_bundle {
         let shown = path.display();
         let pem = std::fs::read(path)
@@ -816,7 +827,7 @@ mod tests {
                 "{status}"
             );
         }
-        for status in [400, 403, 404] {
+        for status in [301, 302, 307, 308, 400, 403, 404] {
             assert!(
                 matches!(
                     cond_put_reply(what, &reply(status, None, "")),
@@ -1093,6 +1104,108 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    /// One HTTP/1.1 request from `s`: the request line, the header lines and the
+    /// `Content-Length` body.
+    fn read_request(s: &mut impl std::io::Read) -> (String, Vec<String>, Vec<u8>) {
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+            head.push(b[0]);
+        }
+        let text = String::from_utf8_lossy(&head).to_string();
+        let mut lines = text.split("\r\n").map(str::to_string);
+        let first = lines.next().unwrap_or_default();
+        let headers: Vec<String> = lines.filter(|l| !l.is_empty()).collect();
+        let n = headers
+            .iter()
+            .find_map(|h| {
+                let (k, v) = h.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; n];
+        let _ = s.read_exact(&mut body);
+        (first, headers, body)
+    }
+
+    /// A plain-HTTP endpoint on 127.0.0.1 that answers every request with `status` and a
+    /// `Location` on a second listener, which sends the request line of anything that
+    /// reaches it to the returned receiver and answers 200 with an ETag.
+    fn redirecting_endpoint(status: u16) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Write;
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for s in target.incoming() {
+                let Ok(mut s) = s else { continue };
+                let _ = tx.send(read_request(&mut s).0);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nETag: \"e1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", origin.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for s in origin.incoming() {
+                let Ok(mut s) = s else { continue };
+                let (first, _, _) = read_request(&mut s);
+                let path = first.split(' ').nth(1).unwrap_or("/").to_string();
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{target_port}{path}\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (endpoint, rx)
+    }
+
+    /// B1: a redirect is never followed (a followed one could carry the body, and the
+    /// signature, to another server, and its answer would be taken as the store's): every
+    /// call gets a permanent error naming the status, and nothing reaches the target.
+    #[test]
+    fn redirects_are_not_followed() {
+        let mut wrong = Vec::new();
+        for status in [301, 302, 307, 308] {
+            let (endpoint, reached) = redirecting_endpoint(status);
+            let mut cfg = cfg_for(&endpoint);
+            cfg.path_style = true;
+            let s = S3Store::new(cfg).unwrap();
+            let calls: [(&str, Result<(), StoreError>); 8] = [
+                ("put", s.put("log/1/00000001", b"ROW").map(drop)),
+                ("put_if_absent", s.put_if_absent("k", b"ROW").map(drop)),
+                (
+                    "put_if_match",
+                    s.put_if_match("k", b"ROW", "\"e\"").map(drop),
+                ),
+                ("get", s.get("k").map(drop)),
+                ("stat", s.stat("k").map(drop)),
+                ("list", s.list("log/").map(drop)),
+                ("delete", s.delete("k")),
+                (
+                    "create_bucket",
+                    s.create_bucket()
+                        .map_err(|e| StoreError::Permanent(e.to_string())),
+                ),
+            ];
+            for (call, r) in calls {
+                match r {
+                    Err(StoreError::Permanent(m)) if m.contains(&format!("HTTP {status}")) => {}
+                    r => wrong.push(format!("{status} {call}: {r:?}")),
+                }
+            }
+            while let Ok(req) = reached.recv_timeout(Duration::from_millis(200)) {
+                wrong.push(format!("{status}: the redirect was followed: {req}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]

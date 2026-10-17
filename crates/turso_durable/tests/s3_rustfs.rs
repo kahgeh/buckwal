@@ -376,3 +376,143 @@ fn tls_wrong_ca_bundle_fails_fast() {
     let ca = ca_bundle().expect("DURABLE_CA_BUNDLE is not set");
     open_fails_on_certificate(Some(ca.with_file_name("other-ca.pem")));
 }
+
+/// One HTTP/1.1 request from `s`: the request line, whether it carries `Authorization`, and
+/// the `Content-Length` body.
+fn read_request(s: &mut impl std::io::Read) -> (String, bool, Vec<u8>) {
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+        head.push(b[0]);
+    }
+    let text = String::from_utf8_lossy(&head).to_string();
+    let first = text.split("\r\n").next().unwrap_or_default().to_string();
+    let n = text
+        .split("\r\n")
+        .find_map(|h| {
+            let (k, v) = h.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let auth = text
+        .split("\r\n")
+        .any(|h| h.to_ascii_lowercase().starts_with("authorization:"));
+    let mut body = vec![0u8; n];
+    let _ = s.read_exact(&mut body);
+    (first, auth, body)
+}
+
+/// Serve `l`: a TLS connection (the test CA's server certificate) gets 307 with a
+/// `Location` on plain `http://127.0.0.1:{plain_port}`; a plain connection sends what it got
+/// to `reached` and gets 200 with an ETag.
+fn serve_redirects(
+    l: std::net::TcpListener,
+    tls: std::sync::Arc<rustls::ServerConfig>,
+    plain_port: u16,
+    reached: std::sync::mpsc::Sender<String>,
+) {
+    use std::io::Write;
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut first = [0u8; 1];
+            if s.peek(&mut first).is_err() {
+                continue;
+            }
+            if first[0] != 0x16 {
+                let (line, auth, body) = read_request(&mut s);
+                let body = String::from_utf8_lossy(&body);
+                let _ = reached.send(format!("{line} authorization={auth} body={body:?}"));
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nETag: \"e1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                continue;
+            }
+            let Ok(conn) = rustls::ServerConnection::new(tls.clone()) else {
+                continue;
+            };
+            let mut t = rustls::StreamOwned::new(conn, s);
+            let (line, _, _) = read_request(&mut t);
+            let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+            let _ = write!(
+                t,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{plain_port}{path}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            t.conn.send_close_notify();
+            let _ = t.flush();
+        }
+    });
+}
+
+/// B1 over TLS: an HTTPS endpoint answering 307 to plain http, on another port or on its own
+/// port, must not get the body or the signature sent in clear, and its 307 is no ack:
+/// every call is a permanent error naming the status.
+#[test]
+#[ignore = "needs RustFS in TLS mode: ./scripts/test.sh"]
+fn tls_redirect_to_plain_http_is_not_followed() {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    require_tls();
+    let ca = ca_bundle().expect("DURABLE_CA_BUNDLE is not set");
+    let server = ca.with_file_name("server");
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs: Vec<_> = CertificateDer::pem_file_iter(server.join("rustfs_cert.pem"))
+        .expect("server certificate")
+        .map(|c| c.expect("server certificate"))
+        .collect();
+    let key = PrivateKeyDer::from_pem_file(server.join("rustfs_key.pem")).expect("server key");
+    let tls = std::sync::Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config"),
+    );
+    let mut wrong = Vec::new();
+    for same_port in [false, true] {
+        let (tx, reached) = std::sync::mpsc::channel();
+        let https = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = https.local_addr().unwrap().port();
+        let plain_port = if same_port {
+            port
+        } else {
+            let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = plain.local_addr().unwrap().port();
+            serve_redirects(plain, tls.clone(), p, tx.clone());
+            p
+        };
+        serve_redirects(https, tls.clone(), plain_port, tx);
+        let s = S3Store::new(S3Config {
+            endpoint: format!("https://127.0.0.1:{port}"),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+            path_style: true,
+            request_timeout: Duration::from_secs(5),
+            ca_bundle: Some(ca.clone()),
+        })
+        .expect("store");
+        let calls: [(&str, Result<(), StoreError>); 3] = [
+            ("put", s.put("log/1/00000001", b"SECRET-ROW-DATA").map(drop)),
+            (
+                "put_if_absent",
+                s.put_if_absent("log/1/00000001", b"SECRET-ROW-DATA")
+                    .map(drop),
+            ),
+            ("get", s.get("log/1/00000001").map(drop)),
+        ];
+        for (call, r) in calls {
+            match r {
+                Err(StoreError::Permanent(m)) if m.contains("HTTP 307") => {}
+                r => wrong.push(format!("same_port={same_port} {call}: {r:?}")),
+            }
+        }
+        while let Ok(req) = reached.recv_timeout(Duration::from_millis(300)) {
+            wrong.push(format!("same_port={same_port}: plain http got {req}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

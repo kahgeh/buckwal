@@ -3186,6 +3186,65 @@ fn encrypted_damaged_page_fails_authentication() {
     }
 }
 
+/// A crash image of a writer's directory with page 1 torn in `app.db`: a seal put page 1
+/// there, then `CREATE TABLE u` committed a newer page 1 to the WAL, and the second half of
+/// `app.db`'s page 1 is zeroed (a torn write). Rows 1..=40 are acked.
+fn torn_page_one_image(store: &Arc<MemStore>, cfg: impl Fn(&Path) -> Config) -> TempDir {
+    let a = tempdir();
+    let db = open_with_store(cfg(a.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=30 {
+        insert(&c, id).unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    c.execute("CREATE TABLE u(x)", &[]).unwrap();
+    for id in 31..=40 {
+        insert(&c, id).unwrap();
+    }
+    let img = tempdir();
+    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-dirty"] {
+        if a.path().join(f).exists() {
+            std::fs::copy(a.path().join(f), img.path().join(f)).unwrap();
+        }
+    }
+    crash(db, vec![c]);
+    let path = img.path().join("app.db");
+    let mut b = std::fs::read(&path).unwrap();
+    assert!(b.len() >= 4096, "{} bytes", b.len());
+    b[2048..4096].fill(0);
+    std::fs::write(&path, b).unwrap();
+    img
+}
+
+/// A torn page 1 in `app.db`: a plaintext directory opens (the WAL's page 1 is the one read),
+/// an encrypted one is refused at open (page 1 fails authentication; turso reads it from
+/// `app.db` too). Nothing acked is lost: a restore from the bucket has every row.
+#[test]
+fn encrypted_torn_page_one_is_unopenable_but_restores() {
+    let store = mem();
+    let img = torn_page_one_image(&store, config);
+    let db = open_mem(&store, img.path());
+    assert_eq!(ids(&db.connect().unwrap()), (1..=40).collect::<Vec<_>>());
+    db.close().unwrap();
+
+    let store = mem();
+    let k = tempdir();
+    let img = torn_page_one_image(&store, |d| enc_config(d, &k, &key_hex()));
+    let m = encryption_err(open_with_store(
+        enc_config(img.path(), &k, &key_hex()),
+        store.clone(),
+    ));
+    assert!(
+        m.contains("does not decrypt") && m.contains("page 1 is damaged"),
+        "{m}"
+    );
+    assert_eq!(
+        restored_ids_encrypted(&store, &k),
+        (1..=40).collect::<Vec<_>>()
+    );
+}
+
 /// A takeover whose key does not fit the database is refused before its claim: the bucket is
 /// unchanged, the directory holds no database, and the running writer keeps committing.
 fn refused_takeover(store: &Arc<MemStore>, cfg: impl Fn(&Path) -> Config) -> String {
