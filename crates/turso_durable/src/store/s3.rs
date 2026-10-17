@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
@@ -18,6 +18,23 @@ pub struct S3Config {
     pub request_timeout: Duration,
     /// PEM file of the CAs that sign the endpoint's certificate; replaces the system trust store.
     pub ca_bundle: Option<std::path::PathBuf>,
+}
+
+/// `secret_key` is redacted, as in `Config`'s Debug: Debug output reaches logs, panics and
+/// error messages.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("path_style", &self.path_style)
+            .field("request_timeout", &self.request_timeout)
+            .field("ca_bundle", &self.ca_bundle)
+            .finish()
+    }
 }
 
 pub struct S3Store {
@@ -795,6 +812,34 @@ mod tests {
             Some("NoSuchKey".into())
         );
         assert_eq!(error_code(b"plain"), None);
+    }
+
+    /// The secret key never reaches `Debug` (logs, panics, error output); the rest does.
+    #[test]
+    fn s3_config_debug_redacts_the_secret_key() {
+        let cfg = S3Config {
+            endpoint: "https://s3.example.com".into(),
+            region: "eu-west-2".into(),
+            bucket: "bkt".into(),
+            access_key: "AKIAEXAMPLEACCESS".into(),
+            secret_key: "s3cr3t/SECRET+value".into(),
+            path_style: true,
+            request_timeout: Duration::from_secs(5),
+            ca_bundle: Some("/etc/ca.pem".into()),
+        };
+        for debug in [format!("{cfg:?}"), format!("{cfg:#?}")] {
+            assert!(!debug.contains("s3cr3t"), "{debug}");
+            assert!(debug.contains("<redacted>"), "{debug}");
+            for shown in [
+                "https://s3.example.com",
+                "eu-west-2",
+                "bkt",
+                "AKIAEXAMPLEACCESS",
+            ] {
+                assert!(debug.contains(shown), "{shown}: {debug}");
+            }
+            assert!(debug.contains("/etc/ca.pem"), "{debug}");
+        }
     }
 
     // AWS SigV4 documentation, "Example: GET Object" (s3, us-east-1, 2013-05-24).

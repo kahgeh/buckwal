@@ -719,6 +719,18 @@ mod tests {
     }
 
     #[test]
+    fn config_debug_redacts_the_secret_key() {
+        let mut c = Config::new("/d", "http://e", "b", "AKIAEXAMPLE", "s3cr3t/SECRET+value");
+        c.encryption_key_file = Some("/keys/db.key".into());
+        let debug = format!("{c:#?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        assert!(
+            debug.contains("AKIAEXAMPLE") && debug.contains("/keys/db.key"),
+            "{debug}"
+        );
+    }
+
+    #[test]
     fn config_from_env_reads_every_setting() {
         let all = [
             ("DURABLE_ENDPOINT", "http://127.0.0.1:9000"),
