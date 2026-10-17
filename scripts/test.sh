@@ -38,10 +38,14 @@ PASS=""
 PEAK_DONE=""
 
 # The peak of the volume samples taken during pass $1, as one line.
-peak() {
+peak_line() {
   local mb
   mb="$(awk -v p="$1" '$1 == p && $2 > m { m = $2 } END { print m + 0 }' "$WORK0/disk")"
   echo "peak turso-durable-objects: $mb MB ($1)"
+}
+
+peak() {
+  peak_line "$1"
   PEAK_DONE="$1"
 }
 
@@ -61,22 +65,29 @@ remove_dir() {
   rm -rf "$1" || echo "test.sh: could not remove $1" >&2
 }
 
-# One EXIT trap: stop the sampler (printing the running pass's peak), remove the workload's
-# directory, empty RustFS's storage in plain mode (after otel-check.sh; telemetry is in
-# ClickHouse, not the bucket), then remove the TLS material. A failed cleanup is reported
-# on stderr and the tests' exit code is kept.
+# One EXIT trap: stop the sampler, remove the workload's directory, empty RustFS's storage
+# in plain mode (after otel-check.sh; telemetry is in ClickHouse, not the bucket), remove
+# the TLS material, and only then print the running pass's peak. Every step runs even when
+# an earlier one fails or stdout/stderr is a closed pipe (`| tee` after Ctrl-C, `| head`):
+# no errexit, SIGPIPE ignored, so a failed write is just a failed write. A failed cleanup is
+# reported on stderr and the tests' exit code is kept.
 cleanup() {
-  local rc=$?
+  local rc=$? pending=""
+  set +e
+  trap '' PIPE
   if [[ -n "$SAMPLER" ]]; then
-    kill "$SAMPLER" 2>/dev/null || true
-    wait "$SAMPLER" 2>/dev/null || true
-    [[ -n "$PASS" && "$PEAK_DONE" != "$PASS" ]] && peak "$PASS"
+    kill "$SAMPLER" 2>/dev/null
+    wait "$SAMPLER" 2>/dev/null
+  fi
+  if [[ -n "$PASS" && "$PEAK_DONE" != "$PASS" && -n "$WORK0" ]]; then
+    pending="$(peak_line "$PASS" 2>/dev/null)"
   fi
   [[ -n "$WORK" ]] && remove_dir "$WORK"
   unset TURSO_DURABLE_TLS_DIR DURABLE_ENCRYPTION_KEY_FILE
   scripts/rustfs.sh reset || echo "test.sh: emptying RustFS storage (rustfs.sh reset) failed" >&2
   [[ -n "$TLS_DIR" ]] && remove_dir "$TLS_DIR"
   [[ -n "$WORK0" ]] && remove_dir "$WORK0"
+  [[ -n "$pending" ]] && echo "$pending"
   exit "$rc"
 }
 trap cleanup EXIT
