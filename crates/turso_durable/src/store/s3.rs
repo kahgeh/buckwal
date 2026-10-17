@@ -252,8 +252,10 @@ fn status_error(what: &str, r: &Reply) -> StoreError {
     }
 }
 
-/// `scheme://host[:port]` with the scheme in lower case and a default port (443 for https,
-/// 80 for http) dropped, so the signed host header is what clients send.
+/// `scheme://host[:port]` with the scheme in lower case, the host as reqwest sends it (its URL
+/// parser's form: lower case, an IPv6 literal compressed), the port as a number (1-65535) and
+/// a default port (443 for https, 80 for http) dropped, so the signed host header is what
+/// clients send. An IPv6 host is a bracketed literal.
 fn normalize_endpoint(endpoint: &str) -> crate::Result<String> {
     let bad = || {
         crate::Error::Config(format!(
@@ -266,19 +268,39 @@ fn normalize_endpoint(endpoint: &str) -> crate::Result<String> {
     if scheme != "http" && scheme != "https" {
         return Err(bad());
     }
-    if authority.contains(['/', '?', '#']) {
+    if authority.contains(['/', '?', '#', '@']) {
         return Err(bad());
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !p.contains(']') => (h, Some(p)),
-        _ => (authority, None),
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (ip, after) = rest.split_once(']').ok_or_else(bad)?;
+        let port = match after {
+            "" => None,
+            a => Some(a.strip_prefix(':').ok_or_else(bad)?),
+        };
+        (&authority[..ip.len() + 2], port)
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
     };
     if host.is_empty() {
         return Err(bad());
     }
-    let default = if scheme == "https" { "443" } else { "80" };
+    let host = reqwest::Url::parse(&format!("{scheme}://{host}"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .ok_or_else(bad)?;
+    let port = match port {
+        None => None,
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(bad)?)
+        }
+        Some(_) => return Err(bad()),
+    };
+    let default = if scheme == "https" { 443 } else { 80 };
     Ok(match port {
-        Some(p) if p != default => format!("{scheme}://{authority}"),
+        Some(p) if p != default => format!("{scheme}://{host}:{p}"),
         _ => format!("{scheme}://{host}"),
     })
 }
@@ -997,6 +1019,63 @@ mod tests {
             object_url(&S3Store::new(cfg_for("HTTP://h:80/")).unwrap().cfg, "k").0,
             "http://b.h/k"
         );
+    }
+
+    /// The signed host is the host reqwest sends: its URL parser's form of the host (lower
+    /// case, an IPv6 literal compressed, an IPv4 address dotted in full), and the port as a
+    /// number with the default dropped.
+    #[test]
+    fn signed_host_is_the_host_reqwest_sends() {
+        for (endpoint, want) in [
+            ("https://S3.Example.COM", "s3.example.com"),
+            ("HTTP://H:9000/", "h:9000"),
+            ("https://h:08443", "h:8443"),
+            ("https://h:0443", "h"),
+            ("http://[::1]", "[::1]"),
+            ("http://[::1]:9000", "[::1]:9000"),
+            ("http://[::1]:80", "[::1]"),
+            ("https://[::ABCD]:9000", "[::abcd]:9000"),
+            ("http://[0:0::1]:9000", "[::1]:9000"),
+            ("http://127.1:9000", "127.0.0.1:9000"),
+        ] {
+            let store = S3Store::new(cfg_for(endpoint)).unwrap();
+            let mut cfg = store.cfg.clone();
+            cfg.path_style = true;
+            let (url, host, _) = object_url(&cfg, "k");
+            assert_eq!(host, want, "{endpoint}");
+            let u = reqwest::Url::parse(&url).unwrap();
+            let sent = match u.port() {
+                Some(p) => format!("{}:{p}", u.host_str().unwrap()),
+                None => u.host_str().unwrap().to_string(),
+            };
+            assert_eq!(sent, host, "{endpoint}: reqwest sends another host");
+        }
+    }
+
+    #[test]
+    fn endpoint_with_a_bad_port_or_host_is_refused() {
+        for e in [
+            "https://h:",
+            "https://h:abc",
+            "https://h:+80",
+            "https://h:0",
+            "https://h:65536",
+            "https://a:b:9000",
+            "https://[::1]:",
+            "https://[::1]x",
+            "https://[::1",
+            "https://[zz]",
+            "https://[]",
+            "https://h]",
+            "https://u@h",
+        ] {
+            match S3Store::new(cfg_for(e)) {
+                Err(crate::Error::Config(m)) => {
+                    assert!(m.contains("must be http(s)://host[:port]"), "{e}: {m}")
+                }
+                r => panic!("{e}: {:?}", r.map(|s| s.cfg.endpoint)),
+            }
+        }
     }
 
     #[test]

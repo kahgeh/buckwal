@@ -488,8 +488,8 @@ fn closed_writer(store: &Arc<MemStore>, n: i64) -> TempDir {
     a
 }
 
-/// A `seal_quiet_ms` over a day in the local state is refused at open as `Corrupt`: it
-/// would panic the monotonic deadline (`u64::MAX`) or hold the first seal back for weeks.
+/// A `seal_quiet_ms` over a day in the local state is refused at open as `Corrupt`: the open
+/// would succeed and its first seal would wait weeks (`u64::MAX`: practically for ever).
 #[test]
 fn open_refuses_absurd_seal_quiet_in_local_state() {
     for v in [30 * 86_400_000u64, u64::MAX] {
@@ -3256,4 +3256,44 @@ fn takeover_with_a_key_on_a_plaintext_database_is_refused() {
     assert!(m.contains("cannot be encrypted in place"), "{m}");
     insert(&c, 11).unwrap();
     assert_eq!(ids(&c), (1..=11).collect::<Vec<_>>());
+}
+
+/// A takeover without a key of an encrypted database is refused before its claim (the
+/// restored page 1 says it is encrypted): the running writer is not fenced. Page 1 only in the
+/// bucket, then in the log too.
+#[test]
+fn takeover_without_a_key_on_an_encrypted_database_is_refused() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    let m = refused_takeover(&store, config);
+    assert!(
+        m.contains("encrypted") && m.contains("DURABLE_ENCRYPTION_KEY_FILE"),
+        "{m}"
+    );
+    insert(&c, 61).unwrap();
+    c.execute("CREATE TABLE u(x)", &[]).unwrap();
+    refused_takeover(&store, config);
+    insert(&c, 62).unwrap();
+    assert_eq!(ids(&c), (1..=62).collect::<Vec<_>>());
+}
+
+/// A takeover without a key of a plaintext database goes ahead (the page-1 check passes).
+#[test]
+fn takeover_without_a_key_on_a_plaintext_database_goes_ahead() {
+    let store = mem();
+    let a = closed_writer(&store, 10);
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    insert(&c, 11).unwrap();
+    let t = tempdir();
+    let rep = crate::takeover_with_store(config(&fresh(&t)), store.clone()).unwrap();
+    assert!(rep.fence_seq > 0, "{rep:?}");
+    assert!(matches!(insert(&c, 12), Err(Error::Fenced(_))));
+    std::mem::forget(c);
+    std::mem::forget(db);
+    let db = open_mem(&store, &fresh(&t));
+    assert_eq!(ids(&db.connect().unwrap()), (1..=11).collect::<Vec<_>>());
 }

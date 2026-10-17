@@ -402,6 +402,15 @@ impl Config {
                 "upload_concurrency must be at least 1".into(),
             ));
         }
+        // The takeover quiet is persisted, and a local state carrying one over
+        // `MAX_SEAL_QUIET` is refused at open.
+        if self.lease.saturating_add(self.request_timeout) > defaults::MAX_SEAL_QUIET {
+            return Err(Error::Config(format!(
+                "DURABLE_LEASE_MS ({:?}) + request_timeout ({:?}) must be at most 24h (the \
+                 longest takeover quiet, MAX_SEAL_QUIET)",
+                self.lease, self.request_timeout
+            )));
+        }
         // A writer's last request inside its lease lands within this long of its last head
         // check (`Bucket::check_lease`); the trim grace must outlast it. No exception for 0.
         let budget = self
@@ -657,6 +666,27 @@ mod tests {
         c.lease = Duration::MAX;
         c.trim_grace = Duration::from_secs(1);
         assert!(matches!(c.validate(), Err(Error::Config(_))));
+    }
+
+    /// The takeover quiet (`lease + request_timeout`) is persisted, and a local state carrying
+    /// one over `MAX_SEAL_QUIET` is refused at open, so `validate` refuses such a lease first.
+    #[test]
+    fn lease_and_request_timeout_fit_the_longest_seal_quiet() {
+        let mut c = Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s");
+        c.request_timeout = Duration::from_secs(10);
+        c.lease = defaults::MAX_SEAL_QUIET - c.request_timeout;
+        c.trim_grace = defaults::MAX_SEAL_QUIET + Duration::from_secs(3600);
+        assert_eq!(c.validate(), Ok(()), "exactly at the limit");
+        c.lease += Duration::from_millis(1);
+        match c.validate() {
+            Err(Error::Config(m)) => assert!(
+                m.contains("DURABLE_LEASE_MS")
+                    && m.contains("request_timeout")
+                    && m.contains("24h"),
+                "{m}"
+            ),
+            r => panic!("{r:?}"),
+        }
     }
 
     #[test]

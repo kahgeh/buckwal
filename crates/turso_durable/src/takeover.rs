@@ -55,10 +55,10 @@ const ATTEMPTS: u32 = 3;
 /// after its head write (a crash, or `Timeout` when the old writer kept appending) resumes at
 /// that open.
 ///
-/// With `encryption_key_file` set, the restored page 1 must fit the key and cipher (D16), or
-/// the takeover fails with `Encryption` before its head write: nothing is written to the
-/// bucket, the restored files are removed, and the old writer keeps running. Without a key it
-/// cannot tell an encrypted database from a plaintext one, and the first open checks.
+/// The restored page 1 must fit the configuration (D16): with `encryption_key_file` set, the
+/// key and cipher; without it, a plaintext database. Otherwise the takeover fails with
+/// `Encryption` before its head write: nothing is written to the bucket, the restored files
+/// are removed, and the old writer keeps running.
 pub fn takeover(config: Config) -> Result<TakeoverReport> {
     let store = config.s3_store()?;
     takeover_with_store(config, store)
@@ -84,13 +84,12 @@ pub fn takeover_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Resul
         let restore = staged.report;
         let state = LocalState::read(&dir)?
             .ok_or_else(|| Error::Corrupt("the restore wrote no local state".into()))?;
-        // Before the claim. Page 1 as the restore saw it, or the newer local one: no GET.
-        if let Some(enc) = &encryption {
-            let page1 = encryption::file_page_one(&dir)?.or(staged.page1);
-            if let Err(e) = check_page_one(page1.as_deref(), Some(enc)) {
-                remove_restored(&dir)?;
-                return Err(e);
-            }
+        // Before the claim, with or without a key. Page 1 as the restore saw it, or the newer
+        // local one: no GET.
+        let page1 = encryption::file_page_one(&dir)?.or(staged.page1);
+        if let Err(e) = check_page_one(page1.as_deref(), encryption.as_deref()) {
+            remove_restored(&dir)?;
+            return Err(e);
         }
         match attach_existing(&dir, &store, &keys, &cfg, state) {
             Ok(a) => {
