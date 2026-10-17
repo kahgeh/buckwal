@@ -368,18 +368,45 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
         let (log_objects, wal_bytes) = shared.maintenance_measures();
         let outcome = cfg.due(log_objects, wal_bytes).then(|| {
             // A panic must not end maintenance for good (the gate is reopened by `Reopen`).
+            #[cfg(test)]
+            let inject_panic = signal.panic_next.swap(false, SeqCst);
+            #[cfg(not(test))]
+            let inject_panic = false;
+            let generation = shared.uploader.generation();
+            let span = tracing::info_span!(
+                target: "turso_durable",
+                "durable.maintenance",
+                durable.generation = generation,
+                durable.log_objects = log_objects,
+                durable.wal_bytes = wal_bytes,
+                durable.gate_wait_ms = Empty,
+                durable.outcome = Empty,
+            );
+            let _entered = span.enter();
             catch_unwind(AssertUnwindSafe(|| {
-                #[cfg(test)]
-                if signal.panic_next.swap(false, SeqCst) {
-                    panic!("injected maintenance panic");
-                }
-                run_once(&shared, cfg, log_objects, wal_bytes)
+                let run = Measured {
+                    span: &span,
+                    generation,
+                    log_objects,
+                    wal_bytes,
+                };
+                run_once(&shared, cfg, run, inject_panic)
             }))
             .unwrap_or_else(|_| {
+                // The run may have emitted `MaintenanceStarted`: it gets an end event too.
+                span.record("durable.outcome", Outcome::Error.as_str());
                 tracing::warn!(
                     target: "turso_durable",
+                    generation,
                     "maintenance checkpoint panicked; retrying later"
                 );
+                // A hook that panics again must not end the thread.
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    shared.emit(Event::MaintenanceSkipped {
+                        generation,
+                        reason: "panic".to_string(),
+                    })
+                }));
                 Outcome::Error
             })
         });
@@ -415,19 +442,31 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
     }
 }
 
+/// What a run was started for, and its span.
+struct Measured<'a> {
+    span: &'a tracing::Span,
+    generation: u64,
+    log_objects: u64,
+    wal_bytes: u64,
+}
+
 /// One run: unless the bucket is failing, close and drain the gate, checkpoint, reopen.
-fn run_once(shared: &Shared, cfg: &MaintenanceConfig, log_objects: u64, wal_bytes: u64) -> Outcome {
-    let generation = shared.uploader.generation();
-    let span = tracing::info_span!(
-        target: "turso_durable",
-        "durable.maintenance",
-        durable.generation = generation,
-        durable.log_objects = log_objects,
-        durable.wal_bytes = wal_bytes,
-        durable.gate_wait_ms = Empty,
-        durable.outcome = Empty,
-    );
-    let _entered = span.enter();
+///
+/// It runs inside its `durable.maintenance` `span`, which the caller made (for
+/// `generation`, `log_objects` and `wal_bytes`) and entered, so a panic's outcome is
+/// recorded on it too.
+fn run_once(
+    shared: &Shared,
+    cfg: &MaintenanceConfig,
+    run: Measured<'_>,
+    inject_panic: bool,
+) -> Outcome {
+    let Measured {
+        span,
+        generation,
+        log_objects,
+        wal_bytes,
+    } = run;
     if let Some(reason) = shared.uploader.bucket_failing() {
         let outcome = Outcome::BucketFailing;
         span.record("durable.outcome", outcome.as_str());
@@ -448,6 +487,9 @@ fn run_once(shared: &Shared, cfg: &MaintenanceConfig, log_objects: u64, wal_byte
         log_objects,
         wal_bytes,
     });
+    if inject_panic {
+        panic!("injected maintenance panic");
+    }
     let start = Instant::now();
     let drained = shared.gate.close_and_drain(cfg.gate_wait);
     let gate_wait = start.elapsed();

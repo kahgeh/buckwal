@@ -431,7 +431,8 @@ pub enum Event {
     /// `bucket degraded` or `last bucket operation failed` (it did not start: no
     /// `MaintenanceStarted`, the gate stayed open), `gate_timeout` (calls or an open
     /// transaction still in flight at the gate wait), `busy` (the engine refused the
-    /// checkpoint), `closed` (the database was closing) or `error: <message>`.
+    /// checkpoint), `closed` (the database was closing), `panic` (the run panicked; the
+    /// span's outcome is `error`) or `error: <message>`.
     MaintenanceSkipped { generation: u64, reason: String },
 }
 

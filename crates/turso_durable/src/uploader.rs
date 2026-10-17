@@ -89,8 +89,10 @@ pub(crate) struct Uploader {
     /// How many log objects the current generation holds (the bucket's next seq − 1).
     log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
-    /// The last bucket operation (a log upload, a seal, or a degraded bucket's catch-up)
-    /// failed; cleared by the next that succeeds.
+    /// The last bucket operation (a log upload, a seal, or a tick's catch-up or probe)
+    /// failed; cleared by the next that succeeds. While set, the thread wakes every
+    /// `MAX_BACKOFF` to probe the bucket, so an idle database clears it once the bucket
+    /// answers.
     last_failed: Arc<AtomicBool>,
     stats: Arc<StatsCell>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -283,8 +285,8 @@ struct Worker {
 impl Worker {
     /// Run jobs in order until every sender is gone, then flush what waits and exit.
     ///
-    /// While syncs are owed or the bucket is degraded, it wakes every `MAX_BACKOFF` (2 s)
-    /// to retry them (`tick`). One degraded state can last: a seal whose head write was
+    /// While syncs are owed, the bucket is degraded or its last operation failed, it wakes
+    /// every `MAX_BACKOFF` (2 s) to retry them, or probe the bucket (`tick`). One degraded state can last: a seal whose head write was
     /// ambiguous and whose head turns out to be published stays pending until the next seal
     /// adopts it (`Bucket::before_record` refuses appends meanwhile), so each wake GETs the
     /// head again (`catch_up`), one GET every 2 s, until that seal. That is rare (an
@@ -297,7 +299,10 @@ impl Worker {
                     deadline = deadline.min(Instant::now() + defaults::MAX_BACKOFF);
                 }
                 rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            } else if !self.owed.is_empty() || self.bucket.degraded() {
+            } else if !self.owed.is_empty()
+                || self.bucket.degraded()
+                || self.last_failed.load(SeqCst)
+            {
                 rx.recv_timeout(defaults::MAX_BACKOFF)
             } else {
                 rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -354,7 +359,8 @@ impl Worker {
 
     /// A wait ran out: a batch whose deadline passed is flushed, and owed syncs are retried
     /// (with the batch, whatever its deadline); otherwise the bucket catches up on what it has
-    /// to settle (a published seal waiting to be adopted keeps it degraded, see `run`).
+    /// to settle (a published seal waiting to be adopted keeps it degraded, see `run`), or,
+    /// after a failure that left nothing to settle, is probed (`Bucket::probe`).
     fn tick(&mut self) {
         match self.batch.deadline() {
             Some(d) if d <= Instant::now() || !self.owed.is_empty() => {
@@ -365,9 +371,12 @@ impl Worker {
                 let _ = self.flush();
             }
             None => {
-                if self.bucket.degraded() {
-                    // A failure leaves it degraded; the next tick tries again.
-                    let ok = self.bucket.catch_up().is_ok();
+                if self.bucket.degraded() || self.last_failed.load(SeqCst) {
+                    // A failure leaves it degraded (or failed); the next tick tries again.
+                    // Not degraded, nothing is owed: the probe is one head GET, so an idle
+                    // database learns that the bucket has recovered (maintenance waits
+                    // for that, `Uploader::bucket_failing`).
+                    let ok = self.bucket.probe().is_ok();
                     self.last_failed.store(!ok, SeqCst);
                 }
                 self.publish_degraded();

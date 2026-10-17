@@ -510,6 +510,22 @@ impl Bucket {
         self.catch_up_at(start).map(|_| ()).map_err(upload_error)
     }
 
+    /// Is the bucket answering? For the uploader after a failed operation that left nothing
+    /// to settle (not degraded), where `catch_up` would send no request at all: one GET of
+    /// the head, no retries, checked as `verify_head` checks it (a moved head fences).
+    /// Writes nothing. Degraded, it is `catch_up`.
+    pub(crate) fn probe(&mut self) -> Result<()> {
+        if self.degraded() {
+            return self.catch_up();
+        }
+        self.check_fenced()?;
+        let once = RetryPolicy {
+            deadline: Duration::ZERO,
+            ..self.retry.clone()
+        };
+        self.verify_head_with(&once).map_err(upload_error)
+    }
+
     /// `check_head`, then `check_idle` and `settle` unless the head is `Published`.
     fn catch_up_at(&mut self, start: Instant) -> Result<HeadCheck> {
         if let published @ HeadCheck::Published(_) = self.check_head(start)? {
@@ -815,11 +831,14 @@ impl Bucket {
     /// GET the head: it must still carry this writer's ETag, or be the exact head a seal of
     /// the current generation publishes. Anything else fences this writer for good.
     fn verify_head(&mut self, start: Instant) -> Result<()> {
+        self.verify_head_with(&self.remaining(start))
+    }
+
+    /// `verify_head` under `policy`.
+    fn verify_head_with(&mut self, policy: &RetryPolicy) -> Result<()> {
         let key = self.keys.head();
         let sent = Instant::now();
-        let stored = retrying(&self.counters, &self.remaining(start), &key, || {
-            self.store.get(&key)
-        })?;
+        let stored = retrying(&self.counters, policy, &key, || self.store.get(&key))?;
         let ours = self.sealed_head().encode();
         match stored {
             Some(o) if o.etag == self.head_etag => {

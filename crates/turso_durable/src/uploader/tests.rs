@@ -609,6 +609,7 @@ struct HeadGetsFail {
     inner: MemStore,
     failing: AtomicBool,
     log_puts: AtomicU64,
+    head_gets: AtomicU64,
 }
 
 impl ObjectStore for HeadGetsFail {
@@ -630,6 +631,9 @@ impl ObjectStore for HeadGetsFail {
         self.inner.put_if_match(key, body, etag)
     }
     fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError> {
+        if key.ends_with("/head") {
+            self.head_gets.fetch_add(1, SeqCst);
+        }
         if key.ends_with("/head") && self.failing.load(SeqCst) {
             return Err(StoreError::Transient("injected head GET failure".into()));
         }
@@ -696,4 +700,66 @@ fn generation_log_objects_counts_appends_and_resets_at_seal() {
     assert_eq!(up.generation_log_objects(), 0);
     up.submit_log(op(6), Batching::Off).wait().unwrap();
     assert_eq!(up.generation_log_objects(), 1);
+}
+
+/// Wait (at most `within`) until the uploader no longer reports the bucket failing.
+fn wait_not_failing(u: &Uploader, within: Duration) {
+    let until = Instant::now() + within;
+    while let Some(why) = u.bucket_failing() {
+        assert!(Instant::now() < until, "still failing: {why}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// An Off sync that fails before its record is built (the idle check's head GET fails)
+/// leaves nothing owed and nothing in doubt: not degraded, but "last bucket operation
+/// failed". On an idle database the uploader probes the bucket (one head GET per wake)
+/// until one succeeds, so maintenance is not skipped forever after the bucket recovers.
+#[test]
+fn last_failed_is_probed_until_the_bucket_answers() {
+    let store = Arc::new(HeadGetsFail::default());
+    let mut b = bucket_with(store.clone(), short());
+    b.set_idle_threshold(Duration::ZERO);
+    let u = Uploader::spawn(b, None, None, Arc::default());
+    store.failing.store(true, SeqCst);
+    assert!(matches!(
+        u.submit_log(op(1), Batching::Off).wait(),
+        Err(Error::Timeout(_))
+    ));
+    assert!(!u.degraded(), "nothing owed, nothing in doubt");
+    assert_eq!(u.bucket_failing(), Some("last bucket operation failed"));
+    // While the head GETs keep failing, the probes fail too.
+    std::thread::sleep(defaults::MAX_BACKOFF + Duration::from_millis(500));
+    assert_eq!(u.bucket_failing(), Some("last bucket operation failed"));
+
+    store.failing.store(false, SeqCst);
+    wait_not_failing(&u, defaults::MAX_BACKOFF * 3);
+    assert_eq!(store.log_puts.load(SeqCst), 0, "a probe writes nothing");
+}
+
+/// A failed seal (a page PUT refused) on an idle bucket: nothing owed, not degraded, and
+/// the idle check not due. The uploader still sends a head GET before it clears the
+/// failure; it does not take "nothing to settle" for a working bucket.
+#[test]
+fn a_failed_seal_on_an_idle_bucket_clears_only_after_a_head_get() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let u = Uploader::spawn(bucket(fault.clone()), None, None, Arc::default());
+    fault.only_keys_containing("/pages/");
+    fault.fail_next_puts_permanently(1);
+    assert!(u.seal_generation(vec![(1, vec![0; 8])], 8, 1).is_err());
+    assert!(!u.degraded(), "nothing in doubt: only a page PUT failed");
+    assert_eq!(u.bucket_failing(), Some("last bucket operation failed"));
+    let failed_at = fault.events().len();
+    wait_not_failing(&u, defaults::MAX_BACKOFF * 3);
+    let head = Keys::new("db").head();
+    let after: Vec<String> = fault.events().split_off(failed_at);
+    assert!(
+        after.iter().any(|e| *e == format!("get {head}")),
+        "cleared without a request: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|e| e.starts_with("put")),
+        "a probe writes nothing: {after:?}"
+    );
 }

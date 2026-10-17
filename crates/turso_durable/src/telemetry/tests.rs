@@ -735,6 +735,41 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
     assert!(seals.iter().any(|s| under_m(s)), "{seals:?}");
 }
 
+/// A run that panics still closes its `durable.maintenance` span, with outcome `error`.
+#[test]
+fn a_panicking_maintenance_run_closes_its_span_as_error() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mut c = config(dir.path());
+        c.maintenance_log_objects = 5;
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        db.shared.maintenance().unwrap().panic_next_run();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 0..10 {
+            insert(&conn, i).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let spans = cap.spans();
+            if spans
+                .named("durable.maintenance")
+                .iter()
+                .any(|s| s.closed.is_some())
+            {
+                break spans;
+            }
+            assert!(Instant::now() < until, "no maintenance span closed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let m = spans.named("durable.maintenance");
+    let first = m.iter().find(|s| s.closed.is_some()).unwrap();
+    assert_eq!(first.field("durable.outcome"), Some("error"), "{m:?}");
+}
+
 // --- The export pipeline -------------------------------------------------------------
 
 use super::pipeline::{build_for_test, Providers};

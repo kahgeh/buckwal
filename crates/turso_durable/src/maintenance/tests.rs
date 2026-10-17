@@ -223,6 +223,30 @@ fn a_panicking_run_backs_off_and_maintenance_goes_on() {
     }
     wait_event(&seen, |e| matches!(e, Event::MaintenanceFinished { .. }));
     assert_eq!(THREAD_PANICS.load(SeqCst), 0, "the thread died");
+    // The panicking run started, so it has an end event: a `panic` skip.
+    let ev = seen.lock().unwrap().clone();
+    let first_run: Vec<&Event> = ev
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::MaintenanceStarted { .. }
+                    | Event::MaintenanceSkipped { .. }
+                    | Event::MaintenanceFinished { .. }
+            )
+        })
+        .take(2)
+        .collect();
+    assert!(
+        matches!(
+            first_run[..],
+            [
+                Event::MaintenanceStarted { .. },
+                Event::MaintenanceSkipped { reason, .. }
+            ] if reason == "panic"
+        ),
+        "{ev:?}"
+    );
 }
 
 /// A run that finds the database closing (`Database::close` took the engine) is a skip,
