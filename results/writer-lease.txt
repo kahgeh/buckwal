@@ -1,0 +1,374 @@
+# turso_durable stage 3 (writer-lease) measurements
+# date: 2026-10-17T15:27:50Z (run 2; run 1 a few minutes earlier)
+# git: 2c152895f57dfc642561a5af1247a01b174c8157 (writer-lease) plus
+#   crates/turso-durable-cli/examples/stage3_costs.rs, committed with this file
+# engine: turso_core 0.8.3 (features fs, json, uuid)
+# RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+# build: cargo build --release --locked -p turso-durable-cli --bins --examples (rustc 1.97.1):
+#   target/release/turso-durable and target/release/examples/stage3_costs
+# machine: Apple M4 Max, macOS 27.0.1
+# laptop figures (Apple M4 Max, RustFS in podman on the same Mac), not production numbers
+# telemetry: DURABLE_OTEL unset (off). DURABLE_BATCHING unset (off). One run per measure.
+#
+# What each measure is:
+# - bench: stage 1's workload (one connection, CREATE TABLE bench, 5000 INSERT OR REPLACE of
+#   a 1 KB blob, then close), default settings. It builds the database the rest work on.
+# - restore: a plain read-only restore of that database, for the restore's GET count.
+# - stage3_costs takeover DIR: turso_durable::takeover_with_store into an empty DIR, with the
+#   S3 store wrapped in a FaultStore that records every request. restore_* are the
+#   TakeoverReport's RestoreReport; total_* count every request of the takeover, restore
+#   included; each request follows as "request <op> <key>" (stat = HEAD, counted as a GET).
+# - CLI takeover: the CLI's line, for a second takeover (over the first).
+# - stage3_costs open DIR: open_with_store of a directory this writer owns; open_* are the
+#   bucket_stats right after open returns (DURABLE_GC_AFTER_SEAL=off, so no GC thread
+#   requests are mixed in); close_* the close's delta.
+# - stage3_costs lease DIR PAUSE_MS: open, CREATE TABLE IF NOT EXISTS lease_cost, commit row 1;
+#   then no_pause_* = the bucket_stats delta of commit 2, made right after; after_pause_* =
+#   the delta of commit 3, made after sleeping PAUSE_MS (31 s; the default lease is 30 s).
+#   DURABLE_GC_AFTER_SEAL=off for the same reason.
+# - gc: the CLI's gc, first with the defaults (trim grace 10 min: every manifest too young),
+#   then, 10 s later, with DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000
+#   DURABLE_RETRY_DEADLINE_MS=1000 DURABLE_REQUEST_TIMEOUT_MS=1000, whose minimum manifest age
+#   is 5 + 1 + 1 + 1 = 8 s, twice. Then a restore + verify, and a count of the rows.
+#
+# Commands (DURABLE_* from scripts/rustfs.sh env; <P> = stage3/<run id>, <T> from mktemp -d;
+# the prefix and <T> were deleted afterwards):
+#   DURABLE_PREFIX=<P> turso-durable bench --dir <T>/bench --commits 5000
+#   DURABLE_PREFIX=<P> turso-durable restore --dir <T>/restored
+#   DURABLE_PREFIX=<P> stage3_costs takeover <T>/took-ex           (run 2; run 1: second)
+#   DURABLE_PREFIX=<P> turso-durable takeover --dir <T>/took       (run 2; run 1: first)
+#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <T>/took    (twice)
+#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs lease <T>/took 31000
+#   DURABLE_PREFIX=<P> turso-durable gc
+#   sleep 10
+#   DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 \
+#     DURABLE_REQUEST_TIMEOUT_MS=1000 DURABLE_PREFIX=<P> turso-durable gc     (twice)
+#   DURABLE_PREFIX=<P> turso-durable restore --dir <T>/after-gc
+#   DURABLE_PREFIX=<P> turso-durable verify --dir <T>/after-gc
+#   DURABLE_PREFIX=<P> turso-durable sql --dir <T>/took \
+#     "SELECT count(*), min(id), max(id) FROM bench" "SELECT count(*) FROM lease_cost"
+#
+# Summary (run 2):
+# - takeover: ms=67; the restore inside it 4 GETs + 1 LIST (3 + 1 log object), 18 ms;
+#   total_puts=2 (put_if_match head, put_if_absent of the fence log/13/2); 10 GETs, 3 LISTs;
+#   quiet_ms=0 (the record before the fence was the bench's last log record, not an empty
+#   seal-start record). CLI takeover (second): ms=67, epoch=3, fence_seq=3.
+# - writer open: open_puts=1 (put_if_match head: the epoch raise), 7 GETs, 2 LISTs, 16-17 ms.
+# - lease: a commit right after another: 1 PUT, 0 GETs; a commit after 31 s: 1 PUT + 1 GET
+#   (get head), exactly one extra head GET.
+# - gc: defaults -> outcome=too_young, 6 ms; small settings -> trimmed_against=13
+#   deleted=5095 ms=7035; again -> deleted=0 ms=165; restore + verify ok, 5000 rows.
+# - bench: p50/p99 1.289/2.086 ms, 678.9 commits/s, bucket_puts=6772, page_puts=1720, in-run
+#   seals 44.1-54.4 ms for 170-172 pages (run 1: 1.204/1.762 ms, 723.7/s, 43.7-50.4 ms).
+
+## run 2 (raw)
+run_id=1792250790 prefix=stage3/1792250790
+
+## bench --commits 5000 (defaults)
+commits=5000
+commit_p50_ms=1.289
+commit_p95_ms=1.618
+commit_p99_ms=2.086
+commit_max_ms=73.123
+commit_max_at=4497
+busy_retries=0
+commits_per_sec=678.9
+commits_acked=5012
+commits_uploaded=5012
+log_puts=5012
+log_put_bytes=41923430
+commits_per_log_put=1.000
+bytes_per_log_put=8364.6
+ack_wait_p50_ms=1.216
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=1.856
+log_puts_per_commit=1.002
+bucket_puts=6772
+page_puts=1720
+seals=12
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=19.731 seal_1_pages=2
+seal_2_ms=44.112 seal_2_pages=170
+seal_3_ms=48.235 seal_3_pages=170
+seal_4_ms=46.084 seal_4_pages=170
+seal_5_ms=51.626 seal_5_pages=172
+seal_6_ms=48.726 seal_6_pages=172
+seal_7_ms=50.572 seal_7_pages=171
+seal_8_ms=47.460 seal_8_pages=171
+seal_9_ms=48.507 seal_9_pages=172
+seal_10_ms=54.385 seal_10_pages=172
+seal_11_ms=49.256 seal_11_pages=171
+seal_12_ms=6.466 seal_12_pages=7
+
+## restore (read-only, for comparison)
+restored generation=13 log_objects=1 gets=4 lists=1 bytes=4661 ms=19
+
+## stage3_costs takeover (first takeover, over the bench writer; requests counted)
+generation=13
+epoch=2
+fence_seq=2
+quiet_ms=0
+ms=67
+restore_log_objects=1
+restore_gets=4
+restore_lists=1
+restore_ms=18
+total_puts=2
+total_gets=10
+total_lists=3
+total_deletes=0
+request get stage3/1792250790/head
+request get stage3/1792250790/manifest/0000000012
+request get stage3/1792250790/pages/0000000012/0000000001
+request list stage3/1792250790/log/0000000013/
+request get stage3/1792250790/log/0000000013/00000000000000000001
+request get stage3/1792250790/head
+request put_if_match stage3/1792250790/head
+request get stage3/1792250790/head
+request get stage3/1792250790/manifest/0000000012
+request list stage3/1792250790/log/0000000013/
+request put_if_absent stage3/1792250790/log/0000000013/00000000000000000002
+request get stage3/1792250790/log/0000000013/00000000000000000001
+request list stage3/1792250790/log/0000000013/
+request get stage3/1792250790/log/0000000013/00000000000000000001
+request get stage3/1792250790/log/0000000013/00000000000000000002
+
+## CLI takeover (second takeover, over the first)
+took over generation=13 epoch=3 fence_seq=3 writer_id=485382e72e5bce8d36a9fff6b6e8ffc9 quiet_ms=0 ms=67
+
+## stage3_costs open #1 of the taken-over directory (DURABLE_GC_AFTER_SEAL=off)
+open_ms=16
+generation=13
+open_puts=1
+open_gets=7
+open_lists=2
+open_deletes=0
+request get stage3/1792250790/head
+request get stage3/1792250790/manifest/0000000012
+request list stage3/1792250790/log/0000000013/
+request put_if_match stage3/1792250790/head
+request get stage3/1792250790/log/0000000013/00000000000000000003
+request list stage3/1792250790/log/0000000013/
+request get stage3/1792250790/log/0000000013/00000000000000000001
+request get stage3/1792250790/log/0000000013/00000000000000000002
+request get stage3/1792250790/log/0000000013/00000000000000000003
+request get stage3/1792250790/pages/0000000012/0000000001
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+
+## stage3_costs open #2 of the same directory (DURABLE_GC_AFTER_SEAL=off)
+open_ms=17
+generation=13
+open_puts=1
+open_gets=7
+open_lists=2
+open_deletes=0
+request get stage3/1792250790/head
+request get stage3/1792250790/manifest/0000000012
+request list stage3/1792250790/log/0000000013/
+request put_if_match stage3/1792250790/head
+request get stage3/1792250790/log/0000000013/00000000000000000003
+request list stage3/1792250790/log/0000000013/
+request get stage3/1792250790/log/0000000013/00000000000000000001
+request get stage3/1792250790/log/0000000013/00000000000000000002
+request get stage3/1792250790/log/0000000013/00000000000000000003
+request get stage3/1792250790/pages/0000000012/0000000001
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+
+## stage3_costs lease, default lease 30 s, pause 31 s (DURABLE_GC_AFTER_SEAL=off)
+lease_ms=30000
+pause_ms=31000
+no_pause_puts=1
+no_pause_gets=0
+no_pause_lists=0
+no_pause_deletes=0
+no_pause_request put_if_absent stage3/1792250790/log/0000000013/00000000000000000007
+after_pause_puts=1
+after_pause_gets=1
+after_pause_lists=0
+after_pause_deletes=0
+after_pause_request get stage3/1792250790/head
+after_pause_request put_if_absent stage3/1792250790/log/0000000013/00000000000000000008
+
+## gc with the defaults (trim grace 10 min): every manifest too young
+gc generation=14 trimmed_against=- age_ms=39000 deleted=0 outcome=too_young ms=6
+
+## wait 10 s (the small settings' minimum age is 5 + 1 + 1 + 1 = 8 s)
+
+## gc with DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 DURABLE_REQUEST_TIMEOUT_MS=1000
+gc generation=14 trimmed_against=13 age_ms=10000 deleted=5095 outcome=trimmed ms=7035
+
+## gc again, same settings
+gc generation=14 trimmed_against=13 age_ms=17000 deleted=0 outcome=trimmed ms=165
+
+## restore + verify after gc
+restored generation=14 log_objects=1 gets=4 lists=1 bytes=4677 ms=24
+verify ok acked=0 present=0 unacked_present=0 duplicate_acks=0
+5000	0	4999
+3
+
+## run 1 (raw; the counted takeover was the second one, over the CLI's)
+run_id=1792250683 prefix=stage3/1792250683
+
+## bench --commits 5000 (defaults)
+commits=5000
+commit_p50_ms=1.204
+commit_p95_ms=1.481
+commit_p99_ms=1.762
+commit_max_ms=70.076
+commit_max_at=2507
+busy_retries=0
+commits_per_sec=723.7
+commits_acked=5012
+commits_uploaded=5012
+log_puts=5012
+log_put_bytes=41923430
+commits_per_log_put=1.000
+bytes_per_log_put=8364.6
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.408
+ack_wait_p99_ms=1.600
+log_puts_per_commit=1.002
+bucket_puts=6772
+page_puts=1720
+seals=12
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=13.397 seal_1_pages=2
+seal_2_ms=45.473 seal_2_pages=170
+seal_3_ms=47.127 seal_3_pages=170
+seal_4_ms=45.579 seal_4_pages=170
+seal_5_ms=46.065 seal_5_pages=172
+seal_6_ms=50.446 seal_6_pages=172
+seal_7_ms=44.249 seal_7_pages=171
+seal_8_ms=43.778 seal_8_pages=171
+seal_9_ms=46.184 seal_9_pages=172
+seal_10_ms=43.653 seal_10_pages=172
+seal_11_ms=45.143 seal_11_pages=171
+seal_12_ms=6.487 seal_12_pages=7
+
+## restore (read-only, for comparison)
+restored generation=13 log_objects=1 gets=4 lists=1 bytes=4661 ms=19
+
+## CLI takeover (first takeover, over the bench writer)
+took over generation=13 epoch=2 fence_seq=2 writer_id=9feeb781201637a44721ac94373faf7f quiet_ms=0 ms=70
+
+## stage3_costs takeover (second takeover, over the first; requests counted)
+generation=13
+epoch=3
+fence_seq=3
+quiet_ms=0
+ms=104
+restore_log_objects=2
+restore_gets=5
+restore_lists=1
+restore_ms=29
+total_puts=2
+total_gets=12
+total_lists=3
+total_deletes=0
+request get stage3/1792250683/head
+request get stage3/1792250683/manifest/0000000012
+request get stage3/1792250683/pages/0000000012/0000000001
+request list stage3/1792250683/log/0000000013/
+request get stage3/1792250683/log/0000000013/00000000000000000001
+request get stage3/1792250683/log/0000000013/00000000000000000002
+request get stage3/1792250683/head
+request put_if_match stage3/1792250683/head
+request get stage3/1792250683/head
+request get stage3/1792250683/manifest/0000000012
+request list stage3/1792250683/log/0000000013/
+request put_if_absent stage3/1792250683/log/0000000013/00000000000000000003
+request get stage3/1792250683/log/0000000013/00000000000000000002
+request list stage3/1792250683/log/0000000013/
+request get stage3/1792250683/log/0000000013/00000000000000000001
+request get stage3/1792250683/log/0000000013/00000000000000000002
+request get stage3/1792250683/log/0000000013/00000000000000000003
+
+## stage3_costs open #1 of the taken-over directory (DURABLE_GC_AFTER_SEAL=off)
+open_ms=42
+generation=13
+open_puts=1
+open_gets=7
+open_lists=2
+open_deletes=0
+request get stage3/1792250683/head
+request get stage3/1792250683/manifest/0000000012
+request list stage3/1792250683/log/0000000013/
+request put_if_match stage3/1792250683/head
+request get stage3/1792250683/log/0000000013/00000000000000000003
+request list stage3/1792250683/log/0000000013/
+request get stage3/1792250683/log/0000000013/00000000000000000002
+request get stage3/1792250683/log/0000000013/00000000000000000001
+request get stage3/1792250683/log/0000000013/00000000000000000003
+request get stage3/1792250683/pages/0000000012/0000000001
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+
+## stage3_costs open #2 of the same directory (DURABLE_GC_AFTER_SEAL=off)
+open_ms=37
+generation=13
+open_puts=1
+open_gets=7
+open_lists=2
+open_deletes=0
+request get stage3/1792250683/head
+request get stage3/1792250683/manifest/0000000012
+request list stage3/1792250683/log/0000000013/
+request put_if_match stage3/1792250683/head
+request get stage3/1792250683/log/0000000013/00000000000000000003
+request list stage3/1792250683/log/0000000013/
+request get stage3/1792250683/log/0000000013/00000000000000000001
+request get stage3/1792250683/log/0000000013/00000000000000000003
+request get stage3/1792250683/log/0000000013/00000000000000000002
+request get stage3/1792250683/pages/0000000012/0000000001
+close_puts=0
+close_gets=0
+close_lists=0
+close_deletes=0
+
+## stage3_costs lease, default lease 30 s, pause 31 s (DURABLE_GC_AFTER_SEAL=off)
+lease_ms=30000
+pause_ms=31000
+no_pause_puts=1
+no_pause_gets=0
+no_pause_lists=0
+no_pause_deletes=0
+no_pause_request put_if_absent stage3/1792250683/log/0000000013/00000000000000000007
+after_pause_puts=1
+after_pause_gets=1
+after_pause_lists=0
+after_pause_deletes=0
+after_pause_request get stage3/1792250683/head
+after_pause_request put_if_absent stage3/1792250683/log/0000000013/00000000000000000008
+
+## gc with the defaults (trim grace 10 min): every manifest too young
+gc generation=14 trimmed_against=- age_ms=39000 deleted=0 outcome=too_young ms=12
+
+## wait 10 s (the small settings' minimum age is 5 + 1 + 1 + 1 = 8 s)
+
+## gc with DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 DURABLE_REQUEST_TIMEOUT_MS=1000
+gc generation=14 trimmed_against=13 age_ms=10000 deleted=5095 outcome=trimmed ms=7108
+
+## gc again, same settings
+gc generation=14 trimmed_against=13 age_ms=17000 deleted=0 outcome=trimmed ms=162
+
+## restore + verify after gc
+restored generation=14 log_objects=1 gets=4 lists=1 bytes=4677 ms=24
+verify ok acked=0 present=0 unacked_present=0 duplicate_acks=0
+5000	0	4999
+3

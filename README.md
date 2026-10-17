@@ -4,14 +4,16 @@ Make a tursodb database durable in an S3 bucket. A Rust library (`turso_durable`
 
 Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
 
-This is stage 2: one writer process, plain HTTP, a runtime batching setting and OpenTelemetry export, tested against RustFS on a laptop (not on AWS S3).
+This is stage 3: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export, and uses plain HTTP. It is tested against RustFS on a laptop (not on AWS S3).
 
 ## How it works
 
 - **Commits.** Each commit writes WAL frames. With batching `Off` (the default), the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`) before the WAL's fsync. With a `Window`, the commit is queued for the uploader, fsynced locally, and the call then waits while the commit shares one log object with other commits (see Batching). Either way, the commit returns `Ok` only when a log object holding it is in the bucket.
 - **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it. It first appends an empty *seal-start* log record and checks that `head` has not moved, so a writer that was taken over stops before it uploads anything. Then it uploads every page that changed in that generation (`pages/…`), then a manifest that maps each page to the generation holding its latest copy, then moves `head` to the next generation.
 - **Restore.** Restore reads `head`, the newest manifest and the current generation's log. It rebuilds the WAL from the log and fetches pages from the bucket only when the engine first reads them.
-- **Trimming.** After each seal, a background thread deletes log objects, manifests and pages that the new head no longer needs. It waits for the trim grace period first.
+- **Takeover.** Another machine takes the database over by restoring it and writing the head with a new writer id at the next epoch, then a fence record in the log (`takeover`, see Guarantees). The old writer, if it still runs, is fenced: its next append, seal or lease check fails `Fenced`.
+- **The lease.** A writer trusts its last look at the head for `lease` (30 s). Past it, the next append, and each page or manifest PUT of a seal, reads the head first.
+- **GC.** Log objects, manifests and pages that the head no longer needs are deleted once the bucket's own clock says they have been unreferenced for longer than the trim grace (10 min). A writer runs GC on a background thread at open and after each seal; `gc` runs it from anywhere.
 
 ## Use
 
@@ -90,15 +92,20 @@ The API:
 
 | Item | What it does |
 |---|---|
-| `open(Config) -> Result<Database>` | Opens `config.dir` as the database's one writer (see the table below). On an empty or restored directory it takes the database over (see the warning below). |
-| `is_claimed(dir) -> Result<bool>` | `true` when `dir` already holds a writer's own database, so `open` continues it. `false` for a missing or empty directory, or one restored and never opened, where `open` would take the database over. It reads only local files. |
+| `open(Config) -> Result<Database>` | Opens `config.dir` as the database's one writer (see the table below). On an empty or restored directory it takes the database over, as `takeover` does (see the warning below). |
+| `is_claimed(dir) -> Result<bool>` | `true` when `dir` already holds a writer's own database, so `open` continues it. `false` for a missing or empty directory, one restored and never opened, or one whose takeover was interrupted, where `open` would take the database over. It reads only local files. |
+| `takeover(Config) -> Result<TakeoverReport>` | Restores the database into `config.dir`, which must be missing or empty (a `durable.lock` alone counts as empty; `Config` otherwise, before any request), then takes it over there: the head names a new writer id at the next epoch, and a fence record follows in the log. A writer still running elsewhere is fenced for good. No engine opens; `open` of `config.dir` continues as the new writer. See Guarantees. |
+| `TakeoverReport` | `generation` (the head's), `epoch` (the head's now, one above the old writer's), `fence_seq` (the fence record's seq in `log/<generation>`), `writer_id` (the new one), `restore` (the last restore's `RestoreReport`), `quiet` (the takeover quiet, `Duration::ZERO` for none) and `elapsed`. |
+| `gc(&Config) -> Result<GcReport>` | One GC pass on the bucket alone (`config.dir` is ignored): deletes what an old enough head no longer reaches (see Guarantees). It sends only GETs, HEADs, LISTs and DELETEs, and is safe beside a running writer and restores. It does not retry a failed bucket call: it fails with `Bucket`. |
+| `GcReport` | `generation` (the head's, 0 when the prefix holds no database), `trimmed_against` (`Option<u64>`, the manifest it trimmed against), `age` (`Option<Duration>`: that manifest's age by the bucket's clock, or, when none was old enough, the oldest one it asked about), `deleted`, `outcome` and `elapsed`. |
+| `GcOutcome` | `Trimmed` (it trimmed against an old enough manifest, possibly deleting nothing), `TooYoung` (every manifest of the head is younger than the minimum age) or `Nothing` (no head, or no manifest yet). `as_str()` gives `trimmed`, `too_young` or `nothing`. |
 | `Database::connect() -> Result<Connection>` | A new connection. Open one per thread. |
 | `Database::generation()` | The generation the bucket's head is at, as this writer last saw it. |
 | `Database::bucket_stats()` | PUTs, GETs, LISTs, DELETEs and bytes sent so far (`store::StatsSnap`). |
 | `Database::upload_stats() -> UploadStats` | How many commits each log PUT carried and how long acks waited, since open (fields below). |
 | `Database::set_batching(Batching) -> Result<()>` | The setting of every connection that has none of its own, from its next commit. It starts as `Config::batching`. `Config` when the setting is invalid. |
 | `Database::batching() -> Batching` | The database's setting. |
-| `Database::close()` | Waits for pending uploads, stops the trimmer, releases the directory. It fails with `Config` while a connection is open. Dropping the last handle and connection also closes it; if a maintenance run is in progress then, the close finishes on the maintenance thread shortly after the drop returns, so call `close()` when you reopen the directory in the same process at once. |
+| `Database::close()` | Waits for pending uploads, waits for a GC pass in progress and stops the GC thread, releases the directory. It fails with `Config` while a connection is open. A close-time seal of a generation under a takeover quiet waits out the quiet first (see Guarantees). Dropping the last handle and connection also closes it; if a maintenance run is in progress then, the close finishes on the maintenance thread shortly after the drop returns, so call `close()` when you reopen the directory in the same process at once. |
 | `Connection::execute(sql, params) -> Result<u64>` | Runs one statement and returns the number of changed rows. `sql` must hold exactly one statement. |
 | `Connection::execute_batch(sql)` | Runs several statements, with no parameters. If the guard refuses any statement, none of them runs. |
 | `Connection::query(sql, params) -> Result<Vec<Vec<Value>>>` | Runs one statement and collects its rows. |
@@ -122,7 +129,7 @@ The API:
 |---|---|
 | `commits_acked` | Commits whose ack returned `Ok`. The acks of one call (`execute_batch` can make several commits) are counted only when every ack of that call succeeded. |
 | `commits_uploaded` | Commits in log records confirmed in the bucket. |
-| `log_puts` | Log records confirmed in the bucket that carry at least one commit. The claim, seal-start and reconcile catch-up records carry none and are not counted. |
+| `log_puts` | Log records confirmed in the bucket that carry at least one commit. Fence, seal-start and reconcile catch-up records carry none and are not counted. |
 | `log_put_bytes` | The encoded size of those records. |
 | `commits_per_log_put` | `commits_uploaded / log_puts`, 0.0 when `log_puts` is 0. |
 | `bytes_per_log_put` | `log_put_bytes / log_puts`, 0.0 when `log_puts` is 0. |
@@ -137,19 +144,20 @@ What `open` does depends on the directory:
 | Local directory | Bucket prefix | `open` |
 |---|---|---|
 | empty or missing | no `head` | Creates a new database with a new writer id. The head starts at generation 1. |
-| empty or missing | has a `head` | Restores into the directory, then claims it (see Guarantees). |
-| restored by `restore`, never opened | — | Claims it, then continues. |
-| this library's directory | — | Continues it. It first reconciles the local WAL with the bucket (D9). |
+| empty or missing | has a `head` | Restores into the directory, then takes it over, as `takeover` does (see Guarantees). |
+| restored by `restore`, never opened | — | Takes it over, then continues. |
+| an interrupted takeover (its claim id is set) | — | Resumes the takeover under the same claim id, then continues. |
+| this library's directory | — | Continues it. It first raises the head's epoch (one head PUT) and, when the generation's last log record is another writer's, appends a fence record. Then it reconciles the local WAL with the bucket (D9). |
 | an `app.db` this library did not create | — | `Error::Config`. An existing SQLite or tursodb file cannot be adopted. |
 
-**Warning: opening a restored or empty directory as the writer takes the database over.** `open` claims the database under a new writer id, and the old writer, if it is still running anywhere, is fenced for good: its next commit fails with `Fenced`. Open such a directory only on purpose, for example to move the database to a new machine. To read the database without taking it over, use `verify` (CLI). Call `is_claimed(dir)` first to tell the cases apart.
+**Warning: opening a restored or empty directory as the writer takes the database over.** `open` takes the database over under a new writer id, and the old writer, if it is still running anywhere, is fenced for good: its next commit fails with `Fenced`. Open such a directory only on purpose, for example to move the database to a new machine. To read the database without taking it over, use `verify` (CLI). Call `is_claimed(dir)` first to tell the cases apart. The takeover persists its claim id in the directory before it writes anything, so a takeover interrupted by a crash, or one that failed after its head write, resumes at the next `open` of that directory.
 
 The files in the directory:
 
 | File | What it is |
 |---|---|
 | `app.db`, `app.db-wal` | The database and its WAL. After a restore, `app.db` fills in lazily as pages are read. |
-| `app.db-durable` | Local state as JSON: writer id, generation, whether every page is local, and the claim. |
+| `app.db-durable` | Local state as JSON: writer id, generation, whether every page is local, the claim, the epoch and the takeover quiet (see Bucket format). |
 | `app.db-dirty` | Page numbers checkpointed since the last seal, fsynced before `app.db` is. |
 | `durable.lock` | The exclusive lock held by the open process. |
 | `app.db-restoring` (inside the directory) and `.<dir>.restore-*` (staging directories next to it) | Exist only while a restore runs. Open or restore cleans up after an interrupted restore. |
@@ -158,7 +166,7 @@ Errors are `turso_durable::Error`:
 
 | Variant | When |
 |---|---|
-| `Fenced` | Another writer owns the database now, or the bucket changed since this directory was restored ("restore again"). |
+| `Fenced` | Another writer took the database over: the head names another writer id (or an epoch below this directory's), or a log position this writer needed holds another writer's record or fence. A fenced writer stays fenced. Also a takeover whose restored generation is no longer the head's: the old writer sealed since the restore (`… restore again`; `takeover` restores again by itself, up to 3 times in all). |
 | `Timeout` | A bucket operation kept failing transiently for the whole retry deadline. An `Off` commit that fails this way is rolled back locally; a `Window` commit stays in the local database (see Batching). |
 | `UploadFailed` | The bucket refused an upload permanently, or the uploader stopped. |
 | `NotFound` | A key that must exist is missing: no database at this prefix (restore, read-only open), or a page the manifest names. |
@@ -246,6 +254,7 @@ pub enum Batching {
 
 **When it does not run, and retries.**
 - No run starts while the bucket is degraded or its last operation failed. The run is skipped as `bucket degraded` or `last bucket operation failed`, with no `MaintenanceStarted`, and the gate stays open. A failed operation is cleared by the next one that succeeds; on an idle database the uploader probes the bucket every 2 s (`MAX_BACKOFF`) with one head GET, which writes nothing, until it answers.
+- No run starts during a takeover quiet either (see Guarantees), since its seal would wait out the quiet with the gate closed. The run is skipped as `takeover quiet`, the same way, and retried once the quiet has passed.
 - After a skipped run the next waits at least 1 s (`MAINTENANCE_RETRY`). Gate timeouts and busy refusals in a row double that: 1, 2, 4, 8, 16, then 30 s (`MAINTENANCE_RETRY_MAX`). A seal resets it. After a failed run (`error: …`) the next waits 1 s, or runs sooner once the generation has grown by one more threshold. Both values are fixed, in `mod defaults`.
 - `busy` means the engine refused the TRUNCATE: engine work outside the gate (a new connection being opened by `Database::connect`, or the prefetch) held the WAL.
 
@@ -254,8 +263,8 @@ pub enum Batching {
 **It applies in every mode.** Under Off the engine usually restarts the WAL by itself, so the trigger rarely fires (see the figures below).
 
 **Seeing it.**
-- Events (`#[doc(hidden)]`, like the others; see Guarantees): `MaintenanceStarted { generation, log_objects, wal_bytes }`; `MaintenanceFinished { generation, gate_wait, elapsed }`, which means the run sealed (`gate_wait` is the drain, `elapsed` the whole run with its seal); `MaintenanceSkipped { generation, reason }`, where `reason` is `bucket degraded`, `last bucket operation failed`, `gate_timeout`, `busy`, `closed` (the database was closing), `panic` or `error: <message>`.
-- The `durable.maintenance` span, one per run (see Telemetry), with outcome `sealed`, `bucket_failing`, `gate_timeout`, `busy`, `closed` or `error`. A failed or panicked run logs a WARN record; routine skips log at INFO.
+- Events (`#[doc(hidden)]`, like the others; see Guarantees): `MaintenanceStarted { generation, log_objects, wal_bytes }`; `MaintenanceFinished { generation, gate_wait, elapsed }`, which means the run sealed (`gate_wait` is the drain, `elapsed` the whole run with its seal); `MaintenanceSkipped { generation, reason }`, where `reason` is `bucket degraded`, `last bucket operation failed`, `takeover quiet`, `gate_timeout`, `busy`, `closed` (the database was closing), `panic` or `error: <message>`.
+- The `durable.maintenance` span, one per run (see Telemetry), with outcome `sealed`, `bucket_failing`, `takeover_quiet`, `gate_timeout`, `busy`, `closed` or `error`. A failed or panicked run logs a WARN record; routine skips log at INFO.
 - `soak` prints the events as lines and `bench` counts them (see CLI).
 
 **What it costs.** Laptop figures (Apple M4 Max, RustFS in podman on the same Mac), from `results/batching-knob.txt`: 6000 commits of 1 KB on 8 connections. The table shows the two final rounds as "a / b"; the file also holds two earlier rounds of the same code, run before `bench` retried busy commits (their Off runs mostly stopped at a busy refusal), which the notes below include. "on" is the defaults, "off" sets both thresholds to 0, and "200" sets `maintenance_log_objects` to 200. With the defaults, `window 50ms` never ran maintenance and Off ran it at most twice.
@@ -284,13 +293,15 @@ pub enum Batching {
 
 ## CLI
 
-`turso-durable <command> --dir DIR …`. S3 settings come from the `DURABLE_*` variables. Build it with `cargo build --release --locked -p turso-durable-cli`.
+`turso-durable <command> --dir DIR …` (`gc` takes no `--dir`). S3 settings come from the `DURABLE_*` variables. Build it with `cargo build --release --locked -p turso-durable-cli`.
 
 | Command | What it does |
 |---|---|
 | `restore --dir DIR` | Restores into an empty `DIR`. It prints `restored generation=… log_objects=… gets=… lists=… bytes=… ms=…`. |
+| `takeover --dir DIR` | `takeover`: restores into the missing or empty `DIR` and takes the database over there. It prints `took over generation=… epoch=… fence_seq=… writer_id=… quiet_ms=… ms=…`. `sql --dir DIR` then continues as the new writer. |
+| `gc` | One GC pass (`gc`) on the bucket prefix, with no directory (`--dir` is a usage error). It prints `gc generation=… trimmed_against=… age_ms=… deleted=… outcome=… ms=…`, with `-` for a missing `trimmed_against` or `age_ms`, and `outcome` `trimmed`, `too_young` or `nothing`. |
 | `verify --dir DIR [--acked FILE]` | Opens `DIR` read-only and runs `PRAGMA integrity_check`. With `--acked`, it checks that every id in FILE (lines `ack <id>` or `<id>`) is in table `soak`, and fails if an id was acked twice. `DIR` may be empty, in which case it restores first. Verify never claims, never seals and never writes to the bucket. |
-| `sql --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, or restored and never opened) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. There is no read-only fallback; use `verify` to read. |
+| `sql --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, restored and never opened, or holding an interrupted takeover) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. With `--claim`, such a directory is taken over exactly as `takeover` does it (or created, when the prefix holds no database), and an interrupted takeover resumes. There is no read-only fallback; use `verify` to read. |
 | `stats --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer like `sql` (the same `--claim` rule), runs each SQL argument as its own `execute`, then prints `Database::upload_stats()` as `key=value` lines: `commits_acked`, `commits_uploaded`, `log_puts`, `log_put_bytes`, `commits_per_log_put`, `bytes_per_log_put`, `ack_wait_p50_ms`, `ack_wait_p95_ms`, `ack_wait_p99_ms`. |
 | `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N] [--connections N] [--batching SPEC] [--batching-file PATH] [--stats-every N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors, printing `error <message>`. More below. |
 | `bench --dir DIR --commits N [--connections N] [--batching SPEC]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, `busy_retries` (commits the engine refused as `database is busy`, each retried after 10 ms for up to 10 s, after which bench fails with the error; latency runs from the first attempt), commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, each seal's ms and page count, then the maintenance checkpoint's `maintenance_runs` (runs started), `maintenance_sealed`, `maintenance_skipped`, `maintenance_gate_wait_max_ms` (the longest drain of a run that sealed), and `generation_log_objects_max` (the highest log seq seen before the close: the most log objects a generation held, which a restore of it reads). |
@@ -301,7 +312,7 @@ pub enum Batching {
 - `--connections N`: N threads, one connection each. Thread `i` commits ids `start + i + k·N`.
 - `--batching-file PATH`: re-read before each commit when the file's mtime or length changed. A valid setting is set on the database and printed as `batching <setting>`. An unreadable file or a bad setting prints one `error: …` line on stderr and keeps the current setting.
 - `--stats-every N`: every N acks, prints the upload stats as `stats <key>=<value>` lines (the `stats` keys), taken while no commit runs.
-- It prints `event seal-started` and `event seal-finished` around each seal. With `--batching` or `--batching-file` it also prints:
+- It prints `event seal-started` and `event seal-finished` around each seal, and `event checkpoint <mode>` after each `--checkpoint` call (`passive`, `full`, `restart`, `truncate` or `reopen`). With `--batching` or `--batching-file` it also prints:
   - `event batch-waiting <n>` when a Window commit joins a batch of n, and `event log-uploaded <commits>` (commit numbers such as `4,5,6`, or `-` for none) when a log record is confirmed;
   - for the maintenance checkpoint, `event maintenance-started log_objects=<n> wal_bytes=<n>`, `event maintenance-finished gate_wait_ms=<ms> ms=<ms>` (it sealed; the drain and the whole run, 3 decimals) and `event maintenance-skipped <reason>`.
 
@@ -309,7 +320,7 @@ Every command exports telemetry when `DURABLE_OTEL=1` (see Telemetry). If the ex
 
 Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on bad arguments.
 
-**Warning:** `sql --claim` on a restored or empty directory takes the database over. The old writer is fenced, and its next commit fails. `soak` and `bench` always open as the writer, so run them only on their own prefix.
+**Warning:** `takeover`, and `sql --claim` on a restored or empty directory, take the database over. The old writer is fenced, and its next commit fails. `soak` and `bench` always open as the writer, so run them only on their own prefix.
 
 ## Settings
 
@@ -322,13 +333,15 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_ACCESS_KEY` | `access_key` | required | |
 | `DURABLE_SECRET_KEY` | `secret_key` | required | Redacted from `Debug`. |
 | `DURABLE_REGION` | `region` | `us-east-1` | Used for SigV4. |
-| `DURABLE_PATH_STYLE` | `path_style` | `true` | `endpoint/bucket/key`. Set it to `false` for virtual-hosted style. Accepts `0`/`1`/`true`/`false`. |
+| `DURABLE_PATH_STYLE` | `path_style` | `true` | `endpoint/bucket/key`. Set it to `false` for virtual-hosted style. Accepts `0`/`1`, `true`/`false` or `on`/`off`. |
 | `DURABLE_PREFIX` | `prefix` | `""` (bucket root) | Every key goes under `<prefix>/`. Use one prefix per database. Only `A-Z a-z 0-9 . _ - /` are allowed, with no leading or trailing `/`, no `//` and no `.` or `..` segment; anything else fails with `Config`. |
 | `DURABLE_RETRY_DEADLINE_MS` | `retry_deadline` | 30 s | How long one bucket job may keep retrying transient errors: a commit's log upload, a seal, or a page fetch. |
 | `DURABLE_REQUEST_TIMEOUT_MS` | `request_timeout` | 10 s | One HTTP request. |
 | `DURABLE_UPLOAD_CONCURRENCY` | `upload_concurrency` | 16 | Parallel page PUTs in a seal, and parallel log GETs in a restore. Must be at least 1. |
-| `DURABLE_TRIM_GRACE_SECS` | `trim_grace` | 10 min | How long an unreferenced object stays before it is deleted. A writer idle for half of it checks the head before its next append (one GET). Fencing an old writer after a restore depends on it (see "Restore and the claim"):<br>• Every process that opens a prefix as a writer must use the same value. A claimer's must never be smaller than the old writer's.<br>• It must exceed 2 × (`retry_deadline` + `request_timeout`), 80 s with the defaults. `Config` refuses a smaller value with an error.<br>• `0` (every commit checks the head) is for tests only, so it stays allowed. It is unsafe while an old writer may still be running.<br>Nothing enforces the same-value rule; stage 3's lease replaces it. |
-| `DURABLE_PREFETCH` | `prefetch` | `false` | After open, fetch every sealed page in the background. |
+| `DURABLE_TRIM_GRACE_SECS` | `trim_grace` | 10 min | How long an unreferenced object stays before GC deletes it. GC trims against a manifest only once the bucket's own clock says it is `trim_grace` + `retry_deadline` + `request_timeout` + 1 s old (10 min 41 s with the defaults; see Guarantees).<br>• It must exceed `lease` + `retry_deadline` + `request_timeout` (70 s with the defaults). `Config` refuses a smaller or equal value, `0` included.<br>• Against another process's old writer, it protects only if it also exceeds that process's `lease` + `retry_deadline` + `request_timeout`. The same settings on every process satisfy this; nothing in the bucket records another process's settings, so nothing enforces it. |
+| `DURABLE_LEASE_MS` | `lease` | 30 s | How long a writer trusts its last confirmation that the head is still its own. Past it, on the monotonic or the wall clock, whichever is further, the next append, and each page or manifest PUT attempt of a seal, GETs the head first (see Guarantees). The takeover quiet is `lease` + `request_timeout`. `0` checks before every append and every round of page PUTs (tests). |
+| `DURABLE_GC_AFTER_SEAL` | `gc_after_seal` | `true` | A writer open runs GC itself, on its own thread (`turso-durable-trimmer`): at open, after each seal and when the next manifest comes of age. Off, only `gc` deletes anything. Accepts `0`/`1`, `true`/`false` or `on`/`off`. |
+| `DURABLE_PREFETCH` | `prefetch` | `false` | After open, fetch every sealed page in the background. Accepts `0`/`1`, `true`/`false` or `on`/`off`. |
 | `DURABLE_BATCHING` | `batching` | `off` | The database's batching setting at open, in the PRAGMA's text: `off` or `window <max_wait> <max_commits> <max_bytes>` (see Batching). A bad value fails with `Config`. |
 | `DURABLE_MAINTENANCE_LOG_OBJECTS` | `maintenance_log_objects` | 1000 | A maintenance checkpoint seals the generation once its log holds this many objects (see "Maintenance checkpoint"). 0 turns this measure off. |
 | `DURABLE_MAINTENANCE_WAL_MIB` | `maintenance_wal_bytes` | 64 MiB | … or once the local `-wal` reaches this size. The variable is in MiB; the field is in bytes. 0 turns this measure off; with both 0, maintenance is off. |
@@ -338,7 +351,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 
 | Variable | `TelemetryConfig` field | Default | Notes |
 |---|---|---|---|
-| `DURABLE_OTEL` | `enabled` | off | Export spans and log records. Accepts `0`/`1`/`true`/`false`. `./scripts/test.sh` turns it on. |
+| `DURABLE_OTEL` | `enabled` | off | Export spans and log records. Accepts `0`/`1`, `true`/`false` or `on`/`off`. `./scripts/test.sh` turns it on. |
 | `DURABLE_OTEL_ENDPOINT` | `endpoint` | `http://localhost:4317` | The OTLP/gRPC collector. Only `http://` (no TLS); anything else fails with `Config`. Set in code, so `OTEL_EXPORTER_OTLP_*ENDPOINT` cannot redirect it, but `OTEL_EXPORTER_OTLP_*HEADERS` are still sent. |
 | `DURABLE_OTEL_LEVEL` | `level` | `info` | The least severe log record exported: `trace`, `debug`, `info`, `warn` or `error`. Spans are always INFO. |
 | `DURABLE_TEST_RUN_ID` | `test_run_id` | unset | Added as the `test_run_id` attribute to every span and log record. An empty value counts as unset. |
@@ -348,6 +361,8 @@ Where the defaults live:
 - The retry backoff is fixed and cannot be configured. It starts at 50 ms (`FIRST_BACKOFF`), doubles, and is capped at 2 s (`MAX_BACKOFF`). Both are in `mod defaults` too. `RetryPolicy::default` in `crates/turso_durable/src/store/retry.rs` takes all three retry values from there.
 - The batching default, `Off`, is `BATCHING` in `mod defaults`. It stays `Off` until there are numbers from real S3. The 60 s cap on a window's `max_wait` is `MAX_BATCH_WAIT`, there too; it cannot be configured. The telemetry defaults are there too (`OTEL`, `OTEL_ENDPOINT`, `OTEL_LEVEL`), with the fixed export limits: one export times out after 1 s (`OTEL_EXPORT_TIMEOUT`), shutdown waits at most 2 s (`OTEL_SHUTDOWN`), and each queue holds 2048 spans or log records (`OTEL_QUEUE`).
 - The maintenance defaults are `MAINTENANCE_LOG_OBJECTS`, `MAINTENANCE_WAL_BYTES` and `MAINTENANCE_GATE_WAIT` in `mod defaults`, with the fixed retry delays: 1 s after a skipped or failed run (`MAINTENANCE_RETRY`), doubled for gate timeouts and busy refusals in a row up to 30 s (`MAINTENANCE_RETRY_MAX`).
+- The lease, trim grace and GC defaults are `LEASE`, `TRIM_GRACE` and `GC_AFTER_SEAL` in `mod defaults`, with two fixed limits: a takeover's fence record steps over at most 64 log positions (`FENCE_MAX_STEPS`), and a seal goes on past its retry deadline for at most 3 rounds in a row in which the store only answered (412s and HEADs) without storing anything (`MAX_ANSWER_ONLY_ROUNDS`). A failed GC pass on a writer's thread is retried at the next seal or after 30 s (`MAINTENANCE_RETRY_MAX`).
+- Every boolean variable (`DURABLE_PATH_STYLE`, `DURABLE_PREFETCH`, `DURABLE_GC_AFTER_SEAL`, `DURABLE_OTEL`) accepts `0`/`1`, `true`/`false` or `on`/`off`, case-insensitive; anything else fails with `Config`.
 - The busy timeout between connections is fixed at 5 s. It lives in `crates/turso_durable/src/conn.rs` (`BUSY_TIMEOUT`).
 
 ## Telemetry
@@ -365,11 +380,14 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `durable.upload` | the first commit's `durable.commit` | One per log PUT: `durable.commits`, `durable.bytes`, `durable.generation`, `durable.seq`, `durable.retries`, `s3.status` |
 | `durable.checkpoint_upload` | the caller's span | One per seal: `durable.generation`, `durable.seq` (the seal-start record's), `durable.pages`, `durable.retries`, `s3.status` |
 | `durable.restore` | the caller's span | `durable.generation`, `durable.seq` (the highest log seq replayed, 0 when the log is empty), `durable.log_objects`, `durable.gets`, `durable.bytes`, `durable.retries`, `s3.status` |
-| `durable.maintenance` | none (the maintenance thread) | One per maintenance run: `durable.generation`, `durable.log_objects`, `durable.wal_bytes` (the measures that made it due), `durable.gate_wait_ms` (the drain; absent when the run did not start), `durable.outcome` (`sealed`, `bucket_failing`, `gate_timeout`, `busy`, `closed` or `error`). The seal's `durable.checkpoint_upload` is its descendant. |
+| `durable.maintenance` | none (the maintenance thread) | One per maintenance run: `durable.generation`, `durable.log_objects`, `durable.wal_bytes` (the measures that made it due), `durable.gate_wait_ms` (the drain; absent when the run did not start), `durable.outcome` (`sealed`, `bucket_failing`, `takeover_quiet`, `gate_timeout`, `busy`, `closed` or `error`). The seal's `durable.checkpoint_upload` is its descendant. |
+| `durable.takeover` | the caller's span (`takeover`, or the `open` that takes a directory over) | One per takeover, around its head write, attach and fence record (the restore before it has its own `durable.restore`): `durable.generation` (the restored generation), `durable.epoch` (the new epoch, recorded once the head write has landed, so a takeover that fails after it still shows it), `durable.seq` (the fence record's), `durable.retries`, `s3.status`, `durable.outcome` (`ok` or `error`) |
+| `durable.fence` | the caller's span (`durable.takeover`, or the writer open that appends one) | One per fence record: `durable.generation`, `durable.seq`, `durable.epoch`, `durable.retries`, `s3.status` |
+| `durable.gc` | the caller's span for `gc`; none on a writer's GC thread | One per GC pass: `durable.generation` (the head's), `durable.manifest` (the manifest trimmed against; absent otherwise), `durable.age_ms` (as `GcReport::age`), `durable.deleted`, `durable.outcome` (`trimmed`, `too_young`, `nothing` or `error`) |
 
 Every span and log record also carries `test_run_id` when one is set (`DURABLE_TEST_RUN_ID`).
 
-**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR). Maintenance logs `maintenance checkpoint not started; retrying later` and `maintenance checkpoint skipped; retrying later` (INFO), and `maintenance checkpoint failed; retrying later` and `maintenance checkpoint panicked; retrying later` (WARN).
+**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR). A takeover logs `took over` (INFO, with `generation`, `epoch`, `fence_seq` and `writer_id`), and `takeover quiet: the old writer's seal may still be uploading` (INFO) when it sets a quiet; a seal that waits one out logs `seal waits out the takeover quiet` (INFO). An open that finds its own earlier process's seal landed logs `a seal of an earlier process landed during the open; attaching again` (INFO). A failed GC pass on a writer's thread logs `gc pass failed` (WARN). Maintenance logs `maintenance checkpoint not started; retrying later` and `maintenance checkpoint skipped; retrying later` (INFO), and `maintenance checkpoint failed; retrying later` and `maintenance checkpoint panicked; retrying later` (WARN).
 - Each record keeps its own time. Without one it gets its observed time, and without that the current time.
 - Log records carry no trace or span ids. Adding them would need an experimental OpenTelemetry feature.
 
@@ -398,19 +416,27 @@ Everything lives under `<prefix>/`. With an empty prefix, keys have no leading `
 | Key | Holds |
 |---|---|
 | `head` | Where the database is now. |
-| `log/<generation:010>/<seq:020>` | One log object per upload: one WAL fsync when Off, several when commits share a window. `seq` starts at 1 and has no gaps within a generation. |
+| `log/<generation:010>/<seq:020>` | One log object per upload: one WAL fsync when Off, several when commits share a window. Or a fence record. `seq` starts at 1 and has no gaps within a generation. |
 | `pages/<generation:010>/<page:010>` | One page, as sealed at the end of `generation`. |
 | `manifest/<generation:010>` | Page map written when `generation` was sealed. |
 
 **Log object.** All integers are little-endian.
 - The magic `b"TDLOG\0\0\x01"`.
-- `kind: u8`: 1 = WAL extents, 2 = fence. Kind 2 is reserved for stage 3; stage 1 reads it as `Fenced`.
+- `kind: u8`: 1 = WAL extents, 2 = fence (below). Stages 1 and 2 read a fence as `Fenced`.
 - `writer_id`: a `u8` length, then ASCII.
-- `sync_count: u32`. A log object holds one or more syncs: one per commit when Off, several when commits share a window. The claim record and the seal-start record (below) are the exceptions: they hold zero syncs, so they add nothing to the generation's WAL image.
+- `sync_count: u32`. A log object holds one or more syncs: one per commit when Off, several when commits share a window. The seal-start record (see Guarantees) is the exception: it holds zero syncs, so it adds nothing to the generation's WAL image. Stage 2's claim record was one too.
 - For each sync, `op_count: u32`, then the ops:
   - tag 1, a write: `[u64 offset][u32 len][bytes]`;
   - tag 2, a truncate: `[u64 len]`.
-- A trailing `sha256` of all preceding bytes.
+- A trailing `sha256` of all preceding bytes. Nothing may follow the last op: trailing bytes are `Corrupt`.
+
+**Fence record** (kind 2). A takeover appends one at the next free seq of the head's generation.
+- The magic, `kind = 2`, then the writer id as above (the new writer's).
+- `sync_count: u32 = 0`.
+- `epoch: u64`: the head's epoch that the takeover wrote.
+- The trailing `sha256`. A fence with a non-zero sync count, without its epoch, or with trailing bytes is `Corrupt`.
+
+Restore replays a generation's records under one rule. Before the first fence, each writer's records form one run, and no other writer's record follows one of the head's writer (logs from stages 1 and 2 hold no fence and follow only this). After a fence by writer `w` at epoch `k`, every Extents record must be `w`'s. A later fence needs an epoch above `k`, or `k` again from `w` (a resumed takeover). Anything else is `Fenced`. A fence adds nothing to the image.
 
 **Manifest.**
 - The magic `b"TDMAN\0\0\x01"`.
@@ -423,22 +449,33 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 **Head.** Flat JSON with keys in this order. Unknown keys are ignored when it is read.
 
 ```json
-{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"<32 hex>"}
+{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"<32 hex>","epoch":4}
 ```
 
 `manifest` is `null` until the first seal. Restore takes pages from `manifest` and replays `log/<generation>/*`.
 
+**The epoch.** A head without `epoch` (written by stages 1 and 2) reads as epoch 0.
+- A new database starts at epoch 1.
+- A takeover writes the head with the new writer id at the epoch above the one it read.
+- Every other writer open raises the epoch by one and keeps its writer id (one head PUT per writer open; a read-only open never writes). So does a writer whose seal's head write had no definite answer, once a head GET shows the write has not landed.
+- The raise is a `PUT` with `If-Match` on the head's ETag, so a head PUT an earlier process (or an earlier attempt) still had in flight carries the old ETag and gets 412 instead of landing.
+- A writer open is refused with `Fenced` while the head names another writer id, or an epoch below the one the directory holds.
+
 **Local state `<dir>/app.db-durable`.**
 
 ```json
-{"format":1,"writer_id":"…","generation":3,"complete":true,"claimed":true,"head_etag":"…"}
+{"format":1,"writer_id":"…","generation":3,"complete":true,"claimed":true,"head_etag":"…","epoch":4,"claim_id":"","seal_not_before_ms":0}
 ```
 
 - It is written to a temp file, fsynced, renamed, and then the directory is fsynced.
 - `complete=false` means pages not yet read since this process opened come from the bucket. Only a finished prefetch in a writer open writes `complete=true`, at once; a seal also writes the current value. A read-only open's prefetch keeps it in memory only, because a read-only open never checkpoints its WAL into `app.db`. Taking in a newer generation on a directory no writer has claimed sets `complete=false`.
 - `claimed=false` with `head_etag` marks a restored directory that no writer has opened yet. An older file without these two keys reads as `claimed=true` with an empty `head_etag`.
+- `epoch`: the head's epoch as this directory last wrote or restored it. Written after the head, so it never exceeds the head's.
+- `claim_id`: the new writer id of a takeover in progress, persisted before its head write and emptied once the takeover is recorded. While it is set, the next writer open resumes the takeover under it.
+- `seal_not_before_ms`: the end of the takeover quiet in unix ms (see Guarantees), 0 for none. A seal of the generation writes 0.
+- A file without `epoch`, `claim_id` or `seal_not_before_ms` reads them as 0, `""` and 0.
 
-**Writer id.** 16 random bytes in hex. A new database and every claim get a new id.
+**Writer id.** 16 random bytes in hex. A new database and every takeover get a new id.
 
 ## S3 features needed
 
@@ -446,15 +483,16 @@ Reading a page inside `1..=page_count` that no run covers fails with `Corrupt`.
 |---|---|
 | AWS Signature V4 (header auth, signed payload hash) | Every request. |
 | Path-style addressing (the default) or virtual-hosted style | `DURABLE_PATH_STYLE`. |
-| `PUT` with `If-None-Match: *` (412 when the key exists) | Log objects. This is what fences a second writer. |
-| `PUT` with `If-Match: <etag>` (412 when the ETag changed) | `head`. A 404 whose error code is `NoSuchKey` also counts as a failed precondition, because RustFS answers that way for a missing key. A 404 `NoSuchBucket` is a permanent error that names the bucket, and so is a 404 with no recognisable code (a proxy or a wrong endpoint is no evidence that the key is gone); neither is reported as `Fenced`. A 409 is retried. |
-| `ETag` on every PUT response and GET | Checking `head` before moving it. |
+| `PUT` with `If-None-Match: *` (412 when the key exists) | Log objects and fence records. This is what fences a second writer. Also the first PUT of each page and manifest in a seal. |
+| `PUT` with `If-Match: <etag>` (412 when the ETag changed) | `head` (seals, epoch raises, takeovers), and a page or manifest PUT over an object of a known ETag (this process's own, or one a HEAD read). A 404 whose error code is `NoSuchKey` also counts as a failed precondition, because RustFS answers that way for a missing key. A 404 `NoSuchBucket` is a permanent error that names the bucket, and so is a 404 with no recognisable code (a proxy or a wrong endpoint is no evidence that the key is gone); neither is reported as `Fenced`. A 409 is retried. |
+| `ETag` on every PUT response and GET | Checking `head` before moving it, and the condition of the next PUT of a page or manifest. |
+| `HEAD` with `ETag`, `Last-Modified` and `Date` | The ETag of a leftover page or manifest, and GC's age of a manifest by the bucket's clock (`Date` − `Last-Modified`, 1 s resolution). |
 | `GET` | Restore, lazy page reads. |
 | `ListObjectsV2` (`list-type=2`, continuation tokens) | Listing a generation's log, and trimming. |
 | `DELETE` | Trimming. |
 | Plain HTTP | Only plain HTTP until stage 4 (no TLS). |
 
-`scripts/s3-gate.sh` checks the conditional-PUT behaviour against the local RustFS. Its results for RustFS 1.0.0 are in `results/rustfs-gate.txt`, and all checks passed.
+`scripts/s3-gate.sh` checks the conditional-PUT behaviour, and (check 5, `head_dates`) that HEAD returns the PUT's ETag with `Last-Modified` and `Date`, against the local RustFS. Its results for RustFS 1.0.0 are in `results/rustfs-gate.txt`, and all checks passed.
 
 ## Guarantees and limits
 
@@ -478,38 +516,86 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - A second process that opens the same directory gets `Locked`. A second open in the same process gets `AlreadyOpen`. Readers in another process are not supported (D4).
 - The bucket allows one writer per prefix. A writer whose log position or head was taken by another writer gets `Fenced` and stays fenced.
 
-**Restore and the claim.**
+**Takeover, the lease and GC.**
+
+*Restore.*
 - `restore` is read-only on the bucket. It costs `3 + log_objects` GETs when a manifest exists (head, manifest, page 1 for the MVCC check, then the log), or `1 + log_objects` for a prefix never sealed (page 1 is seeded from the WAL), plus one LIST. Pages are fetched later, on first read, or in the background with `prefetch`.
-- A restored directory is *unclaimed*. The first writer open claims it with "a head write, then one log record":
-  1. It writes `head` with a new writer id, using `If-Match` on the ETag the restore read.
-  2. It appends one empty log record at the generation's next seq. Stage 3's fence record will reuse this slot.
-- If the head moved since the restore, the claim fails with `Fenced("… restore again")`. Restore into a new directory.
-- An old writer that is still running is fenced at its next append, and nothing it appends after the claim is acked:
-  - If it appends within the trim grace, that append collides with the claim record (or a later record of the claimer's).
-  - Later than that, the claimer may have sealed the generation and its trimmer may have deleted `log/G`, so a record would land where no restore reads it. Every writer therefore checks the head before an append once its idle timer is `trim_grace / 2` old. The check is one GET of `head`, retried within that commit's deadline. If the head still has this writer's ETag (or is this writer's own late head, see item 1 below), the append proceeds. Anything else is `Fenced`, and nothing is written.
-  - The idle timer is refreshed by a confirmed log record or head write, by open's head read, and by a head GET that passes either check: this idle check, or a seal's head check (the seal-start check, or the pending-seal check of a retried seal). A failed or ambiguous request refreshes nothing.
-  - The cost: one GET on the first commit after `trim_grace / 2` of idle (5 min by default). With `trim_grace = 0` every commit makes that GET.
-  - **This fence holds only under assumptions, most of which nothing enforces:**
-    - Every process that opens the prefix as a writer uses the same `trim_grace`, and a claimer's is never smaller than the old writer's. A claimer with a smaller grace (say 0) trims `log/G` before the old writer's check is due, and the old writer's commits are then acked into a log no restore reads.
-    - `trim_grace` exceeds 2 × (`retry_deadline` + `request_timeout`); `Config` now enforces this bound. An append that skipped the check (its timer was younger than `trim_grace / 2`) can still land up to `trim_grace / 2` + `retry_deadline` + `request_timeout` after the timer's last refresh. That stays below `trim_grace` only if `trim_grace` > 2 × (`retry_deadline` + `request_timeout`).
-    - `trim_grace = 0` is for tests only. It is unsafe while an old writer may still be running.
-    - An old writer whose machine was suspended or paused: `Instant` does not advance during system sleep, so its idle timer can stay young and it can skip the idle head check. Stage 3's lease addresses it.
-    - Under those assumptions, an old writer can only reach a trimmed `log/G` after being idle for at least the trim grace, because any earlier append collides with the claim record. Stage 3's lease replaces all of this.
-- An old writer is also fenced at the start of its next seal, before it uploads a page or a manifest. An old writer that restarts is fenced at open.
-- Every seal starts with an empty *seal-start* record at the writer's next seq (`put_if_absent`, one extra log PUT per seal), then a GET of `head` (one extra GET per seal). Page and manifest objects are plain PUTs, so this gate is what stops an old writer from overwriting a generation the claimer already sealed:
-  - The old writer's seal-start record lands on the claim record's seq (or a later record of the claimer's). It is fenced and uploads nothing. This covers an idle old writer that closes after the claim (its close-time TRUNCATE seals), and a commit of the old writer that crosses its own generation boundary (the seal runs inside that commit, before its own log record).
-  - The head check covers the case where the claimer's trimmer has already deleted `log/G` (the claimer sealed G and the trim grace passed), so the record has nothing to collide with. The head names the claimer, so the old writer is fenced.
-  - A seal-start record whose upload is ambiguous is settled at the same seq, like any other in-doubt record, before anything else is written. A retried seal whose earlier head write is now known to be published adopts that head and writes no new record.
-- A generation may then hold the old writer's records followed only by the claimer's, and restore accepts that shape.
-- With these rules, and the `trim_grace` assumptions above, an old writer cannot get a commit acked, or overwrite a sealed generation, after a claim, except in the races and crash windows below, which stage 3's lease and epoch fencing close.
-- One gap remains: between the restore and the claim record, the old writer can still win a seq race. The claimer's open then fails `Fenced`, and nothing acked is lost. Stage 3's lease closes this gap.
-- `verify` (and the hidden `open_read_only`) never claims, never seals and never writes to the bucket.
+- A restored directory is *unclaimed* until the first writer open takes it over.
+- `verify` (and the hidden `open_read_only`) never takes over, never seals and never writes to the bucket.
 - When the bucket holds no manifest yet, restore seeds `app.db` with the WAL's first page-1 frame. turso treats a zero-size database file as new and would delete its WAL (database.rs:738-760, 2223-2246).
 
-**Known races and crash windows (stage 3's lease and epoch fencing close them).** The bucket format does not change for any of them.
-- **An old writer's page PUTs still in flight.** The old writer's seal-start record lands and its head check passes. Then, while its page PUTs are still in flight, another process restores, claims, commits and seals the same generation. The old writer's late page PUTs can overwrite that seal's `pages/G/*` or `manifest/G`. Its head write then fails and it is fenced, but the claimer's pages may already be replaced. Narrowing this needs a lease (stage 3); do not claim a database whose old writer may still be running a seal.
-- **A head PUT in flight at a crash.** A writer crashes while its seal's head PUT is in flight (or, in one process, a failed head PUT lands after the retried seal saw the head unchanged). The restarted writer attaches to the old head and acks commits into `log/G`. Then the delayed PUT lands, and the head names generation G+1 with the manifest the crashed attempt uploaded. A restore then misses the commits acked into `log/G` after the restart. They stay unrestorable until that writer's next seal re-uploads G's pages and adopts that head (`crates/turso_durable/src/bucket.rs:507-508`; the seal-start and idle head checks accept this writer's own late head). They are lost for good if, before that seal, the writer restarts again (reconcile replaces the local WAL with the G+1 image) or another process restores and claims.
-- **A crash between the claim's head write and the local-state write** (`crates/turso_durable/src/db.rs:353-359`). The head then names a writer id that nobody holds. The new directory still has `claimed=false` and the old ETag, so reopening it fails `Fenced("… restore again")`. No claim record was written, so the old writer keeps appending; its commits stay in `log/G` and restore. It is fenced at its next seal, or at its first append after `trim_grace / 2` of idle (the head checks). Nothing acked is lost; restore again into a new directory to continue.
+*Takeover (D11).* One mechanism serves `takeover` (library and CLI), a writer `open` (or `sql --claim`) of an empty directory whose prefix holds a database, and the first writer `open` of a restored directory. After the restore:
+1. A new writer id, the claim id, is persisted in the directory before anything is sent.
+2. The head is read. One that already names the claim id is this takeover, landed before a crash: it resumes. One of another generation than the restored one means the old writer sealed since the restore: `Fenced("… restore again")`, and nothing is written. Otherwise the head is written with the claim id at the next epoch, with `If-Match` on the ETag just read. A 412 reads it again under the same rules, within one retry deadline.
+3. The directory records the new writer id and epoch.
+4. A fence record goes to the generation's next free seq (`If-None-Match: *`). A seq the old writer took first, or a fence of a lower epoch (a takeover that lost the head), is stepped over, at most 64 times (`FENCE_MAX_STEPS`) and within the retry deadline. Past that the takeover fails with `Timeout`. The head already names the new writer, and the error says to open the directory to resume (`open`, or `turso-durable sql --claim --dir DIR` with an SQL argument such as `'SELECT 1'`).
+5. The takeover quiet, when the record before the fence is another writer's seal-start record (below).
+6. Reconcile, after the fence: what the old writer acked between the restore and the fence comes into the directory.
+
+More on takeover:
+- `takeover` restores first. If the old writer sealed in between (step 2's "restore again"), it removes the restored files and restores again, at most 3 times in all. A directory that holds only the `durable.lock` of a failed takeover counts as empty.
+- The head is written first, then the fence. Only one of two racing takeovers wins an epoch's `If-Match`, so a fence is only ever written by its epoch's winner, and restore can check fences strictly. Two takeovers can still both succeed, one after the other, at distinct epochs; the lower one's directory then fails `Fenced` at open.
+- Step 2 checks the restored *generation*, not the restore's ETag: every writer open raises the epoch, so the ETag also changes when the old writer merely restarts. A head of the same generation still has the restored generation's log, and reconcile takes in what was acked since.
+- A writer open of its own directory also appends a fence when the generation's last record is another writer's (a takeover whose fence never landed).
+- A writer open whose epoch raise finds the head of its own crashed process's seal (that seal's head PUT landed during the open) attaches again once, at the sealed generation.
+
+*What the old writer sees.* After a takeover, nothing the old writer sends is acked or published:
+- Its next append collides with the fence record (or a later record of the new writer's) and fences it. If `log/G` was trimmed meanwhile, its lease check reads the moved head first and fences it (below).
+- Its next seal starts with an empty *seal-start* record at its next seq (`If-None-Match: *`, one extra log PUT per seal), then a GET of `head` (one extra GET per seal). The record collides with the fence, or the head check sees the new writer, and it is fenced before it uploads a page. A seal-start record whose upload is ambiguous is settled at the same seq, like any other in-doubt record, before anything else is written.
+- A seal already past that gate sends each page and manifest request only inside its lease, and each PUT is conditional (below).
+- After a restart, it is fenced at open: the head names another writer id.
+- Its records before the fence stay in `log/G`. Restore accepts "the old writer's records, the fence, the new writer's records" (see Bucket format), and reconcile takes them into the new writer's directory, so nothing it acked is lost.
+
+*The lease (D13).* A writer trusts its last confirmation that the head is its own for `lease` (30 s, `DURABLE_LEASE_MS`).
+- A confirmation is a confirmed log record or head write, open's head read, or a head GET that found its own head. A failed or ambiguous request confirms nothing.
+- Its age is the larger of the monotonic and the wall clock's: a machine that slept (the monotonic clock stands still) re-reads the head on waking, and a wall clock stepped back never makes it younger.
+- Past the lease, the next append GETs the head first. Its own head renews the lease; anything else is `Fenced`, and nothing is written. The cost: one GET on the first commit after `lease` of idle (see Costs).
+- In a seal, every page and manifest PUT attempt, retries included, is sent only inside the lease. At a lapse the workers stop, the head is read (renewing the lease, or fencing the writer), and the pages not yet uploaded resume. So no seal request goes out more than `lease` after the writer last saw its own head.
+- A record that lands more than `lease` + `retry_deadline` after the last confirmation (its writer was paused between its lease check and its PUT) counts only after a head GET finds the head still the writer's own. Before this rule, a paused old writer got 400 commits acked into a log that GC had deleted (found by the system test `paused_old_writer_is_fenced_after_resume`).
+
+*Conditional seal PUTs.* Each page and manifest PUT has a condition:
+- a key this seal has not written: `If-None-Match: *`;
+- a key it wrote: `If-Match` on the ETag its PUT got back. A 412 there means someone wrote the key after it, so the head is read: a moved head fences the writer, and its own head lets the seal go on;
+- after a 412 on a key it never wrote (a leftover of an earlier attempt, a crashed process or the old writer): a HEAD for the current ETag, then `If-Match` on it.
+
+So once a new writer has written a key, a stale writer's late PUT fails its condition, except in the residual below. The normal path sends the same requests as plain PUTs.
+
+*The takeover quiet.* When the record just before the fence is another writer's empty record (a seal-start record), or cannot be read, that writer's seal may still be uploading. The new writer then does not seal that generation until `lease` + `request_timeout` after its fence (40 s with the defaults). The old writer sent its last request within `lease` of its last head check, which came before the takeover, and that request ends within `request_timeout`.
+- The deadline is persisted (`seal_not_before_ms`), so a reopen keeps it. `TakeoverReport::quiet` and the CLI's `quiet_ms` show it.
+- A seal of that generation waits it out (`seal waits out the takeover quiet`). So does a close-time seal, so a close can take that long. Maintenance does not start a run meanwhile (`takeover quiet`).
+- It assumes the old writer's `lease` and `request_timeout` are no larger than the new writer's. Nothing in the bucket records another process's settings.
+- The cost: a takeover of a writer that crashed or was killed mid-seal holds the new writer's first seal back by up to 40 s with the defaults.
+
+*The epoch (D12).* Every writer open raises it (see Bucket format). A head PUT that a crashed process still had in flight carries the ETag from before the raise, so it gets 412 instead of publishing a generation without the commits acked since the restart.
+
+*GC (D14).* A pass works on the bucket's own clock:
+1. It GETs the head and LISTs `manifest/`.
+2. It HEADs the manifests up to the head's, newest first, until one is old enough: at least `trim_grace` + `retry_deadline` + `request_timeout` + 1 s (10 min 41 s with the defaults), measured as the HEAD's `Date` − `Last-Modified`. An unknown age never counts as old.
+3. With manifest `m` chosen, it deletes what the head `(m + 1, m)` no longer reaches: the logs of generations up to `m`, the manifests below `m`, and the pages below `m` that manifest `m` does not map to.
+
+More on GC:
+- Why it is safe: what that head no longer reaches has been unreferenced since the head after `manifest/m` was published, within `retry_deadline` + `request_timeout` of the manifest's write; the 1 s covers the dates' resolution. So each object has been unreferenced for longer than `trim_grace`, which exceeds an old writer's `lease` + `retry_deadline` + `request_timeout` (`Config` enforces it for this process's settings). A restore of any head of the last `trim_grace` finds what it reads.
+- Only manifests are aged, so head rewrites (epoch raises) do not reset the clock.
+- It runs in `gc` (library and CLI), and, with `gc_after_seal` (on by default), on the writer's GC thread: at open, after each seal (seals that queue up make one pass) and when the next manifest comes of age. So a process of any lifetime that opens a database sealed long ago trims it at open.
+- On the writer's thread, a pass whose chosen manifest is the one it last trimmed against stops there, before the manifest GET and the LISTs of the trim. A closing writer skips the pass for its last seal; the next open or `gc` trims it.
+- Against another process's old writer, the grace protects only if this process's `trim_grace` also exceeds that writer's `lease` + `retry_deadline` + `request_timeout`. The same settings on every process satisfy it; nothing enforces it.
+
+**The limits stage 2 listed, closed or not.** The bucket format stays v1: the head gains `epoch` and the log may hold fence records, and nothing else changes.
+
+| Stage-2 limit | Now |
+|---|---|
+| An old writer's page PUTs still in flight during a takeover | Closed by the lease (every page and manifest request is sent inside it), the takeover quiet and conditional PUTs, except the residual below. |
+| A suspended or paused old writer | Closed: the lease runs on two clocks, every request is lease-checked, and a record landing late counts only after a head GET. Tested with SIGSTOP (`paused_old_writer_is_fenced_after_resume`). |
+| A crash between the claim's head write and the local-state write | Closed: the claim id is persisted before the head write, and the next open resumes the takeover. |
+| Short-lived processes never trim | Closed: GC on the bucket's clock at open, after seals, and in `gc`. |
+| A head PUT in flight at a crash | Closed by the epoch: every writer open raises it, so the late PUT's `If-Match` gets 412. |
+| Between the restore and the claim record, the old writer can win a seq race | Closed: the fence record steps over the old writer's records, and reconcile takes them in. |
+
+**The residual (known, accepted).** On S3 and RustFS a single-part PUT's ETag is the MD5 of its body, so equal bytes get equal ETags. A late PUT of old writer A lands over new writer B's object when:
+- A was paused for longer than the takeover quiet, between its lease check and the send of a `put_if_match` on an ETag it already held;
+- and B's page (or manifest) is byte-identical to what A conditioned on.
+
+A is fenced at its next request, but the object it overwrote stays. A possible future fix: a takeover could seal into a generation number the old writer never used, so B never writes keys under A's generation G, and A's late conditional PUTs cannot touch anything B references. It needs a change to how generations are numbered at takeover, which is not in this stage.
 
 **Test and diagnostics hooks.** `Config::on_event`, `turso_durable::Event` and `turso_durable::EventHook` are `#[doc(hidden)]`. They exist for the tests and for the CLI's `soak` event lines, and are not part of the supported API: they may change without notice.
 
@@ -523,7 +609,8 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 
 **Limits.**
 - Without `prefetch`, a restored database fetches pages lazily in every process that opens it, until a prefetch completes. Each process fetches each page it reads once. Only a finished prefetch in a writer open marks the directory `complete`.
-- Short-lived processes never trim. The trimmer waits `trim_grace` (10 min by default) after each seal, and close stops it. A process that exits sooner than `trim_grace` after its seals deletes nothing, so the bucket grows until a long-lived process trims or stage 3's `gc` runs.
+- `close` waits for a GC pass in progress. A short-lived process that opens a database with a large backlog starts a long pass at open (5095 deletes took 7.0 s on the laptop, see Costs), and its close waits for it. Set `gc_after_seal` off for such processes and run `gc` elsewhere.
+- `gc` does not retry a failed bucket call; run it again. A writer's GC thread retries a failed pass at its next seal or after 30 s.
 - Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large makes the seal large too. The maintenance checkpoint seals once the `-wal` reaches `maintenance_wal_bytes` (64 MiB by default), but a transaction held open past `maintenance_gate_wait` keeps it from running (it retries with backoff). `CheckpointMode::Truncate` at quiet moments keeps generations small.
 - Never copy a live database directory (`cp -r`, a VM or disk clone). The copy has the same writer id, so fencing cannot tell the two processes apart. Restore into a new directory instead.
 
@@ -536,6 +623,23 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - Closing during a bucket outage can block for up to the retry deadline.
 
 ## Costs (measured)
+
+### Stage 3: takeover, lease and GC
+
+Source: `results/writer-lease.txt`. These are laptop figures (Apple M4 Max, RustFS in podman on the same Mac, release build), not production numbers, from one run with telemetry off. The database is the 5000-commit bench database of stage 1's workload (generation 13 at the takeover). Request counts come from `crates/turso-durable-cli/examples/stage3_costs.rs`, which wraps the S3 store in a counter.
+
+| Measure | Result |
+|---|---|
+| Takeover (`takeover`, into an empty directory) | 67 ms in all, of which the restore took 18 ms with 4 GETs (`3 + 1` log object) and 1 LIST. 2 PUTs in all: the head (`If-Match`) and the fence record (`If-None-Match: *`). 10 GETs and 3 LISTs in all: the restore's, then one head GET before the head write, the attach (head, manifest, LIST), the record before the fence (for the quiet), and reconcile's LIST and log GETs. `quiet_ms=0`: the record before the fence was the bench's last log record, not a seal-start record. A second takeover, through the CLI, also took 67 ms. |
+| Writer open of the taken-over directory | 1 PUT (the epoch raise), 7 GETs and 2 LISTs, 16–17 ms, with `DURABLE_GC_AFTER_SEAL=off` so the GC thread's requests are not counted. Only the raise is new: stage 2's open code made the same GETs and LISTs (not measured). |
+| A commit right after another | 1 PUT (its log record), no GET. |
+| A commit after a 31 s pause (default 30 s lease) | 1 PUT and 1 GET: exactly one extra head GET. |
+| `gc` with the defaults, right after | `outcome=too_young` (the oldest manifest was 39 s old), 6 ms. |
+| `gc` after 10 s, with `DURABLE_TRIM_GRACE_SECS=5`, `DURABLE_LEASE_MS=1000`, `DURABLE_RETRY_DEADLINE_MS=1000`, `DURABLE_REQUEST_TIMEOUT_MS=1000` (minimum age 8 s) | Trimmed against manifest 13: `deleted=5095` in 7035 ms, one DELETE at a time. A second pass deleted 0 in 165 ms. A restore and `verify` afterwards passed, with all 5000 rows. |
+| The 5000-commit bench itself | Commit p50 / p99 1.29 / 2.09 ms, 679 commits/s, 6772 PUTs in all of which 1720 page PUTs. Each in-run seal of 170–172 pages took 44–54 ms (stage 1: 37–44 ms). Its page and manifest PUTs are now conditional; in the normal path they are the same requests as plain PUTs, with a condition header. An earlier round of the same code measured 1.20 / 1.76 ms, 724 commits/s and 44–50 ms per seal. |
+
+- The takeover quiet was not exercised here. When it applies (the old writer's last record is a seal-start record), it holds the new writer's first seal of that generation back for `lease` + `request_timeout`, 40 s with the defaults.
+- GC's request count grows with the bucket: per pass one head GET, one LIST of `manifest/`, one HEAD per manifest it ages, then the manifest GET, the LISTs of `log/`, `manifest/` and `pages/`, and one DELETE per object.
 
 ### Stage 2: batching
 
@@ -576,7 +680,7 @@ Source: `results/durable-core.txt`. These are laptop figures (Apple M4 Max, macO
 | Page PUTs per seal | 169 | 169–172 in the run, 8 at close |
 | Seal time | 44 ms | 37–44 ms in the run, 4.4 ms at close |
 
-These figures predate the seal-start record and the idle head check. Each seal now also makes one extra log PUT and one head GET before its page PUTs. The first commit after `trim_grace / 2` of idle (5 min by default) makes one head GET; the bench never idles that long.
+These figures predate the seal-start record, the lease and the conditional seal PUTs. Each seal now also makes one extra log PUT and one head GET before its page PUTs. The first commit after `lease` of idle (30 s by default) makes one head GET; the bench never idles that long. Stage 3's bench figures are above.
 
 Restoring the 5000-commit database (generation 12, 1673 pages, 6.9 MB):
 - The restore itself took 33 ms. It made 4 GETs (`3 + 1` log object) and 1 LIST, and downloaded 4.6 KB.
@@ -584,7 +688,7 @@ Restoring the 5000-commit database (generation 12, 1673 pages, 6.9 MB):
 
 ## Decisions
 
-These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 from crates.io; paths are relative to its crate root.
+D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0.8.3 from crates.io, with paths relative to its crate root. D11–D14 are stage 3's; their evidence is this repository's code.
 
 | # | Decision | Evidence |
 |---|---|---|
@@ -597,14 +701,18 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 | D7 | `synchronous` is FULL only. The guard refuses lower values, and each statement is checked after `prepare`. | lib.rs:225-229; pager.rs:4711; translate/pragma.rs:662-676. |
 | D8 | Typed errors cross the engine through a thread-local stash. `Connection::checkpoint` uses the engine call that returns `Err`, because the PRAGMA reports busy. | vdbe/execute.rs:796-803; connection.rs:2432-2434. |
 | D9 | On restart on its own disk, the writer reconciles the local WAL with the bucket's generation image: level, behind (take the bucket's), ahead (upload the difference), or a new generation. A different writer id gives `Fenced`. | `crates/turso_durable/src/reconcile.rs` |
-| D10 | Trimming runs after each seal, once the grace period has passed. It deletes older logs, manifests and superseded pages, and never touches a generation at or above the head's manifest. | `crates/turso_durable/src/trim.rs` |
+| D10 | Trimming deletes older logs, manifests and superseded pages, and never touches a generation at or above the head's manifest. When it runs, and against which head, is D14's choice. | `crates/turso_durable/src/trim.rs` |
+| D11 | Takeover and the claim of a restored copy are one mechanism: `takeover`, a writer `open` of an empty or restored directory, and the CLI's `takeover` and `sql --claim` all write the head with a new writer id at the next epoch (`If-Match`), then append a fence record at the next free seq. The head goes first: only one of two racing takeovers wins an epoch's `If-Match`, so only that epoch's winner writes its fence, and restore checks fences strictly. Records the old writer landed meanwhile are stepped over and taken in by reconcile. The claim id is persisted first, so a takeover resumes after a crash. | `crates/turso_durable/src/takeover.rs`; `db.rs` (`claim`, `attach_existing`); `bucket.rs` (`take_over_counted`, `append_fence`) |
+| D12 | The head carries an epoch (absent = 0). A new database starts at 1; a takeover writes the next one with its new writer id; every other writer open, and a writer that finds its ambiguous seal head write did not land, raises it keeping its id. A late head PUT then fails its `If-Match`. A writer open is refused while the head names another writer or an epoch below the directory's. Cost: one head PUT per writer open. | `crates/turso_durable/src/format/head.rs`; `bucket.rs` (`raise_epoch`, `check_head`, `attach`) |
+| D13 | A lease replaces stage 2's idle check: 30 s on the larger of the monotonic and the wall clock. Past it, an append GETs the head first; a seal sends each page and manifest PUT attempt only inside it; a record that lands more than `lease` + `retry_deadline` after the last confirmation counts only after a head GET. Seal PUTs are conditional. A fence that follows another writer's seal-start record starts the takeover quiet (`lease` + `request_timeout`), persisted in the directory. | `crates/turso_durable/src/clock.rs`; `bucket.rs` (`check_lease`, `confirm_landed`, `retrying_in_lease`, `seal_put_step`, `set_seal_not_before`); `db.rs` (`set_quiet`) |
+| D14 | GC runs on the bucket's clock: it ages manifests by HEAD (`Date` − `Last-Modified`), takes the newest one up to the head's that is `trim_grace` + `retry_deadline` + `request_timeout` + 1 s old, and trims against the head that followed it. It runs in `gc`, and on the writer's thread at open, after seals and when the next manifest comes of age. `trim_grace` must exceed `lease` + `retry_deadline` + `request_timeout`, with no exception for 0. | `crates/turso_durable/src/gc.rs`, `trim.rs`, `store/s3.rs` (`stat`), `config.rs` (`validate`) |
 
 ## Test command
 
-- `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests.
-- `./scripts/test.sh`: the above, then empties and starts RustFS (`scripts/rustfs.sh reset`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs).
+- `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests. These include the in-memory takeover tests in `crates/turso_durable/tests/fencing.rs`, each under Off and a Window setting.
+- `./scripts/test.sh`: the above, then empties and starts RustFS (`scripts/rustfs.sh reset`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs). Stage 3 adds: a takeover of a running `soak` under Off and under a Window setting (`takeover_fences_a_running_soak`, `takeover_window_fences_a_running_soak`), an old writer paused with SIGSTOP across a takeover and GC (`paused_old_writer_is_fenced_after_resume`), `gc` after short-lived processes (`gc_cli_trims_after_short_lived_processes`), Window crash rows for PASSIVE, FULL and RESTART, and the S3 test `stat_reports_etag_and_age`.
   - It runs them with `DURABLE_OTEL=1` under one `DURABLE_TEST_RUN_ID` (`turso-durable-<timestamp>-<pid>`, printed as `test run id: …`).
-  - Then it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then a `restore`), so every span kind except `durable.maintenance` is exported.
+  - Then it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then `restore`, `takeover` and `gc`), so every span kind except `durable.maintenance` is exported.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
   - On exit, pass or fail, it empties RustFS's storage again (`scripts/rustfs.sh reset`). A failed reset is reported on stderr and the exit code stays the tests'.
   - Each RustFS-backed test deletes its bucket prefix when it ends. `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
@@ -614,9 +722,9 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 ## Layout
 
 - `crates/turso_durable`: the library.
-- `crates/turso-durable-cli`: the `turso-durable` binary and the system tests.
+- `crates/turso-durable-cli`: the `turso-durable` binary, the system tests and `examples/stage3_costs.rs` (the stage-3 request counts).
 - `scripts/`: `test.sh`, `rustfs.sh` (local S3), `s3-gate.sh`, `otel-check.sh` (the ClickHouse check).
-- `results/`: `rustfs-gate.txt` (conditional-PUT gate), `durable-core.txt` (stage 1 measurements) and `batching-knob.txt` (stage 2 measurements).
+- `results/`: `rustfs-gate.txt` (conditional-PUT gate), `durable-core.txt` (stage 1 measurements), `batching-knob.txt` (stage 2 measurements) and `writer-lease.txt` (stage 3 measurements).
 - `LICENSES/`: third-party licences.
 
 ## Provenance
