@@ -23,9 +23,10 @@ const WAIT: Duration = Duration::from_secs(120);
 const WINDOW: &str = "window 20ms 64 1MiB";
 
 /// Settings a test may set; every child gets them removed first, so the caller's
-/// environment never leaks into a test. `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not
-/// here: `scripts/test.sh` sets them so the children export under its run id.
-const OPTIONAL: [&str; 12] = [
+/// environment never leaks into a test (the TLS and encryption ones come back through
+/// `env()`). `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not here: `scripts/test.sh` sets
+/// them so the children export under its run id.
+const OPTIONAL: [&str; 15] = [
     "DURABLE_PREFIX",
     "DURABLE_RETRY_DEADLINE_MS",
     "DURABLE_REQUEST_TIMEOUT_MS",
@@ -38,10 +39,25 @@ const OPTIONAL: [&str; 12] = [
     "DURABLE_MAINTENANCE_GATE_WAIT_MS",
     "DURABLE_LEASE_MS",
     "DURABLE_GC_AFTER_SEAL",
+    "DURABLE_CA_BUNDLE",
+    "DURABLE_ENCRYPTION_KEY_FILE",
+    "DURABLE_ENCRYPTION_CIPHER",
 ];
 
-/// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`.
+/// Passed through from the caller when set: the second pass of `scripts/test.sh` runs every
+/// test over HTTPS with encryption.
+const PASSED_THROUGH: [&str; 3] = [
+    "DURABLE_CA_BUNDLE",
+    "DURABLE_ENCRYPTION_KEY_FILE",
+    "DURABLE_ENCRYPTION_CIPHER",
+];
+
+/// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`, then
+/// the `PASSED_THROUGH` ones the caller set.
 fn env() -> Vec<(String, String)> {
+    let set = PASSED_THROUGH
+        .iter()
+        .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)));
     [
         ("DURABLE_ENDPOINT", "http://127.0.0.1:9290"),
         ("DURABLE_REGION", "us-east-1"),
@@ -57,6 +73,7 @@ fn env() -> Vec<(String, String)> {
             std::env::var(k).unwrap_or_else(|_| d.to_string()),
         )
     })
+    .chain(set)
     .collect()
 }
 
@@ -183,6 +200,9 @@ struct Ctx {
     tmp: TempDir,
     /// Keep the prefix when the test fails (`DURABLE_KEEP_FAILED=1`).
     keep_failed: bool,
+    /// Keep the prefix, pass or fail (`DURABLE_KEEP_PREFIXES=1`): `scripts/test.sh` scans
+    /// every object each pass leaves.
+    keep_all: bool,
 }
 
 /// A finished command.
@@ -201,6 +221,7 @@ impl Ctx {
             vars,
             tmp: tempfile::tempdir().unwrap(),
             keep_failed: std::env::var("DURABLE_KEEP_FAILED").as_deref() == Ok("1"),
+            keep_all: std::env::var("DURABLE_KEEP_PREFIXES").as_deref() == Ok("1"),
         }
     }
 
@@ -274,6 +295,28 @@ impl Ctx {
         self.try_store().expect("S3 store")
     }
 
+    /// The `Config` of an in-process database in `dir` under this test's prefix, with the
+    /// connection, TLS and encryption settings its CLI children get.
+    fn config(&self, dir: &Path) -> Config {
+        let mut c = Config::new(
+            dir,
+            &self.var("DURABLE_ENDPOINT"),
+            &self.var("DURABLE_BUCKET"),
+            &self.var("DURABLE_ACCESS_KEY"),
+            &self.var("DURABLE_SECRET_KEY"),
+        );
+        c.region = self.var("DURABLE_REGION");
+        c.path_style = self.var("DURABLE_PATH_STYLE") == "true";
+        c.prefix = self.prefix();
+        let set = |k: &str| self.opt_var(k).filter(|v| !v.is_empty());
+        c.ca_bundle = set("DURABLE_CA_BUNDLE").map(Into::into);
+        c.encryption_key_file = set("DURABLE_ENCRYPTION_KEY_FILE").map(Into::into);
+        if let Some(cipher) = set("DURABLE_ENCRYPTION_CIPHER") {
+            c.encryption_cipher = cipher;
+        }
+        c
+    }
+
     fn try_store(&self) -> Result<S3Store, turso_durable::Error> {
         S3Store::new(S3Config {
             endpoint: self.var("DURABLE_ENDPOINT"),
@@ -332,10 +375,13 @@ impl Ctx {
 
 impl Drop for Ctx {
     /// Delete every key under the prefix, also after a failure unless `keep_failed`, which
-    /// prints the prefix instead. Never panics (it may run while a failed assertion unwinds):
-    /// errors are printed. Tests declare `Ctx` first, so their `Soak` (killed) and `Outage`
-    /// (RustFS restored) drop before it.
+    /// prints the prefix instead; `keep_all` keeps it. Never panics (it may run while a
+    /// failed assertion unwinds): errors are printed. Tests declare `Ctx` first, so their
+    /// `Soak` (killed) and `Outage` (RustFS restored) drop before it.
     fn drop(&mut self) {
+        if self.keep_all {
+            return;
+        }
         let prefix = self.prefix();
         if std::thread::panicking() && self.keep_failed {
             eprintln!(
@@ -1580,19 +1626,7 @@ fn trimming_bounds_restore_gets() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn several_connections_against_rustfs() {
     let ctx = Ctx::new("several_connections_against_rustfs");
-    let config = |dir: &Path| {
-        let mut c = Config::new(
-            dir,
-            &ctx.var("DURABLE_ENDPOINT"),
-            &ctx.var("DURABLE_BUCKET"),
-            &ctx.var("DURABLE_ACCESS_KEY"),
-            &ctx.var("DURABLE_SECRET_KEY"),
-        );
-        c.region = ctx.var("DURABLE_REGION");
-        c.path_style = ctx.var("DURABLE_PATH_STYLE") == "true";
-        c.prefix = ctx.prefix();
-        c
-    };
+    let config = |dir: &Path| ctx.config(dir);
     let dir = ctx.dir("db");
     let db = turso_durable::open(config(&dir)).expect("open");
     db.connect()
@@ -1670,16 +1704,7 @@ fn several_connections_against_rustfs() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
     let ctx = Ctx::new("idle_old_writer_closing_after_claim_and_seal_loses_nothing");
-    let mut config = Config::new(
-        ctx.dir("a"),
-        &ctx.var("DURABLE_ENDPOINT"),
-        &ctx.var("DURABLE_BUCKET"),
-        &ctx.var("DURABLE_ACCESS_KEY"),
-        &ctx.var("DURABLE_SECRET_KEY"),
-    );
-    config.region = ctx.var("DURABLE_REGION");
-    config.path_style = ctx.var("DURABLE_PATH_STYLE") == "true";
-    config.prefix = ctx.prefix();
+    let config = ctx.config(&ctx.dir("a"));
     let db_a = turso_durable::open(config).expect("open A");
     let ca = db_a.connect().unwrap();
     ca.execute(
@@ -2229,6 +2254,7 @@ fn failed_test_prefix(name: &'static str, keep_failed: bool) -> (String, bool) {
     let joined = std::thread::spawn(move || {
         let mut ctx = Ctx::new(name);
         ctx.keep_failed = keep_failed;
+        ctx.keep_all = false;
         put_keys(&ctx);
         tx.send(ctx.prefix()).unwrap();
         panic!("{name}: a deliberate failure (the cleanup test)");
@@ -2239,12 +2265,14 @@ fn failed_test_prefix(name: &'static str, keep_failed: bool) -> (String, bool) {
 
 /// A test's `Ctx` deletes every key under its prefix when it is dropped: after a pass, and
 /// after a failure unless `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps the prefix.
+/// `keep_all` (`DURABLE_KEEP_PREFIXES=1`) is off here, whatever the caller set.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn ctx_deletes_its_prefix_unless_a_failure_is_kept() {
     let probe = Ctx::new("cleanup_probe");
     let passed = {
-        let ctx = Ctx::new("cleanup_passed");
+        let mut ctx = Ctx::new("cleanup_passed");
+        ctx.keep_all = false;
         put_keys(&ctx);
         assert_eq!(keys_under(&probe, &ctx.prefix()).len(), 20);
         ctx.prefix()

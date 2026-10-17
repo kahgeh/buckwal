@@ -38,6 +38,33 @@ pub struct BenchArgs {
     pub batching: Option<Batching>,
 }
 
+/// What `scan --expect` asks of the bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// No needle in any object.
+    Absent,
+    /// `CREATE TABLE` and every marker found, the key not.
+    Present,
+}
+
+impl std::fmt::Display for Expect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Expect::Absent => "absent",
+            Expect::Present => "present",
+        })
+    }
+}
+
+/// `scan`, a test command (not in the usage): plaintext needles in the bucket's objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanArgs {
+    pub expect: Expect,
+    /// The whole bucket, not just `<prefix>/`.
+    pub all: bool,
+    pub markers: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Restore {
@@ -69,6 +96,7 @@ pub enum Command {
     Gc,
     Soak(SoakArgs),
     Bench(BenchArgs),
+    Scan(ScanArgs),
 }
 
 pub const USAGE: &str = "usage: turso-durable <command> [options]
@@ -124,6 +152,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut batching_spec = None;
     let mut batching_file = None;
     let mut stats_every = None;
+    let mut expect = None;
+    let mut all = false;
+    let mut markers = Vec::new();
 
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -137,7 +168,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         let known = match (cmd.as_str(), a.as_str()) {
-            (c, "--dir") if c != "gc" => {
+            (c, "--dir") if c != "gc" && c != "scan" => {
                 dir = Some(PathBuf::from(value(a)?));
                 true
             }
@@ -197,6 +228,23 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 commits = Some(num(a, &value(a)?)?);
                 true
             }
+            ("scan", "--expect") => {
+                let v = value(a)?;
+                expect = Some(match v.as_str() {
+                    "absent" => Expect::Absent,
+                    "present" => Expect::Present,
+                    _ => return Err(format!("--expect is absent or present, not {v:?}")),
+                });
+                true
+            }
+            ("scan", "--all") => {
+                all = true;
+                true
+            }
+            ("scan", "--marker") => {
+                markers.push(value(a)?);
+                true
+            }
             _ => false,
         };
         if !known {
@@ -204,11 +252,18 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
     }
 
-    if cmd == "gc" {
-        return match positional.first() {
-            Some(a) => Err(format!("unexpected argument {a:?}")),
-            None => Ok(Command::Gc),
-        };
+    if cmd == "gc" || cmd == "scan" {
+        if let Some(a) = positional.first() {
+            return Err(format!("unexpected argument {a:?}"));
+        }
+        if cmd == "gc" {
+            return Ok(Command::Gc);
+        }
+        return Ok(Command::Scan(ScanArgs {
+            expect: expect.ok_or("--expect is required")?,
+            all,
+            markers,
+        }));
     }
     let dir = dir.ok_or("--dir is required")?;
     if !matches!(cmd.as_str(), "sql" | "stats") && !positional.is_empty() {
@@ -384,6 +439,33 @@ mod tests {
         assert!(p(&["gc", "--dir", "x"]).is_err(), "--dir is a usage error");
         assert!(p(&["gc", "extra"]).is_err());
         assert!(p(&["gc", "--claim"]).is_err());
+    }
+
+    /// `scan` takes no directory; `--expect` is required and `--marker` repeats.
+    #[test]
+    fn parses_scan() {
+        assert_eq!(
+            p(&["scan", "--expect", "present"]),
+            Ok(Command::Scan(ScanArgs {
+                expect: Expect::Present,
+                all: false,
+                markers: vec![],
+            }))
+        );
+        assert_eq!(
+            p(&["scan", "--all", "--marker", "m1", "--expect", "absent", "--marker", "m2"]),
+            Ok(Command::Scan(ScanArgs {
+                expect: Expect::Absent,
+                all: true,
+                markers: vec!["m1".into(), "m2".into()],
+            }))
+        );
+        assert!(p(&["scan"]).is_err(), "--expect is required");
+        assert!(p(&["scan", "--expect", "maybe"]).is_err());
+        assert!(p(&["scan", "--expect", "absent", "--dir", "d"]).is_err());
+        assert!(p(&["scan", "--expect", "absent", "extra"]).is_err());
+        assert!(p(&["scan", "--expect", "absent", "--marker"]).is_err());
+        assert!(p(&["gc", "--all"]).is_err());
     }
 
     #[test]

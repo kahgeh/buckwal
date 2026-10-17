@@ -62,6 +62,9 @@ struct Prefix {
     p: String,
     /// Keep the prefix when the test fails (`DURABLE_KEEP_FAILED=1`).
     keep_failed: bool,
+    /// Keep the prefix, pass or fail (`DURABLE_KEEP_PREFIXES=1`): `scripts/test.sh` scans
+    /// every object each pass leaves.
+    keep_all: bool,
 }
 
 impl std::ops::Deref for Prefix {
@@ -79,8 +82,11 @@ impl std::fmt::Display for Prefix {
 
 impl Drop for Prefix {
     /// Delete every key under the prefix, also after a failure unless `keep_failed`, which
-    /// prints the prefix instead. Never panics: errors are printed.
+    /// prints the prefix instead; `keep_all` keeps it. Never panics: errors are printed.
     fn drop(&mut self) {
+        if self.keep_all {
+            return;
+        }
         if std::thread::panicking() && self.keep_failed {
             eprintln!(
                 "failed; bucket prefix {} kept (DURABLE_KEEP_FAILED=1)",
@@ -102,6 +108,7 @@ fn prefix(test: &str) -> Prefix {
     Prefix {
         p: format!("t/{test}-{n}/"),
         keep_failed: std::env::var("DURABLE_KEEP_FAILED").as_deref() == Ok("1"),
+        keep_all: std::env::var("DURABLE_KEEP_PREFIXES").as_deref() == Ok("1"),
     }
 }
 
@@ -261,6 +268,7 @@ fn failed_test_prefix(test: &'static str, keep_failed: bool) -> (String, bool) {
         let s = store();
         let mut p = prefix(test);
         p.keep_failed = keep_failed;
+        p.keep_all = false;
         s.put(&format!("{p}k"), b"x").unwrap();
         tx.send(p.p.clone()).unwrap();
         panic!("{test}: a deliberate failure (the cleanup test)");
@@ -270,13 +278,15 @@ fn failed_test_prefix(test: &'static str, keep_failed: bool) -> (String, bool) {
 }
 
 /// Dropping a `Prefix` deletes every key under it: after a pass, and after a failure unless
-/// `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps it.
+/// `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps it. `keep_all`
+/// (`DURABLE_KEEP_PREFIXES=1`) is off here, whatever the caller set.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn rustfs_prefix_is_deleted_unless_a_failure_is_kept() {
     let s = store();
     let passed = {
-        let p = prefix("cleanup_passed");
+        let mut p = prefix("cleanup_passed");
+        p.keep_all = false;
         for i in 0..5 {
             s.put(&format!("{p}{i}"), b"x").unwrap();
         }

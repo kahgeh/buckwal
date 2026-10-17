@@ -1,6 +1,7 @@
 //! `turso-durable`: restore, verify, query and exercise a durable database.
 mod args;
 mod bench;
+mod scan;
 mod soak;
 
 use args::Command;
@@ -308,6 +309,7 @@ fn main() -> ExitCode {
         } => stats(dir, sql, *claim, *batching),
         Command::Soak(a) => soak::run(a),
         Command::Bench(a) => bench::run(a),
+        Command::Scan(a) => scan::run(a),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
