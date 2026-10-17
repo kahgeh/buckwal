@@ -350,16 +350,17 @@ impl BucketDbStorage {
         let generation = self.uploader.seal_generation(pages, ps, page_count)?;
         sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
         // Only a claimed writer seals (a read-only open never writes), and the head's ETag
-        // changed with this seal, so none is kept. A takeover quiet (seal-not-before) applied
-        // to the generation just sealed: cleared. The writer id, the epoch and the claim id
-        // are not this seal's to change: they carry over from the state in memory, so nothing
-        // here reads the file after the head is published.
+        // changed with this seal, so none is kept. A takeover quiet (seal-not-before and its
+        // length) applied to the generation just sealed: cleared. The writer id, the epoch and
+        // the claim id are not this seal's to change: they carry over from the state in
+        // memory, so nothing here reads the file after the head is published.
         let state = LocalState {
             generation,
             complete: self.complete.load(SeqCst),
             claimed: true,
             head_etag: String::new(),
             seal_not_before_ms: 0,
+            seal_quiet_ms: 0,
             ..dirty.state.clone()
         };
         self.write_state(&mut dirty, state)?;

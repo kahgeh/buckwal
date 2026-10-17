@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::field::Empty;
 use turso_core::{File, OpenFlags, PlatformIO, IO};
 
@@ -418,6 +418,7 @@ fn create_new(
         epoch: bucket.head().epoch,
         claim_id: String::new(),
         seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
     };
     state.write_atomic(dir)?;
     Ok((bucket, state))
@@ -455,9 +456,10 @@ pub(crate) struct Attached {
 ///    landed first are stepped over.
 /// 5. The takeover quiet (`set_quiet`): a fence before which another writer's last record is a
 ///    seal-start record (`FenceOutcome::seal_may_be_in_flight`) keeps this writer from sealing
-///    the generation for `lease + request_timeout`, persisted as `seal_not_before_ms`;
-///    without a fence, a persisted deadline of the generation is passed on to the bucket,
-///    capped at that length from now.
+///    the generation for `lease + request_timeout`, persisted as `seal_not_before_ms` (its
+///    end) and `seal_quiet_ms` (its length); without a fence, a quiet still pending for the
+///    generation is waited again in full from this open, its persisted length on the
+///    monotonic clock.
 /// 6. Reconcile, after the fence: whatever the old writer acked before the fence (after the
 ///    restore) comes in as `Behind`.
 pub(crate) fn attach_existing(
@@ -478,7 +480,7 @@ pub(crate) fn attach_existing(
             state.epoch = raise_at_open(store, keys, cfg, &state, &mut bucket)?;
             state.write_atomic(dir)?;
             if last_record_is_foreign(&bucket, &state.writer_id, cfg)? {
-                state.seal_not_before_ms = provisional_quiet_ms(cfg);
+                set_provisional_quiet(cfg, &mut state);
                 state.write_atomic(dir)?;
                 fence = Some(resume_takeover(cfg, &state.writer_id, &mut bucket)?);
             }
@@ -513,27 +515,41 @@ fn quiet_of(cfg: &EngineConfig) -> Duration {
     cfg.lease.saturating_add(cfg.request_timeout)
 }
 
-/// `seal_not_before_ms` persisted before a fence is appended, in case the open crashes
-/// between the fence and `set_quiet`: the next open then finds its own fence as the last
-/// record (no fence again) and passes this deadline on. It ends no later than the one
-/// `set_quiet` writes, and starts after the head write, as the quiet must.
-fn provisional_quiet_ms(cfg: &EngineConfig) -> u64 {
-    bucket::unix_ms(SystemTime::now() + quiet_of(cfg))
+/// The takeover quiet persisted before a fence is appended, in case the open crashes between
+/// the fence and `set_quiet`: the next open then finds its own fence as the last record (no
+/// fence again) and waits the persisted length (`set_quiet`). `set_quiet` replaces it.
+fn set_provisional_quiet(cfg: &EngineConfig, state: &mut LocalState) {
+    let quiet = quiet_of(cfg);
+    state.seal_not_before_ms = bucket::unix_ms(SystemTime::now() + quiet);
+    state.seal_quiet_ms = duration_ms(quiet);
+}
+
+/// `d` in whole ms, at least 1 for a nonzero `d`, so a pending quiet's length is never read
+/// back as absent (0).
+fn duration_ms(d: Duration) -> u64 {
+    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    if ms == 0 && !d.is_zero() {
+        1
+    } else {
+        ms
+    }
 }
 
 /// Step 5 of `attach_existing`. With a `fence` from this open: when another writer may still
 /// have a seal of the generation in flight (`FenceOutcome::seal_may_be_in_flight`), the quiet
-/// is `lease + request_timeout` from now, persisted as `state.seal_not_before_ms` (unix ms)
-/// and set on the bucket as an `Instant`; otherwise 0 is persisted (replacing the provisional
-/// deadline). Returns the quiet set.
+/// is `lease + request_timeout` from now, persisted as `state.seal_not_before_ms` (unix ms,
+/// its end) and `state.seal_quiet_ms` (its length), and set on the bucket as an `Instant`;
+/// otherwise 0 is persisted for both (replacing the provisional quiet). Returns the quiet set.
 ///
-/// Without a fence: a `seal_not_before_ms` persisted for `generation` (the local state's at
-/// open), when the head is still at it, is what is left of it on the wall clock now, capped at
-/// `lease + request_timeout` from now (and persisted capped): a wall clock stepped back since
-/// the deadline was written cannot stretch the quiet past its length. The rest is set on the
-/// bucket as an `Instant`, so a wall clock step after the open changes nothing (a quiet
-/// already passed changes nothing either). One of an older generation is dropped (0). The
-/// seal of the generation writes 0 (`BucketDbStorage::seal`).
+/// Without a fence: a quiet pending for `generation` (the local state's at open), when the
+/// head is still at it (`seal_not_before_ms` not 0, so no seal of the generation cleared it),
+/// is waited again in full from this open: its persisted length (`seal_quiet_ms`; this
+/// process's `lease + request_timeout` when the key is absent), on the monotonic clock. The
+/// wall-clock deadline is never read back as a remainder: a wall clock stepped forward since
+/// it was written would shorten the quiet (to nothing), and one stepped back would stretch
+/// it; a reopen with a shorter lease cannot cut it either. The new end and the length are
+/// persisted. One of an older generation is dropped (0). The seal of the generation writes 0
+/// to both keys (`BucketDbStorage::seal`).
 fn set_quiet(
     dir: &Path,
     cfg: &EngineConfig,
@@ -543,21 +559,26 @@ fn set_quiet(
     generation: u64,
 ) -> Result<Duration> {
     let Some(fence) = fence else {
-        let ms = state.seal_not_before_ms;
-        if ms == 0 || bucket.head().generation != generation {
+        if state.seal_not_before_ms == 0 || bucket.head().generation != generation {
             state.seal_not_before_ms = 0;
+            state.seal_quiet_ms = 0;
             return Ok(Duration::ZERO);
         }
-        let now = SystemTime::now();
-        let left = (UNIX_EPOCH + Duration::from_millis(ms))
-            .duration_since(now)
-            .unwrap_or(Duration::ZERO);
-        let capped = left.min(quiet_of(cfg));
-        if capped < left {
-            state.seal_not_before_ms = bucket::unix_ms(now + capped);
-            state.write_atomic(dir)?;
-        }
-        bucket.set_seal_not_before(generation, Instant::now() + capped);
+        let length = match state.seal_quiet_ms {
+            0 => quiet_of(cfg),
+            ms => Duration::from_millis(ms),
+        };
+        let until = Instant::now() + length;
+        state.seal_not_before_ms = bucket::unix_ms(SystemTime::now() + length);
+        state.seal_quiet_ms = duration_ms(length);
+        state.write_atomic(dir)?;
+        bucket.set_seal_not_before(generation, until);
+        tracing::info!(
+            target: "turso_durable",
+            generation,
+            ms = state.seal_quiet_ms,
+            "takeover quiet: pending at open, waited again in full"
+        );
         return Ok(Duration::ZERO);
     };
     let quiet = if fence.seal_may_be_in_flight {
@@ -571,6 +592,7 @@ fn set_quiet(
     } else {
         bucket::unix_ms(wall)
     };
+    state.seal_quiet_ms = duration_ms(quiet);
     state.write_atomic(dir)?;
     if !quiet.is_zero() {
         bucket.set_seal_not_before(fence.pos.generation, until);
@@ -759,7 +781,7 @@ fn claim_in_span(
     state.claimed = true;
     state.head_etag = etag;
     state.epoch = head.epoch;
-    state.seal_not_before_ms = provisional_quiet_ms(cfg);
+    set_provisional_quiet(cfg, state);
     state.write_atomic(dir)?;
     let mut bucket = attach(store, keys, cfg, state)?;
     let fence = bucket.append_fence();
@@ -850,7 +872,8 @@ impl Database {
     ///
     /// Right after a takeover of a generation whose old writer was sealing it
     /// ([`crate::TakeoverReport::quiet`]), the close-time checkpoint's seal first waits out
-    /// that quiet (`lease + request_timeout` after the takeover), so close can take that long.
+    /// that quiet (`lease + request_timeout` after the takeover, or its full persisted length
+    /// after an open that found it pending), so close can take that long.
     pub fn close(self) -> Result<()> {
         // Checked under the lock `connect` holds, so no connection appears in between.
         let mut guard = lock(&self.shared.open);

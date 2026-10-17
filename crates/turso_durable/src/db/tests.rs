@@ -1584,7 +1584,7 @@ fn stage2_head_and_local_state_reopen() {
     let s = state(a.path());
     let stage2 = String::from_utf8(s.encode()).unwrap().replace(
         &format!(
-            ",\"epoch\":{},\"claim_id\":\"\",\"seal_not_before_ms\":0",
+            ",\"epoch\":{},\"claim_id\":\"\",\"seal_not_before_ms\":0,\"seal_quiet_ms\":0",
             s.epoch
         ),
         "",
@@ -2129,13 +2129,19 @@ fn quiet_deadline_is_persisted() {
         "seal_not_before_ms {} is not within 100 ms of now + 800 ms ({want})",
         s.seal_not_before_ms
     );
+    assert_eq!(s.seal_quiet_ms, QUIET.as_millis() as u64, "its length");
     let (hook, seen) = recorder();
     let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
     let cb = db_b.connect().unwrap();
     insert(&cb, 1001).unwrap();
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
     assert_eq!(seal_quiets(&seen).len(), 1, "the reopen kept the quiet");
-    assert_eq!(state(&b_dir).seal_not_before_ms, 0, "the seal cleared it");
+    let s = state(&b_dir);
+    assert_eq!(
+        (s.seal_not_before_ms, s.seal_quiet_ms),
+        (0, 0),
+        "the seal cleared both"
+    );
     cb.close().unwrap();
     db_b.close().unwrap();
     let mut want: Vec<i64> = (1..=5).collect();
@@ -2482,10 +2488,12 @@ fn a_chained_takeover_after_the_middle_writer_committed_keeps_the_quiet() {
     }
 }
 
-/// I1 and M2: the quiet is capped at `lease + request_timeout` from the open that sets it, on
-/// the monotonic clock. A persisted deadline a day ahead (a wall clock stepped back after the
-/// takeover, or set wrong) makes the reopen's first seal wait at most the quiet (800 ms), not
-/// the day. Maintenance's view (`Uploader::seal_quiet_remaining`) agrees with the seal's wait.
+/// I1 and M2, and B1: a reopen waits the quiet's persisted length (800 ms) from the open, on
+/// the monotonic clock, never a wall-clock remainder. A persisted deadline a day ahead (a
+/// wall clock stepped back after the takeover, or set wrong) makes the reopen's first seal
+/// wait at most that length, not the day, and the deadline is persisted again at most that
+/// length from now. Maintenance's view (`Uploader::seal_quiet_remaining`) agrees with the
+/// seal's wait.
 #[test]
 fn a_persisted_quiet_far_ahead_is_capped_at_reopen() {
     let store = mem();
@@ -2509,11 +2517,13 @@ fn a_persisted_quiet_far_ahead_is_capped_at_reopen() {
     let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
     let viewed = db_b.shared.uploader.seal_quiet_remaining();
     let cap = crate::bucket::unix_ms(std::time::SystemTime::now() + QUIET);
-    let persisted = state(&b_dir).seal_not_before_ms;
+    let persisted = state(&b_dir);
     assert!(
-        persisted <= cap,
-        "persisted {persisted}, not capped at {cap}"
+        persisted.seal_not_before_ms <= cap,
+        "persisted {}, not capped at {cap}",
+        persisted.seal_not_before_ms
     );
+    assert_eq!(persisted.seal_quiet_ms, QUIET.as_millis() as u64);
     let cb = db_b.connect().unwrap();
     insert(&cb, 1001).unwrap();
     let began = Instant::now();
@@ -2541,10 +2551,192 @@ fn a_persisted_quiet_far_ahead_is_capped_at_reopen() {
         "{:?}",
         began.elapsed()
     );
-    assert_eq!(state(&b_dir).seal_not_before_ms, 0, "the seal cleared it");
+    let s = state(&b_dir);
+    assert_eq!(
+        (s.seal_not_before_ms, s.seal_quiet_ms),
+        (0, 0),
+        "the seal cleared both"
+    );
     cb.close().unwrap();
     db_b.close().unwrap();
     let mut want: Vec<i64> = (1..=5).collect();
     want.push(1001);
     assert_eq!(restored_ids(&store), want);
+}
+
+/// B1: the wall clock steps forward between `takeover` and the `open` that follows (a new
+/// process, as with the CLI; or a crash and reopen during the quiet). The step is simulated
+/// by moving the persisted deadline to "now", a forward step of the whole quiet. Old writer A
+/// is mid-seal with a page PUT held after its lease check, inside its 2 s lease. B's reopen
+/// must still wait the full persisted length (2.5 s) from the open, on the monotonic clock,
+/// so A's held PUT, released after B's seal, fails its condition: B's `pages/G/*` and
+/// `manifest/G` stay byte-identical, A is fenced, and a restore holds both writers' rows.
+fn forward_wall_step_between_takeover_and_open(batching: crate::Batching) {
+    let store = mem();
+    let hold = Arc::new(crate::store::fault::HoldStore::new(store.clone()));
+    let a = tempdir();
+    let db_a = open_with_store(chain_config(a.path(), batching, None), hold.clone()).unwrap();
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    for id in 1..=30 {
+        insert_kb(&ca, id);
+    }
+    let gen = db_a.generation();
+    let (held_rx, go) = hold.hold_next_put("/pages/");
+    let a_seal = std::thread::spawn(move || {
+        let r = ca.checkpoint(CheckpointMode::Truncate);
+        (r, ca, db_a)
+    });
+    let key = held_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("A's page PUT is held");
+
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let rep_b =
+        crate::takeover_with_store(chain_config(&b_dir, batching, None), store.clone()).unwrap();
+    assert_eq!(rep_b.quiet, CHAIN_QUIET, "{rep_b:?}");
+    let mut s = state(&b_dir);
+    assert_eq!(
+        s.seal_quiet_ms,
+        CHAIN_QUIET.as_millis() as u64,
+        "{batching:?}"
+    );
+    s.seal_not_before_ms = crate::bucket::unix_ms(std::time::SystemTime::now());
+    s.write_atomic(&b_dir).unwrap();
+
+    let took = Instant::now();
+    let db_b = open_with_store(chain_config(&b_dir, batching, None), store.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    for id in 3001..=3010 {
+        insert_kb(&cb, id);
+    }
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    let sealed_after = took.elapsed();
+    assert_eq!(head(&*store).generation, gen + 1, "B sealed G");
+    let published = sealed_objects(&bucket_objects(&store), gen);
+    assert!(!published.is_empty());
+
+    go.send(()).unwrap();
+    let (a_result, ca, db_a) = a_seal.join().unwrap();
+    let after = sealed_objects(&bucket_objects(&store), gen);
+    let changed = changed_keys(&published, &after);
+    let outcomes = hold.outcomes();
+    eprintln!(
+        "{batching:?}: B sealed {sealed_after:?} after open; A's held {key}: {outcomes:?}; \
+         changed keys of B's published seal: {changed:?}"
+    );
+    assert!(
+        sealed_after >= CHAIN_QUIET,
+        "{batching:?}: B's seal returned {sealed_after:?} after the open, before the \
+         persisted quiet {CHAIN_QUIET:?}"
+    );
+    assert!(
+        changed.is_empty(),
+        "{batching:?}: A's late PUT of {key} overwrote B's seal of generation {gen}: {changed:?}"
+    );
+    assert!(
+        matches!(&outcomes[..], [o] if o.ends_with(": 412")),
+        "{batching:?}: A's held PUT must fail its condition: {outcomes:?}"
+    );
+    assert!(
+        matches!(a_result, Err(Error::Fenced(_))),
+        "{batching:?}: {a_result:?}"
+    );
+    crash(db_a, vec![ca]);
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=30).collect();
+    want.extend(3001..=3010);
+    assert_eq!(restored_ids(&store), want, "{batching:?}");
+}
+
+/// B1 under `Off` and a `Window`.
+#[test]
+fn a_forward_wall_step_between_takeover_and_open_keeps_the_quiet() {
+    for b in batchings() {
+        forward_wall_step_between_takeover_and_open(b);
+    }
+}
+
+/// B1: the quiet's length is persisted with it, so a reopen configured with a shorter lease
+/// (quiet 800 ms) than the takeover's (2.5 s) still waits the persisted 2.5 s from the open.
+#[test]
+fn a_reopen_with_a_shorter_lease_waits_the_persisted_quiet() {
+    let store = mem();
+    let _a = writer_left_in_a_seal(&store, 5);
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let rep = crate::takeover_with_store(
+        chain_config(&b_dir, crate::Batching::Off, None),
+        store.clone(),
+    )
+    .unwrap();
+    assert_eq!(rep.quiet, CHAIN_QUIET, "{rep:?}");
+    assert_eq!(state(&b_dir).seal_quiet_ms, CHAIN_QUIET.as_millis() as u64);
+    let (hook, seen) = recorder();
+    let took = Instant::now();
+    let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
+    let cb = db_b.connect().unwrap();
+    insert(&cb, 1001).unwrap();
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    let sealed_after = took.elapsed();
+    let quiets = seal_quiets(&seen);
+    eprintln!("shorter lease: sealed {sealed_after:?} after open; waits {quiets:?}");
+    assert!(
+        sealed_after >= CHAIN_QUIET,
+        "the reopen's seal returned {sealed_after:?} after the open, before the persisted \
+         quiet {CHAIN_QUIET:?} (waits {quiets:?})"
+    );
+    assert!(
+        matches!(quiets[..], [(_, wait)] if wait > QUIET && wait <= CHAIN_QUIET),
+        "{quiets:?}"
+    );
+    let s = state(&b_dir);
+    assert_eq!(
+        (s.seal_not_before_ms, s.seal_quiet_ms),
+        (0, 0),
+        "the seal cleared both"
+    );
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=5).collect();
+    want.push(1001);
+    assert_eq!(restored_ids(&store), want);
+}
+
+/// B1: a pending quiet persisted before `seal_quiet_ms` existed (deadline set, no length)
+/// reads as the reopening process's `lease + request_timeout`, waited in full from the open,
+/// even with the deadline already past on the wall clock.
+#[test]
+fn a_pending_quiet_without_a_length_waits_the_reopens_quiet() {
+    let store = mem();
+    let _a = writer_left_in_a_seal(&store, 5);
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let rep = crate::takeover_with_store(quiet_config(&b_dir, None), store.clone()).unwrap();
+    assert_eq!(rep.quiet, QUIET, "{rep:?}");
+    let mut s = state(&b_dir);
+    s.seal_not_before_ms = crate::bucket::unix_ms(std::time::SystemTime::now());
+    s.seal_quiet_ms = 0;
+    s.write_atomic(&b_dir).unwrap();
+    let (hook, seen) = recorder();
+    let took = Instant::now();
+    let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
+    assert_eq!(state(&b_dir).seal_quiet_ms, QUIET.as_millis() as u64);
+    let cb = db_b.connect().unwrap();
+    insert(&cb, 1001).unwrap();
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    let sealed_after = took.elapsed();
+    assert!(
+        sealed_after >= QUIET,
+        "sealed {sealed_after:?} after the open"
+    );
+    assert!(
+        matches!(seal_quiets(&seen)[..], [(_, wait)] if wait <= QUIET),
+        "{:?}",
+        seal_quiets(&seen)
+    );
+    cb.close().unwrap();
+    db_b.close().unwrap();
 }

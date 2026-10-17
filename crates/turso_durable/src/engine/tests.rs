@@ -92,6 +92,7 @@ pub(crate) fn writer_trimmed(
                 epoch: b.head().epoch,
                 claim_id: String::new(),
                 seal_not_before_ms: 0,
+                seal_quiet_ms: 0,
             };
             s.write_atomic(dir).unwrap();
             (b, s)

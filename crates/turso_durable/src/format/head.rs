@@ -91,14 +91,20 @@ pub(crate) struct LocalState {
     pub epoch: u64,
     /// The claim this copy made (empty before the key existed).
     pub claim_id: String,
-    /// Earliest time, in ms, a seal may run (0 before the key existed).
+    /// The takeover quiet pending for `generation`, as wall-clock unix ms when it was set to
+    /// end (0: none; 0 before the key existed). Only whether it is 0 is trusted: a reopen
+    /// waits the quiet's full length (`seal_quiet_ms`) again, on the monotonic clock.
     pub seal_not_before_ms: u64,
+    /// The length, in ms, of the pending takeover quiet (0 when none, and before the key
+    /// existed: a pending quiet then reads as the reopening process's `lease +
+    /// request_timeout`).
+    pub seal_quiet_ms: u64,
 }
 
 impl LocalState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         format!(
-            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{}}}",
+            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{},\"seal_quiet_ms\":{}}}",
             self.format,
             escape(&self.writer_id),
             self.generation,
@@ -107,7 +113,8 @@ impl LocalState {
             escape(&self.head_etag),
             self.epoch,
             escape(&self.claim_id),
-            self.seal_not_before_ms
+            self.seal_not_before_ms,
+            self.seal_quiet_ms
         )
         .into_bytes()
     }
@@ -137,6 +144,11 @@ impl LocalState {
             },
             seal_not_before_ms: if o.has("seal_not_before_ms") {
                 o.num("seal_not_before_ms")?
+            } else {
+                0
+            },
+            seal_quiet_ms: if o.has("seal_quiet_ms") {
+                o.num("seal_quiet_ms")?
             } else {
                 0
             },

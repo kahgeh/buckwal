@@ -30,9 +30,10 @@ pub struct TakeoverReport {
     /// generation waits (`lease + request_timeout`), because some earlier writer's last record
     /// before the fence is a seal-start record (that writer may be several takeovers back),
     /// or a record before the fence could not be read, so that writer's page and manifest
-    /// PUTs may still be in flight. Zero otherwise. It is persisted in the directory, so the
-    /// [`crate::open`] that follows keeps it; a checkpoint or close in the quiet waits for
-    /// its end, and maintenance does not start meanwhile.
+    /// PUTs may still be in flight. Zero otherwise. It is persisted in the directory with its
+    /// length, so the [`crate::open`] that follows waits that full length again from the open
+    /// (on the monotonic clock, whatever the wall clock did meanwhile); a checkpoint or close
+    /// in the quiet waits for its end, and maintenance does not start meanwhile.
     pub quiet: Duration,
     pub elapsed: Duration,
 }

@@ -370,6 +370,7 @@ fn restore_files(
         epoch: head.epoch,
         claim_id: String::new(),
         seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
     }
     .write_atomic(dir)?;
     let delta = store.stats().since(&before);

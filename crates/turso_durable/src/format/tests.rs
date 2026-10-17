@@ -236,12 +236,13 @@ fn local_state_atomic_write() {
         epoch: 0,
         claim_id: String::new(),
         seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
     };
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s.clone()));
     assert_eq!(
         String::from_utf8(s.encode()).unwrap(),
-        r#"{"format":1,"writer_id":"w1","generation":3,"complete":true,"claimed":false,"head_etag":"\"e1\"","epoch":0,"claim_id":"","seal_not_before_ms":0}"#
+        r#"{"format":1,"writer_id":"w1","generation":3,"complete":true,"claimed":false,"head_etag":"\"e1\"","epoch":0,"claim_id":"","seal_not_before_ms":0,"seal_quiet_ms":0}"#
     );
     // A file written before `claimed` and `head_etag` existed: claimed, no ETag.
     let old =
@@ -547,10 +548,18 @@ fn stage2_local_state_reads_with_defaults() {
         epoch: 4,
         claim_id: "c1".into(),
         seal_not_before_ms: 99,
+        seal_quiet_ms: 800,
     };
     assert_eq!(
         String::from_utf8(full.encode()).unwrap(),
-        r#"{"format":1,"writer_id":"w","generation":3,"complete":true,"claimed":true,"head_etag":"e","epoch":4,"claim_id":"c1","seal_not_before_ms":99}"#
+        r#"{"format":1,"writer_id":"w","generation":3,"complete":true,"claimed":true,"head_etag":"e","epoch":4,"claim_id":"c1","seal_not_before_ms":99,"seal_quiet_ms":800}"#
     );
     assert_eq!(LocalState::decode(&full.encode()).unwrap(), full);
+    // A file written before `seal_quiet_ms` existed: a pending quiet of no length (0), which
+    // the reopen reads as its own `lease + request_timeout`.
+    let before = LocalState::decode(
+        br#"{"format":1,"writer_id":"w","generation":3,"complete":true,"claimed":true,"head_etag":"e","epoch":4,"claim_id":"c1","seal_not_before_ms":99}"#,
+    )
+    .unwrap();
+    assert_eq!((before.seal_not_before_ms, before.seal_quiet_ms), (99, 0));
 }

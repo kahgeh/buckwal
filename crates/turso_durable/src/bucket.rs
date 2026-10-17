@@ -127,11 +127,12 @@ enum Raise {
 /// The takeover quiet (`Bucket::set_seal_not_before`): no seal of `generation` starts before
 /// `until`, on the monotonic clock.
 ///
-/// Why only that clock: the quiet is `lease + request_timeout` from when it is set, and a
-/// wall deadline capped at that length from the same moment can never end later than
-/// `until`, so it would add nothing. Uncapped, a wall clock stepped back would stall every
-/// commit and close for the size of the step. A machine that sleeps through the quiet only
-/// makes the wait longer (`Instant` stands still), which is the safe side.
+/// Why only that clock: a wall clock stepped forward would end a wall deadline early (and
+/// let an old writer's late PUT overwrite this writer's seal), and one stepped back would
+/// stall every commit and close for the size of the step. So a reopen waits the persisted
+/// length again in full (`db::set_quiet`) rather than a wall-clock remainder. A machine that
+/// sleeps through the quiet only makes the wait longer (`Instant` stands still), which is the
+/// safe side.
 #[derive(Debug, Clone, Copy)]
 struct SealQuiet {
     generation: u64,
@@ -598,9 +599,9 @@ impl Bucket {
     /// The takeover quiet: no seal of `generation` starts before `until` (monotonic).
     /// `db::attach_existing` sets it when another writer may still have a seal of the
     /// generation in flight at this writer's fence (`FenceOutcome::seal_may_be_in_flight`),
-    /// to `lease + request_timeout` after the fence. A later open turns the persisted
-    /// wall-clock deadline back into an `Instant`, capped at `lease + request_timeout` from
-    /// that open (`db::set_quiet`). A seal of `generation` clears it.
+    /// to `lease + request_timeout` after the fence. A later open that finds the quiet still
+    /// pending (no seal of `generation` cleared it) waits its persisted length again in full
+    /// from that open (`db::set_quiet`). A seal of `generation` clears it.
     ///
     /// Why: that writer's page and manifest requests may still be in flight. Its PUTs are
     /// conditional (`seal_put_step`): one conditioned on what it saw before this writer wrote
