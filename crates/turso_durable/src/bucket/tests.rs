@@ -526,6 +526,40 @@ fn a_zero_lease_seal_checks_the_head_before_each_put() {
     assert_eq!(f.stored_head().generation, 2);
 }
 
+/// A seal that keeps uploading is not cut off by the retry deadline: with 150 ms page PUTs,
+/// one worker and a 300 ms deadline, the seal outlasts its deadline while every round
+/// uploads pages, and the manifest's first lapse (pages went out since the last head check)
+/// still renews the lease instead of ending the seal with `Timeout`. Under a 200 ms lease and
+/// under a zero lease.
+#[test]
+fn a_long_seal_that_keeps_uploading_outlasts_the_deadline() {
+    let mut got = Vec::new();
+    for (lease, n) in [(Duration::from_millis(200), 4), (Duration::ZERO, 3)] {
+        let f = Fixture::new();
+        let short = RetryPolicy {
+            deadline: Duration::from_millis(300),
+            ..fast()
+        };
+        let mut b = f.create(short, 1);
+        b.set_lease(lease);
+        b.append_log(syncs(1)).unwrap();
+        f.fault.only_keys_containing("/pages/");
+        f.fault.delay_puts(Duration::from_millis(150));
+        let before = f.fault.events().len();
+        let r = b.seal_generation(pages(n), 4096, n);
+        let ev = seal_events(&f.fault.events()[before..]);
+        let manifest_last = ev.last() == Some(&"manifest");
+        got.push((lease, r, manifest_last, f.stored_head().generation, ev));
+    }
+    for (lease, r, manifest_last, generation, ev) in &got {
+        assert_eq!(
+            (r, manifest_last, generation),
+            (&Ok(2), &true, &2),
+            "lease {lease:?}: {ev:?}; all: {got:?}"
+        );
+    }
+}
+
 /// Head GETs slower than the lease leave it lapsed as soon as it is renewed, so no PUT can
 /// go out: once the deadline has passed, the seal ends with `Timeout` instead of reading the
 /// head forever, and it uploaded nothing.

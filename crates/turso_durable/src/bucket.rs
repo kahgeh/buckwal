@@ -801,13 +801,17 @@ impl Bucket {
         let key = self.keys.manifest(gen);
         let body = manifest.encode();
         // The page PUTs, not a head check, came just before: no free attempt (a zero lease
-        // checks the head first).
+        // checks the head first). The first lapse here always renews: the PUTs before it
+        // went out after the last head check, and a seal is stuck only when a lapse follows
+        // its own renewal with nothing sent, which is what `progressed = false` marks.
         let mut free = false;
+        let mut progressed = true;
         while self
             .retrying_in_lease(start, &key, &mut free, || self.store.put(&key, &body))?
             .is_none()
         {
-            self.renew_lease(start, false)?;
+            self.renew_lease(start, progressed)?;
+            progressed = false;
             free = self.lease.is_zero();
         }
 
@@ -883,9 +887,10 @@ impl Bucket {
 
     /// `retrying` for a seal's PUTs: each attempt, retries included, is sent only inside the
     /// lease; the first one refused ends the call with `None` (nothing sent, not counted as a
-    /// retry). A zero lease (tests) would refuse every attempt, so there each worker sends one
-    /// attempt after each head check: `free` starts true for a zero lease and the first
-    /// attempt spends it.
+    /// retry). A zero lease (tests) would refuse every attempt, so there one attempt per
+    /// worker per round goes out free: each round follows a head check, `free` starts true for
+    /// a zero lease in each worker of a round (and for the manifest after a renewal), and that
+    /// worker's first attempt spends it.
     fn retrying_in_lease<T>(
         &self,
         start: Instant,
@@ -905,14 +910,15 @@ impl Bucket {
     }
 
     /// The lease lapsed during a seal: GET the head (`verify_head`), which renews it or fences
-    /// this writer. A round that uploaded nothing (`progressed` false) after the call's
-    /// deadline ends the seal with `Timeout` instead: the head checks themselves outlast the
-    /// lease, and the seal would never move on.
+    /// this writer. `progressed` says whether any PUT landed since the last head check. A
+    /// lapse with none (the head check itself outlasted the lease) after the call's deadline
+    /// ends the seal with `Timeout` instead, or the seal would read the head forever.
     fn renew_lease(&mut self, start: Instant, progressed: bool) -> Result<()> {
         let elapsed = start.elapsed();
         if !progressed && elapsed >= self.retry.deadline {
             return Err(Error::Timeout(format!(
-                "seal of generation {}: the lease ({:?}) lapsed again after {elapsed:?}",
+                "seal of generation {}: no PUT went out inside the lease ({:?}) since the last \
+                 head check, {elapsed:?} into the seal",
                 self.head.generation, self.lease
             )));
         }
