@@ -33,6 +33,7 @@ pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
         trim_grace: crate::config::defaults::TRIM_GRACE,
         events: None,
         read_only: false,
+        encryption: None,
     }
 }
 

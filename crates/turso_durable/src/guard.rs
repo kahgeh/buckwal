@@ -5,6 +5,9 @@
 //! - `PRAGMA journal_mode` set to anything but `wal`: only the WAL is shipped.
 //! - `PRAGMA synchronous` below FULL: a commit that does not fsync is not uploaded either.
 //! - `ATTACH`: writes to an attached database are not shipped.
+//! - `PRAGMA hexkey` or `PRAGMA cipher` set to a value: the engine would swap the
+//!   connection's key or cipher (translate/pragma.rs:644-655); the key comes from
+//!   `DURABLE_ENCRYPTION_KEY_FILE` only (D16).
 //! - `PRAGMA durable_batching` the engine would be handed: [`crate::Connection`] runs it
 //!   itself ([`batching_pragma`]), and the engine would take it for an unknown pragma and
 //!   silently do nothing. So it is refused among other statements (not even the first of
@@ -94,6 +97,11 @@ fn check_batching(name: &QualifiedName, body: Option<&PragmaBody>, explain: bool
 }
 
 fn check_pragma(name: &str, value: &Expr) -> Result<()> {
+    if name.eq_ignore_ascii_case("hexkey") || name.eq_ignore_ascii_case("cipher") {
+        return Err(Error::Unsupported(
+            "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)",
+        ));
+    }
     let value = pragma_value(value).map(|v| v.to_ascii_lowercase());
     if name.eq_ignore_ascii_case("journal_mode") {
         return match value.as_deref() {
@@ -366,6 +374,26 @@ mod tests {
             check_sql_split("PRAGMA durable_batching = off; PRAGMA synchronous = off"),
             Err(Error::Unsupported("synchronous below FULL"))
         );
+    }
+
+    /// Setting the key or the cipher would swap the connection's (translate/pragma.rs:644-655);
+    /// the key comes from DURABLE_ENCRYPTION_KEY_FILE only. Reading them is fine.
+    #[test]
+    fn encryption_pragmas_are_refused() {
+        let what = "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)";
+        for sql in [
+            &format!("PRAGMA hexkey='{}'", "00".repeat(32)) as &str,
+            "PRAGMA HEXKEY = \"0011\"",
+            "PRAGMA main.hexkey('00')",
+            "PRAGMA cipher = 'aes256gcm'",
+            "pragma Cipher(aegis256)",
+            "SELECT 1; PRAGMA cipher = 'aes128gcm'",
+        ] {
+            assert_eq!(refused(sql), what, "{sql}");
+        }
+        for sql in ["PRAGMA cipher", "PRAGMA hexkey", "PRAGMA main.cipher"] {
+            assert_eq!(check_sql(sql), Ok(()), "{sql}");
+        }
     }
 
     #[test]

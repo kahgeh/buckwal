@@ -132,7 +132,7 @@ fn refuse_mvcc(page1: &[u8]) -> Result<()> {
 }
 
 /// The first whole page-1 frame of a `-wal` image (layout as in `wal_frame_pages`).
-fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
+pub(crate) fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
     let ps = u32::from_be_bytes(wal.get(8..12)?.try_into().ok()?) as usize;
     if ps == 0 {
         return None;
@@ -141,6 +141,36 @@ fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
         .chunks_exact(24 + ps)
         .find(|f| f[0..4] == 1u32.to_be_bytes())
         .map(|f| &f[24..])
+}
+
+/// Page 1 as `manifest/<g>` maps it.
+fn manifest_page_one(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    g: u64,
+    retry: &RetryPolicy,
+    retries: &AtomicU64,
+) -> Result<Vec<u8>> {
+    let manifest = Manifest::decode(&get(store, retry, retries, &keys.manifest(g))?)?;
+    let pg = manifest
+        .pages
+        .get(&1)
+        .ok_or_else(|| Error::Corrupt(format!("manifest/{g} has no entry for page 1")))?;
+    get(store, retry, retries, &keys.page(*pg, 1))
+}
+
+/// The bucket's sealed page 1: the head, its manifest, then the page (3 GETs). None while the
+/// bucket holds no manifest (never sealed: page 1 is in the log).
+pub(crate) fn sealed_page_one(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+) -> Result<Option<Vec<u8>>> {
+    let retries = AtomicU64::new(0);
+    let head = Head::decode(&get(store, retry, &retries, &keys.head())?)?;
+    head.manifest
+        .map(|g| manifest_page_one(store, keys, g, retry, &retries))
+        .transpose()
 }
 
 /// The `-wal` image `B` of the head's generation: every record of `log/<generation>`
@@ -339,12 +369,7 @@ fn restore_files(
         .ok_or_else(|| Error::NotFound(head_key.clone()))?;
     let head = Head::decode(&head_obj.body)?;
     if let Some(g) = head.manifest {
-        let manifest = Manifest::decode(&get(&*store, retry, retries, &keys.manifest(g))?)?;
-        let pg = manifest
-            .pages
-            .get(&1)
-            .ok_or_else(|| Error::Corrupt(format!("manifest/{g} has no entry for page 1")))?;
-        refuse_mvcc(&get(&*store, retry, retries, &keys.page(*pg, 1))?)?;
+        refuse_mvcc(&manifest_page_one(&*store, keys, g, retry, retries)?)?;
     }
     let (wal, log_objects) = generation_image_counted(&*store, keys, &head, cfg, retries)?;
     // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).

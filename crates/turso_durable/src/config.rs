@@ -1,6 +1,7 @@
 //! Public configuration: [`Config`] and its defaults. `Event` and `EventHook` (the
 //! `on_event` field) are test and diagnostics hooks, hidden from the docs.
 use crate::batching::Batching;
+use crate::encryption::{parse_cipher, Encryption};
 use crate::error::{Error, Result};
 use crate::format::Keys;
 use crate::store::s3::{S3Config, S3Store};
@@ -74,6 +75,9 @@ pub mod defaults {
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.
     pub const PREFIX: &str = "";
+    /// The cipher of an encrypted database (`DURABLE_ENCRYPTION_CIPHER`): any name turso's
+    /// `CipherMode::try_from` accepts.
+    pub const ENCRYPTION_CIPHER: &str = "aegis256";
 
     /// Export traces and logs over OTLP (`DURABLE_OTEL`): off in the library.
     pub const OTEL: bool = false;
@@ -142,6 +146,14 @@ pub struct Config {
     /// How long a maintenance run holds new calls back while it waits for the ones in flight
     /// (and open transactions) to end; then it gives up and retries later.
     pub maintenance_gate_wait: Duration,
+    /// A local file holding the database's encryption key as hex (D16); `None` stores the
+    /// database unencrypted. Read at open, never uploaded. An existing database must match
+    /// it: a key on an unencrypted database, or none on an encrypted one, is refused with
+    /// `Encryption`.
+    pub encryption_key_file: Option<PathBuf>,
+    /// The cipher (any name turso's `CipherMode::try_from` accepts; `Config` otherwise). A
+    /// value other than the default needs `encryption_key_file`.
+    pub encryption_cipher: String,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -170,13 +182,15 @@ impl fmt::Debug for Config {
             .field("maintenance_log_objects", &self.maintenance_log_objects)
             .field("maintenance_wal_bytes", &self.maintenance_wal_bytes)
             .field("maintenance_gate_wait", &self.maintenance_gate_wait)
+            .field("encryption_key_file", &self.encryption_key_file)
+            .field("encryption_cipher", &self.encryption_cipher)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 19] = [
+const ENV_VARS: [&str; 21] = [
     "DURABLE_ENDPOINT",
     "DURABLE_CA_BUNDLE",
     "DURABLE_REGION",
@@ -196,6 +210,8 @@ const ENV_VARS: [&str; 19] = [
     "DURABLE_MAINTENANCE_GATE_WAIT_MS",
     "DURABLE_LEASE_MS",
     "DURABLE_GC_AFTER_SEAL",
+    "DURABLE_ENCRYPTION_KEY_FILE",
+    "DURABLE_ENCRYPTION_CIPHER",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -273,6 +289,8 @@ impl Config {
             maintenance_log_objects: defaults::MAINTENANCE_LOG_OBJECTS,
             maintenance_wal_bytes: defaults::MAINTENANCE_WAL_BYTES,
             maintenance_gate_wait: defaults::MAINTENANCE_GATE_WAIT,
+            encryption_key_file: None,
+            encryption_cipher: defaults::ENCRYPTION_CIPHER.to_string(),
             on_event: None,
         }
     }
@@ -354,6 +372,12 @@ impl Config {
             c.maintenance_gate_wait =
                 Duration::from_millis(parse_num("DURABLE_MAINTENANCE_GATE_WAIT_MS", &v)?);
         }
+        if let Some(v) = get("DURABLE_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
+            c.encryption_key_file = Some(PathBuf::from(v));
+        }
+        if let Some(v) = get("DURABLE_ENCRYPTION_CIPHER").filter(|v| !v.is_empty()) {
+            c.encryption_cipher = v;
+        }
         Ok(c)
     }
 
@@ -391,6 +415,15 @@ impl Config {
             )));
         }
         self.batching.validate()?;
+        let cipher = parse_cipher(&self.encryption_cipher)?;
+        if self.encryption_key_file.is_none()
+            && cipher != parse_cipher(defaults::ENCRYPTION_CIPHER)?
+        {
+            return Err(Error::Config(format!(
+                "DURABLE_ENCRYPTION_CIPHER is {} but DURABLE_ENCRYPTION_KEY_FILE is not set",
+                self.encryption_cipher
+            )));
+        }
         let maintenance = self.maintenance_log_objects > 0 || self.maintenance_wal_bytes > 0;
         if maintenance && self.maintenance_gate_wait.is_zero() {
             return Err(Error::Config(
@@ -420,6 +453,7 @@ impl Config {
             trim_grace: self.trim_grace,
             events: self.on_event.clone(),
             read_only,
+            encryption: None,
         }
     }
 
@@ -533,6 +567,9 @@ pub(crate) struct EngineConfig {
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are
     /// refused (`ShippingFile`, `BucketDbStorage`).
     pub read_only: bool,
+    /// The cipher and key the engine opens and connects with (D16); `None` is unencrypted.
+    /// [`Config::engine`] leaves it `None`: `open` loads the key file (`encryption::load`).
+    pub encryption: Option<Arc<Encryption>>,
 }
 
 impl EngineConfig {
@@ -703,6 +740,8 @@ mod tests {
             ("DURABLE_MAINTENANCE_GATE_WAIT_MS", "75"),
             ("DURABLE_LEASE_MS", "2500"),
             ("DURABLE_GC_AFTER_SEAL", "off"),
+            ("DURABLE_ENCRYPTION_KEY_FILE", "/etc/db.key"),
+            ("DURABLE_ENCRYPTION_CIPHER", "aes256gcm"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads DURABLE_* variables.
@@ -741,6 +780,8 @@ mod tests {
         assert_eq!(c.maintenance_gate_wait, Duration::from_millis(75));
         assert_eq!(c.lease, Duration::from_millis(2500));
         assert!(!c.gc_after_seal);
+        assert_eq!(c.encryption_key_file, Some(PathBuf::from("/etc/db.key")));
+        assert_eq!(c.encryption_cipher, "aes256gcm");
 
         // Only the four required ones: the rest are defaults.
         let env = required();
@@ -882,6 +923,70 @@ mod tests {
         let c = read(&env);
         assert_eq!(c.ca_bundle, Some(PathBuf::from("/etc/ca.pem")));
         assert!(format!("{c:?}").contains("/etc/ca.pem"));
+    }
+
+    #[test]
+    fn unknown_cipher_is_config_error() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.encryption_key_file = Some("/k".into());
+        c.encryption_cipher = "rot13".into();
+        assert_eq!(
+            c.validate(),
+            Err(Error::Config(
+                "DURABLE_ENCRYPTION_CIPHER rot13 is not a cipher turso supports".into()
+            ))
+        );
+        // Every spelling turso accepts.
+        for name in ["aes256gcm", "AES-256-GCM", "aegis_128l", "aegis256x4"] {
+            c.encryption_cipher = name.into();
+            assert_eq!(c.validate(), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn cipher_without_key_file_is_config_error() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert_eq!(c.encryption_cipher, defaults::ENCRYPTION_CIPHER);
+        assert_eq!(defaults::ENCRYPTION_CIPHER, "aegis256");
+        assert_eq!(c.validate(), Ok(()), "the default cipher, no key: off");
+        c.encryption_cipher = "aes256gcm".into();
+        match c.validate() {
+            Err(Error::Config(m)) => assert!(
+                m.contains("DURABLE_ENCRYPTION_CIPHER")
+                    && m.contains("DURABLE_ENCRYPTION_KEY_FILE"),
+                "{m}"
+            ),
+            r => panic!("{r:?}"),
+        }
+        c.encryption_key_file = Some("/k".into());
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn from_env_reads_encryption_settings() {
+        let read = |env: &HashMap<&str, &str>| {
+            Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap()
+        };
+        let mut env = required();
+        let c = read(&env);
+        assert_eq!(c.encryption_key_file, None);
+        assert_eq!(c.encryption_cipher, "aegis256");
+        env.insert("DURABLE_ENCRYPTION_KEY_FILE", "");
+        env.insert("DURABLE_ENCRYPTION_CIPHER", "");
+        let c = read(&env);
+        assert_eq!(c.encryption_key_file, None, "empty = off");
+        assert_eq!(c.encryption_cipher, "aegis256", "empty = the default");
+        env.insert("DURABLE_ENCRYPTION_KEY_FILE", "/keys/db.key");
+        env.insert("DURABLE_ENCRYPTION_CIPHER", "aegis128l");
+        let c = read(&env);
+        assert_eq!(c.encryption_key_file, Some(PathBuf::from("/keys/db.key")));
+        assert_eq!(c.encryption_cipher, "aegis128l");
+        let debug = format!("{c:?}");
+        assert!(
+            debug.contains("/keys/db.key") && debug.contains("aegis128l"),
+            "{debug}"
+        );
+        assert!(c.engine(false).encryption.is_none(), "open loads the key");
     }
 
     /// A prefix is limited to `[A-Za-z0-9._/-]` with no empty segment: anything else (XML

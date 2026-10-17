@@ -16,6 +16,7 @@ pub enum Error {
     Engine(String),
     Io(String),
     Config(String),
+    Encryption(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +36,7 @@ impl fmt::Display for Error {
             Error::Engine(m) => write!(f, "engine error: {m}"),
             Error::Io(m) => write!(f, "io error: {m}"),
             Error::Config(m) => write!(f, "config error: {m}"),
+            Error::Encryption(m) => write!(f, "encryption error: {m}"),
         }
     }
 }

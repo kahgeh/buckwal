@@ -4,6 +4,7 @@
 
 use crate::bucket::Bucket;
 use crate::config::EngineConfig;
+use crate::encryption::{check_page_one, local_page_one};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE};
 use crate::format::LocalState;
@@ -15,10 +16,33 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
+use turso_core::{
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, OpenOptions, PlatformIO,
+    SqliteDialect, IO,
+};
+
+/// The engine's database, with the key every connection to it needs (D16). turso builds each
+/// connection's pager from the key that connection is given (database.rs:2386-2395,
+/// 2465-2495), so every engine connection is made here. Without encryption, `connect` is
+/// turso's plain `connect()` (both pass `None`, database.rs:2383-2395).
+#[derive(Clone)]
+pub(crate) struct EngineDb {
+    db: Arc<Database>,
+    key: Option<EncryptionKey>,
+}
+
+impl EngineDb {
+    pub(crate) fn connect(&self) -> turso_core::Result<Arc<turso_core::Connection>> {
+        self.db.connect_with_encryption(self.key.clone())
+    }
+
+    pub(crate) fn mvcc_enabled(&self) -> bool {
+        self.db.mvcc_enabled()
+    }
+}
 
 pub(crate) struct Engine {
-    pub db: Arc<Database>,
+    pub db: EngineDb,
     /// Tests inspect the page cache through it; the engine holds its own handle.
     #[cfg_attr(not(test), allow(dead_code))]
     pub storage: Arc<BucketDbStorage>,
@@ -109,6 +133,11 @@ pub(crate) fn open_engine(
         read_only: cfg.read_only,
     }));
     storage.adopt_persisted_dirty()?;
+    // D16: page 1, as the engine will read it, against the encryption setting.
+    check_page_one(
+        local_page_one(dir, &storage)?.as_deref(),
+        cfg.encryption.as_deref(),
+    )?;
     let wal_bytes = Arc::new(AtomicU64::new(0));
     let io = Arc::new(DurableIo::new(
         platform,
@@ -118,10 +147,23 @@ pub(crate) fn open_engine(
         wal_bytes.clone(),
         cfg.read_only,
     ));
-    let opts = OpenOptions::new(Arc::new(SqliteDialect))
+    let mut opts = OpenOptions::new(Arc::new(SqliteDialect))
         .storage(storage.clone())
         .flags(OpenFlags::Create);
-    let db = Database::open(io.clone(), &db_path, opts).map_err(engine_error)?;
+    // All three of turso's switches (D16): the database option, the cipher and key at open
+    // (a new database gets its reserved bytes from them), and the key on every connection.
+    if let Some(enc) = &cfg.encryption {
+        opts = opts
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(EncryptionOpts {
+                cipher: enc.cipher.to_string(),
+                hexkey: hex::encode(enc.key.as_slice()),
+            });
+    }
+    let db = EngineDb {
+        db: Database::open(io.clone(), &db_path, opts).map_err(engine_error)?,
+        key: cfg.encryption.as_ref().map(|e| e.key.clone()),
+    };
     if db.mvcc_enabled() {
         return Err(Error::Unsupported("MVCC"));
     }

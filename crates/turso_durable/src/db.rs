@@ -3,13 +3,14 @@ use crate::batching::Batching;
 use crate::bucket::{self, Bucket, FenceOutcome};
 use crate::config::{Config, EngineConfig, Event, EventHook};
 use crate::conn::Connection;
-use crate::engine::{engine_error, open_engine, Engine};
+use crate::encryption::{self, check_page_one};
+use crate::engine::{engine_error, open_engine, Engine, EngineDb};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
 use crate::format::{decode_record, Keys, LocalState, LogRecord, FORMAT};
 use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
 use crate::reconcile::{reconcile, Reconciled};
-use crate::restore::{clear_interrupted_restore, restore_staged};
+use crate::restore::{clear_interrupted_restore, restore_staged, sealed_page_one};
 use crate::stats::{StatsCell, UploadStats};
 use crate::store::{with_retry, ObjectStore, StatsSnap};
 use crate::trim::spawn_trimmer;
@@ -163,7 +164,7 @@ impl Shared {
     }
 
     /// The engine, while the database is open (maintenance connects to it).
-    pub(crate) fn engine_db(&self) -> Option<Arc<turso_core::Database>> {
+    pub(crate) fn engine_db(&self) -> Option<EngineDb> {
         lock(&self.open).as_ref().map(|o| o.engine.db.clone())
     }
 
@@ -268,15 +269,20 @@ pub fn open_read_only_with_store(config: Config, store: Arc<dyn ObjectStore>) ->
 
 fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Result<Database> {
     config.validate()?;
+    let encryption = encryption::load(&config)?;
     let guard = DirGuard::acquire(&config.dir)?;
     let dir = guard.dir().to_path_buf();
-    let cfg = config.engine(read_only);
+    let mut cfg = config.engine(read_only);
+    cfg.encryption = encryption;
     let keys = config.keys();
     clear_interrupted_restore(&dir)?;
     refuse_mvcc_file(&dir.join(DB_FILE))?;
 
     let (bucket, state, reconciled) = match LocalState::read(&dir)? {
-        Some(state) => attached(attach_existing(&dir, &store, &keys, &cfg, state)?),
+        Some(state) => {
+            refuse_encryption_mismatch(&dir, &store, &keys, &cfg)?;
+            attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
+        }
         None if dir.join(DB_FILE).exists() => {
             return Err(Error::Config(format!(
                 "{} holds an app.db not created by turso_durable",
@@ -287,6 +293,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             restore_staged(store.clone(), &keys, &dir, &cfg)?;
             let state = LocalState::read(&dir)?
                 .ok_or_else(|| Error::Corrupt("the restore wrote no local state".into()))?;
+            refuse_encryption_mismatch(&dir, &store, &keys, &cfg)?;
             attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
         }
         None if read_only => {
@@ -375,6 +382,26 @@ fn refuse_mvcc_file(path: &Path) -> Result<()> {
         return Err(Error::Unsupported("MVCC"));
     }
     Ok(())
+}
+
+/// Page 1 against the encryption setting (`encryption::check_page_one`) before a writer open
+/// writes anything to the bucket: its claim, epoch raise or fence would otherwise land before
+/// `open_engine`'s check refuses the open. Page 1 comes from the local files; a writer open of
+/// a restored directory that holds none (the bucket's manifest has it) GETs the sealed page 1
+/// (`sealed_page_one`). A read-only open writes nothing to the bucket and leaves that case to
+/// `open_engine`.
+fn refuse_encryption_mismatch(
+    dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+) -> Result<()> {
+    let page1 = match encryption::file_page_one(dir)? {
+        Some(p) => Some(p),
+        None if cfg.read_only => None,
+        None => sealed_page_one(&**store, keys, &cfg.retry)?,
+    };
+    check_page_one(page1.as_deref(), cfg.encryption.as_deref())
 }
 
 fn head_exists(store: &dyn ObjectStore, keys: &Keys, cfg: &EngineConfig) -> Result<bool> {

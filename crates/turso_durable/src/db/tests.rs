@@ -2762,3 +2762,426 @@ fn a_pending_quiet_without_a_length_waits_the_reopens_quiet() {
     cb.close().unwrap();
     db_b.close().unwrap();
 }
+
+// Encryption (D16).
+
+/// The test key: 32 bytes of 0x11, as hex.
+fn key_hex() -> String {
+    "11".repeat(32)
+}
+
+/// `config(dir)` with encryption on: `hex` written to `keydir/key`.
+fn enc_config(dir: &Path, keydir: &TempDir, hex: &str) -> Config {
+    let path = keydir.path().join("key");
+    std::fs::write(&path, hex).unwrap();
+    let mut c = config(dir);
+    c.encryption_key_file = Some(path);
+    c
+}
+
+fn encryption_err<T: std::fmt::Debug>(r: Result<T>) -> String {
+    match r {
+        Err(Error::Encryption(m)) => m,
+        r => panic!("expected Encryption, got {r:?}"),
+    }
+}
+
+/// An encrypted writer, closed: rows 1..=50 from two connections, a TRUNCATE checkpoint (a
+/// seal), then rows 51..=60. Returns its directory.
+fn encrypted_writer(store: &Arc<MemStore>, keydir: &TempDir) -> TempDir {
+    let a = tempdir();
+    let db = open_with_store(enc_config(a.path(), keydir, &key_hex()), store.clone()).unwrap();
+    let (c1, c2) = (db.connect().unwrap(), db.connect().unwrap());
+    create(&c1);
+    for id in 1..=50 {
+        insert(if id % 2 == 0 { &c1 } else { &c2 }, id).unwrap();
+    }
+    let gen = db.generation();
+    c1.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert!(db.generation() > gen, "the checkpoint sealed");
+    for id in 51..=60 {
+        insert(&c2, id).unwrap();
+    }
+    c1.close().unwrap();
+    c2.close().unwrap();
+    db.close().unwrap();
+    a
+}
+
+#[test]
+fn encrypted_open_commit_reopen_keeps_rows() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let page1 = std::fs::read(a.path().join("app.db")).unwrap();
+    assert!(page1.starts_with(b"Turso"), "app.db is not encrypted");
+    let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), (1..=60).collect::<Vec<_>>());
+    integrity_ok(&c);
+}
+
+#[test]
+fn encrypted_restore_fetches_pages_lazily_and_decrypts() {
+    let store = mem();
+    let k = tempdir();
+    let _a = encrypted_writer(&store, &k);
+    for prefetch in [false, true] {
+        let r = tempdir();
+        let mut cfg = enc_config(&fresh(&r), &k, &key_hex());
+        cfg.prefetch = prefetch;
+        let db = open_with_store(cfg, store.clone()).unwrap();
+        let c = db.connect().unwrap();
+        assert_eq!(ids(&c), (1..=60).collect::<Vec<_>>(), "prefetch {prefetch}");
+        integrity_ok(&c);
+        let lazy = {
+            let open = db.shared.open.lock().unwrap();
+            open.as_ref().unwrap().engine.storage.lazy_gets()
+        };
+        assert!(
+            lazy > 0,
+            "prefetch {prefetch}: no page came from the bucket"
+        );
+        c.close().unwrap();
+        db.close().unwrap();
+    }
+}
+
+const MARKER: &str = "turso-durable-plaintext-marker";
+
+/// A key with letters, so its lower- and upper-case hex differ.
+fn mixed_key_hex() -> String {
+    "a1".repeat(32)
+}
+
+/// The bucket workload: a table and an index, 200 marked rows (half under Off, half under a
+/// window), a TRUNCATE checkpoint, a takeover into a second directory that commits 10 rows,
+/// then GC.
+fn bucket_workload(store: &Arc<MemStore>, keydir: Option<&TempDir>) {
+    let cfg = |dir: &Path| match keydir {
+        Some(k) => enc_config(dir, k, &mixed_key_hex()),
+        None => config(dir),
+    };
+    let a = tempdir();
+    let db = open_with_store(cfg(a.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    c.execute("CREATE INDEX t_v ON t(v)", &[]).unwrap();
+    for id in 1..=200 {
+        if id == 101 {
+            c.set_batching(Some("window 5ms 8 1MiB".parse().unwrap()))
+                .unwrap();
+        }
+        c.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[
+                Value::from_i64(id),
+                Value::build_text(format!("{MARKER}-{id}")),
+            ],
+        )
+        .unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+
+    let b = tempdir();
+    let b_dir = fresh(&b);
+    crate::takeover_with_store(cfg(&b_dir), store.clone()).unwrap();
+    let db = open_with_store(cfg(&b_dir), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    for id in 201..=210 {
+        insert(&c, id).unwrap();
+    }
+    assert_eq!(ids(&c), (1..=210).collect::<Vec<_>>());
+    c.close().unwrap();
+    db.close().unwrap();
+    crate::gc_with_store(&cfg(&b_dir), store.clone()).unwrap();
+}
+
+/// Which of the needles some object in the bucket holds (GETting every key).
+fn needles_found(store: &Arc<MemStore>) -> BTreeSet<&'static str> {
+    let hex = mixed_key_hex();
+    let needles: [(&str, Vec<u8>); 6] = [
+        ("marker", MARKER.into()),
+        ("CREATE TABLE", "CREATE TABLE".into()),
+        ("SQLite header", b"SQLite format 3\0".to_vec()),
+        ("key hex", hex.clone().into_bytes()),
+        ("KEY HEX", hex.to_uppercase().into_bytes()),
+        ("raw key", vec![0xa1; 32]),
+    ];
+    let keys = store.list("").unwrap();
+    assert!(keys.len() > 5, "{keys:?}");
+    let mut found = BTreeSet::new();
+    for key in keys {
+        let body = store.get(&key).unwrap().unwrap().body;
+        for (name, needle) in &needles {
+            if body.windows(needle.len()).any(|w| w == &needle[..]) {
+                found.insert(*name);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn encrypted_bucket_has_no_plaintext() {
+    let store = mem();
+    let k = tempdir();
+    bucket_workload(&store, Some(&k));
+    assert_eq!(needles_found(&store), BTreeSet::new());
+}
+
+/// The control of `encrypted_bucket_has_no_plaintext`: without encryption the same search
+/// finds the rows and the schema.
+#[test]
+fn plaintext_bucket_shows_the_schema() {
+    let store = mem();
+    bucket_workload(&store, None);
+    let found = needles_found(&store);
+    assert!(
+        found.contains("marker") && found.contains("CREATE TABLE"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn open_without_key_on_encrypted_database_is_refused() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let etag = head_etag(&store);
+    // Its own directory.
+    let m = encryption_err(open_with_store(config(a.path()), store.clone()));
+    assert!(m.contains("DURABLE_ENCRYPTION_KEY_FILE"), "{m}");
+    // A fresh directory that auto-restores: refused before the takeover.
+    let r = tempdir();
+    let m = encryption_err(open_with_store(config(&fresh(&r)), store.clone()));
+    assert!(m.contains("DURABLE_ENCRYPTION_KEY_FILE"), "{m}");
+    assert_eq!(head_etag(&store), etag, "the refused opens wrote the head");
+    // The writer still owns it.
+    let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
+    assert_eq!(ids(&db.connect().unwrap()), (1..=60).collect::<Vec<_>>());
+}
+
+#[test]
+fn open_with_wrong_key_is_refused() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let wrong = tempdir();
+    let wrong_hex = "22".repeat(32);
+    for dir in [a.path().to_path_buf(), fresh(&tempdir())] {
+        let m = encryption_err(open_with_store(
+            enc_config(&dir, &wrong, &wrong_hex),
+            store.clone(),
+        ));
+        assert!(m.contains("does not decrypt"), "{m}");
+        assert!(!m.contains(&key_hex()) && !m.contains(&wrong_hex), "{m}");
+    }
+}
+
+/// Every object in the bucket with its ETag.
+fn etags(store: &Arc<MemStore>) -> BTreeMap<String, String> {
+    store
+        .list("")
+        .unwrap()
+        .into_iter()
+        .map(|k| {
+            let etag = store.get(&k).unwrap().unwrap().etag;
+            (k, etag)
+        })
+        .collect()
+}
+
+#[test]
+fn open_with_key_on_plaintext_database_is_refused() {
+    let store = mem();
+    let a = closed_writer(&store, 10);
+    let db_bytes = std::fs::read(a.path().join("app.db")).unwrap();
+    let objects = etags(&store);
+    let k = tempdir();
+    let m = encryption_err(open_with_store(
+        enc_config(a.path(), &k, &key_hex()),
+        store.clone(),
+    ));
+    assert!(m.contains("cannot be encrypted in place"), "{m}");
+    assert_eq!(std::fs::read(a.path().join("app.db")).unwrap(), db_bytes);
+    assert_eq!(
+        etags(&store),
+        objects,
+        "the refused open wrote to the bucket"
+    );
+    let db = open_mem(&store, a.path());
+    assert_eq!(ids(&db.connect().unwrap()), (1..=10).collect::<Vec<_>>());
+}
+
+#[test]
+fn cipher_mismatch_is_refused() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let mut c = enc_config(a.path(), &k, &key_hex());
+    c.encryption_cipher = "aes256gcm".into();
+    let m = encryption_err(open_with_store(c, store.clone()));
+    assert!(m.contains("aegis256") && m.contains("aes256gcm"), "{m}");
+}
+
+#[test]
+fn encrypted_verify_needs_the_key() {
+    let store = mem();
+    let k = tempdir();
+    let _a = encrypted_writer(&store, &k);
+    let puts = store.stats().puts;
+    let v = tempdir();
+    let m = encryption_err(open_read_only_with_store(config(v.path()), store.clone()));
+    assert!(m.contains("DURABLE_ENCRYPTION_KEY_FILE"), "{m}");
+    let db =
+        open_read_only_with_store(enc_config(v.path(), &k, &key_hex()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), (1..=60).collect::<Vec<_>>());
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(store.stats().puts, puts, "verify wrote to the bucket");
+}
+
+#[test]
+fn encrypted_open_refuses_mvcc_header() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let path = a.path().join("app.db");
+    let mut b = std::fs::read(&path).unwrap();
+    assert!(b.starts_with(b"Turso"));
+    b[18] = 255;
+    std::fs::write(&path, b).unwrap();
+    let r = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone());
+    assert_eq!(unsupported(r), "MVCC");
+}
+
+#[test]
+fn encrypted_mvcc_pragma_is_refused_and_header_unchanged() {
+    let store = mem();
+    let t = tempdir();
+    let k = tempdir();
+    let cfg = || enc_config(t.path(), &k, &key_hex());
+    let db = open_with_store(cfg(), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    insert(&c, 1).unwrap();
+    for sql in [
+        "PRAGMA journal_mode='mvcc'",
+        "PRAGMA journal_mode=mvcc",
+        "PRAGMA journal_mode='EXPERIMENTAL_MVCC'",
+        "PRAGMA main.journal_mode = 'mvcc'",
+    ] {
+        assert_eq!(unsupported(c.execute(sql, &[])), "MVCC", "{sql}");
+        assert_eq!(unsupported(c.query(sql, &[])), "MVCC", "{sql}");
+    }
+    insert(&c, 2).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    assert!(std::fs::read(t.path().join("app.db"))
+        .unwrap()
+        .starts_with(b"Turso"));
+    assert_eq!(header_bytes(t.path()), (2, 2));
+
+    let db = open_with_store(cfg(), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), vec![1, 2]);
+    let mode = c.query("PRAGMA journal_mode", &[]).unwrap();
+    assert_eq!(text(&mode[0][0]), "wal");
+}
+
+/// Every id a fresh read-only open with the test key sees.
+fn restored_ids_encrypted(store: &Arc<MemStore>, keydir: &TempDir) -> Vec<i64> {
+    let v = tempdir();
+    let cfg = enc_config(v.path(), keydir, &key_hex());
+    let db = open_read_only_with_store(cfg, store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    let ids = ids(&c);
+    c.close().unwrap();
+    db.close().unwrap();
+    ids
+}
+
+#[test]
+fn encrypted_window_batching_shares_puts() {
+    let store = mem();
+    let t = tempdir();
+    let k = tempdir();
+    let mut cfg = enc_config(t.path(), &k, &key_hex());
+    cfg.batching = "window 50ms 64 1MiB".parse().unwrap();
+    let db = open_with_store(cfg, store.clone()).unwrap();
+    create(&db.connect().unwrap());
+    let threads: Vec<_> = (0..4)
+        .map(|n| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let c = db.connect().unwrap();
+                (0..10).map(|i| 1 + n * 10 + i).for_each(|id| {
+                    insert(&c, id).unwrap();
+                });
+                c.close().unwrap();
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let s = db.upload_stats();
+    assert!(s.commits_per_log_put > 1.0, "{s:?}");
+    db.close().unwrap();
+    assert_eq!(
+        restored_ids_encrypted(&store, &k),
+        (1..=40).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn encrypted_maintenance_checkpoint_seals() {
+    let store = mem();
+    let t = tempdir();
+    let k = tempdir();
+    let mut cfg = enc_config(t.path(), &k, &key_hex());
+    cfg.maintenance_log_objects = 5;
+    let db = open_with_store(cfg, store.clone()).unwrap();
+    let gen = db.generation();
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=30 {
+        insert(&c, id).unwrap();
+    }
+    let until = Instant::now() + Duration::from_secs(10);
+    while db.generation() == gen {
+        assert!(Instant::now() < until, "maintenance never sealed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(
+        restored_ids_encrypted(&store, &k),
+        (1..=30).collect::<Vec<_>>()
+    );
+}
+
+/// A damaged page fails the cipher's authentication when the engine reads it, instead of
+/// reading as garbage.
+#[test]
+fn encrypted_damaged_page_fails_authentication() {
+    let store = mem();
+    let k = tempdir();
+    let a = encrypted_writer(&store, &k);
+    let path = a.path().join("app.db");
+    let mut b = std::fs::read(&path).unwrap();
+    let ps = 4096;
+    assert!(b.len() >= 2 * ps, "{} bytes", b.len());
+    b[ps + 200] ^= 1; // page 2: t's root
+    std::fs::write(&path, b).unwrap();
+    let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    match c.query("SELECT id FROM t ORDER BY id", &[]) {
+        Err(Error::Engine(m)) => assert!(m.contains("Decryption failed"), "{m}"),
+        r => panic!("read a damaged page: {r:?}"),
+    }
+}

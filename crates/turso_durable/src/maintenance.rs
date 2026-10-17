@@ -571,7 +571,8 @@ fn run_once(
 }
 
 /// `checkpoint(TRUNCATE)` on a fresh engine connection (not a public `Connection`: not
-/// counted, no gate), set up as `Connection::new` sets one up, inside an `Off` commit context.
+/// counted, no gate; with the database's key, `EngineDb::connect`), set up as
+/// `Connection::new` sets one up, inside an `Off` commit context.
 fn checkpoint(shared: &Shared) -> Result<(), (Outcome, String)> {
     let error = |e: Error| (Outcome::Error, format!("error: {e}"));
     // `Database::close` took the engine and waits for this run (`Shared::finish`).
