@@ -104,10 +104,27 @@
 #   (Task 6's run of the same code: 11.5 min, peaks 663 and 713 MB, 12614 of 41196 objects with
 #   CREATE TABLE in pass 1, 44362 objects in pass 2.)
 #
-# Final test-command run (after the merge fixes)
-# PLACEHOLDER: not yet run. To be filled from the controller's ./scripts/test.sh run of the
-# merge-fix commit: commit, rc and wall time; per pass the test counts, the scan lines and
-# the peak; the otel check line.
+# Final test-command run (after the merge fixes): the canonical figures (laptop, RustFS)
+# (./scripts/test.sh at commit b4afb8f, the controller's run; `real 703.27` s (11:43); rc=0;
+#   test run id turso-durable-20261018103945-87483)
+#   unit: test result ok: 24 passed (cli); 379 passed (lib); 31; 5; 1
+#   pass 1 (plain HTTP, no encryption): system "test result: ok. 38 passed; 0 failed";
+#     S3 "test result: ok. 8 passed; 0 failed; … 4 filtered out" (the 4 tls_* tests)
+#     scan: 42232 objects, 524987956 bytes
+#     CREATE TABLE: found in 13071 objects
+#     SQLite header: found in 13071 objects
+#     bench payload: found in 2006 objects
+#     peak turso-durable-objects: 684 MB (plain)
+#   pass 2 (HTTPS + encryption): system "test result: ok. 38 passed; 0 failed";
+#     S3 "test result: ok. 12 passed; 0 failed" (incl. tls_redirect_to_plain_http_is_not_followed)
+#     scan: 44022 objects, 543159646 bytes
+#     CREATE TABLE: not found / SQLite header: not found / bench payload: not found /
+#     marker 1: not found / the encryption key: not found
+#     peak turso-durable-objects: 708 MB (https+encryption)
+#   otel check PASSED: durable.ack_wait=83318 durable.checkpoint_upload=517 durable.commit=83315
+#     durable.fence=21 durable.gc=797 durable.local_fsync=83494 durable.local_write=83528
+#     durable.maintenance=111 durable.restore=144 durable.takeover=21 durable.upload=50283 logs=994
+#   After the run: RustFS plain and empty, no turso-durable-* dirs in $TMPDIR, tree clean.
 #
 # Raw bench output of the six runs (setup a, b, c; off then window) follows.
 
