@@ -135,6 +135,22 @@ fn takeover(dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// GC: delete what an old enough head no longer reaches. It needs no directory.
+fn gc() -> CliResult<()> {
+    let r = turso_durable::gc(&config(Path::new("."))?).map_err(err)?;
+    let opt = |v: Option<u128>| v.map_or("-".to_string(), |v| v.to_string());
+    say(&format!(
+        "gc generation={} trimmed_against={} age_ms={} deleted={} outcome={} ms={}",
+        r.generation,
+        opt(r.trimmed_against.map(u128::from)),
+        opt(r.age.map(|a| a.as_millis())),
+        r.deleted,
+        r.outcome.as_str(),
+        r.elapsed.as_millis()
+    ));
+    Ok(())
+}
+
 pub fn is_missing_table(msg: &str) -> bool {
     msg.to_ascii_lowercase().contains("no such table")
 }
@@ -275,6 +291,7 @@ fn main() -> ExitCode {
     let result = match &cmd {
         Command::Restore { dir } => restore(dir),
         Command::Takeover { dir } => takeover(dir),
+        Command::Gc => gc(),
         Command::Verify { dir, acked } => verify(dir, acked.as_deref()),
         Command::Sql {
             dir,

@@ -1138,3 +1138,82 @@ fn takeover_failing_at_the_fence_exports_its_epoch() {
     assert_eq!(t.field("durable.outcome"), Some("error"));
     assert_eq!(t.field("durable.epoch"), Some(epoch.as_str()));
 }
+
+/// `gc` runs in a `durable.gc` span: the head's generation, the manifest trimmed against and
+/// its age, what was deleted, and the outcome.
+#[test]
+fn gc_exports_a_gc_span() {
+    let cap = Capture::new();
+    let a = tempfile::tempdir().unwrap();
+    let mem = Arc::new(MemStore::new());
+    let mut cfg = config(a.path());
+    cfg.gc_after_seal = false;
+    let min_age = cfg.engine(false).gc_min_age();
+    let (spans, young, old) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let db = crate::open_with_store(cfg.clone(), mem.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for x in 1..=2 {
+            insert(&conn, x).unwrap();
+            conn.checkpoint(CheckpointMode::Truncate).unwrap();
+        }
+        conn.close().unwrap();
+        db.close().unwrap();
+        let young = crate::gc_with_store(&cfg, mem.clone()).unwrap();
+        mem.advance_clock(min_age);
+        let old = crate::gc_with_store(&cfg, mem.clone()).unwrap();
+        (cap.spans(), young, old)
+    });
+    assert_eq!(young.outcome, crate::GcOutcome::TooYoung);
+    assert_eq!(old.outcome, crate::GcOutcome::Trimmed);
+    let gcs = spans.named("durable.gc");
+    assert_eq!(gcs.len(), 2, "{gcs:?}");
+    for g in &gcs {
+        assert_eq!(g.target, "turso_durable");
+        assert_eq!(g.level, Level::INFO);
+        assert_eq!(
+            g.field("durable.generation"),
+            Some(old.generation.to_string().as_str())
+        );
+        assert!(g.closed.is_some());
+    }
+    assert_eq!(gcs[0].field("durable.outcome"), Some("too_young"));
+    assert_eq!(gcs[0].field("durable.manifest"), None);
+    assert_eq!(gcs[0].field("durable.deleted"), Some("0"));
+    let t = gcs[1];
+    assert_eq!(t.field("durable.outcome"), Some("trimmed"));
+    assert_eq!(
+        t.field("durable.manifest"),
+        Some(old.trimmed_against.unwrap().to_string().as_str())
+    );
+    assert_eq!(
+        t.field("durable.deleted"),
+        Some(old.deleted.to_string().as_str())
+    );
+    assert!(old.deleted > 0);
+    let age_ms: u128 = t.field("durable.age_ms").unwrap().parse().unwrap();
+    assert!(age_ms >= min_age.as_millis(), "{age_ms}");
+}
+
+/// A pass that fails reports `error`.
+#[test]
+fn failed_gc_exports_error_outcome() {
+    let cap = Capture::new();
+    let a = tempfile::tempdir().unwrap();
+    let mem = Arc::new(MemStore::new());
+    let mut cfg = config(a.path());
+    cfg.gc_after_seal = false;
+    let (spans, r) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let db = crate::open_with_store(cfg.clone(), mem.clone()).unwrap();
+        db.close().unwrap();
+        // A head that does not decode.
+        mem.put("head", b"not a head").unwrap();
+        let r = crate::gc_with_store(&cfg, mem.clone());
+        (cap.spans(), r)
+    });
+    assert!(r.is_err(), "{r:?}");
+    let gcs = spans.named("durable.gc");
+    assert_eq!(gcs.len(), 1, "{gcs:?}");
+    assert_eq!(gcs[0].field("durable.outcome"), Some("error"));
+}

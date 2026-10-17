@@ -159,7 +159,6 @@ fn seal_is_ordered_after_queued_logs_and_reports() {
     let snap = trim_rx.try_recv().expect("a trim snapshot after the seal");
     assert_eq!((snap.head.generation, snap.head.manifest), (2, Some(1)));
     assert_eq!(snap.manifest.unwrap().page_count, 2);
-    assert!(snap.at <= Instant::now());
 
     let seen = seen.lock().unwrap().clone();
     let kinds: Vec<String> = seen

@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
 pub(crate) struct Engine {
@@ -60,7 +59,7 @@ pub(crate) fn engine_error(e: turso_core::LimboError) -> Error {
 }
 
 /// Open `<dir>/app.db` through the bucket wrappers. `state` is the directory's local state,
-/// already reconciled with `bucket`. `trim_tx`, when given, feeds a trimmer
+/// already reconciled with `bucket`. `trim_tx`, when given, wakes a trimmer
 /// (`trim::spawn_trimmer`): the head at open first, then one snapshot per seal.
 pub(crate) fn open_engine(
     dir: &Path,
@@ -83,11 +82,10 @@ pub(crate) fn open_engine(
     let store = bucket.store();
     let keys = bucket.keys().clone();
     let manifest = bucket.manifest().cloned();
-    // D10: the trimmer starts from the head at open; each seal sends the next snapshot.
+    // D10: the open wakes the trimmer first; each seal wakes it again.
     if let Some(tx) = &trim_tx {
         // No trimmer listening is not an open failure.
         let _ = tx.send(TrimSnapshot {
-            at: Instant::now(),
             head: bucket.head().clone(),
             manifest: manifest.clone(),
         });

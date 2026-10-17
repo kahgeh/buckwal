@@ -10,6 +10,7 @@ pub(crate) mod engine;
 pub mod error;
 pub(crate) mod files;
 pub(crate) mod format;
+pub(crate) mod gc;
 pub(crate) mod guard;
 pub(crate) mod io;
 pub(crate) mod maintenance;
@@ -32,6 +33,9 @@ pub use db::{is_claimed, open, Database};
 #[doc(hidden)]
 pub use db::{open_read_only, open_read_only_with_store, open_with_store};
 pub use error::{Error, Result};
+#[doc(hidden)]
+pub use gc::gc_with_store;
+pub use gc::{gc, GcOutcome, GcReport};
 #[doc(hidden)]
 pub use restore::restore_with_store;
 pub use restore::{restore, RestoreReport};

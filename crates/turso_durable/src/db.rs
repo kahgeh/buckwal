@@ -253,7 +253,7 @@ pub fn open_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Result<Da
 }
 
 /// Open for reading only (verification): nothing is ever written to the bucket. The
-/// directory is not claimed, no trimmer runs, every statement that writes is refused, and
+/// directory is not claimed, no GC runs, every statement that writes is refused, and
 /// close never checkpoints.
 #[doc(hidden)]
 pub fn open_read_only(config: Config) -> Result<Database> {
@@ -301,19 +301,20 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         }
     };
 
-    let (trim_tx, trim_rx) = if read_only {
+    // GC on the writer's own thread (never a read-only open's, never on a commit's path).
+    let (trim_tx, trim_rx) = if read_only || !config.gc_after_seal {
         (None, None)
     } else {
         let (tx, rx) = mpsc::channel();
         (Some(tx), Some(rx))
     };
     let engine = open_engine(&dir, bucket, &state, &cfg, trim_tx)?;
-    // open_engine sent the head at open as the trimmer's first snapshot.
+    // open_engine sent the open's wake: the trimmer's pass at start.
     let trimmer = trim_rx.map(|rx| {
         spawn_trimmer(
             store.clone(),
             keys.clone(),
-            config.trim_grace,
+            cfg.gc_min_age(),
             rx,
             cfg.events.clone(),
         )

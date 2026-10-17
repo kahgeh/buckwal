@@ -33,6 +33,9 @@ pub mod defaults {
     pub const FENCE_MAX_STEPS: u64 = 64;
     /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
+    /// A writer runs GC itself (`DURABLE_GC_AFTER_SEAL`): at open, after each seal and when
+    /// the next manifest comes of age.
+    pub const GC_AFTER_SEAL: bool = true;
     /// Fetch every sealed page in the background after open.
     pub const PREFETCH: bool = false;
     /// Every commit is uploaded on its own.
@@ -100,9 +103,15 @@ pub struct Config {
     pub retry_deadline: Duration,
     pub request_timeout: Duration,
     pub upload_concurrency: usize,
-    /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
-    /// It must exceed `lease + retry_deadline + request_timeout` (`Config` otherwise).
+    /// How long an unreferenced object stays in the bucket before GC deletes it: GC trims
+    /// against a manifest only once it is `trim_grace + retry_deadline + request_timeout +
+    /// 1 s` old by the bucket's own clock. It must exceed `lease + retry_deadline +
+    /// request_timeout` (`Config` otherwise).
     pub trim_grace: Duration,
+    /// A writer open runs GC itself, on a thread of its own: at open, after each seal and
+    /// when the next manifest comes of age (`DURABLE_GC_AFTER_SEAL`). Off, only
+    /// [`crate::gc`] deletes anything.
+    pub gc_after_seal: bool,
     /// How long the writer trusts its last confirmation that the head is still its own: a
     /// confirmed log record or head write, or a head GET that found its head. Past it (on
     /// either the monotonic or the wall clock), the next append, and each page or manifest
@@ -143,6 +152,7 @@ impl fmt::Debug for Config {
             .field("request_timeout", &self.request_timeout)
             .field("upload_concurrency", &self.upload_concurrency)
             .field("trim_grace", &self.trim_grace)
+            .field("gc_after_seal", &self.gc_after_seal)
             .field("lease", &self.lease)
             .field("prefetch", &self.prefetch)
             .field("batching", &self.batching)
@@ -155,7 +165,7 @@ impl fmt::Debug for Config {
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 17] = [
+const ENV_VARS: [&str; 18] = [
     "DURABLE_ENDPOINT",
     "DURABLE_REGION",
     "DURABLE_PATH_STYLE",
@@ -173,6 +183,7 @@ const ENV_VARS: [&str; 17] = [
     "DURABLE_MAINTENANCE_WAL_MIB",
     "DURABLE_MAINTENANCE_GATE_WAIT_MS",
     "DURABLE_LEASE_MS",
+    "DURABLE_GC_AFTER_SEAL",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -242,6 +253,7 @@ impl Config {
             request_timeout: defaults::REQUEST_TIMEOUT,
             upload_concurrency: defaults::UPLOAD_CONCURRENCY,
             trim_grace: defaults::TRIM_GRACE,
+            gc_after_seal: defaults::GC_AFTER_SEAL,
             lease: defaults::LEASE,
             prefetch: defaults::PREFETCH,
             batching: defaults::BATCHING,
@@ -296,6 +308,9 @@ impl Config {
         }
         if let Some(v) = get("DURABLE_TRIM_GRACE_SECS") {
             c.trim_grace = Duration::from_secs(parse_num("DURABLE_TRIM_GRACE_SECS", &v)?);
+        }
+        if let Some(v) = get("DURABLE_GC_AFTER_SEAL") {
+            c.gc_after_seal = parse_bool("DURABLE_GC_AFTER_SEAL", &v)?;
         }
         if let Some(v) = get("DURABLE_LEASE_MS") {
             c.lease = Duration::from_millis(parse_num("DURABLE_LEASE_MS", &v)?);
@@ -383,6 +398,7 @@ impl Config {
             prefetch: self.prefetch,
             lease: self.lease,
             request_timeout: self.request_timeout,
+            trim_grace: self.trim_grace,
             events: self.on_event.clone(),
             read_only,
         }
@@ -489,15 +505,69 @@ pub(crate) struct EngineConfig {
     /// How long one HTTP request may take: the S3 store's own setting, here for the waits
     /// that must outlast a request in flight (the takeover quiet).
     pub request_timeout: Duration,
+    /// `Config::trim_grace`, for [`EngineConfig::gc_min_age`].
+    pub trim_grace: Duration,
     pub events: Option<EventHook>,
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are
     /// refused (`ShippingFile`, `BucketDbStorage`).
     pub read_only: bool,
 }
 
+impl EngineConfig {
+    /// How old a manifest must be, by the bucket's clock, before GC trims against it:
+    /// `trim_grace + retry_deadline + request_timeout + 1 s`. The second covers the 1 s
+    /// resolution of the age a bucket reports (`ObjectStore::stat`).
+    pub(crate) fn gc_min_age(&self) -> Duration {
+        self.trim_grace
+            .saturating_add(self.retry.deadline)
+            .saturating_add(self.request_timeout)
+            .saturating_add(Duration::from_secs(1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_after_seal_from_env() {
+        assert!(Config::new("/d", "http://e", "b", "ak", "sk").gc_after_seal);
+        let env = required();
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert!(c.gc_after_seal, "on by default");
+        for (v, want) in [("off", false), ("0", false), ("true", true)] {
+            let mut env = required();
+            env.insert("DURABLE_GC_AFTER_SEAL", v);
+            let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+            assert_eq!(c.gc_after_seal, want, "{v}");
+        }
+        let mut env = required();
+        env.insert("DURABLE_GC_AFTER_SEAL", "sometimes");
+        match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+            Err(Error::Config(m)) => assert!(m.contains("DURABLE_GC_AFTER_SEAL"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn gc_min_age_adds_the_request_budget_and_a_second() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert_eq!(
+            c.engine(false).gc_min_age(),
+            Duration::from_secs(600 + 30 + 10 + 1),
+            "defaults"
+        );
+        c.trim_grace = Duration::from_secs(2);
+        c.lease = Duration::ZERO;
+        c.retry_deadline = Duration::from_millis(400);
+        c.request_timeout = Duration::from_millis(500);
+        assert_eq!(c.validate(), Ok(()));
+        assert_eq!(c.engine(false).gc_min_age(), Duration::from_millis(3900));
+        assert_eq!(c.engine(true).gc_min_age(), Duration::from_millis(3900));
+        // Huge durations saturate instead of panicking.
+        c.trim_grace = Duration::MAX;
+        assert_eq!(c.engine(false).gc_min_age(), Duration::MAX);
+    }
 
     /// `trim_grace` must exceed `lease + retry_deadline + request_timeout`, and 0 is refused
     /// like any other value: an append or page PUT sent inside the lease lands within that
@@ -609,6 +679,7 @@ mod tests {
             ("DURABLE_MAINTENANCE_WAL_MIB", "3"),
             ("DURABLE_MAINTENANCE_GATE_WAIT_MS", "75"),
             ("DURABLE_LEASE_MS", "2500"),
+            ("DURABLE_GC_AFTER_SEAL", "off"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads DURABLE_* variables.
@@ -645,6 +716,7 @@ mod tests {
         assert_eq!(c.maintenance_wal_bytes, 3 << 20);
         assert_eq!(c.maintenance_gate_wait, Duration::from_millis(75));
         assert_eq!(c.lease, Duration::from_millis(2500));
+        assert!(!c.gc_after_seal);
 
         // Only the four required ones: the rest are defaults.
         let env = required();

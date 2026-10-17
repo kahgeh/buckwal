@@ -23,11 +23,13 @@ use std::time::{Duration, Instant, SystemTime};
 use tracing::field::Empty;
 use tracing::{info_span, Span};
 
-/// What the bucket looked like right after a seal; the trimmer deletes what it no longer needs.
+/// What the bucket looked like right after a seal (or at open): the trimmer's wake-up. The
+/// trimmer reads the head and its ages from the bucket itself; tests read these.
 #[derive(Debug, Clone)]
 pub(crate) struct TrimSnapshot {
-    pub at: Instant,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub head: Head,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub manifest: Option<Manifest>,
 }
 
@@ -538,7 +540,6 @@ impl Worker {
         if let Some(tx) = &self.trim_tx {
             // No trimmer listening is not an upload failure.
             let _ = tx.send(TrimSnapshot {
-                at: Instant::now(),
                 head: self.bucket.head().clone(),
                 manifest: self.bucket.manifest().cloned(),
             });

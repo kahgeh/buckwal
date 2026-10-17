@@ -65,6 +65,8 @@ pub enum Command {
     Takeover {
         dir: PathBuf,
     },
+    /// Delete what an old enough head no longer reaches; no directory.
+    Gc,
     Soak(SoakArgs),
     Bench(BenchArgs),
 }
@@ -72,6 +74,7 @@ pub enum Command {
 pub const USAGE: &str = "usage: turso-durable <command> [options]
   restore --dir DIR
   takeover --dir DIR
+  gc
   verify  --dir DIR [--acked FILE]
   sql     --dir DIR [--claim] [--batching SPEC] SQL...
   stats   --dir DIR [--claim] [--batching SPEC] SQL...
@@ -134,7 +137,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         let known = match (cmd.as_str(), a.as_str()) {
-            (_, "--dir") => {
+            (c, "--dir") if c != "gc" => {
                 dir = Some(PathBuf::from(value(a)?));
                 true
             }
@@ -201,6 +204,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
     }
 
+    if cmd == "gc" {
+        return match positional.first() {
+            Some(a) => Err(format!("unexpected argument {a:?}")),
+            None => Ok(Command::Gc),
+        };
+    }
     let dir = dir.ok_or("--dir is required")?;
     if !matches!(cmd.as_str(), "sql" | "stats") && !positional.is_empty() {
         return Err(format!("unexpected argument {:?}", positional[0]));
@@ -366,6 +375,15 @@ mod tests {
         assert!(p(&["takeover"]).is_err(), "--dir is required");
         assert!(p(&["takeover", "--dir", "d", "--claim"]).is_err());
         assert!(p(&["takeover", "--dir", "d", "extra"]).is_err());
+    }
+
+    /// `gc` takes no directory: it works on the bucket alone.
+    #[test]
+    fn parses_gc() {
+        assert_eq!(p(&["gc"]), Ok(Command::Gc));
+        assert!(p(&["gc", "--dir", "x"]).is_err(), "--dir is a usage error");
+        assert!(p(&["gc", "extra"]).is_err());
+        assert!(p(&["gc", "--claim"]).is_err());
     }
 
     #[test]

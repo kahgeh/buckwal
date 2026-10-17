@@ -1453,6 +1453,22 @@ fn trimming_bounds_restore_gets() {
     let head = ctx.head();
     // 500 commits at --every 50: a seal per checkpoint (the first at least) plus close.
     assert!(head.generation >= 9, "checkpoints sealed: {head:?}");
+    // GC trims against a manifest once the bucket says it is 3.9 s old (2 s + 400 ms +
+    // 500 ms + 1 s). Until the head's own manifest is, an older one may be the newest old
+    // enough, which leaves the logs above it: wait for the head's.
+    let want = format!("trimmed_against={} ", head.generation - 1);
+    let start = Instant::now();
+    let gc = loop {
+        let out = ctx.ok(&["gc"]).stdout;
+        if out.contains("outcome=trimmed") && out.contains(&want) {
+            break out;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "gc never trimmed against the head's manifest: {out}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    };
     let logs = ctx.list("log/");
     let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
     assert!(
@@ -1471,8 +1487,9 @@ fn trimming_bounds_restore_gets() {
         "restore read every log object left"
     );
     eprintln!(
-        "trimming_bounds_restore_gets: {} seals; log/ holds {} keys of generation {}; {}",
+        "trimming_bounds_restore_gets: {} seals; {}; log/ holds {} keys of generation {}; {}",
         soak.count("event seal-finished"),
+        gc.trim(),
         logs.len(),
         head.generation,
         v.restored
