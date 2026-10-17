@@ -28,6 +28,9 @@ pub mod defaults {
     /// How long a writer trusts its last look at the head (`DURABLE_LEASE_MS`): past it, the
     /// next append, page PUT or manifest PUT re-reads the head first.
     pub const LEASE: Duration = Duration::from_secs(30);
+    /// How many log positions a takeover's fence record may step over (positions an old
+    /// writer still running took first) before the takeover gives up with `Timeout`. Fixed.
+    pub const FENCE_MAX_STEPS: u64 = 64;
     /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
     /// Fetch every sealed page in the background after open.
@@ -414,7 +417,7 @@ pub type EventHook = Arc<dyn Fn(&Event) + Send + Sync>;
 pub enum Event {
     /// A log object landed at `log/<generation>/<seq>`; `bytes` is its encoded size.
     /// `commits` lists the commit numbers of the syncs it holds, in order; it is empty for
-    /// a record that carries no commit (a claim, a seal start, a reconcile catch-up, or an
+    /// a record that carries no commit (a fence, a seal start, a reconcile catch-up, or an
     /// in-doubt record settled after its commits were already failed).
     LogUploaded {
         generation: u64,
@@ -457,6 +460,14 @@ pub enum Event {
     /// checkpoint), `closed` (the database was closing), `panic` (the run panicked; the
     /// span's outcome is `error`) or `error: <message>`.
     MaintenanceSkipped { generation: u64, reason: String },
+    /// This directory took the database over (a takeover, or the first writer open of a
+    /// restored directory): the head names its writer at `epoch`, and its fence record is at
+    /// `log/<generation>/<fence_seq>`.
+    TookOver {
+        generation: u64,
+        epoch: u64,
+        fence_seq: u64,
+    },
 }
 
 /// How the engine talks to the bucket.

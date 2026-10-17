@@ -9,7 +9,12 @@
 //!   (`durable.generation`, `durable.seq`, `durable.pages`, `durable.retries`, `s3.status`),
 //!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);
 //! - `durable.restore` (`durable.generation`, `durable.log_objects`, `durable.gets`,
-//!   `durable.bytes`, `durable.seq`, `durable.retries`, `s3.status`) (`restore.rs`).
+//!   `durable.bytes`, `durable.seq`, `durable.retries`, `s3.status`) (`restore.rs`);
+//! - `durable.takeover` (`durable.generation`, `durable.epoch`, `durable.seq` (the fence's),
+//!   `durable.retries`, `s3.status`, `durable.outcome`), around a takeover's head write and
+//!   fence (`db.rs`), and `durable.fence` (`durable.generation`, `durable.seq`,
+//!   `durable.epoch`, `durable.retries`, `s3.status`) around each fence record
+//!   (`bucket.rs`).
 //!
 //! Log events have the target `turso_durable` exactly.
 //!

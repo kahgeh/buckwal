@@ -119,6 +119,22 @@ fn restore(dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// Restore into the empty directory `dir` and take the database over there; a writer still
+/// running elsewhere is fenced for good. `sql --dir` then continues it.
+fn takeover(dir: &Path) -> CliResult<()> {
+    let r = turso_durable::takeover(config(dir)?).map_err(err)?;
+    say(&format!(
+        "took over generation={} epoch={} fence_seq={} writer_id={} quiet_ms={} ms={}",
+        r.generation,
+        r.epoch,
+        r.fence_seq,
+        r.writer_id,
+        r.quiet.as_millis(),
+        r.elapsed.as_millis()
+    ));
+    Ok(())
+}
+
 pub fn is_missing_table(msg: &str) -> bool {
     msg.to_ascii_lowercase().contains("no such table")
 }
@@ -258,6 +274,7 @@ fn main() -> ExitCode {
     };
     let result = match &cmd {
         Command::Restore { dir } => restore(dir),
+        Command::Takeover { dir } => takeover(dir),
         Command::Verify { dir, acked } => verify(dir, acked.as_deref()),
         Command::Sql {
             dir,

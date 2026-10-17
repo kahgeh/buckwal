@@ -17,6 +17,7 @@ pub(crate) mod reconcile;
 pub(crate) mod restore;
 pub mod stats;
 pub mod store;
+pub(crate) mod takeover;
 pub mod telemetry;
 pub(crate) mod trim;
 pub(crate) mod uploader;
@@ -35,6 +36,9 @@ pub use error::{Error, Result};
 pub use restore::restore_with_store;
 pub use restore::{restore, RestoreReport};
 pub use stats::UploadStats;
+#[doc(hidden)]
+pub use takeover::takeover_with_store;
+pub use takeover::{takeover, TakeoverReport};
 pub use turso_core::Value;
 
 #[cfg(test)]

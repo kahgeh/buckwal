@@ -1048,3 +1048,43 @@ fn the_endpoint_is_trimmed_before_it_is_checked_and_used() {
         Err(Error::Config(_))
     ));
 }
+
+#[test]
+fn takeover_exports_takeover_and_fence_spans() {
+    let cap = Capture::new();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (spans, rep) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemStore::new());
+        let db = crate::open_with_store(config(a.path()), store.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        insert(&conn, 1).unwrap();
+        let rep = crate::takeover_with_store(config(b.path()), store.clone()).unwrap();
+        (cap.spans(), rep)
+    });
+    let takeovers = spans.named("durable.takeover");
+    assert_eq!(takeovers.len(), 1, "{takeovers:?}");
+    let t = takeovers[0];
+    assert_eq!(t.target, "turso_durable");
+    assert_eq!(t.level, Level::INFO);
+    let (epoch, seq) = (rep.epoch.to_string(), rep.fence_seq.to_string());
+    assert_eq!(
+        t.field("durable.generation"),
+        Some(rep.generation.to_string().as_str())
+    );
+    assert_eq!(t.field("durable.epoch"), Some(epoch.as_str()));
+    assert_eq!(t.field("durable.seq"), Some(seq.as_str()));
+    assert_eq!(t.field("durable.retries"), Some("0"));
+    assert_eq!(t.field("durable.outcome"), Some("ok"));
+    assert_eq!(t.field("s3.status"), Some("200"));
+    assert!(t.closed.is_some());
+    assert_eq!(spans.named("durable.fence").len(), 1);
+    let f = spans.with_parent(t.id, "durable.fence");
+    assert_eq!(f.target, "turso_durable");
+    assert_eq!(f.field("durable.generation"), t.field("durable.generation"));
+    assert_eq!(f.field("durable.seq"), Some(seq.as_str()));
+    assert_eq!(f.field("durable.epoch"), Some(epoch.as_str()));
+    assert_eq!(f.field("durable.retries"), Some("0"));
+    assert_eq!(f.field("s3.status"), Some("200"));
+}

@@ -148,15 +148,18 @@ fn wal_page_one(wal: &[u8]) -> Option<&[u8]> {
 /// 1, 2, 3, …).
 ///
 /// Which writers' records a generation may hold: runs of records by other writer ids (one run
-/// per writer), then only records of `head.writer_id`. A claim (`bucket::claim`) hands a restored copy's head
-/// to a new writer id inside the same generation, so the records before it are the old
-/// writer's. Each writer's next seq is its own counter and the first `put_if_absent`
-/// collision fences the loser for good, so bucket fencing can only produce "the old writer's
-/// records, then the claimer's" (a claim of a claimed copy adds one more run). A record of
-/// another writer after a record of `head.writer_id`, or a writer whose records resume after
-/// another writer's, means two writers interleaved (the replay would be inconsistent): `Fenced`.
-/// A fence record `F(w, k)` ends that rule: after it every Extents record must be by `w`, and a
-/// later fence needs an epoch above `k`, or `k` from the same writer (a resumed claim).
+/// per writer), then only records of `head.writer_id`. A takeover
+/// (`bucket::take_over_counted`) hands a restored copy's head to a new writer id inside the
+/// same generation, so the records before it are the old writer's. Each writer's next seq is
+/// its own counter and the first `put_if_absent` collision fences the loser for good, so
+/// bucket fencing can only produce "the old writer's records, then the new writer's" (a
+/// takeover of a taken-over copy adds one more run). A record of another writer after a
+/// record of `head.writer_id`, or a writer whose records resume after another writer's, means
+/// two writers interleaved (the replay would be inconsistent): `Fenced`. Logs written before
+/// stage 3 hold no fence record and follow only this rule.
+/// A fence record `F(w, k)` (every takeover appends one) ends that rule: after it every
+/// Extents record must be by `w`, and a later fence needs an epoch above `k`, or `k` from the
+/// same writer (a resumed claim).
 pub(crate) fn generation_image(
     store: &dyn ObjectStore,
     keys: &Keys,
@@ -381,7 +384,8 @@ fn restore_files(
 }
 
 /// Restore the bucket `config` names into `dir`, which must hold no database yet. Nothing is
-/// written to the bucket; the first [`crate::open`] of `dir` claims the database.
+/// written to the bucket; the first writer [`crate::open`] of `dir` takes the database over
+/// (as [`crate::takeover`] does).
 pub fn restore(config: &Config, dir: &Path) -> Result<RestoreReport> {
     let store = config.s3_store()?;
     restore_with_store(config, store, dir)
@@ -491,14 +495,20 @@ pub(crate) fn clear_interrupted_restore(dir: &Path) -> Result<()> {
     if !dir.join(RESTORING_FILE).exists() {
         return Ok(());
     }
+    remove_restored(dir)?;
+    fs::remove_file(dir.join(RESTORING_FILE)).map_err(|e| io_err("remove restore marker", e))?;
+    fsync_dir(dir)
+}
+
+/// Remove the files a restore moves into `dir` and the dirty file, those that exist, then
+/// fsync `dir`: the directory holds no database afterwards. Called with the directory held.
+pub(crate) fn remove_restored(dir: &Path) -> Result<()> {
     for f in RESTORED.iter().chain(&[DIRTY_FILE]) {
         match fs::remove_file(dir.join(f)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err("remove partly restored file", e)),
+            Err(e) => return Err(io_err("remove restored file", e)),
         }
     }
-    fsync_dir(dir)?;
-    fs::remove_file(dir.join(RESTORING_FILE)).map_err(|e| io_err("remove restore marker", e))?;
     fsync_dir(dir)
 }

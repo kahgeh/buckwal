@@ -1,6 +1,6 @@
 //! [`open`] and [`Database`]: the directory locks (D4), the order of an open, and shutdown.
 use crate::batching::Batching;
-use crate::bucket::{self, Bucket};
+use crate::bucket::{self, Bucket, FenceOutcome};
 use crate::config::{Config, EngineConfig, Event, EventHook};
 use crate::conn::Connection;
 use crate::engine::{engine_error, open_engine, Engine};
@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use tracing::field::Empty;
 use turso_core::{File, OpenFlags, PlatformIO, IO};
 
 /// The canonical directories this process holds (D4). `durable.lock`'s `fcntl` lock is per
@@ -223,23 +224,26 @@ impl std::fmt::Debug for Database {
 /// own database.
 ///
 /// Opening an empty directory whose bucket prefix holds a database, or a directory restored
-/// by [`crate::restore`] and never opened, takes the database over: this process claims it
-/// under a new writer id, and a writer still running elsewhere is fenced for good (its next
-/// commit fails `Fenced`). [`is_claimed`] tells the cases apart beforehand.
+/// by [`crate::restore`] and never opened, takes the database over as [`crate::takeover`]
+/// does: this process claims it under a new writer id at the next epoch and appends a fence
+/// record, and a writer still running elsewhere is fenced for good (its next commit fails
+/// `Fenced`). A takeover interrupted by a crash resumes at the next open. [`is_claimed`]
+/// tells the cases apart beforehand.
 pub fn open(config: Config) -> Result<Database> {
     let store = config.s3_store()?;
     open_with_store(config, store)
 }
 
 /// Whether `dir` holds a database a writer already owns, so a writer [`open`] continues it.
-/// False for a missing or empty directory, one restored and never opened as a writer, or one
-/// an interrupted restore left: there `open` would restore, claim or create the database,
-/// taking it over from any writer still running. It reads only local files.
+/// False for a missing or empty directory, one restored and never opened as a writer, one
+/// whose takeover was interrupted (its claim id is set), or one an interrupted restore left:
+/// there `open` would restore, claim or create the database, taking it over from any writer
+/// still running. It reads only local files.
 pub fn is_claimed(dir: &Path) -> Result<bool> {
     if dir.join(RESTORING_FILE).exists() {
         return Ok(false);
     }
-    Ok(LocalState::read(dir)?.is_some_and(|s| s.claimed))
+    Ok(LocalState::read(dir)?.is_some_and(|s| s.claimed && s.claim_id.is_empty()))
 }
 
 #[doc(hidden)]
@@ -271,7 +275,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     refuse_mvcc_file(&dir.join(DB_FILE))?;
 
     let (bucket, state, reconciled) = match LocalState::read(&dir)? {
-        Some(state) => attach_existing(&dir, &store, &keys, &cfg, state)?,
+        Some(state) => attached(attach_existing(&dir, &store, &keys, &cfg, state)?),
         None if dir.join(DB_FILE).exists() => {
             return Err(Error::Config(format!(
                 "{} holds an app.db not created by turso_durable",
@@ -282,7 +286,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             restore_staged(store.clone(), &keys, &dir, &cfg)?;
             let state = LocalState::read(&dir)?
                 .ok_or_else(|| Error::Corrupt("the restore wrote no local state".into()))?;
-            attach_existing(&dir, &store, &keys, &cfg, state)?
+            attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
         }
         None if read_only => {
             return Err(Error::NotFound(format!(
@@ -346,6 +350,11 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             reconciled,
         }),
     })
+}
+
+/// What `open_impl` keeps of an `Attached`.
+fn attached(a: Attached) -> (Bucket, LocalState, Option<Reconciled>) {
+    (a.bucket, a.state, Some(a.reconciled))
 }
 
 /// Bytes 18/19 of an existing `app.db`, read before the engine opens it: 255 is MVCC (D5).
@@ -412,38 +421,75 @@ fn create_new(
     Ok((bucket, state))
 }
 
-/// The directory's own database: a writer claims a restored copy first, then attaches and
-/// reconciles against the current log (a record acked by the old writer since the restore
-/// comes in as `Behind`). A read-only open attaches as the directory's writer id, unclaimed.
-/// Every open attaches with the directory's epoch as the least it accepts in the head.
+/// What `attach_existing` hands on.
+pub(crate) struct Attached {
+    pub bucket: Bucket,
+    pub state: LocalState,
+    pub reconciled: Reconciled,
+    /// The fence record this open appended: a takeover's, or the one a writer open appends
+    /// when its generation's last record is another writer's.
+    pub fence: Option<FenceOutcome>,
+}
+
+/// The directory's own database, in this order:
 ///
-/// A writer open that did not claim raises the head's epoch (`Bucket::raise_epoch`) after
-/// attaching and before reconcile, then records the new epoch in the local state (after the
-/// raise, so the local epoch never exceeds the head's). A head PUT that an earlier process of
-/// this writer still had in flight then gets a 412 instead of landing on a generation this
-/// process appends to. A read-only open never raises it: it writes nothing to the bucket.
-///
-/// A writer that just claimed, or whose generation's last record is another writer's (a
-/// claim whose record never landed), appends one empty record at its next seq before the
-/// engine opens: a still-running old writer's next append collides with it and is fenced
-/// for good, so it can never ack into a generation this writer will seal (`bucket::claim`).
-/// If the old writer got there first, this append is `Fenced` and the open fails.
-fn attach_existing(
+/// 1. A writer open of a restored copy (unclaimed) takes it over first (`claim`): the head
+///    names a new writer id at the next epoch.
+/// 2. Attach as the directory's writer id, with the directory's epoch as the least it
+///    accepts in the head. A read-only open attaches as the directory's writer id,
+///    unclaimed, and never writes anything to the bucket.
+/// 3. A writer open that did not take over raises the head's epoch (`Bucket::raise_epoch`),
+///    then records the new epoch in the local state (after the raise, so the local epoch
+///    never exceeds the head's). A head PUT that an earlier process of this writer still had
+///    in flight then gets a 412 instead of landing on a generation this process appends to.
+///    If such a PUT of a seal landed between the attach and the raise, the open attaches
+///    again, at the sealed generation, and raises that head.
+/// 4. A takeover, or a writer open whose generation's last record is another writer's (a
+///    takeover whose fence never landed), appends a fence record (`Bucket::append_fence`):
+///    a still-running old writer's next append collides with it and is fenced for good, so
+///    it can never ack into a generation this writer will seal. Records the old writer
+///    landed first are stepped over.
+/// 5. Reconcile, after the fence: whatever the old writer acked before the fence (after the
+///    restore) comes in as `Behind`.
+pub(crate) fn attach_existing(
     dir: &Path,
     store: &Arc<dyn ObjectStore>,
     keys: &Keys,
     cfg: &EngineConfig,
     mut state: LocalState,
-) -> Result<(Bucket, LocalState, Option<Reconciled>)> {
-    let claiming = !state.claimed && !cfg.read_only;
-    if claiming {
-        let writer_id = new_writer_id()?;
-        let etag = bucket::claim(&**store, keys, &cfg.retry, &state.head_etag, &writer_id)?;
-        state.writer_id = writer_id;
-        state.claimed = true;
-        state.head_etag = etag;
-        state.write_atomic(dir)?;
-    }
+) -> Result<Attached> {
+    let (mut bucket, fence) = if !state.claimed && !cfg.read_only {
+        let (bucket, fence) = claim(dir, store, keys, cfg, &mut state)?;
+        (bucket, Some(fence))
+    } else {
+        let mut bucket = attach(store, keys, cfg, &state)?;
+        let mut fence = None;
+        if !cfg.read_only {
+            state.epoch = raise_at_open(store, keys, cfg, &state, &mut bucket)?;
+            state.write_atomic(dir)?;
+            if last_record_is_foreign(&bucket, &state.writer_id, cfg)? {
+                fence = Some(bucket.append_fence()?);
+            }
+        }
+        (bucket, fence)
+    };
+    let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
+    Ok(Attached {
+        bucket,
+        state,
+        reconciled,
+        fence,
+    })
+}
+
+/// `Bucket::attach` as `state`'s writer id, with its epoch as the least accepted, and the
+/// configured lease (before any record goes out).
+fn attach(
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    state: &LocalState,
+) -> Result<Bucket> {
     let mut bucket = Bucket::attach(
         store.clone(),
         keys.clone(),
@@ -452,20 +498,144 @@ fn attach_existing(
         &state.writer_id,
         state.epoch,
     )?;
-    // Before reconcile's catch-up record and the claim (or foreign-tail) record below.
     bucket.set_lease(cfg.lease);
-    if !cfg.read_only && !claiming {
-        state.epoch = bucket.raise_epoch()?;
-        state.write_atomic(dir)?;
-    }
-    let reconciled = reconcile(dir, &mut bucket, &mut state, cfg)?;
-    if !cfg.read_only && (claiming || last_record_is_foreign(&bucket, &state.writer_id, cfg)?) {
-        bucket.append_log(vec![]).map_err(|f| f.error)?;
-    }
-    Ok((bucket, state, Some(reconciled)))
+    Ok(bucket)
 }
 
-/// The last record of the head's generation was written by a writer other than `writer_id`.
+/// The open-time epoch raise. When the raise finds this writer's own sealed head instead (a
+/// crashed seal's late head PUT landed after the attach read the head), attach again, once,
+/// and raise that head. Returns the new epoch.
+fn raise_at_open(
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    state: &LocalState,
+    bucket: &mut Bucket,
+) -> Result<u64> {
+    if let Some(epoch) = bucket.raise_epoch()? {
+        return Ok(epoch);
+    }
+    tracing::info!(
+        target: "turso_durable",
+        generation = bucket.head().generation + 1,
+        "a seal of an earlier process landed during the open; attaching again"
+    );
+    *bucket = attach(store, keys, cfg, state)?;
+    bucket
+        .raise_epoch()?
+        .ok_or_else(|| Error::Fenced("the head moved again during the open; open again".into()))
+}
+
+/// A takeover of a restored copy, in a `durable.takeover` span (`durable.generation`,
+/// `durable.epoch`, `durable.seq` (the fence's), `durable.retries`, `s3.status`,
+/// `durable.outcome`):
+///
+/// 1. The claim id: `state.claim_id`, an interrupted claim's, or a new id persisted as
+///    `claim_id` before anything is sent, so a crash after the head write resumes under the
+///    same id (`take_over_counted` returns a head that already names it).
+/// 2. The head write (`bucket::take_over_counted`), on the restored generation; then the
+///    claimed state `{writer_id: claim_id, claimed: true, head_etag, epoch, claim_id: ""}`.
+/// 3. Attach, and the fence record (`Bucket::append_fence`).
+///
+/// It emits `Event::TookOver` and logs the takeover.
+fn claim(
+    dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    state: &mut LocalState,
+) -> Result<(Bucket, FenceOutcome)> {
+    let span = tracing::info_span!(
+        target: "turso_durable",
+        "durable.takeover",
+        durable.generation = state.generation,
+        durable.epoch = Empty,
+        durable.seq = Empty,
+        durable.retries = Empty,
+        s3.status = Empty,
+        durable.outcome = Empty,
+    );
+    let retries = AtomicU64::new(0);
+    let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries));
+    span.record("durable.retries", retries.load(SeqCst));
+    match &r {
+        Ok((bucket, fence)) => {
+            let (generation, epoch) = (bucket.head().generation, bucket.head().epoch);
+            span.record("durable.epoch", epoch);
+            span.record("durable.seq", fence.pos.seq);
+            span.record("durable.outcome", "ok");
+            span.in_scope(|| {
+                tracing::info!(
+                    target: "turso_durable",
+                    generation,
+                    epoch,
+                    fence_seq = fence.pos.seq,
+                    writer_id = %state.writer_id,
+                    "took over"
+                )
+            });
+            if let Some(h) = &cfg.events {
+                h(&Event::TookOver {
+                    generation,
+                    epoch,
+                    fence_seq: fence.pos.seq,
+                });
+            }
+        }
+        Err(_) => {
+            span.record("durable.outcome", "error");
+        }
+    }
+    r
+}
+
+fn claim_in_span(
+    dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    state: &mut LocalState,
+    retries: &AtomicU64,
+) -> Result<(Bucket, FenceOutcome)> {
+    if state.claim_id.is_empty() {
+        state.claim_id = new_writer_id()?;
+        state.write_atomic(dir)?;
+    }
+    let (head, etag) = bucket::take_over_counted(
+        &**store,
+        keys,
+        &cfg.retry,
+        state.generation,
+        &state.claim_id,
+        retries,
+    )?;
+    #[cfg(test)]
+    if FAIL_AFTER_CLAIM_HEAD.with(|f| f.get()) {
+        return Err(Error::Io(
+            "injected: crash after the claim's head write".into(),
+        ));
+    }
+    state.writer_id = std::mem::take(&mut state.claim_id);
+    state.claimed = true;
+    state.head_etag = etag;
+    state.epoch = head.epoch;
+    state.write_atomic(dir)?;
+    let mut bucket = attach(store, keys, cfg, state)?;
+    let fence = bucket.append_fence();
+    retries.fetch_add(bucket.counters().retries.load(SeqCst), SeqCst);
+    Ok((bucket, fence?))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: `attach_existing` fails with `Io` right after the claim's head write, before
+    /// the claimed local state is written (a crash mid-claim). Per thread, so parallel tests
+    /// do not see it.
+    pub(crate) static FAIL_AFTER_CLAIM_HEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The last record of the head's generation (an Extents or a fence record) was written by a
+/// writer other than `writer_id`: a takeover by `writer_id` whose fence never landed.
 fn last_record_is_foreign(bucket: &Bucket, writer_id: &str, cfg: &EngineConfig) -> Result<bool> {
     let seq = bucket.next_seq();
     if seq <= 1 {

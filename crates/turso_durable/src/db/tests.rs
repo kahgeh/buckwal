@@ -720,9 +720,9 @@ fn verify_against_live_writer_loses_nothing() {
     assert_eq!(head(&*store).writer_id, writer_id);
 }
 
-/// The old writer acks a record between the restore and the claim: the claimed writer's
-/// reconcile takes it in (`Behind`), its claim record (no syncs) follows at the next seq, then
-/// its own commits; restore and reconcile both accept that log.
+/// The old writer acks a record between the restore and the claim: the claim's fence record
+/// lands after it, the claimed writer's reconcile takes it in (`Behind`), then its own commits
+/// follow; restore and reconcile both accept that log.
 #[test]
 fn claim_after_old_writer_appended_comes_in_behind() {
     let store = mem();
@@ -746,23 +746,24 @@ fn claim_after_old_writer_appended_comes_in_behind() {
     assert_eq!(ids(&cb), (1..=11).collect::<Vec<_>>());
     insert(&cb, 12).unwrap();
     assert_eq!(log_seqs(&*store, gen), (1..=n + 2).collect::<Vec<_>>());
-    match record(&store, gen, n + 1) {
-        LogRecord::Extents { writer_id, syncs } => {
-            assert_eq!(writer_id, b_id);
-            assert!(syncs.is_empty(), "the claim record holds syncs");
-        }
-        r => panic!("{r:?}"),
-    }
+    assert_eq!(
+        record(&store, gen, n + 1),
+        LogRecord::Fence {
+            writer_id: b_id.clone(),
+            epoch: head(&*store).epoch
+        },
+        "the claim's fence record"
+    );
     assert!(
         matches!(&record(&store, gen, n + 2), LogRecord::Extents { writer_id, .. } if *writer_id == b_id)
     );
-    // The old writer's next append collides with the claim record.
+    // The old writer's next append collides with the fence record.
     let r13 = insert(&ca, 13);
     assert!(matches!(r13, Err(Error::Fenced(_))), "{r13:?}");
     crash(db_a, vec![ca]);
     crash(db_b, vec![cb]);
 
-    // Restore: [A's records, B's claim record, B's record].
+    // Restore: [A's records, B's fence record, B's record].
     let v = tempdir();
     let verify = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
     assert_eq!(
@@ -896,7 +897,7 @@ fn sealed_objects(all: &BTreeMap<String, Vec<u8>>, gen: u64) -> BTreeMap<String,
 /// what B left, and a fresh restore holds every row either writer acked, integrity ok.
 ///
 /// With `trim`, B's trimmer has also run (its grace passed): `log/G` is gone, so A's
-/// seal-start record cannot collide with B's claim record.
+/// seal-start record cannot collide with B's fence record.
 fn old_writer_after_claim_and_seal(
     prepare_a: fn(&Connection),
     trim: bool,
@@ -1152,8 +1153,9 @@ fn commit_after_the_lease_checks_the_head() {
     crash(db, vec![c]);
 }
 
-/// The claim record (and any record appended before the engine opens) uses the configured
-/// lease, not the built-in one: with `lease` = 0 the claimer GETs the head right before it.
+/// The claim's fence record (and any record appended before the engine opens) uses the
+/// configured lease, not the built-in one: with `lease` = 0 the claimer GETs the head right
+/// before it.
 #[test]
 fn claim_record_append_uses_the_configured_lease() {
     let mem = mem();
@@ -1174,14 +1176,15 @@ fn claim_record_append_uses_the_configured_lease() {
     let at = ev
         .iter()
         .position(|e| *e == claim_put)
-        .expect("the claim record");
+        .expect("the fence record");
     assert_eq!(ev[at - 1], format!("get {}", keys().head()), "{ev:?}");
     drop(db_b);
     crash(db_a, vec![ca]);
 }
 
-/// A claim whose record never landed (the open failed after the head write): the next open
-/// sees the generation's last record is another writer's and appends one then.
+/// A claim whose fence record never landed (the open failed after the claimed state was
+/// written): the next open sees the generation's last record is another writer's and appends
+/// the fence then.
 #[test]
 fn reopen_after_claim_without_its_record_appends_one() {
     let store = mem();
@@ -1197,11 +1200,14 @@ fn reopen_after_claim_without_its_record_appends_one() {
     let mut s = state(r.path());
     let b_id = "b".repeat(32);
     let cfg = config(r.path()).engine(false);
-    s.head_etag = crate::bucket::claim(&*store, &keys(), &cfg.retry, &s.head_etag, &b_id).unwrap();
+    let (h, etag) =
+        crate::bucket::take_over(&*store, &keys(), &cfg.retry, s.generation, &b_id).unwrap();
+    s.head_etag = etag;
+    s.epoch = h.epoch;
     s.writer_id = b_id.clone();
     s.claimed = true;
     s.write_atomic(r.path()).unwrap();
-    // No claim record yet: A still acks.
+    // No fence record yet: A still acks.
     insert(&ca, 11).unwrap();
 
     let db_b = open_mem(&store, r.path());
@@ -1209,7 +1215,7 @@ fn reopen_after_claim_without_its_record_appends_one() {
     let gen = head(&*store).generation;
     let last = *log_seqs(&*store, gen).last().unwrap();
     assert!(
-        matches!(record(&store, gen, last), LogRecord::Extents { writer_id, syncs } if writer_id == b_id && syncs.is_empty())
+        matches!(record(&store, gen, last), LogRecord::Fence { writer_id, .. } if writer_id == b_id)
     );
     let r12 = insert(&ca, 12);
     assert!(matches!(r12, Err(Error::Fenced(_))), "{r12:?}");
@@ -1642,4 +1648,267 @@ fn seal_does_not_read_the_local_state_file() {
     assert_eq!(state(a.path()).generation, gen + 1);
     c.close().unwrap();
     db.close().unwrap();
+}
+
+/// README race 3: a claim that crashed after its head write and before the claimed local
+/// state was written. The claim id was persisted first, so the next open resumes it: the head
+/// already names that id, the epoch went up once, and the open ends with that writer's fence.
+#[test]
+fn crash_after_the_claim_head_resumes() {
+    let store = mem();
+    let a = tempdir();
+    let db_a = open_mem(&store, a.path());
+    let ca = db_a.connect().unwrap();
+    create(&ca);
+    for id in 1..=10 {
+        insert(&ca, id).unwrap();
+    }
+    let e0 = head(&*store).epoch;
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+
+    FAIL_AFTER_CLAIM_HEAD.with(|f| f.set(true));
+    let first = open_with_store(config(r.path()), store.clone());
+    FAIL_AFTER_CLAIM_HEAD.with(|f| f.set(false));
+    assert!(matches!(first, Err(Error::Io(_))), "{:?}", first.err());
+    let claim_id = state(r.path()).claim_id;
+    assert!(
+        !crate::is_claimed(r.path()).unwrap(),
+        "an interrupted claim"
+    );
+
+    let db_b = open_with_store(config(r.path()), store.clone())
+        .unwrap_or_else(|e| panic!("reopen after the crashed claim: {e:?}"));
+    let h = head(&*store);
+    assert!(!claim_id.is_empty(), "the claim id was persisted first");
+    assert_eq!((h.writer_id.as_str(), h.epoch), (claim_id.as_str(), e0 + 1));
+    let s = state(r.path());
+    assert_eq!(
+        (
+            s.writer_id.as_str(),
+            s.claimed,
+            s.claim_id.as_str(),
+            s.epoch
+        ),
+        (claim_id.as_str(), true, "", e0 + 1)
+    );
+    let last = *log_seqs(&*store, h.generation).last().unwrap();
+    assert_eq!(
+        record(&store, h.generation, last),
+        LogRecord::Fence {
+            writer_id: claim_id.clone(),
+            epoch: e0 + 1
+        }
+    );
+    let r11 = insert(&ca, 11);
+    assert!(matches!(r11, Err(Error::Fenced(_))), "{r11:?}");
+    let cb = db_b.connect().unwrap();
+    assert_eq!(ids(&cb), (1..=10).collect::<Vec<_>>());
+    insert(&cb, 100).unwrap();
+    crash(db_a, vec![ca]);
+    cb.close().unwrap();
+    db_b.close().unwrap();
+    let mut want: Vec<i64> = (1..=10).collect();
+    want.push(100);
+    assert_eq!(restored_ids(&store), want);
+}
+
+/// A MemStore that, at the first `put_if_match` of the head, first lands `late` (a head PUT
+/// a crashed process still had in flight, If-Match on its ETag), then passes the call on.
+struct LateHeadBeforeRaise {
+    inner: Arc<MemStore>,
+    late: Mutex<Option<(Vec<u8>, String)>>,
+}
+
+impl ObjectStore for LateHeadBeforeRaise {
+    fn put(&self, key: &str, body: &[u8]) -> std::result::Result<String, crate::store::StoreError> {
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(
+        &self,
+        key: &str,
+        body: &[u8],
+    ) -> std::result::Result<CondPut, crate::store::StoreError> {
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> std::result::Result<CondPut, crate::store::StoreError> {
+        if key == keys().head() {
+            if let Some((late, e)) = self.late.lock().unwrap().take() {
+                let landed = self.inner.put_if_match(key, &late, &e).unwrap();
+                assert!(matches!(landed, CondPut::Created { .. }), "{landed:?}");
+            }
+        }
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::Object>, crate::store::StoreError> {
+        self.inner.get(key)
+    }
+    fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, crate::store::StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> std::result::Result<(), crate::store::StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.inner.stats()
+    }
+}
+
+/// A crashed seal's head PUT (this writer's own sealed head of its generation) lands between
+/// the open's head read and its epoch raise: the raise's 412 finds that head, and the open
+/// attaches again (now at the sealed generation) instead of failing `Fenced`.
+#[test]
+fn open_attaches_again_when_its_own_late_seal_head_lands_before_the_raise() {
+    let store = mem();
+    let a = closed_writer(&store, 10);
+    let h = head(&*store);
+    let e = head_etag(&store);
+    let late = Head {
+        generation: h.generation + 1,
+        manifest: Some(h.generation),
+        ..h.clone()
+    };
+    // The crashed seal uploaded its manifest before its head PUT (as in
+    // `late_head_put_after_restart_cannot_land`).
+    let m = store
+        .get(&keys().manifest(h.generation - 1))
+        .unwrap()
+        .unwrap();
+    store.put(&keys().manifest(h.generation), &m.body).unwrap();
+    let wrapped = Arc::new(LateHeadBeforeRaise {
+        inner: store.clone(),
+        late: Mutex::new(Some((late.encode(), e))),
+    });
+    let db = open_with_store(config(a.path()), wrapped.clone())
+        .unwrap_or_else(|e| panic!("open with its own late seal head: {e:?}"));
+    assert!(wrapped.late.lock().unwrap().is_none(), "the late PUT ran");
+    let now = head(&*store);
+    assert_eq!(
+        (now.generation, now.epoch, now.writer_id.as_str()),
+        (h.generation + 1, h.epoch + 1, h.writer_id.as_str())
+    );
+    assert_eq!(db.generation(), h.generation + 1);
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), (1..=10).collect::<Vec<_>>());
+    insert(&c, 11).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restored_ids(&store), (1..=11).collect::<Vec<_>>());
+}
+
+/// The two settings every fencing test runs under.
+fn batchings() -> [crate::Batching; 2] {
+    [
+        crate::Batching::Off,
+        crate::Batching::Window {
+            max_wait: Duration::from_millis(5),
+            max_commits: 64,
+            max_bytes: 1 << 20,
+        },
+    ]
+}
+
+fn config_batching(dir: &Path, b: crate::Batching) -> Config {
+    let mut c = config(dir);
+    c.batching = b;
+    c
+}
+
+/// The claim checks the restored generation, not the restore's ETag: the old writer acks
+/// 51..=80 in the same generation after the restore (no seal), and the claim still goes
+/// ahead. Its fence lands right after the old writer's last record, reconcile takes those
+/// records in (`Behind`), and the old writer is fenced.
+#[test]
+fn old_writer_records_after_the_restore_are_taken_in() {
+    for b in batchings() {
+        let store = mem();
+        let a = tempdir();
+        let db_a = open_with_store(config_batching(a.path(), b), store.clone()).unwrap();
+        let ca = db_a.connect().unwrap();
+        create(&ca);
+        for id in 1..=50 {
+            insert(&ca, id).unwrap();
+        }
+        let r = tempdir();
+        restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+        let gen = head(&*store).generation;
+        for id in 51..=80 {
+            insert(&ca, id).unwrap();
+        }
+        assert_eq!(head(&*store).generation, gen, "{b:?}: A did not seal");
+        let a_last = *log_seqs(&*store, gen).last().unwrap();
+        let a_id = state(a.path()).writer_id;
+
+        let db_b = open_with_store(config_batching(r.path(), b), store.clone()).unwrap();
+        assert_eq!(db_b.shared.reconciled, Some(Reconciled::Behind), "{b:?}");
+        let b_id = state(r.path()).writer_id;
+        assert!(
+            matches!(record(&store, gen, a_last), LogRecord::Extents { writer_id, .. } if writer_id == a_id),
+            "{b:?}: A's last record"
+        );
+        assert_eq!(
+            record(&store, gen, a_last + 1),
+            LogRecord::Fence {
+                writer_id: b_id.clone(),
+                epoch: head(&*store).epoch
+            },
+            "{b:?}: B's fence right after A's last record"
+        );
+        let r81 = insert(&ca, 81);
+        assert!(matches!(r81, Err(Error::Fenced(_))), "{b:?}: {r81:?}");
+        let cb = db_b.connect().unwrap();
+        assert_eq!(ids(&cb), (1..=80).collect::<Vec<_>>(), "{b:?}");
+        insert(&cb, 1001).unwrap();
+        crash(db_a, vec![ca]);
+        cb.close().unwrap();
+        db_b.close().unwrap();
+        let mut want: Vec<i64> = (1..=80).collect();
+        want.push(1001);
+        assert_eq!(restored_ids(&store), want, "{b:?}");
+    }
+}
+
+/// The old writer seals after the restore, so the generation moved: the claim fails
+/// "restore again" and writes nothing to the bucket (no head change, no fence).
+#[test]
+fn old_writer_seal_after_the_restore_makes_the_claim_restore_again() {
+    for b in batchings() {
+        let store = mem();
+        let a = tempdir();
+        let db_a = open_with_store(config_batching(a.path(), b), store.clone()).unwrap();
+        let ca = db_a.connect().unwrap();
+        create(&ca);
+        for id in 1..=5 {
+            insert(&ca, id).unwrap();
+        }
+        let r = tempdir();
+        restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+        insert(&ca, 6).unwrap();
+        ca.checkpoint(CheckpointMode::Truncate).unwrap();
+        let before = bucket_objects(&store);
+
+        let res = open_with_store(config_batching(r.path(), b), store.clone());
+        match res {
+            Err(Error::Fenced(m)) => assert!(m.contains("restore again"), "{b:?}: {m}"),
+            res => panic!("{b:?}: expected Fenced, got {:?}", res.err()),
+        }
+        assert_eq!(
+            bucket_objects(&store),
+            before,
+            "{b:?}: B wrote to the bucket"
+        );
+        assert!(!state(r.path()).claimed);
+        insert(&ca, 7).unwrap();
+        ca.close().unwrap();
+        db_a.close().unwrap();
+        assert_eq!(restored_ids(&store), (1..=7).collect::<Vec<_>>(), "{b:?}");
+    }
 }

@@ -9,12 +9,13 @@
 use crate::clock::Stamp;
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
-use crate::format::{encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
+use crate::format::{decode_record, encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
 use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::field::Empty;
 use tracing::Span;
 
 /// Where a log object lives: `log/<generation>/<seq>`.
@@ -85,8 +86,8 @@ enum Lapse {
 enum Raise {
     /// The raised head is published and adopted.
     Raised,
-    /// The head holds the pending seal's head instead (its late PUT landed first), with this
-    /// ETag: nothing was raised.
+    /// The head holds the pending seal's head (or, at open, this writer's own sealed head)
+    /// instead: its late PUT landed first, with this ETag. Nothing was raised.
     Published(String),
 }
 
@@ -149,83 +150,160 @@ fn upload_error(e: Error) -> Error {
     }
 }
 
-/// What `claim` tells a restored directory whose head moved since the restore.
+/// `with_retry` under what is left of `retry.deadline` since `start`, adding its extra
+/// attempts to `retries`.
+fn retry_rest<T>(
+    retry: &RetryPolicy,
+    start: Instant,
+    retries: &AtomicU64,
+    what: &str,
+    mut op: impl FnMut() -> std::result::Result<T, StoreError>,
+) -> Result<T> {
+    let policy = RetryPolicy {
+        deadline: retry.deadline.saturating_sub(start.elapsed()),
+        ..retry.clone()
+    };
+    with_retry(&policy, what, |attempt| {
+        if attempt > 0 {
+            retries.fetch_add(1, Relaxed);
+        }
+        op()
+    })
+}
+
+/// What `take_over` tells a restored directory whose generation is no longer the head's.
 pub(crate) const RESTORE_AGAIN: &str =
     "the bucket changed since this directory was restored; restore again";
 
-/// The first half of taking over a restored copy's database as `writer_id`: a claim is a
-/// head write, then one log record.
+/// The first half of a takeover (the claim of a restored copy) as `writer_id`: the head is
+/// written again with the new writer id and its epoch raised by one, same generation and
+/// manifest. The second half is the fence record (`Bucket::append_fence`), which the caller
+/// appends once attached (`db::attach_existing`). Returns the new head and its ETag.
 ///
-/// This writes the head the restore read (ETag `head_etag`) again with the new writer id,
-/// same generation and manifest, with `put_if_match`. A head that moved since the restore
-/// (412, or 404 when it is gone) is `Fenced` with "restore again", and nothing is written.
-/// Returns the new head's ETag. The caller then attaches, reconciles and appends one record
-/// of its own (an empty one) at its next seq (`db::attach_existing`); stage 3's fence record
-/// will take that slot.
+/// It GETs the head. One that already names `writer_id` is returned as is: a claim whose head
+/// write landed before its process crashed resumes under the same id (the caller persisted it
+/// first). One of another generation than `expect_generation` (the restored one; the old
+/// writer sealed since, so the restored copy is stale), or none at all, is `Fenced` with
+/// "restore again", and nothing is written. Otherwise a `put_if_match` on the ETag just read.
+/// A 412 means the head moved: it is read again and the same rules apply, so a concurrent
+/// takeover of the same generation is followed by this one at the next epoch (the last
+/// takeover wins), and a write of ours that landed though its reply was lost is found as a
+/// head naming `writer_id`. Every request shares one deadline (`retry.deadline`); extra
+/// attempts are added to `retries`.
 ///
-/// That record matters because a still-running old writer does not see the head change: it
-/// keeps appending to the same generation, and the new writer's seal (If-Match on a head only
-/// it moved) would orphan whatever the old one acked after it. The record takes the next seq,
-/// so either the old writer's append collides with it and the old writer is fenced for good,
-/// or the old writer got there first and the new writer's open fails `Fenced`. After a
-/// claim, an old writer restarting on its own disk is fenced by the writer-id check at
-/// attach. A still-running one is fenced at its next append: through the claim record when
-/// it appends within the trim grace, and otherwise (`log/G` may be trimmed by then) through
-/// the lease's head check before that append (`Bucket::check_lease`, under the assumption it
-/// lists). It is also fenced at the start of its next seal
+/// Why the generation and not the restore's ETag: every writer open raises the epoch, so
+/// the ETag also changes when the old writer merely restarts. A head of the same generation,
+/// whatever its writer and epoch, still has the restored generation's log, and the records
+/// the old writer acked since the restore come in through reconcile (`Behind`), the fence
+/// record landing after them.
+///
+/// Why a still-running old writer cannot lose an ack: it does not see the head change and
+/// keeps appending to the same generation. The fence record takes the next free seq, so
+/// either the old writer's next append collides with it and the old writer is fenced for
+/// good, or its record got there first, is stepped over (`append_fence`) and taken in by
+/// reconcile. After a takeover, an old writer restarting on its own disk is fenced by the
+/// writer-id check at attach. A still-running one is fenced at its next append: through the
+/// fence record when it appends within the trim grace, and otherwise (`log/G` may be trimmed
+/// by then) through the lease's head check before that append (`Bucket::check_lease`, under
+/// the assumption it lists). It is also fenced at the start of its next seal
 /// (`Bucket::seal_start`: its seal-start record collides, or the head moved), before it
 /// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed,
 /// and its page and manifest PUTs stop at the first lapse of its lease (`Bucket::seal`).
-/// The log stays linear. Such a generation holds the old writer's records, then the new
-/// one's, which `restore::generation_image` accepts.
-pub(crate) fn claim(
+/// The log stays linear: such a generation holds the old writer's records, then the fence,
+/// then the new writer's, which `restore::generation_image` accepts.
+pub(crate) fn take_over_counted(
     store: &dyn ObjectStore,
     keys: &Keys,
     retry: &RetryPolicy,
-    head_etag: &str,
+    expect_generation: u64,
     writer_id: &str,
-) -> Result<String> {
-    enum Claim {
-        Done(String),
-        Moved,
-    }
+    retries: &AtomicU64,
+) -> Result<(Head, String)> {
     if !writer_id.is_ascii() || writer_id.len() > u8::MAX as usize {
         return Err(Error::Config(
             "writer id must be ASCII and at most 255 bytes".into(),
         ));
     }
+    let start = Instant::now();
     let key = keys.head();
-    let moved = || Error::Fenced(RESTORE_AGAIN.into());
-    let Some(current) = with_retry(retry, &key, |_| store.get(&key))? else {
-        return Err(moved());
-    };
-    if head_etag.is_empty() || current.etag != head_etag {
-        return Err(moved());
-    }
-    let head = Head {
-        writer_id: writer_id.to_string(),
-        ..Head::decode(&current.body)?
-    };
-    let body = head.encode();
-    let r = with_retry(retry, &key, |attempt| {
-        // After a failed attempt the put may have landed: look before writing again.
-        if attempt > 0 {
-            match store.get(&key)? {
-                Some(o) if o.body == body => return Ok(Claim::Done(o.etag)),
-                Some(o) if o.etag == head_etag => {}
-                _ => return Ok(Claim::Moved),
-            }
+    let restore_again = || Error::Fenced(RESTORE_AGAIN.into());
+    loop {
+        let Some(current) = retry_rest(retry, start, retries, &key, || store.get(&key))? else {
+            return Err(restore_again());
+        };
+        let head = Head::decode(&current.body)?;
+        if head.writer_id == writer_id {
+            return Ok((head, current.etag));
         }
-        Ok(match store.put_if_match(&key, &body, head_etag)? {
-            CondPut::Created { etag } => Claim::Done(etag),
-            CondPut::PreconditionFailed => Claim::Moved,
+        if head.generation != expect_generation {
+            return Err(restore_again());
+        }
+        let new = Head {
+            writer_id: writer_id.to_string(),
+            epoch: head.epoch + 1,
+            ..head
+        };
+        let body = new.encode();
+        let put = retry_rest(retry, start, retries, &key, || {
+            store.put_if_match(&key, &body, &current.etag)
         })
-    })
-    .map_err(upload_error)?;
-    match r {
-        Claim::Done(etag) => Ok(etag),
-        Claim::Moved => Err(moved()),
+        .map_err(upload_error)?;
+        if let CondPut::Created { etag } = put {
+            return Ok((new, etag));
+        }
+        // The head moved since the GET: read it again, within the same deadline.
+        let elapsed = start.elapsed();
+        if elapsed >= retry.deadline {
+            return Err(Error::Timeout(format!(
+                "takeover: the head kept changing for {elapsed:?}; retry the takeover"
+            )));
+        }
     }
+}
+
+/// `take_over_counted`, its extra attempts not counted anywhere.
+#[cfg(test)]
+pub(crate) fn take_over(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    expect_generation: u64,
+    writer_id: &str,
+) -> Result<(Head, String)> {
+    take_over_counted(
+        store,
+        keys,
+        retry,
+        expect_generation,
+        writer_id,
+        &AtomicU64::new(0),
+    )
+}
+
+/// What `Bucket::append_fence` landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FenceOutcome {
+    pub pos: LogPos,
+    /// The record just before the fence is another writer's Extents record with no syncs:
+    /// that writer's last act may have been a seal-start record, so its seal's page PUTs may
+    /// still be in flight. Also true when that record could not be read.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub after_foreign_empty: bool,
+}
+
+/// What a fence PUT found at its seq.
+enum FencePut {
+    /// The fence is there (created, or an earlier attempt of ours landed).
+    Landed,
+    /// Another writer's record the fence steps over: an old writer's Extents record, or a
+    /// fence of a lower epoch (a losing concurrent takeover).
+    Occupied(LogRecord),
+}
+
+/// Another writer's Extents record with no syncs: a seal-start record (or a stage-2 claim
+/// record).
+fn foreign_empty(rec: &LogRecord, writer_id: &str) -> bool {
+    matches!(rec, LogRecord::Extents { writer_id: w, syncs } if w != writer_id && syncs.is_empty())
 }
 
 impl Bucket {
@@ -521,6 +599,161 @@ impl Bucket {
         }
     }
 
+    /// The second half of a takeover (`take_over`), and what a writer open appends when its
+    /// generation's last record is another writer's: a fence record `Fence { writer_id,
+    /// epoch }` (this writer's, at the head's epoch) at the next free seq, with
+    /// `put_if_absent`, through the same head, lease and in-doubt checks as any record
+    /// (`before_record`). A still-running old writer's next append collides with it and
+    /// fences that writer for good; restore accepts only this writer's records after it.
+    ///
+    /// A seq already taken by another writer's Extents record (the old writer appended
+    /// between the takeover's head write and this PUT), or by a fence of a lower epoch (a
+    /// concurrent takeover that lost the head), is stepped over: the fence moves to the next
+    /// seq, under the same deadline, at most `defaults::FENCE_MAX_STEPS` times. Past that, or
+    /// past the deadline, it gives up with `Timeout`: the head already names this writer, so a
+    /// retry resumes the takeover, and the old writer's records stay restorable before the
+    /// fence. The records stepped over come in through reconcile, which runs after the fence.
+    /// A fence of an equal or higher epoch (a takeover after this one) fences this writer.
+    /// Our own identical bytes count as landed. An ambiguous PUT leaves the fence in doubt at
+    /// its seq, like any record.
+    ///
+    /// It runs in a `durable.fence` span (`durable.generation`, `durable.seq`,
+    /// `durable.epoch`, `durable.retries`, `s3.status`).
+    pub(crate) fn append_fence(&mut self) -> Result<FenceOutcome> {
+        let start = Instant::now();
+        let retries = self.counters.retries.load(Relaxed);
+        let span = tracing::info_span!(
+            target: "turso_durable",
+            "durable.fence",
+            durable.generation = self.head.generation,
+            durable.seq = Empty,
+            durable.epoch = self.head.epoch,
+            durable.retries = Empty,
+            s3.status = Empty,
+        );
+        let r = span.in_scope(|| {
+            self.check_fenced()
+                .and_then(|()| self.append_fence_at(start))
+                .map_err(upload_error)
+        });
+        span.record("durable.seq", r.as_ref().map_or(self.seq, |o| o.pos.seq));
+        span.record(
+            "durable.retries",
+            self.counters.retries.load(Relaxed).saturating_sub(retries),
+        );
+        r
+    }
+
+    fn append_fence_at(&mut self, start: Instant) -> Result<FenceOutcome> {
+        self.before_record(start)?;
+        let body = encode_record(&LogRecord::Fence {
+            writer_id: self.head.writer_id.clone(),
+            epoch: self.head.epoch,
+        });
+        let mut steps = 0u64;
+        // The record at `self.seq - 1`, once a step has read it.
+        let mut previous: Option<LogRecord> = None;
+        loop {
+            let pos = LogPos {
+                generation: self.head.generation,
+                seq: self.seq,
+            };
+            let key = self.keys.log(pos.generation, pos.seq);
+            let sent = Stamp::now();
+            match self.put_fence_at(start, &key, &body) {
+                Ok(FencePut::Landed) => {
+                    self.last_confirmed = sent;
+                    self.seq += 1;
+                    self.counters.log_puts.fetch_add(1, Relaxed);
+                    self.emit_uploaded(pos, body.len() as u64);
+                    let after_foreign_empty = match previous {
+                        Some(rec) => foreign_empty(&rec, &self.head.writer_id),
+                        None => self.foreign_empty_before(start, pos),
+                    };
+                    return Ok(FenceOutcome {
+                        pos,
+                        after_foreign_empty,
+                    });
+                }
+                Ok(FencePut::Occupied(rec)) => {
+                    if steps == crate::config::defaults::FENCE_MAX_STEPS
+                        || start.elapsed() >= self.retry.deadline
+                    {
+                        return Err(Error::Timeout(format!(
+                            "takeover: the old writer kept appending past {steps} log \
+                             positions; retry the takeover"
+                        )));
+                    }
+                    steps += 1;
+                    self.seq += 1;
+                    previous = Some(rec);
+                }
+                Err(e @ Error::Fenced(_)) => return Err(self.fence(e)),
+                // The seq holds a record that is not one: not ambiguous, nothing owed.
+                Err(e @ Error::Corrupt(_)) => return Err(e),
+                Err(e) => {
+                    self.in_doubt = Some(InDoubt { pos, body });
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// `put_if_absent` of the fence `body` at `key`; on a 412, what holds the key decides.
+    fn put_fence_at(&self, start: Instant, key: &str, body: &[u8]) -> Result<FencePut> {
+        let c = &self.counters;
+        let r = retrying(c, &self.remaining(start), key, || {
+            self.store.put_if_absent(key, body)
+        })?;
+        if let CondPut::Created { .. } = r {
+            return Ok(FencePut::Landed);
+        }
+        let Some(o) = retrying(c, &self.remaining(start), key, || self.store.get(key))? else {
+            return Err(Error::Fenced(format!(
+                "{key} was taken, then removed, by another writer"
+            )));
+        };
+        // An earlier attempt of ours landed and its reply was lost.
+        if o.body == body {
+            return Ok(FencePut::Landed);
+        }
+        let rec = decode_record(&o.body)?;
+        let (ours, epoch) = (&self.head.writer_id, self.head.epoch);
+        match &rec {
+            LogRecord::Extents { writer_id, .. } if writer_id != ours => {
+                Ok(FencePut::Occupied(rec))
+            }
+            LogRecord::Fence { epoch: k, .. } if *k < epoch => Ok(FencePut::Occupied(rec)),
+            LogRecord::Extents { .. } => Err(Error::Fenced(format!(
+                "{key} holds a record of this writer id, not its fence"
+            ))),
+            LogRecord::Fence {
+                writer_id,
+                epoch: k,
+            } => Err(Error::Fenced(format!(
+                "{key} holds the fence of writer {writer_id:?} at epoch {k}, not below this \
+                 writer's {epoch}"
+            ))),
+        }
+    }
+
+    /// Whether the record before `pos` is another writer's empty Extents record. A record
+    /// that cannot be read counts as one (the caller then assumes the more cautious case).
+    fn foreign_empty_before(&self, start: Instant, pos: LogPos) -> bool {
+        if pos.seq <= 1 {
+            return false;
+        }
+        let key = self.keys.log(pos.generation, pos.seq - 1);
+        match retrying(&self.counters, &self.remaining(start), &key, || {
+            self.store.get(&key)
+        }) {
+            Ok(Some(o)) => {
+                decode_record(&o.body).map_or(true, |rec| foreign_empty(&rec, &self.head.writer_id))
+            }
+            Ok(None) | Err(_) => true,
+        }
+    }
+
     /// Everything an append does before it builds its record (`catch_up_at`); a head that a
     /// pending seal may have published refuses the append.
     fn before_record(&mut self, start: Instant) -> Result<()> {
@@ -576,7 +809,7 @@ impl Bucket {
         self.fenced || self.in_doubt.is_some() || self.pending_seal.is_some()
     }
 
-    /// The lease check before an append. Another writer's claim record fences this one at its
+    /// The lease check before an append. Another writer's fence record fences this one at its
     /// next append, but only while `log/G` exists: once that writer has sealed G and its
     /// trimmer has deleted `log/G` (its trim grace after the seal), this writer's next record
     /// would land in a log no restore reads, and its commit would be acked. So an append once
@@ -662,22 +895,32 @@ impl Bucket {
     /// head is exactly the raised one counts as landed; any other head fences this writer.
     /// It renews the lease and returns the new epoch.
     ///
-    /// Every writer open calls it (`db::attach_existing`): a head PUT that a crashed
-    /// process of this writer still had in flight carries the ETag from before the raise, so
-    /// it can no longer land after the restarted writer acked more records. A failure leaves
-    /// the open failed; the next open reads whatever the head is then.
-    pub(crate) fn raise_epoch(&mut self) -> Result<u64> {
+    /// Every writer open that does not take over calls it (`db::attach_existing`): a head
+    /// PUT that a crashed process of this writer still had in flight carries the ETag from
+    /// before the raise, so it can no longer land after the restarted writer acked more
+    /// records. A failure leaves the open failed; the next open reads whatever the head is
+    /// then.
+    ///
+    /// `None` when the 412 found, instead, the head a seal of the current generation by this
+    /// writer publishes (`sealed_head`): such a late PUT landed between `attach`'s head read
+    /// and the raise. Nothing was raised and this writer is not fenced; the caller attaches
+    /// again, at the sealed generation.
+    pub(crate) fn raise_epoch(&mut self) -> Result<Option<u64>> {
         let start = Instant::now();
         self.check_fenced()?;
-        match self.raise_epoch_at(start, None).map_err(upload_error)? {
-            Raise::Raised => Ok(self.head.epoch),
-            // Only a pending seal's head is reported as published, and none was given.
-            Raise::Published(_) => unreachable!("no pending seal head to find"),
+        let sealed = self.sealed_head().encode();
+        match self
+            .raise_epoch_at(start, Some(&sealed))
+            .map_err(upload_error)?
+        {
+            Raise::Raised => Ok(Some(self.head.epoch)),
+            Raise::Published(_) => Ok(None),
         }
     }
 
     /// `raise_epoch` within the call that started at `start`. A 412 whose stored head is
-    /// `pending` (a pending seal's head, encoded) is `Raise::Published`.
+    /// `pending` (a pending seal's head, or the open's own sealed head, encoded) is
+    /// `Raise::Published`.
     fn raise_epoch_at(&mut self, start: Instant, pending: Option<&[u8]>) -> Result<Raise> {
         let head = self.raised_head();
         let sent = Stamp::now();
@@ -920,19 +1163,19 @@ impl Bucket {
     /// The gate before a seal uploads anything: a writer that another writer took over must
     /// not overwrite `pages/G/*` or `manifest/G`, which are plain puts and which that writer
     /// may already have sealed. A seal of an old writer that has nothing left to ship sends
-    /// no log record, so the claim record alone would not fence it.
+    /// no log record, so the fence record alone would not fence it.
     ///
     /// 1. An empty record (zero syncs) goes to this writer's next seq with `put_if_absent`,
-    ///    through `put_log`: a seq taken by another writer's record (a claim record, say)
+    ///    through `put_log`: a seq taken by another writer's record (a fence record, say)
     ///    fences this writer and nothing is uploaded; an ambiguous result leaves it in doubt
     ///    and the seal fails, to be settled at the same seq like any other record. It keeps
     ///    the seqs contiguous and adds nothing to the generation's image.
     /// 2. Then a GET of the head (`verify_head`), which must still carry this writer's ETag
     ///    or be the very head this seal publishes. The record cannot collide once the trimmer has
-    ///    deleted `log/G` (another writer sealed G and its grace passed), and a claimer's head
-    ///    write precedes its claim record; a moved head fences.
+    ///    deleted `log/G` (another writer sealed G and its grace passed), and a takeover's head
+    ///    write precedes its fence record; a moved head fences.
     ///
-    /// A claimer that restores and claims after step 2 lands its claim record after ours and
+    /// A takeover that restores and claims after step 2 lands its fence record after ours and
     /// may seal G while this seal's page PUTs are in flight: those stop at the first lapse of
     /// the lease, whose head check fences this writer (`seal`).
     fn seal_start(&mut self, start: Instant) -> Result<()> {

@@ -61,12 +61,17 @@ pub enum Command {
         claim: bool,
         batching: Option<Batching>,
     },
+    /// Restore into an empty directory and take the database over there.
+    Takeover {
+        dir: PathBuf,
+    },
     Soak(SoakArgs),
     Bench(BenchArgs),
 }
 
 pub const USAGE: &str = "usage: turso-durable <command> [options]
   restore --dir DIR
+  takeover --dir DIR
   verify  --dir DIR [--acked FILE]
   sql     --dir DIR [--claim] [--batching SPEC] SQL...
   stats   --dir DIR [--claim] [--batching SPEC] SQL...
@@ -202,6 +207,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     }
     match cmd.as_str() {
         "restore" => Ok(Command::Restore { dir }),
+        "takeover" => Ok(Command::Takeover { dir }),
         "verify" => Ok(Command::Verify { dir, acked }),
         "sql" | "stats" if positional.is_empty() => {
             Err(format!("{cmd} needs at least one SQL argument"))
@@ -347,6 +353,19 @@ mod tests {
                 batching: None,
             }))
         );
+    }
+
+    #[test]
+    fn parses_takeover() {
+        assert_eq!(
+            p(&["takeover", "--dir", "d"]),
+            Ok(Command::Takeover {
+                dir: PathBuf::from("d")
+            })
+        );
+        assert!(p(&["takeover"]).is_err(), "--dir is required");
+        assert!(p(&["takeover", "--dir", "d", "--claim"]).is_err());
+        assert!(p(&["takeover", "--dir", "d", "extra"]).is_err());
     }
 
     #[test]

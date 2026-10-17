@@ -1407,42 +1407,285 @@ fn head_conflict_fences() {
 }
 
 #[test]
-fn claim_rewrites_head_with_new_writer_only_if_unchanged() {
+fn take_over_raises_the_epoch_with_the_new_writer_in_the_same_generation() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
     b.append_log(syncs(1)).unwrap();
-    let before = f.mem.get(&keys().head()).unwrap().unwrap();
     let old = f.stored_head();
 
     // An ambiguous first attempt (stored, then an error): the retry finds its own head.
     f.fault.store_then_fail_next_puts(1);
-    let etag = claim(&*f.store(), &keys(), &fast(), &before.etag, "w2").unwrap();
-    let now = f.mem.get(&keys().head()).unwrap().unwrap();
-    assert_eq!(now.etag, etag);
-    assert_eq!(
-        f.stored_head(),
-        Head {
-            writer_id: "w2".into(),
-            ..old
-        }
-    );
+    let (h, etag) = take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
+    let want = Head {
+        writer_id: "w2".into(),
+        epoch: old.epoch + 1,
+        ..old.clone()
+    };
+    assert_eq!(h, want);
+    assert_eq!(f.stored_head(), want);
+    assert_eq!(f.mem.get(&keys().head()).unwrap().unwrap().etag, etag);
+
+    // A resumed claim: the head already names the id; returned as is, nothing written.
+    let puts = f.mem.stats().puts;
+    let again = take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
+    assert_eq!(again, (want.clone(), etag.clone()));
+    assert_eq!(f.mem.stats().puts, puts);
+
     // The old writer can no longer attach; the new one can, after the old one's record.
     assert!(matches!(f.attach("w1"), Err(Error::Fenced(_))));
     assert_eq!(f.attach("w2").unwrap().next_seq(), 2);
 
-    // The head moved since `before`: refused, and nothing is written.
+    // Another takeover of the same generation wins the next epoch (whatever the ETag).
+    let (h3, _) = take_over(&*f.store(), &keys(), &fast(), 1, "w3").unwrap();
+    assert_eq!((h3.writer_id.as_str(), h3.epoch), ("w3", old.epoch + 2));
+
+    // Another generation, or no head: "restore again", and nothing is written.
     let puts = f.mem.stats().puts;
-    let r = claim(&*f.store(), &keys(), &fast(), &before.etag, "w3");
+    let r = take_over(&*f.store(), &keys(), &fast(), 2, "w4");
     assert!(
         matches!(&r, Err(Error::Fenced(m)) if m.contains("restore again")),
         "{r:?}"
     );
     assert_eq!(f.mem.stats().puts, puts);
-    let r = claim(&*f.store(), &keys(), &fast(), "", "w3");
-    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
     f.mem.delete(&keys().head()).unwrap();
-    let r = claim(&*f.store(), &keys(), &fast(), &etag, "w3");
+    let r = take_over(&*f.store(), &keys(), &fast(), 1, "w4");
+    assert!(
+        matches!(&r, Err(Error::Fenced(m)) if m.contains("restore again")),
+        "{r:?}"
+    );
+    assert_eq!(f.mem.stats().puts, puts);
+}
+
+/// A store over a `MemStore` with hooks: `before_head_cas` runs once, before the first
+/// `put_if_match` of the head is passed on; `before_log_put` runs before each `put_if_absent`
+/// of a log key is passed on. It counts the `put_if_absent` calls of log keys.
+type HeadHook = Box<dyn FnOnce(&MemStore) + Send>;
+type LogHook = Box<dyn Fn(&str, &MemStore) + Send + Sync>;
+
+#[derive(Default)]
+struct Interpose {
+    mem: Arc<MemStore>,
+    before_head_cas: Mutex<Option<HeadHook>>,
+    before_log_put: Option<LogHook>,
+    log_puts: AtomicU64,
+}
+
+impl ObjectStore for Interpose {
+    fn put(&self, key: &str, body: &[u8]) -> std::result::Result<String, StoreError> {
+        self.mem.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> std::result::Result<CondPut, StoreError> {
+        if keys().parse_log(key).is_some() {
+            self.log_puts.fetch_add(1, Relaxed);
+            if let Some(h) = &self.before_log_put {
+                h(key, &self.mem);
+            }
+        }
+        self.mem.put_if_absent(key, body)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> std::result::Result<CondPut, StoreError> {
+        if key == keys().head() {
+            if let Some(h) = self.before_head_cas.lock().unwrap().take() {
+                h(&self.mem);
+            }
+        }
+        self.mem.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError> {
+        self.mem.get(key)
+    }
+    fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError> {
+        self.mem.list(prefix)
+    }
+    fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+        self.mem.delete(key)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.mem.stats()
+    }
+}
+
+/// `head` with its epoch raised and another writer: a concurrent takeover that landed.
+fn rival_takeover(mem: &MemStore, writer_id: &str, generation: Option<u64>) {
+    let o = mem.get(&keys().head()).unwrap().unwrap();
+    let h = Head::decode(&o.body).unwrap();
+    let rival = Head {
+        writer_id: writer_id.into(),
+        epoch: h.epoch + 1,
+        generation: generation.unwrap_or(h.generation),
+        ..h
+    };
+    let r = mem.put_if_match(&keys().head(), &rival.encode(), &o.etag);
+    assert!(matches!(r, Ok(CondPut::Created { .. })), "{r:?}");
+}
+
+/// Two takeovers race: the other one's head lands between our GET and our `put_if_match`.
+/// Same generation: ours is retried on the new ETag and wins the next epoch. Another
+/// generation: "restore again".
+#[test]
+fn take_over_after_a_rival_retries_on_the_same_generation_only() {
+    let mem = Arc::new(MemStore::new());
+    Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
+    let store = Interpose {
+        mem: mem.clone(),
+        ..Interpose::default()
+    };
+    *store.before_head_cas.lock().unwrap() =
+        Some(Box::new(|m: &MemStore| rival_takeover(m, "rival", None)));
+    let (h, _) = take_over(&store, &keys(), &fast(), 1, "w2").unwrap();
+    assert_eq!((h.writer_id.as_str(), h.epoch, h.generation), ("w2", 3, 1));
+
+    *store.before_head_cas.lock().unwrap() = Some(Box::new(|m: &MemStore| {
+        rival_takeover(m, "rival2", Some(2))
+    }));
+    let r = take_over(&store, &keys(), &fast(), 1, "w3");
+    assert!(
+        matches!(&r, Err(Error::Fenced(m)) if m.contains("restore again")),
+        "{r:?}"
+    );
+    let stored = Head::decode(&mem.get(&keys().head()).unwrap().unwrap().body).unwrap();
+    assert_eq!(stored.writer_id, "rival2");
+}
+
+fn engine_cfg() -> crate::config::EngineConfig {
+    crate::config::Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s").engine(false)
+}
+
+fn fence(writer_id: &str, epoch: u64) -> LogRecord {
+    LogRecord::Fence {
+        writer_id: writer_id.into(),
+        epoch,
+    }
+}
+
+/// w1 at seq 1, then a takeover by w2 (epoch 2) attached at seq 2.
+fn taken_over(f: &Fixture) -> (Bucket, Bucket) {
+    let mut a = f.create(fast(), 4);
+    a.append_log(syncs(1)).unwrap();
+    take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
+    let b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
+    assert_eq!(b.next_seq(), 2);
+    (a, b)
+}
+
+#[test]
+fn append_fence_steps_over_an_old_writer_record() {
+    // The old writer's record lands at the new writer's next seq first: the fence steps over
+    // it, and the old writer's next append collides with the fence.
+    let f = Fixture::new();
+    let (mut a, mut b) = taken_over(&f);
+    a.append_log(syncs(2)).unwrap();
+    let out = b.append_fence().unwrap();
+    assert_eq!(
+        (out.pos, out.after_foreign_empty),
+        (
+            LogPos {
+                generation: 1,
+                seq: 3
+            },
+            false
+        )
+    );
+    assert_eq!(f.record(1, 3), Some(fence("w2", 2)));
+    assert_eq!(b.next_seq(), 4);
+    let r = a.append_log(syncs(3)).map_err(|f| f.error);
     assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    // The restore image: w1's two records, then the fence.
+    let (_, n) =
+        crate::restore::generation_image(&*f.store(), &keys(), b.head(), &engine_cfg()).unwrap();
+    assert_eq!(n, 3);
+
+    // A losing concurrent takeover's fence (a lower epoch) is stepped over too.
+    let f = Fixture::new();
+    let (_a, mut b) = taken_over(&f);
+    f.mem
+        .put(&keys().log(1, 2), &encode_record(&fence("w0", 1)))
+        .unwrap();
+    assert_eq!(b.append_fence().unwrap().pos.seq, 3);
+    assert_eq!(f.record(1, 3), Some(fence("w2", 2)));
+
+    // Another writer's fence at an equal or higher epoch fences this writer.
+    for epoch in [2, 3] {
+        let f = Fixture::new();
+        let (_a, mut b) = taken_over(&f);
+        f.mem
+            .put(&keys().log(1, 2), &encode_record(&fence("w3", epoch)))
+            .unwrap();
+        let r = b.append_fence();
+        assert!(matches!(r, Err(Error::Fenced(_))), "epoch {epoch}: {r:?}");
+        assert_eq!(f.record(1, 3), None);
+        assert!(b.append_log(syncs(4)).is_err(), "fenced for good");
+    }
+
+    // Our own fence already there (an earlier attempt landed): landed, no step.
+    let f = Fixture::new();
+    let (_a, mut b) = taken_over(&f);
+    f.mem
+        .put(&keys().log(1, 2), &encode_record(&fence("w2", 2)))
+        .unwrap();
+    assert_eq!(b.append_fence().unwrap().pos.seq, 2);
+    assert_eq!(f.log_keys(1).len(), 2);
+}
+
+#[test]
+fn append_fence_after_an_empty_old_writer_record_reports_it() {
+    // The old writer's seal-start record (no syncs) is the last before the fence.
+    let f = Fixture::new();
+    let (_a, mut b) = taken_over(&f);
+    f.mem
+        .put(&keys().log(1, 2), &encode_record(&empty("w1")))
+        .unwrap();
+    let out = b.append_fence().unwrap();
+    assert_eq!((out.pos.seq, out.after_foreign_empty), (3, true));
+    // Right after the old writer's commit record: false.
+    let f = Fixture::new();
+    let (_a, mut b) = taken_over(&f);
+    let out = b.append_fence().unwrap();
+    assert_eq!((out.pos.seq, out.after_foreign_empty), (2, false));
+}
+
+#[test]
+fn append_fence_gives_up_after_the_step_bound() {
+    // An old writer that always wins: before each fence PUT, its record lands at that key.
+    let mem = Arc::new(MemStore::new());
+    let mut a = Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
+    a.append_log(syncs(1)).unwrap();
+    take_over(&*mem, &keys(), &fast(), 1, "w2").unwrap();
+    let store = Arc::new(Interpose {
+        mem: mem.clone(),
+        before_log_put: Some(Box::new(|key: &str, m: &MemStore| {
+            m.put_if_absent(key, &encode_record(&ours(9))).unwrap();
+        })),
+        ..Interpose::default()
+    });
+    let mut b = Bucket::attach(store.clone(), keys(), fast(), 4, "w2", 2).unwrap();
+    let r = b.append_fence();
+    assert!(
+        matches!(&r, Err(Error::Timeout(m)) if m.contains("retry the takeover")),
+        "{r:?}"
+    );
+    assert_eq!(
+        store.log_puts.load(Relaxed),
+        65,
+        "64 steps after the first PUT"
+    );
+    let fences = mem
+        .list(&keys().log_prefix(1))
+        .unwrap()
+        .iter()
+        .filter(|k| {
+            matches!(
+                decode_record(&mem.get(k).unwrap().unwrap().body).unwrap(),
+                LogRecord::Fence { .. }
+            )
+        })
+        .count();
+    assert_eq!(fences, 0, "no fence anywhere in the log");
 }
 
 #[test]
@@ -1628,7 +1871,7 @@ fn raise_epoch_keeps_writer_generation_and_manifest() {
     let mut b = f.create(fast(), 4);
     b.seal_generation(pages(1), 4096, 1).unwrap();
     let before = f.stored_head();
-    assert_eq!(b.raise_epoch(), Ok(before.epoch + 1));
+    assert_eq!(b.raise_epoch(), Ok(Some(before.epoch + 1)));
     let want = Head {
         epoch: before.epoch + 1,
         ..before.clone()
@@ -1637,7 +1880,11 @@ fn raise_epoch_keeps_writer_generation_and_manifest() {
 
     f.fault.only_keys_containing("/head");
     f.fault.store_then_fail_next_puts(1);
-    assert_eq!(b.raise_epoch(), Ok(want.epoch + 1), "landed, reply lost");
+    assert_eq!(
+        b.raise_epoch(),
+        Ok(Some(want.epoch + 1)),
+        "landed, reply lost"
+    );
     assert_eq!(f.stored_head().epoch, want.epoch + 1);
     f.fault.only_keys_containing("");
     assert_eq!(b.seal_generation(vec![], 4096, 1), Ok(3));
