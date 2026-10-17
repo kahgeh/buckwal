@@ -652,13 +652,13 @@ impl ObjectStore for HeadGetsFail {
 
 #[test]
 fn uploader_is_degraded_while_window_syncs_are_owed() {
-    // With an idle threshold of 0 every append GETs the head first (`check_idle`). While
+    // With a lease of 0 every append GETs the head first (`check_lease`). While
     // those GETs fail, the record is never built: no PUT is sent, so the bucket has nothing
     // to settle (not fenced, nothing in doubt, no seal pending) and is not degraded itself.
     // Only the owed Window sync makes the uploader degraded.
     let store = Arc::new(HeadGetsFail::default());
     let mut b = bucket_with(store.clone(), short());
-    b.set_idle_threshold(Duration::ZERO);
+    b.set_lease(Duration::ZERO);
     let u = Uploader::spawn(b, None, None, Arc::default());
     store.failing.store(true, SeqCst);
     let t = u.submit_log(op(1), window(10, 64));
@@ -711,7 +711,7 @@ fn wait_not_failing(u: &Uploader, within: Duration) {
     }
 }
 
-/// An Off sync that fails before its record is built (the idle check's head GET fails)
+/// An Off sync that fails before its record is built (the lease check's head GET fails)
 /// leaves nothing owed and nothing in doubt: not degraded, but "last bucket operation
 /// failed". On an idle database the uploader probes the bucket (one head GET per wake)
 /// until one succeeds, so maintenance is not skipped forever after the bucket recovers.
@@ -719,7 +719,7 @@ fn wait_not_failing(u: &Uploader, within: Duration) {
 fn last_failed_is_probed_until_the_bucket_answers() {
     let store = Arc::new(HeadGetsFail::default());
     let mut b = bucket_with(store.clone(), short());
-    b.set_idle_threshold(Duration::ZERO);
+    b.set_lease(Duration::ZERO);
     let u = Uploader::spawn(b, None, None, Arc::default());
     store.failing.store(true, SeqCst);
     assert!(matches!(
@@ -743,7 +743,7 @@ fn last_failed_is_probed_until_the_bucket_answers() {
 }
 
 /// A failed seal (a page PUT refused) on an idle bucket: nothing owed, not degraded, and
-/// the idle check not due. The uploader still sends a head GET before it clears the
+/// the lease check not due. The uploader still sends a head GET before it clears the
 /// failure; it does not take "nothing to settle" for a working bucket.
 #[test]
 fn a_failed_seal_on_an_idle_bucket_clears_only_after_a_head_get() {

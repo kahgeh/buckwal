@@ -17,6 +17,17 @@ fn config(dir: &Path) -> Config {
     c
 }
 
+/// `config` with a lease of `lease` and the smallest valid budget around it: retry deadline
+/// and request timeout 100 ms, trim grace 1 s.
+fn config_with_lease(dir: &Path, lease: Duration) -> Config {
+    let mut c = config(dir);
+    c.lease = lease;
+    c.retry_deadline = Duration::from_millis(100);
+    c.request_timeout = Duration::from_millis(100);
+    c.trim_grace = Duration::from_secs(1);
+    c
+}
+
 fn mem() -> Arc<MemStore> {
     Arc::new(MemStore::new())
 }
@@ -1001,14 +1012,13 @@ fn old_writer_commit_crossing_its_boundary_after_claim_and_seal_is_fenced() {
 
 /// The merge review of the B1 fix: B claims, commits and seals G, and B's trimmer deletes
 /// `log/G`. An idle old writer A then commits normally: its record would land in the empty
-/// `log/G`, which no restore reads, and the commit would be acked. With A's trim grace (and
-/// so its idle threshold) at zero, A checks the head before that append and is fenced.
+/// `log/G`, which no restore reads, and the commit would be acked. With A's lease at zero,
+/// A checks the head before that append and is fenced.
 #[test]
 fn idle_old_writer_appending_into_trimmed_log_is_fenced() {
     let store = mem();
     let a = tempdir();
-    let mut cfg_a = config(a.path());
-    cfg_a.trim_grace = Duration::ZERO;
+    let cfg_a = config_with_lease(a.path(), Duration::ZERO);
     let db_a = open_with_store(cfg_a, store.clone()).unwrap();
     let ca = db_a.connect().unwrap();
     create(&ca);
@@ -1058,15 +1068,14 @@ fn idle_old_writer_appending_into_trimmed_log_is_fenced() {
     assert_eq!(ids(&c), acked);
 }
 
-/// A single writer that checks the head before every append (trim grace zero) commits,
-/// seals and commits again as usual: its own head (and the one each seal moves it to)
-/// lets every append proceed.
+/// A single writer that checks the head before every append and every page PUT (lease
+/// zero) commits, seals and commits again as usual: its own head (and the one each seal
+/// moves it to) lets every append and page PUT proceed.
 #[test]
-fn single_writer_with_idle_check_on_every_append_keeps_working() {
+fn single_writer_with_lease_check_on_every_append_keeps_working() {
     let store = mem();
     let a = tempdir();
-    let mut cfg = config(a.path());
-    cfg.trim_grace = Duration::ZERO;
+    let cfg = config_with_lease(a.path(), Duration::ZERO);
     let db = open_with_store(cfg.clone(), store.clone()).unwrap();
     let c = db.connect().unwrap();
     create(&c);
@@ -1111,18 +1120,14 @@ fn head_and_log_events(events: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The `/2` margin, end to end: with `trim_grace` = 200 ms a commit right after another
-/// makes no head GET, and a commit after 120 ms of idle (past the 100 ms threshold) GETs the
-/// head before its log PUT.
+/// The lease, end to end: with `lease` = 100 ms a commit right after another makes no head
+/// GET, and a commit after 120 ms of idle (past the lease) GETs the head before its log PUT.
 #[test]
-fn commit_after_half_the_trim_grace_checks_the_head() {
+fn commit_after_the_lease_checks_the_head() {
     let mem = mem();
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let a = tempdir();
-    let mut cfg = config(a.path());
-    cfg.trim_grace = Duration::from_millis(200);
-    cfg.retry_deadline = Duration::from_millis(40);
-    cfg.request_timeout = Duration::from_millis(50);
+    let cfg = config_with_lease(a.path(), Duration::from_millis(100));
     let db = open_with_store(cfg, fault.clone()).unwrap();
     let c = db.connect().unwrap();
     create(&c);
@@ -1148,10 +1153,9 @@ fn commit_after_half_the_trim_grace_checks_the_head() {
 }
 
 /// The claim record (and any record appended before the engine opens) uses the configured
-/// threshold, not the built-in one: with `trim_grace` = 0 the claimer GETs the head right
-/// before it.
+/// lease, not the built-in one: with `lease` = 0 the claimer GETs the head right before it.
 #[test]
-fn claim_record_append_uses_the_configured_idle_threshold() {
+fn claim_record_append_uses_the_configured_lease() {
     let mem = mem();
     let a = tempdir();
     let db_a = open_mem(&mem, a.path());
@@ -1163,8 +1167,7 @@ fn claim_record_append_uses_the_configured_idle_threshold() {
     let r = tempdir();
     restore_with_store(&config(r.path()), mem.clone(), r.path()).unwrap();
     let fault = Arc::new(FaultStore::new(mem.clone()));
-    let mut cfg = config(r.path());
-    cfg.trim_grace = Duration::ZERO;
+    let cfg = config_with_lease(r.path(), Duration::ZERO);
     let db_b = open_with_store(cfg, fault.clone()).unwrap();
     let ev = fault.events();
     let claim_put = format!("put_if_absent {}", keys().log(gen, next));

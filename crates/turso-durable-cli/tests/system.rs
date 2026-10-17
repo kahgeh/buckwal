@@ -25,7 +25,7 @@ const WINDOW: &str = "window 20ms 64 1MiB";
 /// Settings a test may set; every child gets them removed first, so the caller's
 /// environment never leaks into a test. `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not
 /// here: `scripts/test.sh` sets them so the children export under its run id.
-const OPTIONAL: [&str; 10] = [
+const OPTIONAL: [&str; 11] = [
     "DURABLE_PREFIX",
     "DURABLE_RETRY_DEADLINE_MS",
     "DURABLE_REQUEST_TIMEOUT_MS",
@@ -36,6 +36,7 @@ const OPTIONAL: [&str; 10] = [
     "DURABLE_MAINTENANCE_LOG_OBJECTS",
     "DURABLE_MAINTENANCE_WAL_MIB",
     "DURABLE_MAINTENANCE_GATE_WAIT_MS",
+    "DURABLE_LEASE_MS",
 ];
 
 /// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`.
@@ -1431,7 +1432,12 @@ fn mvcc_pragma_refused_then_all_acks_restore() {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn trimming_bounds_restore_gets() {
-    let ctx = Ctx::new("trimming_bounds_restore_gets").set("DURABLE_TRIM_GRACE_SECS", "0");
+    // The smallest valid grace: 2 s > lease 0 + 400 ms + 500 ms.
+    let ctx = Ctx::new("trimming_bounds_restore_gets")
+        .set("DURABLE_TRIM_GRACE_SECS", "2")
+        .set("DURABLE_LEASE_MS", "0")
+        .set("DURABLE_RETRY_DEADLINE_MS", "400")
+        .set("DURABLE_REQUEST_TIMEOUT_MS", "500");
     let dir = ctx.dir("db");
     let args = [
         "--checkpoint",

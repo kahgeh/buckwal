@@ -6,12 +6,13 @@
 //! at the same position before anything else is written, and a position or head held by
 //! another writer fences this one for good.
 
+use crate::clock::Stamp;
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
 use crate::format::{encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
 use crate::store::{with_retry, CondPut, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::Span;
@@ -50,7 +51,7 @@ pub(crate) struct Appended {
 pub(crate) struct AppendFailure {
     pub error: Error,
     /// `Some(syncs)`, the syncs as passed, when no PUT of this record was attempted: the call
-    /// failed before the record was built (fenced already, or in `check_head`, `check_idle`
+    /// failed before the record was built (fenced already, or in `check_head`, `check_lease`
     /// or `settle`). They are in no object and owed nowhere, so they may be sent again.
     /// `None` when the record went to `put_log`: it is in doubt (owed at its seq, settled by
     /// the next call) or the writer is fenced. Its syncs must not be sent in another record.
@@ -70,6 +71,14 @@ struct InDoubt {
 struct PendingSeal {
     head: Head,
     manifest: Manifest,
+}
+
+/// How a round of a seal's page PUTs ended (`Bucket::put_pages_until_lapse`).
+enum Lapse {
+    /// Every page of the round is uploaded.
+    Done,
+    /// The lease lapsed first: these indices (into the seal's pages) are not uploaded yet.
+    Remaining(Vec<usize>),
 }
 
 /// What a GET of the head says about a pending seal.
@@ -95,14 +104,14 @@ pub(crate) struct Bucket {
     /// generation + 1, so nothing may go to this generation until that is known.
     pending_seal: Option<PendingSeal>,
     fenced: bool,
-    /// The idle timer (`check_idle`): when the request behind the last confirmation was sent.
-    /// It is refreshed by a confirmed log record (`put_log`), a confirmed head write
-    /// (`put_head`, and `create`'s), open's head read (`attach`), and a head GET that passes
-    /// `check_head` (unchanged) or `verify_head`. A failed or ambiguous request refreshes
+    /// The lease (`check_lease`): when the request behind the last confirmation was sent, on
+    /// both clocks. It is renewed by a confirmed log record (`put_log`), a confirmed head
+    /// write (`put_head`, and `create`'s), open's head read (`attach`), and a head GET that
+    /// passes `check_head` (unchanged) or `verify_head`. A failed or ambiguous request renews
     /// nothing, and neither do page and manifest PUTs (which only makes the check run sooner).
-    last_confirmed: Instant,
-    /// See `set_idle_threshold`.
-    idle_threshold: Duration,
+    last_confirmed: Stamp,
+    /// See `set_lease`.
+    lease: Duration,
     counters: Arc<Counters>,
     events: Option<EventHook>,
 }
@@ -152,13 +161,13 @@ pub(crate) const RESTORE_AGAIN: &str =
 /// claim, an old writer restarting on its own disk is fenced by the writer-id check at
 /// attach. A still-running one is fenced at its next append: through the claim record when
 /// it appends within the trim grace, and otherwise (`log/G` may be trimmed by then) through
-/// the idle head check before that append (`Bucket::check_idle`, under the trim-grace
-/// assumptions it lists). It is also fenced at the start of its next seal
+/// the lease's head check before that append (`Bucket::check_lease`, under the assumption it
+/// lists). It is also fenced at the start of its next seal
 /// (`Bucket::seal_start`: its seal-start record collides, or the head moved), before it
-/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed.
-/// The log stays linear; stage 3's lease closes the remaining races (`seal_start` names
-/// one). Such a generation holds the old writer's records, then the new one's, which
-/// `restore::generation_image` accepts.
+/// uploads a page or a manifest, so it cannot overwrite a generation the new writer sealed,
+/// and its page and manifest PUTs stop at the first lapse of its lease (`Bucket::seal`).
+/// The log stays linear. Such a generation holds the old writer's records, then the new
+/// one's, which `restore::generation_image` accepts.
 pub(crate) fn claim(
     store: &dyn ObjectStore,
     keys: &Keys,
@@ -219,8 +228,8 @@ impl Bucket {
         head_etag: String,
     ) -> Bucket {
         Bucket {
-            last_confirmed: Instant::now(),
-            idle_threshold: crate::config::defaults::TRIM_GRACE / 2,
+            last_confirmed: Stamp::now(),
+            lease: crate::config::defaults::LEASE,
             store,
             keys,
             retry,
@@ -264,7 +273,7 @@ impl Bucket {
         let body = head.encode();
         let key = keys.head();
         let counters = Counters::default();
-        let sent = Instant::now();
+        let sent = Stamp::now();
         let exists = || Error::Config("a database already exists at this prefix".into());
         let r = retrying(&counters, &retry, &key, || store.put_if_absent(&key, &body))?;
         let etag = match r {
@@ -300,7 +309,7 @@ impl Bucket {
     ) -> Result<Bucket> {
         let counters = Counters::default();
         let key = keys.head();
-        let sent = Instant::now();
+        let sent = Stamp::now();
         let obj = retrying(&counters, &retry, &key, || store.get(&key))?
             .ok_or_else(|| Error::NotFound("head".into()))?;
         let head = Head::decode(&obj.body)?;
@@ -368,19 +377,17 @@ impl Bucket {
         self.counters.clone()
     }
 
-    /// Appends after this long without a confirmed write check the head first
-    /// (`check_idle`). The engine sets half the trim grace; zero checks before every append.
-    pub(crate) fn set_idle_threshold(&mut self, t: Duration) {
-        self.idle_threshold = t;
+    /// The lease (`check_lease`): the engine sets `Config::lease`; zero checks the head before
+    /// every append and every round of page PUTs.
+    pub(crate) fn set_lease(&mut self, lease: Duration) {
+        self.lease = lease;
     }
 
-    /// Move the idle timer back by `by`, as if the last confirmed write were that much older.
+    /// Move the last confirmation back by `instant_by` on the monotonic clock and `wall_by`
+    /// on the wall clock, as if it were that much older on each.
     #[cfg(test)]
-    pub(crate) fn age_idle_timer(&mut self, by: Duration) {
-        self.last_confirmed = self
-            .last_confirmed
-            .checked_sub(by)
-            .expect("an instant that far back");
+    pub(crate) fn age_lease(&mut self, instant_by: Duration, wall_by: Duration) {
+        self.last_confirmed.back(instant_by, wall_by);
     }
 
     pub(crate) fn set_event_hook(&mut self, events: Option<EventHook>) {
@@ -502,7 +509,7 @@ impl Bucket {
     }
 
     /// Resolve what an earlier failure left owed, without writing a new record: a pending
-    /// seal's head (`check_head`), the idle check (`check_idle`), then the in-doubt record
+    /// seal's head (`check_head`), the lease (`check_lease`), then the in-doubt record
     /// (`settle`). With nothing owed it sends no PUT. One deadline, counted from its start.
     /// A head that a pending seal published is left for the next seal to adopt (`Ok`).
     pub(crate) fn catch_up(&mut self) -> Result<()> {
@@ -527,12 +534,12 @@ impl Bucket {
         self.verify_head_with(&once).map_err(upload_error)
     }
 
-    /// `check_head`, then `check_idle` and `settle` unless the head is `Published`.
+    /// `check_head`, then `check_lease` and `settle` unless the head is `Published`.
     fn catch_up_at(&mut self, start: Instant) -> Result<HeadCheck> {
         if let published @ HeadCheck::Published(_) = self.check_head(start)? {
             return Ok(published);
         }
-        self.check_idle(start)?;
+        self.check_lease(start)?;
         self.settle(start)?;
         Ok(HeadCheck::Unmoved)
     }
@@ -543,26 +550,24 @@ impl Bucket {
         self.fenced || self.in_doubt.is_some() || self.pending_seal.is_some()
     }
 
-    /// The idle self-check before an append. Another writer's claim record fences this one at
-    /// its next append, but only while `log/G` exists: once that writer has sealed G and its
+    /// The lease check before an append. Another writer's claim record fences this one at its
+    /// next append, but only while `log/G` exists: once that writer has sealed G and its
     /// trimmer has deleted `log/G` (its trim grace after the seal), this writer's next record
-    /// would land in a log no restore reads, and its commit would be acked. So an append after
-    /// `idle_threshold` (half this writer's trim grace) without a refresh of the idle timer
-    /// GETs the head first, within the call's deadline (`verify_head`): ours, it proceeds;
-    /// anything else fences.
+    /// would land in a log no restore reads, and its commit would be acked. So an append once
+    /// `lease` has passed since the last confirmation (`last_confirmed`, on the larger of the
+    /// monotonic and the wall clock, so a machine that slept counts its sleep) GETs the head
+    /// first, within the call's deadline (`verify_head`): ours, it proceeds and the lease is
+    /// renewed; anything else fences. A seal checks the lease before each page and manifest
+    /// PUT attempt instead (`seal`).
     ///
-    /// This holds only under assumptions that nothing here enforces (README, Settings):
-    /// - every writer on the prefix uses the same trim grace; a claimer whose grace is
-    ///   smaller than this writer's can trim `log/G` before this writer's check is due;
-    /// - the trim grace exceeds 2 × (retry deadline + request timeout): an append that
-    ///   skipped the check can still land up to trim grace / 2 + retry deadline + request
-    ///   timeout after the timer's last refresh, which stays below the trim grace only then;
-    /// - a trim grace of 0 (tests only) checks before every append, but the claimer's
-    ///   trimmer then deletes `log/G` at once, inside any in-flight append's window.
-    ///
-    /// Stage 3's lease replaces this.
-    fn check_idle(&mut self, start: Instant) -> Result<()> {
-        if self.last_confirmed.elapsed() < self.idle_threshold {
+    /// An append that skipped the check sends its last attempt within `lease` +
+    /// `retry_deadline` of the last confirmation, and that attempt ends within
+    /// `request_timeout`; `Config::validate` requires the trim grace to exceed that sum.
+    /// Against another process this holds only if that process's trim grace exceeds this
+    /// writer's sum too (README, Settings): nothing in the bucket records another process's
+    /// settings.
+    fn check_lease(&mut self, start: Instant) -> Result<()> {
+        if self.last_confirmed.age() < self.lease {
             return Ok(());
         }
         self.verify_head(start)
@@ -579,7 +584,7 @@ impl Bucket {
         };
         let pending_body = pending.head.encode();
         let key = self.keys.head();
-        let sent = Instant::now();
+        let sent = Stamp::now();
         let stored = retrying(&self.counters, &self.remaining(start), &key, || {
             self.store.get(&key)
         })?;
@@ -649,7 +654,7 @@ impl Bucket {
             seq: self.seq,
         };
         let key = self.keys.log(pos.generation, pos.seq);
-        let sent = Instant::now();
+        let sent = Stamp::now();
         match self.put_log_at(start, &key, &body) {
             Ok(()) => {
                 self.last_confirmed = sent;
@@ -771,9 +776,16 @@ impl Bucket {
         // Pages and the manifest are unreferenced until the head moves: plain puts. A failed
         // seal whose head never landed may overwrite them next time (`check_head` above
         // ensures a published one is adopted instead). `seal_start` ensured no other writer
-        // has taken this generation over, so these puts never touch a generation another
-        // writer sealed (apart from the race its comment names).
-        self.put_pages(start, gen, &pages)?;
+        // had taken this generation over, and each PUT attempt is sent only inside the lease:
+        // at a lapse the workers stop, the head is read again (renewing the lease, or fencing
+        // this writer) and the pages not yet uploaded resume. So no page or manifest PUT goes
+        // out more than `lease` after this writer last saw its own head (a zero lease, for
+        // tests, lets each worker send one attempt right after each head check).
+        let mut todo: Vec<usize> = (0..pages.len()).collect();
+        while let Lapse::Remaining(rest) = self.put_pages_until_lapse(start, gen, &pages, &todo)? {
+            self.renew_lease(start, rest.len() < todo.len())?;
+            todo = rest;
+        }
 
         let dirty: BTreeSet<u32> = pages.iter().map(|(p, _)| *p).collect();
         let empty = Manifest {
@@ -788,9 +800,16 @@ impl Bucket {
             .sealed(gen, &dirty, page_size, page_count);
         let key = self.keys.manifest(gen);
         let body = manifest.encode();
-        retrying(&self.counters, &self.remaining(start), &key, || {
-            self.store.put(&key, &body)
-        })?;
+        // The page PUTs, not a head check, came just before: no free attempt (a zero lease
+        // checks the head first).
+        let mut free = false;
+        while self
+            .retrying_in_lease(start, &key, &mut free, || self.store.put(&key, &body))?
+            .is_none()
+        {
+            self.renew_lease(start, false)?;
+            free = self.lease.is_zero();
+        }
 
         let head = self.sealed_head();
         // From the first head attempt until a definite answer, the head may be published.
@@ -817,8 +836,9 @@ impl Bucket {
     ///    deleted `log/G` (another writer sealed G and its grace passed), and a claimer's head
     ///    write precedes its claim record; a moved head fences.
     ///
-    /// What remains (stage 3's lease): a claimer that restores and claims after step 2 lands
-    /// its claim record after ours and may seal G while this seal's page puts are in flight.
+    /// A claimer that restores and claims after step 2 lands its claim record after ours and
+    /// may seal G while this seal's page PUTs are in flight: those stop at the first lapse of
+    /// the lease, whose head check fences this writer (`seal`).
     fn seal_start(&mut self, start: Instant) -> Result<()> {
         let body = encode_record(&LogRecord::Extents {
             writer_id: self.head.writer_id.clone(),
@@ -839,7 +859,7 @@ impl Bucket {
     /// `verify_head` under `policy`.
     fn verify_head_with(&mut self, policy: &RetryPolicy) -> Result<()> {
         let key = self.keys.head();
-        let sent = Instant::now();
+        let sent = Stamp::now();
         let stored = retrying(&self.counters, policy, &key, || self.store.get(&key))?;
         let ours = self.sealed_head().encode();
         match stored {
@@ -861,29 +881,85 @@ impl Bucket {
         }
     }
 
-    /// Upload `pages` of generation `gen`, `concurrency` at a time; the first error wins.
-    fn put_pages(&self, start: Instant, gen: u64, pages: &[(u32, Vec<u8>)]) -> Result<()> {
+    /// `retrying` for a seal's PUTs: each attempt, retries included, is sent only inside the
+    /// lease; the first one refused ends the call with `None` (nothing sent, not counted as a
+    /// retry). A zero lease (tests) would refuse every attempt, so there each worker sends one
+    /// attempt after each head check: `free` starts true for a zero lease and the first
+    /// attempt spends it.
+    fn retrying_in_lease<T>(
+        &self,
+        start: Instant,
+        what: &str,
+        free: &mut bool,
+        mut op: impl FnMut() -> std::result::Result<T, StoreError>,
+    ) -> Result<Option<T>> {
+        with_retry(&self.remaining(start), what, |attempt| {
+            if !(std::mem::take(free) || self.last_confirmed.age() < self.lease) {
+                return Ok(None);
+            }
+            if attempt > 0 {
+                self.counters.retries.fetch_add(1, Relaxed);
+            }
+            op().map(Some)
+        })
+    }
+
+    /// The lease lapsed during a seal: GET the head (`verify_head`), which renews it or fences
+    /// this writer. A round that uploaded nothing (`progressed` false) after the call's
+    /// deadline ends the seal with `Timeout` instead: the head checks themselves outlast the
+    /// lease, and the seal would never move on.
+    fn renew_lease(&mut self, start: Instant, progressed: bool) -> Result<()> {
+        let elapsed = start.elapsed();
+        if !progressed && elapsed >= self.retry.deadline {
+            return Err(Error::Timeout(format!(
+                "seal of generation {}: the lease ({:?}) lapsed again after {elapsed:?}",
+                self.head.generation, self.lease
+            )));
+        }
+        self.verify_head(start)
+    }
+
+    /// Upload the pages at indices `todo` of `pages` (generation `gen`), `concurrency` at a
+    /// time; the first error wins. Each attempt goes through `retrying_in_lease`: the first
+    /// refused attempt stops every worker, and the indices not uploaded come back as
+    /// `Lapse::Remaining` for the caller to renew the lease and resume.
+    fn put_pages_until_lapse(
+        &self,
+        start: Instant,
+        gen: u64,
+        pages: &[(u32, Vec<u8>)],
+        todo: &[usize],
+    ) -> Result<Lapse> {
         let next = AtomicUsize::new(0);
         let failed: Mutex<Option<Error>> = Mutex::new(None);
-        let workers = self.concurrency.min(pages.len());
+        let lapsed = AtomicBool::new(false);
+        let refused: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let workers = self.concurrency.min(todo.len());
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::scope(|s| {
             for _ in 0..workers {
                 s.spawn(|| {
+                    let mut free = self.lease.is_zero();
                     tracing::dispatcher::with_default(&dispatch, || loop {
-                        if failed.lock().unwrap().is_some() {
+                        if failed.lock().unwrap().is_some() || lapsed.load(Relaxed) {
                             return;
                         }
-                        let Some((page, body)) = pages.get(next.fetch_add(1, Relaxed)) else {
+                        let Some(&i) = todo.get(next.fetch_add(1, Relaxed)) else {
                             return;
                         };
+                        let (page, body) = &pages[i];
                         let key = self.keys.page(gen, *page);
-                        let r = retrying(&self.counters, &self.remaining(start), &key, || {
+                        let r = self.retrying_in_lease(start, &key, &mut free, || {
                             self.store.put(&key, body)
                         });
                         match r {
-                            Ok(_) => {
+                            Ok(Some(_)) => {
                                 self.counters.page_puts.fetch_add(1, Relaxed);
+                            }
+                            Ok(None) => {
+                                refused.lock().unwrap().push(i);
+                                lapsed.store(true, Relaxed);
+                                return;
                             }
                             Err(e) => {
                                 failed.lock().unwrap().get_or_insert(e);
@@ -894,10 +970,17 @@ impl Bucket {
                 });
             }
         });
-        match failed.into_inner().unwrap() {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = failed.into_inner().unwrap() {
+            return Err(e);
         }
+        if !lapsed.into_inner() {
+            return Ok(Lapse::Done);
+        }
+        // Refused ones, then those no worker took.
+        let mut rest = refused.into_inner().unwrap();
+        rest.extend_from_slice(&todo[next.into_inner().min(todo.len())..]);
+        rest.sort_unstable();
+        Ok(Lapse::Remaining(rest))
     }
 
     /// Move the head with `put_if_match`; returns its new ETag. A 412 is ours only when the
@@ -906,7 +989,7 @@ impl Bucket {
         let key = self.keys.head();
         let body = head.encode();
         let c = &self.counters;
-        let sent = Instant::now();
+        let sent = Stamp::now();
         let r = retrying(c, &self.remaining(start), &key, || {
             self.store.put_if_match(&key, &body, &self.head_etag)
         })?;

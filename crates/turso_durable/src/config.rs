@@ -25,6 +25,9 @@ pub mod defaults {
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
     /// Parallel uploads in a seal, and parallel log fetches in a restore.
     pub const UPLOAD_CONCURRENCY: usize = 16;
+    /// How long a writer trusts its last look at the head (`DURABLE_LEASE_MS`): past it, the
+    /// next append, page PUT or manifest PUT re-reads the head first.
+    pub const LEASE: Duration = Duration::from_secs(30);
     /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
     /// Fetch every sealed page in the background after open.
@@ -94,7 +97,15 @@ pub struct Config {
     pub retry_deadline: Duration,
     pub request_timeout: Duration,
     pub upload_concurrency: usize,
+    /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
+    /// It must exceed `lease + retry_deadline + request_timeout` (`Config` otherwise).
     pub trim_grace: Duration,
+    /// How long the writer trusts its last confirmation that the head is still its own: a
+    /// confirmed log record or head write, or a head GET that found its head. Past it (on
+    /// either the monotonic or the wall clock), the next append, and each page or manifest
+    /// PUT attempt of a seal, GETs the head first; another writer's head fences this one.
+    /// 0 checks before every append and page PUT (tests).
+    pub lease: Duration,
     pub prefetch: bool,
     /// How commits are gathered into one upload (`DURABLE_BATCHING`).
     pub batching: Batching,
@@ -129,6 +140,7 @@ impl fmt::Debug for Config {
             .field("request_timeout", &self.request_timeout)
             .field("upload_concurrency", &self.upload_concurrency)
             .field("trim_grace", &self.trim_grace)
+            .field("lease", &self.lease)
             .field("prefetch", &self.prefetch)
             .field("batching", &self.batching)
             .field("maintenance_log_objects", &self.maintenance_log_objects)
@@ -140,7 +152,7 @@ impl fmt::Debug for Config {
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 16] = [
+const ENV_VARS: [&str; 17] = [
     "DURABLE_ENDPOINT",
     "DURABLE_REGION",
     "DURABLE_PATH_STYLE",
@@ -157,6 +169,7 @@ const ENV_VARS: [&str; 16] = [
     "DURABLE_MAINTENANCE_LOG_OBJECTS",
     "DURABLE_MAINTENANCE_WAL_MIB",
     "DURABLE_MAINTENANCE_GATE_WAIT_MS",
+    "DURABLE_LEASE_MS",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -226,6 +239,7 @@ impl Config {
             request_timeout: defaults::REQUEST_TIMEOUT,
             upload_concurrency: defaults::UPLOAD_CONCURRENCY,
             trim_grace: defaults::TRIM_GRACE,
+            lease: defaults::LEASE,
             prefetch: defaults::PREFETCH,
             batching: defaults::BATCHING,
             maintenance_log_objects: defaults::MAINTENANCE_LOG_OBJECTS,
@@ -280,6 +294,9 @@ impl Config {
         if let Some(v) = get("DURABLE_TRIM_GRACE_SECS") {
             c.trim_grace = Duration::from_secs(parse_num("DURABLE_TRIM_GRACE_SECS", &v)?);
         }
+        if let Some(v) = get("DURABLE_LEASE_MS") {
+            c.lease = Duration::from_millis(parse_num("DURABLE_LEASE_MS", &v)?);
+        }
         if let Some(v) = get("DURABLE_PREFETCH") {
             c.prefetch = parse_bool("DURABLE_PREFETCH", &v)?;
         }
@@ -324,11 +341,16 @@ impl Config {
                 "upload_concurrency must be at least 1".into(),
             ));
         }
-        let budget = self.retry_deadline.saturating_add(self.request_timeout);
-        if !self.trim_grace.is_zero() && self.trim_grace <= budget.saturating_mul(2) {
+        // A writer's last request inside its lease lands within this long of its last head
+        // check (`Bucket::check_lease`); the trim grace must outlast it. No exception for 0.
+        let budget = self
+            .lease
+            .saturating_add(self.retry_deadline)
+            .saturating_add(self.request_timeout);
+        if self.trim_grace <= budget {
             return Err(Error::Config(format!(
-                "trim_grace ({:?}) must exceed 2 × (retry_deadline ({:?}) + request_timeout ({:?}))",
-                self.trim_grace, self.retry_deadline, self.request_timeout
+                "trim_grace ({:?}) must exceed lease ({:?}) + retry_deadline ({:?}) + request_timeout ({:?})",
+                self.trim_grace, self.lease, self.retry_deadline, self.request_timeout
             )));
         }
         self.batching.validate()?;
@@ -356,7 +378,8 @@ impl Config {
             },
             upload_concurrency: self.upload_concurrency,
             prefetch: self.prefetch,
-            trim_grace: self.trim_grace,
+            lease: self.lease,
+            request_timeout: self.request_timeout,
             events: self.on_event.clone(),
             read_only,
         }
@@ -436,14 +459,6 @@ pub enum Event {
     MaintenanceSkipped { generation: u64, reason: String },
 }
 
-impl EngineConfig {
-    /// A writer idle this long checks the head before its next append
-    /// (`Bucket::set_idle_threshold`, `Bucket::check_idle`): half the trim grace.
-    pub(crate) fn idle_threshold(&self) -> Duration {
-        self.trim_grace / 2
-    }
-}
-
 /// How the engine talks to the bucket.
 #[derive(Clone)]
 pub(crate) struct EngineConfig {
@@ -454,9 +469,12 @@ pub(crate) struct EngineConfig {
     pub upload_concurrency: usize,
     /// Fetch every sealed page in the background after open.
     pub prefetch: bool,
-    /// The trimmer's grace; the writer's idle self-check runs after half of it
-    /// (`Bucket::set_idle_threshold`).
-    pub trim_grace: Duration,
+    /// The writer's lease (`Bucket::set_lease`, `Bucket::check_lease`).
+    pub lease: Duration,
+    /// How long one HTTP request may take: the S3 store's own setting, here for the waits
+    /// that must outlast a request in flight.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub request_timeout: Duration,
     pub events: Option<EventHook>,
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are
     /// refused (`ShippingFile`, `BucketDbStorage`).
@@ -467,37 +485,54 @@ pub(crate) struct EngineConfig {
 mod tests {
     use super::*;
 
-    /// The idle check's margin is exactly half the trim grace (`Bucket::check_idle`).
+    /// `trim_grace` must exceed `lease + retry_deadline + request_timeout`, and 0 is refused
+    /// like any other value: an append or page PUT sent inside the lease lands within that
+    /// sum of the writer's last head check, and only then before another writer's GC.
     #[test]
-    fn idle_threshold_is_half_the_trim_grace() {
+    fn trim_grace_must_exceed_lease_and_request_budget() {
         let mut c = Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s");
-        c.trim_grace = Duration::from_millis(200);
-        assert_eq!(c.engine(false).idle_threshold(), Duration::from_millis(100));
-        c.trim_grace = Duration::ZERO;
-        assert_eq!(c.engine(false).idle_threshold(), Duration::ZERO);
-        c.trim_grace = Duration::from_secs(600);
-        assert_eq!(c.engine(false).idle_threshold(), Duration::from_secs(300));
-    }
-    #[test]
-    fn trim_grace_must_exceed_twice_the_request_budget() {
-        let mut c = Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s");
+        assert_eq!(c.validate(), Ok(()), "defaults: 600 s > 70 s");
+        c.lease = Duration::from_secs(30);
         c.retry_deadline = Duration::from_secs(30);
         c.request_timeout = Duration::from_secs(10);
-        c.trim_grace = Duration::from_secs(80); // == 2 × 40 s: refused
+        c.trim_grace = Duration::from_secs(70); // == 30 + 30 + 10 s: refused
         assert!(matches!(c.validate(), Err(Error::Config(m))
-            if m.contains("trim_grace") && m.contains("retry_deadline") && m.contains("request_timeout")));
-        c.trim_grace = Duration::from_secs(81);
+            if m.contains("trim_grace") && m.contains("lease")
+                && m.contains("retry_deadline") && m.contains("request_timeout")));
+        c.trim_grace = Duration::from_secs(71);
         assert_eq!(c.validate(), Ok(()));
-        c.trim_grace = Duration::ZERO; // tests only, still allowed
+        c.trim_grace = Duration::ZERO; // no exception for 0
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("trim_grace")));
+        // A zero lease still needs the request budget.
+        c.lease = Duration::ZERO;
+        c.trim_grace = Duration::from_secs(40);
+        assert!(matches!(c.validate(), Err(Error::Config(_))));
+        c.trim_grace = Duration::from_secs(41);
         assert_eq!(c.validate(), Ok(()));
         // Huge durations saturate instead of panicking.
         c.retry_deadline = Duration::MAX;
+        c.lease = Duration::MAX;
         c.trim_grace = Duration::from_secs(1);
         assert!(matches!(c.validate(), Err(Error::Config(_))));
-        assert_eq!(
-            Config::new("/tmp/x", "http://h", "b", "k", "s").validate(),
-            Ok(())
-        ); // defaults: 600 s > 80 s
+    }
+
+    #[test]
+    fn lease_from_env() {
+        let mut env = required();
+        env.insert("DURABLE_LEASE_MS", "1500");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(c.lease, Duration::from_millis(1500));
+        assert_eq!(c.engine(false).lease, Duration::from_millis(1500));
+        let env = required();
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(c.lease, Duration::from_secs(30));
+        assert_eq!(defaults::LEASE, Duration::from_secs(30));
+        let mut env = required();
+        env.insert("DURABLE_LEASE_MS", "soon");
+        match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+            Err(Error::Config(m)) => assert!(m.contains("DURABLE_LEASE_MS"), "{m}"),
+            r => panic!("{r:?}"),
+        }
     }
 
     use std::collections::HashMap;
@@ -521,11 +556,15 @@ mod tests {
         assert_eq!(c.request_timeout, Duration::from_secs(10));
         assert_eq!(c.upload_concurrency, 16);
         assert_eq!(c.trim_grace, Duration::from_secs(600));
+        assert_eq!(c.lease, Duration::from_secs(30));
         assert!(!c.prefetch);
         assert!(!format!("{c:?}").contains("sk\""), "the secret is printed");
         let mut c = c;
         c.retry_deadline = Duration::from_millis(1234);
-        let r = c.engine(false).retry;
+        c.request_timeout = Duration::from_millis(321);
+        let e = c.engine(false);
+        assert_eq!((e.lease, e.request_timeout), (c.lease, c.request_timeout));
+        let r = e.retry;
         assert_eq!(
             (r.deadline, r.first_backoff, r.max_backoff),
             (
@@ -555,6 +594,7 @@ mod tests {
             ("DURABLE_MAINTENANCE_LOG_OBJECTS", "250"),
             ("DURABLE_MAINTENANCE_WAL_MIB", "3"),
             ("DURABLE_MAINTENANCE_GATE_WAIT_MS", "75"),
+            ("DURABLE_LEASE_MS", "2500"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads DURABLE_* variables.
@@ -590,6 +630,7 @@ mod tests {
         assert_eq!(c.maintenance_log_objects, 250);
         assert_eq!(c.maintenance_wal_bytes, 3 << 20);
         assert_eq!(c.maintenance_gate_wait, Duration::from_millis(75));
+        assert_eq!(c.lease, Duration::from_millis(2500));
 
         // Only the four required ones: the rest are defaults.
         let env = required();

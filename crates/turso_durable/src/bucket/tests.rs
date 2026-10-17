@@ -358,14 +358,34 @@ fn seal_start_accepts_our_own_late_head() {
     assert_eq!(b.seal_generation(vec![], 4096, 2), Ok(3));
 }
 
-/// The idle self-check: an append after `idle_threshold` without a confirmed write GETs the
-/// head first; one before it does not. The timer is moved by hand (`age_idle_timer`), so a
-/// slow machine cannot turn "before" into "after".
+/// The lease: an append once `lease` has passed since the last confirmation GETs the head
+/// first. The stamp is moved by hand (`age_lease`), so a slow machine cannot turn "within"
+/// into "after".
 #[test]
-fn append_after_idle_threshold_checks_the_head_first() {
+fn append_after_the_lease_checks_the_head() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.set_idle_threshold(Duration::from_secs(10));
+    b.set_lease(Duration::from_millis(100));
+    let k = keys();
+    b.age_lease(Duration::from_millis(150), Duration::ZERO);
+    let before = f.fault.events().len();
+    b.append_log(syncs(1)).unwrap();
+    assert_eq!(
+        f.fault.events()[before..],
+        [
+            format!("get {}", k.head()),
+            format!("put_if_absent {}", k.log(1, 1))
+        ],
+        "past the lease: the head is checked first"
+    );
+}
+
+/// Inside the lease no head GET is sent; a confirmed append renews it.
+#[test]
+fn append_within_the_lease_sends_no_get() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.set_lease(Duration::from_secs(10));
     let k = keys();
 
     let before = f.fault.events().len();
@@ -373,19 +393,19 @@ fn append_after_idle_threshold_checks_the_head_first() {
     assert_eq!(
         f.fault.events()[before..],
         [format!("put_if_absent {}", k.log(1, 1))],
-        "inside the threshold: no head GET"
+        "inside the lease: no head GET"
     );
 
-    b.age_idle_timer(Duration::from_secs(9));
+    b.age_lease(Duration::from_secs(9), Duration::from_secs(9));
     let before = f.fault.events().len();
     b.append_log(syncs(2)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
         [format!("put_if_absent {}", k.log(1, 2))],
-        "9 s of a 10 s threshold: no head GET"
+        "9 s of a 10 s lease on both clocks: no head GET"
     );
 
-    b.age_idle_timer(Duration::from_secs(11));
+    b.age_lease(Duration::from_secs(11), Duration::ZERO);
     let before = f.fault.events().len();
     b.append_log(syncs(3)).unwrap();
     assert_eq!(
@@ -394,7 +414,7 @@ fn append_after_idle_threshold_checks_the_head_first() {
             format!("get {}", k.head()),
             format!("put_if_absent {}", k.log(1, 3))
         ],
-        "idle past the threshold: the head is checked first"
+        "past the lease: the head is checked first"
     );
 
     // The append just confirmed a write: the next one goes straight to the log again.
@@ -406,11 +426,191 @@ fn append_after_idle_threshold_checks_the_head_first() {
     );
 }
 
-/// A failed or ambiguous append confirms nothing: it does not refresh the idle timer, so
-/// once the threshold has passed since the last confirmed write, the next append still GETs
-/// the head first (then settles the in-doubt record).
+/// A machine that slept: `Instant` stood still but the wall clock moved past the lease. The
+/// append checks the head, finds another writer's, and is fenced without writing.
 #[test]
-fn failed_or_ambiguous_append_does_not_refresh_the_idle_timer() {
+fn a_writer_that_slept_checks_the_head() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    b.set_lease(Duration::from_millis(100));
+    let other = Head {
+        format: 1,
+        generation: 1,
+        manifest: None,
+        writer_id: "w2".into(),
+        epoch: 1,
+    };
+    f.mem.put(&keys().head(), &other.encode()).unwrap();
+    b.age_lease(Duration::ZERO, Duration::from_secs(1));
+    let before = f.fault.events().len();
+    let r = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    let ev = f.fault.events()[before..].to_vec();
+    assert_eq!(ev, [format!("get {}", keys().head())]);
+    assert!(!ev.iter().any(|e| e.starts_with("put_if_absent")), "{ev:?}");
+    assert!(f.log_keys(1).is_empty());
+}
+
+/// The head GETs, page PUTs and manifest PUTs among `events`, as "get head", "page" and
+/// "manifest".
+fn seal_events(events: &[String]) -> Vec<&'static str> {
+    let k = keys();
+    let head = format!("get {}", k.head());
+    let pages = format!("put {}", k.page_root());
+    let manifest = format!("put {}", k.manifest_root());
+    events
+        .iter()
+        .filter_map(|e| {
+            if *e == head {
+                Some("get head")
+            } else if e.starts_with(&pages) {
+                Some("page")
+            } else if e.starts_with(&manifest) {
+                Some("manifest")
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// A seal whose page PUTs outlast the lease re-reads the head between them (renewing it) and
+/// resumes the pages not yet uploaded. With 150 ms per page PUT and a 200 ms lease, no round
+/// after a head check can send a third PUT: it would go 300 ms after the check.
+#[test]
+fn seal_renews_the_lease_between_page_puts() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.set_lease(Duration::from_millis(200));
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/pages/");
+    f.fault.delay_puts(Duration::from_millis(150));
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages(4), 4096, 4), Ok(2));
+    let ev = seal_events(&f.fault.events()[before..]);
+    let first = ev.iter().position(|e| *e == "page").unwrap();
+    let last = ev.iter().rposition(|e| *e == "page").unwrap();
+    assert!(
+        ev[first..last].contains(&"get head"),
+        "a head check between page PUTs: {ev:?}"
+    );
+    assert_eq!(ev.iter().filter(|e| **e == "page").count(), 4, "{ev:?}");
+    assert_eq!(ev.last(), Some(&"manifest"), "{ev:?}");
+    for round in ev.split(|e| *e == "get head") {
+        assert!(
+            round.iter().filter(|e| **e == "page").count() <= 2,
+            "at most two 150 ms PUTs inside a 200 ms lease: {ev:?}"
+        );
+    }
+    for p in 1..=4 {
+        assert_eq!(f.body(&keys().page(1, p)), Some(vec![p as u8; 16]));
+    }
+    assert_eq!(f.stored_head().generation, 2);
+}
+
+/// A zero lease (tests) would refuse every attempt: instead each worker sends one PUT
+/// attempt after each head check, so with one worker every page and the manifest follow
+/// their own head GET.
+#[test]
+fn a_zero_lease_seal_checks_the_head_before_each_put() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.set_lease(Duration::ZERO);
+    b.append_log(syncs(1)).unwrap();
+    let before = f.fault.events().len();
+    assert_eq!(b.seal_generation(pages(3), 4096, 3), Ok(2));
+    assert_eq!(
+        seal_events(&f.fault.events()[before..]),
+        ["get head", "page", "get head", "page", "get head", "page", "get head", "manifest"]
+    );
+    assert_eq!(f.stored_head().generation, 2);
+}
+
+/// Head GETs slower than the lease leave it lapsed as soon as it is renewed, so no PUT can
+/// go out: once the deadline has passed, the seal ends with `Timeout` instead of reading the
+/// head forever, and it uploaded nothing.
+#[test]
+fn a_seal_whose_head_checks_outlast_the_lease_times_out() {
+    let f = Fixture::new();
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(300),
+        ..fast()
+    };
+    let mut b = f.create(short, 1);
+    b.set_lease(Duration::from_millis(50));
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/head");
+    f.fault.delay_gets(Duration::from_millis(100));
+    let before = f.fault.events().len();
+    let t = Instant::now();
+    let r = b.seal_generation(pages(2), 4096, 2);
+    assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    let ev = seal_events(&f.fault.events()[before..]);
+    assert!(!ev.contains(&"page") && !ev.contains(&"manifest"), "{ev:?}");
+    assert!(
+        ev.iter().filter(|e| **e == "get head").count() >= 2,
+        "{ev:?}"
+    );
+    assert_eq!(f.stored_head().generation, 1);
+    assert!(!b.degraded(), "nothing owed: the next seal starts over");
+}
+
+/// Another writer moves the head while a seal's page PUTs are in flight: the head check at
+/// the lapse fences the seal, which sends no page PUT after it and no manifest.
+#[test]
+fn seal_stops_page_puts_when_the_head_moves_mid_seal() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 1);
+    b.set_lease(Duration::from_millis(200));
+    b.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/pages/");
+    f.fault.delay_puts(Duration::from_millis(150));
+    let before = f.fault.events().len();
+    let page_put = format!("put {}", keys().page_root());
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !f.fault.events()[before..]
+                .iter()
+                .any(|e| e.starts_with(&page_put))
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let current = f.mem.get(&keys().head()).unwrap().unwrap();
+            let other = Head {
+                writer_id: "w2".into(),
+                epoch: 1,
+                ..Head::decode(&current.body).unwrap()
+            };
+            let r = f
+                .mem
+                .put_if_match(&keys().head(), &other.encode(), &current.etag)
+                .unwrap();
+            assert!(matches!(r, CondPut::Created { .. }), "{r:?}");
+        });
+        b.seal_generation(pages(4), 4096, 4)
+    });
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    let ev = seal_events(&f.fault.events()[before..]);
+    let check = ev.iter().rposition(|e| *e == "get head").unwrap();
+    assert!(
+        ev[..check].contains(&"page"),
+        "the fencing check came between page PUTs: {ev:?}"
+    );
+    assert!(
+        !ev[check..].contains(&"page"),
+        "no page PUT after the fencing check: {ev:?}"
+    );
+    assert!(!ev.contains(&"manifest"), "no manifest PUT: {ev:?}");
+    assert!(f.body(&keys().manifest(1)).is_none());
+    assert!(b.degraded(), "fenced for good");
+}
+
+/// A failed or ambiguous append confirms nothing: it does not renew the lease, so once the
+/// lease has passed since the last confirmed write, the next append still GETs the head
+/// first (then settles the in-doubt record).
+#[test]
+fn failed_or_ambiguous_append_does_not_renew_the_lease() {
     let short = RetryPolicy {
         deadline: Duration::from_millis(100),
         ..fast()
@@ -419,10 +619,10 @@ fn failed_or_ambiguous_append_does_not_refresh_the_idle_timer() {
     for ambiguous in [false, true] {
         let f = Fixture::new();
         let mut b = f.create(short.clone(), 4);
-        b.set_idle_threshold(Duration::from_secs(10));
+        b.set_lease(Duration::from_secs(10));
         b.append_log(syncs(1)).unwrap();
         // 9 s after the last confirmed write: no check, and this append fails.
-        b.age_idle_timer(Duration::from_secs(9));
+        b.age_lease(Duration::from_secs(9), Duration::from_secs(9));
         if ambiguous {
             f.fault.store_then_fail_next_puts(1);
         }
@@ -434,14 +634,14 @@ fn failed_or_ambiguous_append_does_not_refresh_the_idle_timer() {
         ));
         assert!(
             !f.fault.events()[before..].contains(&format!("get {}", k.head())),
-            "ambiguous={ambiguous}: no check inside the threshold"
+            "ambiguous={ambiguous}: no check inside the lease"
         );
         assert_eq!(f.record(1, 2).is_some(), ambiguous);
         f.fault.fail_puts_after(u64::MAX);
 
-        // 2 s later: 11 s since the last confirmed write. Had the failed append refreshed
-        // the timer, it would be 2 s and nothing would be checked.
-        b.age_idle_timer(Duration::from_secs(2));
+        // 2 s later: 11 s since the last confirmed write. Had the failed append renewed
+        // the lease, it would be 2 s and nothing would be checked.
+        b.age_lease(Duration::from_secs(2), Duration::from_secs(2));
         let before = f.fault.events().len();
         assert_eq!(
             b.append_log(syncs(3))
@@ -461,14 +661,14 @@ fn failed_or_ambiguous_append_does_not_refresh_the_idle_timer() {
     }
 }
 
-/// Idle past the threshold with the head moved by another writer (it claimed and sealed
+/// Past the lease with the head moved by another writer (it claimed and sealed
 /// this generation, and its trimmer deleted the log): the append is fenced and writes
 /// nothing, even though its seq is free.
 #[test]
-fn idle_append_with_moved_head_is_fenced_and_writes_nothing() {
+fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.set_idle_threshold(Duration::ZERO);
+    b.set_lease(Duration::ZERO);
     b.append_log(syncs(1)).unwrap();
     let other = Head {
         format: 1,
@@ -497,13 +697,13 @@ fn idle_append_with_moved_head_is_fenced_and_writes_nothing() {
     assert_eq!(f.fault.events().len(), n, "fenced for good");
 }
 
-/// Idle past the threshold, single writer: the head is unchanged (or is our own late head
+/// Past the lease, single writer: the head is unchanged (or is our own late head
 /// for this generation's seal), so the append proceeds.
 #[test]
-fn idle_append_with_our_head_proceeds() {
+fn lapsed_append_with_our_head_proceeds() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.set_idle_threshold(Duration::ZERO);
+    b.set_lease(Duration::ZERO);
     assert_eq!(
         b.append_log(syncs(1))
             .map(|a| a.pos)
@@ -1289,9 +1489,9 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
     assert!(!b.degraded());
 
-    // The idle check finds a moved head: fenced before the record is built.
+    // The lease check finds a moved head: fenced before the record is built.
     let (mem, _fault, mut b) = fault_bucket_with_short_deadline();
-    b.set_idle_threshold(Duration::ZERO);
+    b.set_lease(Duration::ZERO);
     let other = Head {
         format: 1,
         generation: 1,

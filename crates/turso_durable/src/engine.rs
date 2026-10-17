@@ -70,8 +70,8 @@ pub(crate) fn open_engine(
     trim_tx: Option<Sender<TrimSnapshot>>,
 ) -> Result<Engine> {
     // `db` sets it right after create or attach, before any append; this covers every other
-    // caller (`Bucket::check_idle`).
-    bucket.set_idle_threshold(cfg.idle_threshold());
+    // caller (`Bucket::check_lease`).
+    bucket.set_lease(cfg.lease);
     let db_path = dir
         .join(DB_FILE)
         .to_str()
