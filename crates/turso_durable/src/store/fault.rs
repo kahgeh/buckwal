@@ -279,4 +279,18 @@ mod tests {
         s.put("slow", b"v").unwrap();
         assert!(t.elapsed() >= Duration::from_millis(60));
     }
+
+    #[test]
+    fn fault_store_stat_records_and_delays_like_get() {
+        let (m, s) = setup();
+        m.put("slow", b"v").unwrap();
+        s.only_keys_containing("slow");
+        s.delay_gets(Duration::from_millis(60));
+        let t = std::time::Instant::now();
+        assert!(s.stat("fast").unwrap().is_none());
+        assert!(t.elapsed() < Duration::from_millis(40));
+        assert!(s.stat("slow").unwrap().is_some());
+        assert!(t.elapsed() >= Duration::from_millis(60));
+        assert_eq!(s.events(), vec!["stat fast", "stat slow"]);
+    }
 }

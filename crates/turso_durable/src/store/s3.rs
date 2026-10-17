@@ -516,6 +516,9 @@ impl ObjectStore for S3Store {
         }
     }
 
+    /// A signed HEAD. `Last-Modified` and `Date` have 1 s resolution, so the age can exceed
+    /// the truth by just under 1 s. A 404 is `None` (a HEAD has no body to tell a missing
+    /// key from a missing bucket): unknown, never old.
     fn stat(&self, key: &str) -> Result<Option<ObjectStat>, StoreError> {
         let r = self.send("HEAD", key, &[], &[], &[])?;
         self.gets.fetch_add(1, Relaxed);

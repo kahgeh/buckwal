@@ -88,8 +88,10 @@ pub trait ObjectStore: Send + Sync {
         etag: &str,
     ) -> std::result::Result<CondPut, StoreError>;
     fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError>;
-    /// The object's ETag and age as the store sees it (`None` for a missing key). Counted
-    /// as a GET.
+    /// The object's ETag and age as the store sees it, counted as a GET. `None` means "no
+    /// such key, or (on a HEAD) a bucket the store cannot tell apart": a caller must treat
+    /// it as unknown, never as old. The age comes from two headers of 1 s resolution, so it
+    /// can exceed the truth by just under 1 s; a caller acting on age adds 1 s for that.
     fn stat(&self, key: &str) -> std::result::Result<Option<ObjectStat>, StoreError>;
     /// Every key under `prefix`, sorted ascending.
     fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError>;

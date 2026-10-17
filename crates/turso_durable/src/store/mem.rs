@@ -23,7 +23,7 @@ fn cond_status(r: &CondPut) -> u16 {
 #[derive(Default)]
 struct Inner {
     objects: BTreeMap<String, Object>,
-    /// When each key was last written (the real clock, before `clock_offset`).
+    /// When each key was last written, by the store's clock (real now + `clock_offset`).
     written: BTreeMap<String, Instant>,
     /// Added to the real clock: the test clock `advance_clock` moves.
     clock_offset: Duration,
@@ -60,7 +60,8 @@ impl MemStore {
     fn store(inner: &mut Inner, key: &str, body: &[u8]) -> String {
         inner.version += 1;
         let etag = format!("{}-{}", hex::encode(Sha256::digest(body)), inner.version);
-        inner.written.insert(key.to_string(), Instant::now());
+        let now = Instant::now() + inner.clock_offset;
+        inner.written.insert(key.to_string(), now);
         inner.objects.insert(
             key.to_string(),
             Object {
@@ -121,11 +122,9 @@ impl ObjectStore for MemStore {
             let inner = self.inner.lock().unwrap();
             inner.objects.get(key).map(|o| ObjectStat {
                 etag: o.etag.clone(),
-                age: inner
-                    .written
-                    .get(key)
-                    .map_or(Duration::ZERO, |w| w.elapsed())
-                    + inner.clock_offset,
+                age: inner.written.get(key).map_or(Duration::ZERO, |w| {
+                    (Instant::now() + inner.clock_offset).saturating_duration_since(*w)
+                }),
             })
         };
         self.gets.fetch_add(1, Relaxed);
@@ -244,8 +243,12 @@ mod tests {
         let st = s.stat("k").unwrap().unwrap();
         assert!(st.age >= Duration::from_secs(5), "{:?}", st.age);
         assert_eq!(st.etag, s.get("k").unwrap().unwrap().etag);
-        // A rewrite starts the age again.
+        // A rewrite starts the age again, and so does a first put after the clock moved.
         s.put("k", b"abd").unwrap();
-        assert!(s.stat("k").unwrap().unwrap().age >= Duration::from_secs(5));
+        let age = s.stat("k").unwrap().unwrap().age;
+        assert!(age < Duration::from_secs(1), "{age:?}");
+        s.put("new", b"x").unwrap();
+        let age = s.stat("new").unwrap().unwrap().age;
+        assert!(age < Duration::from_secs(1), "{age:?}");
     }
 }
