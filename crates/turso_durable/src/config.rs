@@ -31,6 +31,9 @@ pub mod defaults {
     /// How many log positions a takeover's fence record may step over (positions an old
     /// writer still running took first) before the takeover gives up with `Timeout`. Fixed.
     pub const FENCE_MAX_STEPS: u64 = 64;
+    /// The longest takeover quiet a local state may carry (`seal_quiet_ms`); a larger value
+    /// is refused as `Corrupt` at open. Fixed.
+    pub const MAX_SEAL_QUIET: Duration = Duration::from_secs(24 * 60 * 60);
     /// How many rounds in a row of a seal's page or manifest requests that the store answered
     /// (412s, stats) without storing anything count as progress, letting the seal go on past
     /// its retry deadline. A round that stores an object resets it. Fixed.

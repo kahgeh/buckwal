@@ -267,6 +267,25 @@ fn local_state_atomic_write() {
     assert!(is_corrupt(LocalState::read(dir.path())));
 }
 
+#[test]
+fn local_state_refuses_absurd_seal_quiet() {
+    let with = |ms: u64| LocalState {
+        format: 1,
+        writer_id: "w1".into(),
+        generation: 3,
+        complete: true,
+        claimed: true,
+        head_etag: String::new(),
+        epoch: 0,
+        claim_id: String::new(),
+        seal_not_before_ms: 1,
+        seal_quiet_ms: ms,
+    };
+    assert!(is_corrupt(LocalState::decode(&with(u64::MAX).encode())));
+    assert!(is_corrupt(LocalState::decode(&with(86_400_001).encode())));
+    assert!(LocalState::decode(&with(86_400_000).encode()).is_ok());
+}
+
 /// Append the sha256 of `body` (computed here, independent of the codecs).
 fn seal(mut body: Vec<u8>) -> Vec<u8> {
     use sha2::{Digest, Sha256};

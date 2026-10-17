@@ -1,6 +1,7 @@
 //! `head` object (bucket) and `app.db-durable` (local state): flat JSON.
 use super::json::{escape, Obj};
 use super::FORMAT;
+use crate::config::defaults;
 use crate::error::{Error, Result};
 use crate::files::{io_err, STATE_FILE};
 use std::fs::{self, File};
@@ -121,6 +122,16 @@ impl LocalState {
 
     pub(crate) fn decode(b: &[u8]) -> Result<LocalState> {
         let o = Obj::parse(b)?;
+        let seal_quiet_ms = if o.has("seal_quiet_ms") {
+            o.num("seal_quiet_ms")?
+        } else {
+            0
+        };
+        if u128::from(seal_quiet_ms) > defaults::MAX_SEAL_QUIET.as_millis() {
+            return Err(corrupt(&format!(
+                "local state: seal_quiet_ms {seal_quiet_ms} is over a day"
+            )));
+        }
         Ok(LocalState {
             format: check_format(&o, "local state")?,
             writer_id: o.str("writer_id")?.to_string(),
@@ -147,11 +158,7 @@ impl LocalState {
             } else {
                 0
             },
-            seal_quiet_ms: if o.has("seal_quiet_ms") {
-                o.num("seal_quiet_ms")?
-            } else {
-                0
-            },
+            seal_quiet_ms,
         })
     }
 

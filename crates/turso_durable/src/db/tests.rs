@@ -488,6 +488,28 @@ fn closed_writer(store: &Arc<MemStore>, n: i64) -> TempDir {
     a
 }
 
+/// A `seal_quiet_ms` over a day in the local state is refused at open as `Corrupt`: it
+/// would panic the monotonic deadline (`u64::MAX`) or hold the first seal back for weeks.
+#[test]
+fn open_refuses_absurd_seal_quiet_in_local_state() {
+    for v in [30 * 86_400_000u64, u64::MAX] {
+        let store = mem();
+        let a = closed_writer(&store, 3);
+        let mut s = state(a.path());
+        s.seal_not_before_ms = 1;
+        s.seal_quiet_ms = v;
+        s.write_atomic(a.path()).unwrap();
+        match open_with_store(config(a.path()), store.clone()) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("seal_quiet_ms"), "{m}"),
+            Err(e) => panic!("seal_quiet_ms = {v}: {e}"),
+            Ok(db) => {
+                std::mem::forget(db);
+                panic!("opened with seal_quiet_ms = {v}");
+            }
+        }
+    }
+}
+
 fn no_database_files(dir: &Path) {
     for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-restoring"] {
         assert!(!dir.join(f).exists(), "{f} was left in {}", dir.display());
