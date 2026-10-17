@@ -28,6 +28,8 @@ struct Inner {
     /// Added to the real clock: the test clock `advance_clock` moves.
     clock_offset: Duration,
     version: u64,
+    /// ETags from the body alone, as S3's MD5 ETags are (`with_content_etags`).
+    content_etags: bool,
 }
 
 #[derive(Default)]
@@ -46,6 +48,15 @@ impl MemStore {
         Self::default()
     }
 
+    /// A store whose ETag depends only on the body, as a single-part PUT's MD5 ETag does on
+    /// S3 and RustFS: equal bytes get equal ETags, however often they are written.
+    #[cfg(test)]
+    pub(crate) fn with_content_etags() -> Self {
+        let s = Self::default();
+        s.inner.lock().unwrap().content_etags = true;
+        s
+    }
+
     /// Move this store's clock forward: every object's `stat` age grows by `by`.
     pub fn advance_clock(&self, by: Duration) {
         self.inner.lock().unwrap().clock_offset += by;
@@ -59,7 +70,12 @@ impl MemStore {
     /// Store `body` under `key` with a fresh ETag. Caller holds the lock.
     fn store(inner: &mut Inner, key: &str, body: &[u8]) -> String {
         inner.version += 1;
-        let etag = format!("{}-{}", hex::encode(Sha256::digest(body)), inner.version);
+        let hash = hex::encode(Sha256::digest(body));
+        let etag = if inner.content_etags {
+            hash
+        } else {
+            format!("{hash}-{}", inner.version)
+        };
         let now = Instant::now() + inner.clock_offset;
         inner.written.insert(key.to_string(), now);
         inner.objects.insert(

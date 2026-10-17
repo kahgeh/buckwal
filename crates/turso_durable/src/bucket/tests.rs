@@ -2235,7 +2235,7 @@ fn a_seal_overwrites_a_foreign_leftover_page() {
 /// on our own object, whose ETag we never learnt. The seal stats it and puts the same bytes
 /// with `put_if_match` on that ETag. It is not fenced, and the stored body is ours.
 #[test]
-fn a_lost_reply_on_a_conditional_page_put_counts_as_done() {
+fn a_lost_reply_on_a_conditional_page_put_is_rewritten_without_fencing() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
     b.append_log(syncs(1)).unwrap();
@@ -2332,4 +2332,58 @@ fn a_seal_finding_its_own_page_overwritten_checks_the_head_first() {
             assert_eq!(f.body(&k.page(1, p)), Some(vec![2; 16]));
         }
     }
+}
+
+/// Pins a known, documented limit, not desired behaviour (the residual at
+/// `Bucket::seal_put_step`). On a store whose ETags depend only on the body, as a single-part
+/// PUT's MD5 ETag does on S3 and RustFS, old writer A's late `put_if_match` lands over new
+/// writer B's published page when A was paused longer than the takeover quiet between its
+/// lease check and the send, and B's page is byte-identical to the one A conditioned on.
+///
+/// A's first seal attempt uploads page 1 as bytes X and fails at its manifest, so A holds X's
+/// ETag. A's second attempt, with other bytes, sends `put_if_match` on it and is held. B takes
+/// over and seals generation 1 with page 1 = X (the same ETag). Released, A's PUT succeeds.
+#[test]
+fn residual_content_equal_etag_lets_a_stale_put_through() {
+    let mem = Arc::new(MemStore::with_content_etags());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let f = Fixture { mem, fault };
+    let k = keys();
+    let hold = Arc::new(HoldStore::new(f.store()));
+    let mut a = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
+    a.set_lease(Duration::from_millis(200));
+    a.append_log(syncs(1)).unwrap();
+    f.fault.only_keys_containing("/manifest/");
+    f.fault.fail_next_puts_permanently(1);
+    let r = a.seal_generation(pages_of(1, 0xA), 4096, 1);
+    assert!(matches!(r, Err(Error::UploadFailed(_))), "{r:?}");
+    let (held_rx, go) = hold.hold_next_put("/pages/");
+    std::thread::scope(|s| {
+        let a_seal = s.spawn(move || a.seal_generation(pages_of(1, 0xC), 4096, 1));
+        let key = held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(key, k.page(1, 1));
+        take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
+        let mut b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
+        assert!(b.append_fence().unwrap().after_foreign_empty);
+        let quiet = Duration::from_millis(300);
+        b.set_seal_not_before(1, Instant::now() + quiet, SystemTime::now() + quiet);
+        b.append_log(syncs(2)).unwrap();
+        let b_pages = vec![(1, vec![0xA; 16]), (2, vec![0xB; 16])];
+        assert_eq!(b.seal_generation(b_pages, 4096, 2), Ok(2));
+        assert_eq!(f.body(&k.page(1, 1)), Some(vec![0xA; 16]), "B's page 1");
+        go.send(()).unwrap();
+        let r = a_seal.join().unwrap();
+        assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    });
+    assert_eq!(
+        hold.outcomes(),
+        [format!("put_if_match {}: stored", k.page(1, 1))],
+        "the residual: A's late PUT matched B's content-equal ETag"
+    );
+    assert_eq!(
+        f.body(&k.page(1, 1)),
+        Some(vec![0xC; 16]),
+        "A's bytes now sit under B's published seal"
+    );
+    assert_eq!(f.stored_head().writer_id, "w2");
 }
