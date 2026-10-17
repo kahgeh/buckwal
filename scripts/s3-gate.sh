@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
-# Conditional-PUT gate against the local RustFS. Writes results/rustfs-gate.txt.
+# Conditional-PUT gate against the local RustFS. Writes results/rustfs-gate.txt, or
+# results/rustfs-gate-tls.txt when DURABLE_CA_BUNDLE is set (HTTPS, locally generated CA).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 OUT="$ROOT/results/rustfs-gate.txt"
+if [ -n "${DURABLE_CA_BUNDLE:-}" ]; then OUT="$ROOT/results/rustfs-gate-tls.txt"; fi
 IMAGE_DIGEST="sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
 
-if [ ! -x "$HERE/rustfs.sh" ] || ! eval "$("$HERE/rustfs.sh" env 2>/dev/null)" 2>/dev/null \
-   || ! curl -sS -o /dev/null --max-time 5 "$DURABLE_ENDPOINT/health" 2>/dev/null; then
+# DURABLE_ENDPOINT already set (e.g. from `TURSO_DURABLE_TLS_DIR=... rustfs.sh env`) is kept;
+# DURABLE_CA_BUNDLE, when set, is the CA curl trusts (RustFS in TLS mode).
+if [ -z "${DURABLE_ENDPOINT:-}" ]; then
+  [ -x "$HERE/rustfs.sh" ] && eval "$("$HERE/rustfs.sh" env 2>/dev/null)" 2>/dev/null
+fi
+CA=()
+if [ -n "${DURABLE_CA_BUNDLE:-}" ]; then CA=(--cacert "$DURABLE_CA_BUNDLE"); fi
+
+if [ -z "${DURABLE_ENDPOINT:-}" ] \
+   || ! curl -sS -o /dev/null --max-time 5 ${CA[@]+"${CA[@]}"} "$DURABLE_ENDPOINT/health" 2>/dev/null; then
   echo "RustFS is not running (scripts/rustfs.sh up)" >&2
   exit 2
 fi
@@ -21,7 +31,7 @@ trap 'rm -rf "$TMP"' EXIT
 # s3 METHOD URL OUTFILE [curl args...] -> prints HTTP code; headers in OUTFILE.h, body in OUTFILE
 s3() {
   local method="$1" url="$2" out="$3"; shift 3
-  curl -sS -X "$method" --aws-sigv4 "aws:amz:${DURABLE_REGION}:s3" --user "$AK:$SK" \
+  curl -sS ${CA[@]+"${CA[@]}"} -X "$method" --aws-sigv4 "aws:amz:${DURABLE_REGION}:s3" --user "$AK:$SK" \
     -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
     -D "$out.h" -o "$out" -w '%{http_code}' "$@" "$url"
 }
@@ -127,6 +137,7 @@ pg=$(s3 GET "$BASE/$PREFIX/race" "$TMP/pg")
 
 {
   echo "# RustFS conditional-PUT gate"
+  if [ -n "${DURABLE_CA_BUNDLE:-}" ]; then echo "# ran over HTTPS ($DURABLE_ENDPOINT) against a locally generated CA"; fi
   echo "# image: docker.io/rustfs/rustfs:1.0.0@$IMAGE_DIGEST"
   echo "# curl: $(curl --version | head -1)"
   echo "# date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

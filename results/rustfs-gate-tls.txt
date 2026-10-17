@@ -1,0 +1,13 @@
+# RustFS conditional-PUT gate
+# ran over HTTPS (https://localhost:9290) against a locally generated CA
+# image: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+# curl: curl 8.7.1 (x86_64-apple-darwin26.0) libcurl/8.7.1 (SecureTransport) LibreSSL/3.3.6 zlib/1.2.12 nghttp2/1.69.0
+# date: 2026-10-17T20:34:17Z
+# prefix: gate/1792269256/
+PASS create_if_absent: first=200 second=412 get_body=first
+PASS create_race: 200x1 412x19 get_body=body-1 winner=body-1
+PASS if_match: match=200 etag1="8b04d5e3775d298e78455efc5ca404d5" etag2="0f81d52e06caaa4860887488d18271c7" stale=412 missing_key=404
+PASS etag_header: every 200 PUT carried ETag (e.g. "8b04d5e3775d298e78455efc5ca404d5")
+PASS head_dates: head=200 etag="69af8a69d0dcb1e6d31f66fdcbfc82c1" last_modified=[Sat, 17 Oct 2026 20:34:16 GMT] date=[Sat, 17 Oct 2026 20:34:16 GMT]
+PASS list_delete: list=200 keys=3 delete=204
+PASS pause: pause=ok unpause=ok get_after=200
