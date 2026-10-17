@@ -98,7 +98,7 @@ The API:
 | `Database::upload_stats() -> UploadStats` | How many commits each log PUT carried and how long acks waited, since open (fields below). |
 | `Database::set_batching(Batching) -> Result<()>` | The setting of every connection that has none of its own, from its next commit. It starts as `Config::batching`. `Config` when the setting is invalid. |
 | `Database::batching() -> Batching` | The database's setting. |
-| `Database::close()` | Waits for pending uploads, stops the trimmer, releases the directory. It fails with `Config` while a connection is open. Dropping the last handle and connection also closes it. |
+| `Database::close()` | Waits for pending uploads, stops the trimmer, releases the directory. It fails with `Config` while a connection is open. Dropping the last handle and connection also closes it; if a maintenance run is in progress then, the close finishes on the maintenance thread shortly after the drop returns, so call `close()` when you reopen the directory in the same process at once. |
 | `Connection::execute(sql, params) -> Result<u64>` | Runs one statement and returns the number of changed rows. `sql` must hold exactly one statement. |
 | `Connection::execute_batch(sql)` | Runs several statements, with no parameters. If the guard refuses any statement, none of them runs. |
 | `Connection::query(sql, params) -> Result<Vec<Vec<Value>>>` | Runs one statement and collects its rows. |
@@ -279,7 +279,7 @@ pub enum Batching {
   - At 50 ms (threshold 200) the slowest commit did not rise. p99 was 119–123 ms against 76–79 ms, but runs with the defaults and no maintenance run reached 110.9 ms (final round) and 120.8 ms (the earlier w50-on round, `maintenance_runs=0`), so p99 does not separate them there.
 - The engine still restarts the WAL by itself at times under Window (at 10 and 50 ms here), and then maintenance has nothing to do.
 - Under Off the defaults ran 0–2 times per 6000 commits, with gate waits of 82 and 203 ms and commit p99 of 2.2–6.4 ms (2.9–3.3 ms without maintenance). Every final Off run's slowest commit (7.5–9.3 s, among the first 8 commits, with or without maintenance) probably includes `bench`'s busy retries (its latency runs from the first attempt; inferred, since the runs report only a `busy_retries` count, not which commits retried) and is start-up lock contention in the engine (inferred).
-- Under Off a low threshold is expensive: statements in flight wait in the engine's busy handler while they hold the gate, so each drain took up to 365–437 ms, commit p99 rose to 565–647 ms and throughput fell from 644–667 to 371–407 commits/s. The default threshold keeps runs rare under Off.
+- Under Off a low threshold is expensive: statements in flight wait in the engine's busy handler while they hold the gate, so each drain took up to 365–437 ms, commit p99 rose to 565–647 ms and throughput fell from 640–667 to 371–407 commits/s. The default threshold keeps runs rare under Off.
 - With 8 Off connections the engine also refuses a commit as `database is busy (locked)` now and then, with or without maintenance (3–7 per 6000 commits here). `bench` retries those after a 10 ms pause, for up to 10 s per commit (`busy_retries`); an application has to retry them too.
 
 ## CLI

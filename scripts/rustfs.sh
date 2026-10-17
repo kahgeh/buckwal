@@ -90,6 +90,7 @@ cmd_down() {
   ensure_machine
   podman rm -f "$NAME" >/dev/null 2>&1 || true
   podman volume rm -f "$VOLUME" >/dev/null 2>&1 || true
+  ! podman volume exists "$VOLUME" || die "volume $VOLUME is still there after removal"
 }
 
 case "${1:-}" in

@@ -1792,7 +1792,7 @@ Final rounds (c29e11c), each cell "round a / round b":
 | window 50ms| off         | 63.4 / 69.9, 63.0 / 70.8 | 76.8 / 79.0    | 425 / 410              | 0 / 0         | -                  | 4 / 5   | 358 / 265                | 4 / 4 |
 | window 50ms| lo200       | 63.3 / 70.5, 62.8 / 70.6 | 120.9 / 119.2  | 319 / 248              | 1 (1) / 2 (2) | 24.3 / 40.7        | 7 / 7   | 202 / 202                | 4 / 4 |
 
-(seals include the setup connection's close and the bench's close. Commits/s: off 644-667,
+(seals include the setup connection's close and the bench's close. Commits/s: off 640-667,
 off lo200 390-407, window 1ms 977-1024, 10ms 398-407, 50ms 124. busy_retries: off 3-7 per
 run, 0 under every Window setting and under off lo200.)
 
@@ -1843,12 +1843,13 @@ What the figures show:
 - Under Off, the defaults ran 0-2 times per 6000 commits (generation_log_objects_max
   999-1009), with gate waits of 82 and 203 ms: p99 2.2-6.4 ms on against 2.9-3.3 ms off.
   Every final Off run's slowest commit (7.5-9.3 s, commit #4-#8, maintenance on or off)
-  includes bench's busy retries (latency runs from the first attempt; 3-7 refusals per
-  run) and is start-up lock contention between the 8 connections (inferred, as in the
-  2000-commit runs above).
+  probably includes bench's busy retries (latency runs from the first attempt; 3-7
+  refusals per run, and the runs report only that count, not which commit retried) and
+  start-up lock contention between the 8 connections (both inferred, as in the 2000-commit
+  runs above).
 - Off with a low threshold is expensive: at lo200 the 26-29 runs drained for up to 365-437
   ms each (statements in flight wait in the engine's busy handler while they hold the
-  gate), commit p99 rose to 565-647 ms and throughput fell from 644-667 to 371-407
+  gate), commit p99 rose to 565-647 ms and throughput fell from 640-667 to 371-407
   commits/s. Final round a also skipped one run (bench does not print the reason) and its
   generation reached 988 log objects before the next. The default threshold (1000) keeps
   runs rare under Off.
