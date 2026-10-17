@@ -304,7 +304,9 @@ What the figures show:
 - Checkpoint uploads (seals): with Off and one connection the automatic checkpoint restarted
   the WAL every ~500 commits and each seal took 41-45 ms for 170 pages, as in stage 1.
   Under Window with 8 connections no WAL restart happened in the run, so the whole run's
-  pages (696-728) were sealed once, at the last connection's close, in 177-186 ms. With one
+  pages (696-728) were sealed once, at the last connection's close, in 177-186 ms.
+  (These runs predate the maintenance checkpoint, which now seals such a generation during
+  the run: see "Maintenance checkpoint" below.) With one
   Window connection the in-run seals took 43-75 ms for 170 pages.
 
 Restore (the c1-off prefix: generation 6):
@@ -313,3 +315,925 @@ Restore (the c1-off prefix: generation 6):
   restore time.
 - verify (PRAGMA integrity_check, which reads every page lazily) of that fresh restore took
   0.23 s wall, process start included.
+
+
+# ============================================================================================
+# Maintenance checkpoint (Task 13)
+# date: 2026-10-17T08:52:04Z
+# git: c29e11c (batching-knob; the measured code, before this section was committed)
+# engine, RustFS, build, machine: as above (rustc 1.97.1, release build, target/release/turso-durable)
+# laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
+# telemetry: DURABLE_OTEL unset (off).
+#
+# Workload: bench --commits 6000 --connections 8 [--batching SPEC], one new DURABLE_PREFIX per
+# run (bench/maint-<timestamp>-<label>), then restore of that prefix into a fresh directory.
+# Two rounds (a, b) of every configuration, run back to back; one run per row, so treat small
+# differences as noise.
+# Maintenance: on = the defaults (maintenance_log_objects 1000, maintenance_wal_bytes 64 MiB,
+# gate wait 500 ms); off = DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0;
+# lo200 = DURABLE_MAINTENANCE_LOG_OBJECTS=200 (the extra runs: with the defaults, maintenance
+# never ran in 6000 commits under window 50ms, and at most once under off).
+#
+# New keys:
+# - busy_retries: commits the engine refused as "database is busy (locked)" and bench retried
+#   (latency from the first attempt). Before bench retried them, 9 of 10 Off runs at 6000
+#   commits and 8 connections failed on the first one (7 of 7 with maintenance off, 2 of 3 on).
+# - maintenance_runs / _sealed / _skipped: MaintenanceStarted / MaintenanceFinished /
+#   MaintenanceSkipped events. maintenance_gate_wait_max_ms: the longest drain of a run that
+#   sealed.
+# - generation_log_objects_max: the highest log seq seen before the close: the most log objects
+#   one generation held during the run. A restore taken then would cost 3 + that many GETs.
+# - The restore GETs of the final state are 4 in every run: bench closes the database, and the
+#   close-time TRUNCATE seals, so the final generation holds 1 log object.
+
+## off-on-a: batching=off maintenance=on prefix=bench/maint-20261017195204-off-on-a
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.shqvYe/db --commits 6000 --connections 8
+commits=6000
+commit_p50_ms=1.339
+commit_p95_ms=1.729
+commit_p99_ms=4.601
+commit_max_ms=7506.237
+commit_max_at=8
+busy_retries=3
+commits_per_sec=651.0
+commits_acked=6010
+commits_uploaded=6011
+log_puts=6011
+log_put_bytes=50874658
+commits_per_log_put=1.000
+bytes_per_log_put=8463.6
+ack_wait_p50_ms=1.280
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=2.176
+log_puts_per_commit=1.002
+bucket_puts=8156
+page_puts=2111
+seals=10
+maintenance_runs=1
+maintenance_sealed=1
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=82.213
+generation_log_objects_max=1009
+seal_1_ms=18.746 seal_1_pages=2
+seal_2_ms=45.189 seal_2_pages=170
+seal_3_ms=41.193 seal_3_pages=170
+seal_4_ms=80.644 seal_4_pages=344
+seal_5_ms=42.840 seal_5_pages=176
+seal_6_ms=43.155 seal_6_pages=171
+seal_7_ms=82.178 seal_7_pages=344
+seal_8_ms=90.738 seal_8_pages=371
+seal_9_ms=41.749 seal_9_pages=172
+seal_10_ms=50.132 seal_10_pages=191
+$ turso-durable restore --dir <fresh>
+restored generation=11 log_objects=1 gets=4 lists=1 bytes=5243 ms=19
+real 0.03
+user 0.00
+sys 0.00
+
+## off-off-a: batching=off maintenance=off prefix=bench/maint-20261017195204-off-off-a
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.VXyFVm/db --commits 6000 --connections 8
+commits=6000
+commit_p50_ms=1.353
+commit_p95_ms=1.764
+commit_p99_ms=3.291
+commit_max_ms=8197.441
+commit_max_at=4
+busy_retries=4
+commits_per_sec=644.1
+commits_acked=6010
+commits_uploaded=6010
+log_puts=6010
+log_put_bytes=50684458
+commits_per_log_put=1.000
+bytes_per_log_put=8433.4
+ack_wait_p50_ms=1.280
+ack_wait_p95_ms=1.600
+ack_wait_p99_ms=1.920
+log_puts_per_commit=1.002
+bucket_puts=8142
+page_puts=2098
+seals=10
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=1488
+seal_1_ms=5.543 seal_1_pages=2
+seal_2_ms=42.649 seal_2_pages=170
+seal_3_ms=43.824 seal_3_pages=170
+seal_4_ms=122.111 seal_4_pages=509
+seal_5_ms=79.150 seal_5_pages=344
+seal_6_ms=40.324 seal_6_pages=173
+seal_7_ms=43.723 seal_7_pages=172
+seal_8_ms=51.350 seal_8_pages=171
+seal_9_ms=95.940 seal_9_pages=341
+seal_10_ms=21.448 seal_10_pages=46
+$ turso-durable restore --dir <fresh>
+restored generation=11 log_objects=1 gets=4 lists=1 bytes=5179 ms=23
+real 0.04
+user 0.00
+sys 0.00
+
+## w1-on-a: batching=window 1ms 64 1MiB maintenance=on prefix=bench/maint-20261017195204-w1-on-a
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.uTC9z8/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+commits=6000
+commit_p50_ms=5.174
+commit_p95_ms=22.155
+commit_p99_ms=71.278
+commit_max_ms=381.972
+commit_max_at=1477
+busy_retries=0
+commits_per_sec=976.8
+commits_acked=6003
+commits_uploaded=6004
+log_puts=1915
+log_put_bytes=68367994
+commits_per_log_put=3.135
+bytes_per_log_put=35701.3
+ack_wait_p50_ms=3.328
+ack_wait_p95_ms=4.864
+ack_wait_p99_ms=5.632
+log_puts_per_commit=0.319
+bucket_puts=4124
+page_puts=2197
+seals=3
+maintenance_runs=1
+maintenance_sealed=1
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=31.228
+generation_log_objects_max=1005
+seal_1_ms=5.785 seal_1_pages=2
+seal_2_ms=267.125 seal_2_pages=1147
+seal_3_ms=227.584 seal_3_pages=1048
+$ turso-durable restore --dir <fresh>
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=21
+real 0.03
+user 0.00
+sys 0.00
+
+## w1-off-a: batching=window 1ms 64 1MiB maintenance=off prefix=bench/maint-20261017195204-w1-off-a
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.6I61Su/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+commits=6000
+commit_p50_ms=5.015
+commit_p95_ms=22.470
+commit_p99_ms=65.568
+commit_max_ms=229.507
+commit_max_at=2475
+busy_retries=0
+commits_per_sec=1005.1
+commits_acked=6002
+commits_uploaded=6002
+log_puts=1944
+log_put_bytes=68258603
+commits_per_log_put=3.087
+bytes_per_log_put=35112.5
+ack_wait_p50_ms=3.456
+ack_wait_p95_ms=4.352
+ack_wait_p99_ms=4.864
+log_puts_per_commit=0.324
+bucket_puts=4138
+page_puts=2185
+seals=2
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=1945
+seal_1_ms=5.376 seal_1_pages=2
+seal_2_ms=512.145 seal_2_pages=2183
+$ turso-durable restore --dir <fresh>
+restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=25
+real 0.04
+user 0.00
+sys 0.00
+
+## w10-on-a: batching=window 10ms 64 1MiB maintenance=on prefix=bench/maint-20261017195204-w10-on-a
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.N5VQTe/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+commits=6000
+commit_p50_ms=14.822
+commit_p95_ms=34.015
+commit_p99_ms=72.787
+commit_max_ms=528.352
+commit_max_at=5813
+busy_retries=0
+commits_per_sec=407.3
+commits_acked=6003
+commits_uploaded=6004
+log_puts=990
+log_put_bytes=69659734
+commits_per_log_put=6.065
+bytes_per_log_put=70363.4
+ack_wait_p50_ms=12.288
+ack_wait_p95_ms=19.456
+ack_wait_p99_ms=21.504
+log_puts_per_commit=0.165
+bucket_puts=3133
+page_puts=2131
+seals=3
+maintenance_runs=1
+maintenance_sealed=1
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=15.060
+generation_log_objects_max=956
+seal_1_ms=8.349 seal_1_pages=2
+seal_2_ms=467.144 seal_2_pages=2057
+seal_3_ms=28.529 seal_3_pages=72
+$ turso-durable restore --dir <fresh>
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=21
+real 0.03
+user 0.00
+sys 0.00
+
+## w10-off-a: batching=window 10ms 64 1MiB maintenance=off prefix=bench/maint-20261017195204-w10-off-a
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hOtkrp/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+commits=6000
+commit_p50_ms=15.043
+commit_p95_ms=34.123
+commit_p99_ms=68.039
+commit_max_ms=565.596
+commit_max_at=4255
+busy_retries=0
+commits_per_sec=400.1
+commits_acked=6003
+commits_uploaded=6003
+log_puts=976
+log_put_bytes=70038874
+commits_per_log_put=6.151
+bytes_per_log_put=71761.1
+ack_wait_p50_ms=12.800
+ack_wait_p95_ms=19.456
+ack_wait_p99_ms=22.528
+log_puts_per_commit=0.163
+bucket_puts=3125
+page_puts=2137
+seals=3
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=699
+seal_1_ms=11.419 seal_1_pages=2
+seal_2_ms=402.083 seal_2_pages=1512
+seal_3_ms=148.582 seal_3_pages=623
+$ turso-durable restore --dir <fresh>
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=18
+real 0.03
+user 0.00
+sys 0.00
+
+## w50-on-a: batching=window 50ms 64 1MiB maintenance=on prefix=bench/maint-20261017195204-w50-on-a
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hDPJ8H/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+commits=6000
+commit_p50_ms=62.878
+commit_p95_ms=70.510
+commit_p99_ms=74.906
+commit_max_ms=630.625
+commit_max_at=5991
+busy_retries=0
+commits_per_sec=123.8
+commits_acked=6004
+commits_uploaded=6004
+log_puts=758
+log_put_bytes=70728671
+commits_per_log_put=7.921
+bytes_per_log_put=93309.6
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.126
+bucket_puts=2851
+page_puts=2078
+seals=4
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=447
+seal_1_ms=7.996 seal_1_pages=2
+seal_2_ms=243.095 seal_2_pages=842
+seal_3_ms=320.065 seal_3_pages=1225
+seal_4_ms=25.982 seal_4_pages=9
+$ turso-durable restore --dir <fresh>
+restored generation=5 log_objects=1 gets=4 lists=1 bytes=4490 ms=21
+real 0.04
+user 0.00
+sys 0.00
+
+## w50-off-a: batching=window 50ms 64 1MiB maintenance=off prefix=bench/maint-20261017195204-w50-off-a
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.bHQLOr/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+commits=6000
+commit_p50_ms=63.441
+commit_p95_ms=69.935
+commit_p99_ms=76.786
+commit_max_ms=424.871
+commit_max_at=2837
+busy_retries=0
+commits_per_sec=123.8
+commits_acked=6004
+commits_uploaded=6004
+log_puts=756
+log_put_bytes=70158161
+commits_per_log_put=7.942
+bytes_per_log_put=92801.8
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.126
+bucket_puts=2854
+page_puts=2083
+seals=4
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=358
+seal_1_ms=19.080 seal_1_pages=2
+seal_2_ms=215.679 seal_2_pages=976
+seal_3_ms=144.842 seal_3_pages=496
+seal_4_ms=176.223 seal_4_pages=609
+$ turso-durable restore --dir <fresh>
+restored generation=5 log_objects=1 gets=4 lists=1 bytes=4474 ms=21
+real 0.04
+user 0.00
+sys 0.00
+
+## off-lo200-a: batching=off maintenance=lo200 prefix=bench/maint-20261017195204-off-lo200-a
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.QrBFvh/db --commits 6000 --connections 8
+commits=6000
+commit_p50_ms=1.257
+commit_p95_ms=2.083
+commit_p99_ms=565.103
+commit_max_ms=2212.080
+commit_max_at=4329
+busy_retries=0
+commits_per_sec=407.0
+commits_acked=6028
+commits_uploaded=6053
+log_puts=6053
+log_put_bytes=52557072
+commits_per_log_put=1.000
+bytes_per_log_put=8682.8
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=2.432
+log_puts_per_commit=1.009
+bucket_puts=8311
+page_puts=2170
+seals=28
+maintenance_runs=26
+maintenance_sealed=25
+maintenance_skipped=1
+maintenance_gate_wait_max_ms=437.286
+generation_log_objects_max=988
+seal_1_ms=6.792 seal_1_pages=2
+seal_2_ms=20.528 seal_2_pages=73
+seal_3_ms=20.348 seal_3_pages=75
+seal_4_ms=27.670 seal_4_pages=74
+seal_5_ms=27.868 seal_5_pages=74
+seal_6_ms=50.404 seal_6_pages=73
+seal_7_ms=25.835 seal_7_pages=73
+seal_8_ms=25.151 seal_8_pages=74
+seal_9_ms=23.012 seal_9_pages=75
+seal_10_ms=25.786 seal_10_pages=74
+seal_11_ms=25.779 seal_11_pages=73
+seal_12_ms=27.280 seal_12_pages=73
+seal_13_ms=23.622 seal_13_pages=76
+seal_14_ms=21.438 seal_14_pages=75
+seal_15_ms=27.776 seal_15_pages=75
+seal_16_ms=21.177 seal_16_pages=76
+seal_17_ms=22.287 seal_17_pages=73
+seal_18_ms=20.735 seal_18_pages=73
+seal_19_ms=49.334 seal_19_pages=73
+seal_20_ms=40.490 seal_20_pages=76
+seal_21_ms=53.872 seal_21_pages=73
+seal_22_ms=22.994 seal_22_pages=77
+seal_23_ms=75.217 seal_23_pages=337
+seal_24_ms=15.950 seal_24_pages=17
+seal_25_ms=23.206 seal_25_pages=76
+seal_26_ms=27.033 seal_26_pages=76
+seal_27_ms=52.545 seal_27_pages=78
+seal_28_ms=13.838 seal_28_pages=26
+$ turso-durable restore --dir <fresh>
+restored generation=29 log_objects=1 gets=4 lists=1 bytes=5867 ms=19
+real 0.04
+user 0.00
+sys 0.00
+
+## w50-lo200-a: batching=window 50ms 64 1MiB maintenance=lo200 prefix=bench/maint-20261017195204-w50-lo200-a
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kll3qb/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+commits=6000
+commit_p50_ms=63.278
+commit_p95_ms=70.548
+commit_p99_ms=120.896
+commit_max_ms=318.956
+commit_max_at=4415
+busy_retries=0
+commits_per_sec=124.2
+commits_acked=6007
+commits_uploaded=6008
+log_puts=758
+log_put_bytes=71076021
+commits_per_log_put=7.926
+bytes_per_log_put=93767.8
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.126
+bucket_puts=2877
+page_puts=2095
+seals=7
+maintenance_runs=1
+maintenance_sealed=1
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=24.297
+generation_log_objects_max=202
+seal_1_ms=10.652 seal_1_pages=2
+seal_2_ms=84.986 seal_2_pages=246
+seal_3_ms=77.182 seal_3_pages=244
+seal_4_ms=147.690 seal_4_pages=558
+seal_5_ms=129.946 seal_5_pages=486
+seal_6_ms=113.871 seal_6_pages=483
+seal_7_ms=24.979 seal_7_pages=76
+$ turso-durable restore --dir <fresh>
+restored generation=8 log_objects=1 gets=4 lists=1 bytes=4538 ms=23
+real 0.04
+user 0.00
+sys 0.00
+
+## off-on-b: batching=off maintenance=on prefix=bench/maint-20261017195546-off-on-b
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.rGIR8c/db --commits 6000 --connections 8
+commits=6000
+commit_p50_ms=1.310
+commit_p95_ms=1.668
+commit_p99_ms=2.226
+commit_max_ms=8920.502
+commit_max_at=7
+busy_retries=7
+commits_per_sec=666.7
+commits_acked=6011
+commits_uploaded=6011
+log_puts=6011
+log_put_bytes=50597801
+commits_per_log_put=1.000
+bytes_per_log_put=8417.5
+ack_wait_p50_ms=1.280
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=1.728
+log_puts_per_commit=1.002
+bucket_puts=8141
+page_puts=2093
+seals=11
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=999
+seal_1_ms=6.443 seal_1_pages=2
+seal_2_ms=46.181 seal_2_pages=170
+seal_3_ms=79.627 seal_3_pages=339
+seal_4_ms=45.744 seal_4_pages=172
+seal_5_ms=46.575 seal_5_pages=172
+seal_6_ms=45.499 seal_6_pages=171
+seal_7_ms=42.966 seal_7_pages=171
+seal_8_ms=82.571 seal_8_pages=341
+seal_9_ms=50.217 seal_9_pages=177
+seal_10_ms=44.707 seal_10_pages=173
+seal_11_ms=54.459 seal_11_pages=205
+$ turso-durable restore --dir <fresh>
+restored generation=12 log_objects=1 gets=4 lists=1 bytes=4939 ms=21
+real 0.04
+user 0.00
+sys 0.00
+
+## off-off-b: batching=off maintenance=off prefix=bench/maint-20261017195546-off-off-b
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.wOapYA/db --commits 6000 --connections 8
+commits=6000
+commit_p50_ms=1.378
+commit_p95_ms=1.786
+commit_p99_ms=2.875
+commit_max_ms=9293.595
+commit_max_at=5
+busy_retries=3
+commits_per_sec=640.3
+commits_acked=6007
+commits_uploaded=6007
+log_puts=6007
+log_put_bytes=50721247
+commits_per_log_put=1.000
+bytes_per_log_put=8443.7
+ack_wait_p50_ms=1.344
+ack_wait_p95_ms=1.600
+ack_wait_p99_ms=1.856
+log_puts_per_commit=1.001
+bucket_puts=8128
+page_puts=2096
+seals=7
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=2000
+seal_1_ms=5.228 seal_1_pages=2
+seal_2_ms=159.788 seal_2_pages=672
+seal_3_ms=46.941 seal_3_pages=177
+seal_4_ms=79.588 seal_4_pages=340
+seal_5_ms=86.881 seal_5_pages=345
+seal_6_ms=135.329 seal_6_pages=511
+seal_7_ms=19.765 seal_7_pages=49
+$ turso-durable restore --dir <fresh>
+restored generation=8 log_objects=1 gets=4 lists=1 bytes=5322 ms=20
+real 0.04
+user 0.00
+sys 0.00
+
+## w1-on-b: batching=window 1ms 64 1MiB maintenance=on prefix=bench/maint-20261017195546-w1-on-b
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kwXnkG/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+commits=6000
+commit_p50_ms=5.159
+commit_p95_ms=15.144
+commit_p99_ms=64.941
+commit_max_ms=464.252
+commit_max_at=3081
+busy_retries=0
+commits_per_sec=1023.9
+commits_acked=6003
+commits_uploaded=6004
+log_puts=1927
+log_put_bytes=67364611
+commits_per_log_put=3.116
+bytes_per_log_put=34958.3
+ack_wait_p50_ms=3.456
+ack_wait_p95_ms=4.608
+ack_wait_p99_ms=5.632
+log_puts_per_commit=0.321
+bucket_puts=4148
+page_puts=2209
+seals=3
+maintenance_runs=1
+maintenance_sealed=1
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=13.572
+generation_log_objects_max=1005
+seal_1_ms=9.439 seal_1_pages=2
+seal_2_ms=243.084 seal_2_pages=1138
+seal_3_ms=249.907 seal_3_pages=1069
+$ turso-durable restore --dir <fresh>
+restored generation=4 log_objects=1 gets=4 lists=1 bytes=4522 ms=23
+real 0.04
+user 0.00
+sys 0.00
+
+## w1-off-b: batching=window 1ms 64 1MiB maintenance=off prefix=bench/maint-20261017195546-w1-off-b
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.1OY2Ov/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+commits=6000
+commit_p50_ms=5.414
+commit_p95_ms=15.009
+commit_p99_ms=50.333
+commit_max_ms=268.602
+commit_max_at=5668
+busy_retries=0
+commits_per_sec=1004.4
+commits_acked=6002
+commits_uploaded=6002
+log_puts=1888
+log_put_bytes=67836802
+commits_per_log_put=3.179
+bytes_per_log_put=35930.5
+ack_wait_p50_ms=3.584
+ack_wait_p95_ms=4.864
+ack_wait_p99_ms=5.376
+log_puts_per_commit=0.315
+bucket_puts=4073
+page_puts=2176
+seals=2
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=1889
+seal_1_ms=5.410 seal_1_pages=2
+seal_2_ms=547.080 seal_2_pages=2174
+$ turso-durable restore --dir <fresh>
+restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=26
+real 0.04
+user 0.00
+sys 0.00
+
+## w10-on-b: batching=window 10ms 64 1MiB maintenance=on prefix=bench/maint-20261017195546-w10-on-b
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.lb0Q4B/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+commits=6000
+commit_p50_ms=14.964
+commit_p95_ms=35.222
+commit_p99_ms=81.058
+commit_max_ms=477.939
+commit_max_at=3570
+busy_retries=0
+commits_per_sec=398.2
+commits_acked=6005
+commits_uploaded=6005
+log_puts=983
+log_put_bytes=69704763
+commits_per_log_put=6.109
+bytes_per_log_put=70910.2
+ack_wait_p50_ms=12.800
+ack_wait_p95_ms=19.456
+ack_wait_p99_ms=22.528
+log_puts_per_commit=0.164
+bucket_puts=3145
+page_puts=2144
+seals=5
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=350
+seal_1_ms=7.923 seal_1_pages=2
+seal_2_ms=208.873 seal_2_pages=768
+seal_3_ms=129.395 seal_3_pages=503
+seal_4_ms=108.611 seal_4_pages=388
+seal_5_ms=136.377 seal_5_pages=483
+$ turso-durable restore --dir <fresh>
+restored generation=6 log_objects=1 gets=4 lists=1 bytes=4570 ms=23
+real 0.04
+user 0.00
+sys 0.00
+
+## w10-off-b: batching=window 10ms 64 1MiB maintenance=off prefix=bench/maint-20261017195546-w10-off-b
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.FGwZKa/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+commits=6000
+commit_p50_ms=14.886
+commit_p95_ms=35.155
+commit_p99_ms=79.815
+commit_max_ms=398.079
+commit_max_at=2657
+busy_retries=0
+commits_per_sec=405.7
+commits_acked=6005
+commits_uploaded=6005
+log_puts=981
+log_put_bytes=70208833
+commits_per_log_put=6.121
+bytes_per_log_put=71568.6
+ack_wait_p50_ms=12.800
+ack_wait_p95_ms=19.456
+ack_wait_p99_ms=21.504
+log_puts_per_commit=0.164
+bucket_puts=3152
+page_puts=2153
+seals=5
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=354
+seal_1_ms=5.444 seal_1_pages=2
+seal_2_ms=176.963 seal_2_pages=757
+seal_3_ms=32.818 seal_3_pages=132
+seal_4_ms=133.269 seal_4_pages=503
+seal_5_ms=187.734 seal_5_pages=759
+$ turso-durable restore --dir <fresh>
+restored generation=6 log_objects=1 gets=4 lists=1 bytes=4586 ms=21
+real 0.04
+user 0.00
+sys 0.00
+
+## w50-on-b: batching=window 50ms 64 1MiB maintenance=on prefix=bench/maint-20261017195546-w50-on-b
+$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.jSj7vz/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+commits=6000
+commit_p50_ms=62.900
+commit_p95_ms=70.738
+commit_p99_ms=110.945
+commit_max_ms=466.244
+commit_max_at=3176
+busy_retries=0
+commits_per_sec=124.0
+commits_acked=6005
+commits_uploaded=6005
+log_puts=758
+log_put_bytes=70823788
+commits_per_log_put=7.922
+bytes_per_log_put=93435.1
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.126
+bucket_puts=2869
+page_puts=2093
+seals=5
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=401
+seal_1_ms=6.009 seal_1_pages=2
+seal_2_ms=278.455 seal_2_pages=1096
+seal_3_ms=183.107 seal_3_pages=729
+seal_4_ms=53.696 seal_4_pages=128
+seal_5_ms=52.346 seal_5_pages=138
+$ turso-durable restore --dir <fresh>
+restored generation=6 log_objects=1 gets=4 lists=1 bytes=4538 ms=21
+real 0.04
+user 0.00
+sys 0.00
+
+## w50-off-b: batching=window 50ms 64 1MiB maintenance=off prefix=bench/maint-20261017195546-w50-off-b
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.T0Vqv8/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+commits=6000
+commit_p50_ms=63.026
+commit_p95_ms=70.838
+commit_p99_ms=78.969
+commit_max_ms=409.764
+commit_max_at=5221
+busy_retries=0
+commits_per_sec=123.7
+commits_acked=6005
+commits_uploaded=6005
+log_puts=757
+log_put_bytes=71592448
+commits_per_log_put=7.933
+bytes_per_log_put=94573.9
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.126
+bucket_puts=2868
+page_puts=2093
+seals=5
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=265
+seal_1_ms=10.300 seal_1_pages=2
+seal_2_ms=204.521 seal_2_pages=722
+seal_3_ms=182.530 seal_3_pages=604
+seal_4_ms=120.390 seal_4_pages=488
+seal_5_ms=84.653 seal_5_pages=277
+$ turso-durable restore --dir <fresh>
+restored generation=6 log_objects=1 gets=4 lists=1 bytes=4538 ms=21
+real 0.03
+user 0.00
+sys 0.00
+
+## off-lo200-b: batching=off maintenance=lo200 prefix=bench/maint-20261017195546-off-lo200-b
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.GrYPJ8/db --commits 6000 --connections 8
+commits=6000
+commit_p50_ms=1.251
+commit_p95_ms=2.398
+commit_p99_ms=601.449
+commit_max_ms=953.842
+commit_max_at=3914
+busy_retries=0
+commits_per_sec=389.7
+commits_acked=6031
+commits_uploaded=6060
+log_puts=6060
+log_put_bytes=53000039
+commits_per_log_put=1.000
+bytes_per_log_put=8745.9
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=2.304
+log_puts_per_commit=1.010
+bucket_puts=8352
+page_puts=2195
+seals=31
+maintenance_runs=29
+maintenance_sealed=29
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=365.069
+generation_log_objects_max=209
+seal_1_ms=5.734 seal_1_pages=2
+seal_2_ms=27.239 seal_2_pages=72
+seal_3_ms=44.946 seal_3_pages=74
+seal_4_ms=25.684 seal_4_pages=74
+seal_5_ms=21.553 seal_5_pages=74
+seal_6_ms=49.276 seal_6_pages=74
+seal_7_ms=28.451 seal_7_pages=75
+seal_8_ms=40.359 seal_8_pages=74
+seal_9_ms=50.488 seal_9_pages=75
+seal_10_ms=40.573 seal_10_pages=74
+seal_11_ms=25.355 seal_11_pages=75
+seal_12_ms=30.634 seal_12_pages=75
+seal_13_ms=47.538 seal_13_pages=75
+seal_14_ms=27.611 seal_14_pages=78
+seal_15_ms=24.792 seal_15_pages=75
+seal_16_ms=20.020 seal_16_pages=76
+seal_17_ms=24.149 seal_17_pages=75
+seal_18_ms=52.523 seal_18_pages=75
+seal_19_ms=37.658 seal_19_pages=74
+seal_20_ms=28.753 seal_20_pages=77
+seal_21_ms=47.552 seal_21_pages=74
+seal_22_ms=35.825 seal_22_pages=76
+seal_23_ms=50.576 seal_23_pages=77
+seal_24_ms=25.126 seal_24_pages=73
+seal_25_ms=24.044 seal_25_pages=74
+seal_26_ms=43.949 seal_26_pages=75
+seal_27_ms=39.221 seal_27_pages=78
+seal_28_ms=25.978 seal_28_pages=77
+seal_29_ms=36.089 seal_29_pages=76
+seal_30_ms=26.874 seal_30_pages=79
+seal_31_ms=7.517 seal_31_pages=13
+$ turso-durable restore --dir <fresh>
+restored generation=32 log_objects=1 gets=4 lists=1 bytes=5931 ms=23
+real 0.05
+user 0.00
+sys 0.00
+
+## w50-lo200-b: batching=window 50ms 64 1MiB maintenance=lo200 prefix=bench/maint-20261017195546-w50-lo200-b
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.ENhDEZ/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+commits=6000
+commit_p50_ms=62.819
+commit_p95_ms=70.630
+commit_p99_ms=119.184
+commit_max_ms=248.361
+commit_max_at=1602
+busy_retries=0
+commits_per_sec=124.1
+commits_acked=6007
+commits_uploaded=6009
+log_puts=758
+log_put_bytes=70414745
+commits_per_log_put=7.927
+bytes_per_log_put=92895.4
+ack_wait_p50_ms=57.344
+ack_wait_p95_ms=69.632
+ack_wait_p99_ms=73.728
+log_puts_per_commit=0.126
+bucket_puts=2886
+page_puts=2104
+seals=7
+maintenance_runs=2
+maintenance_sealed=2
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=40.745
+generation_log_objects_max=202
+seal_1_ms=24.385 seal_1_pages=2
+seal_2_ms=172.869 seal_2_pages=548
+seal_3_ms=87.156 seal_3_pages=378
+seal_4_ms=165.849 seal_4_pages=555
+seal_5_ms=82.481 seal_5_pages=244
+seal_6_ms=64.560 seal_6_pages=129
+seal_7_ms=80.058 seal_7_pages=248
+$ turso-durable restore --dir <fresh>
+restored generation=8 log_objects=1 gets=4 lists=1 bytes=4570 ms=34
+real 0.05
+user 0.00
+sys 0.00
+
+## Maintenance summary
+laptop (Apple M4 Max, RustFS in podman on the same Mac), not production. 6000 commits of 1 KB,
+8 connections, DURABLE_OTEL off. Each cell is "round a / round b".
+
+| Batching   | Maintenance | commit p50 / p95 (ms)   | commit p99 (ms) | commit max (ms)        | runs (sealed) | max gate wait (ms) | seals | generation_log_objects_max | restore GETs (final) |
+|------------|-------------|-------------------------|-----------------|------------------------|---------------|--------------------|-------|----------------------------|----------------------|
+| off        | on          | 1.34 / 1.73, 1.31 / 1.67 | 4.60 / 2.23    | 7506 / 8921 (#8 / #7)  | 1 (1) / 0     | 82.2 / -           | 10 / 11 | 1009 / 999               | 4 / 4 |
+| off        | off         | 1.35 / 1.76, 1.38 / 1.79 | 3.29 / 2.88    | 8197 / 9294 (#4 / #5)  | 0 / 0         | -                  | 10 / 7  | 1488 / 2000              | 4 / 4 |
+| off        | lo200       | 1.26 / 2.08, 1.25 / 2.40 | 565.1 / 601.4  | 2212 / 954             | 26 (25) / 29 (29) | 437.3 / 365.1  | 28 / 31 | 988 / 209                | 4 / 4 |
+| window 1ms | on          | 5.17 / 22.2, 5.16 / 15.1 | 71.3 / 64.9    | 382 / 464              | 1 (1) / 1 (1) | 31.2 / 13.6        | 3 / 3   | 1005 / 1005              | 4 / 4 |
+| window 1ms | off         | 5.02 / 22.5, 5.41 / 15.0 | 65.6 / 50.3    | 230 / 269              | 0 / 0         | -                  | 2 / 2   | 1945 / 1889              | 4 / 4 |
+| window 10ms| on          | 14.8 / 34.0, 15.0 / 35.2 | 72.8 / 81.1    | 528 / 478              | 1 (1) / 0     | 15.1 / -           | 3 / 5   | 956 / 350                | 4 / 4 |
+| window 10ms| off         | 15.0 / 34.1, 14.9 / 35.2 | 68.0 / 79.8    | 566 / 398              | 0 / 0         | -                  | 3 / 5   | 699 / 354                | 4 / 4 |
+| window 50ms| on          | 62.9 / 70.5, 62.9 / 70.7 | 74.9 / 110.9   | 631 / 466              | 0 / 0         | -                  | 4 / 5   | 447 / 401                | 4 / 4 |
+| window 50ms| off         | 63.4 / 69.9, 63.0 / 70.8 | 76.8 / 79.0    | 425 / 410              | 0 / 0         | -                  | 4 / 5   | 358 / 265                | 4 / 4 |
+| window 50ms| lo200       | 63.3 / 70.5, 62.8 / 70.6 | 120.9 / 119.2  | 319 / 248              | 1 (1) / 2 (2) | 24.3 / 40.7        | 7 / 7   | 202 / 202                | 4 / 4 |
+
+(seals include the setup connection's close and the bench's close. Commits/s: off 644-667,
+off lo200 390-407, window 1ms 977-1024, 10ms 398-407, 50ms 124. busy_retries: off 3-7 per
+run, 0 under every Window setting and under off lo200.)
+
+What the figures show:
+- Why it exists: with maintenance off, a generation under window 1ms held 1889-1945 log
+  objects (no in-run seal: seals 2 = setup + close), so a restore taken then would have cost
+  about 1900 GETs. With the defaults it held at most 1005 (one maintenance run, at 1000
+  objects). The system test (debug build, 8 connections, window 1ms, killed after 3000 acks)
+  shows the same: off, 0 seals and a restore of 936-943 log objects (937-944 GETs); at a
+  threshold of 200, 5 maintenance seals and a restore of 1 log object (4 GETs), killed right
+  after a maintenance seal.
+- The engine still restarts the WAL by itself sometimes under Window: at 10 ms round a sealed
+  once in the run without maintenance (seals 3), round b three times (5); at 50 ms, 2-3 times. At
+  50 ms no generation reached 1000 objects or 64 MiB, so the defaults never ran maintenance
+  there; the lo200 rows measure its stall instead. window 10ms round a ran maintenance at
+  956 log objects, so the -wal measure (64 MiB) fired (inferred: bench does not print the
+  -wal size).
+- The stall under Window: with the defaults, at most one maintenance run per 6000 commits. Its gate wait was 13.6-31.2
+  ms at 1 ms, 15.1 ms at 10 ms, 24.3-40.7 ms at 50 ms (lo200). At 1 ms, commit p99 rose by
+  5.7 and 14.6 ms and the slowest commit by 152 and 196 ms; the maintenance seal itself took
+  267 and 243 ms for 1147 and 1138 pages (seal_2 of the w1-on runs). At 10 and 50 ms the on/off
+  differences are inside the round-to-round noise (window 50ms round b's p99 was 110.9 ms
+  with no maintenance run at all). The hold bound is gate wait + the seal's duration; a
+  bigger generation makes a longer seal (467 ms for 2057 pages in window 10ms round a, whose
+  slowest commit, 528 ms, was still inside the no-maintenance runs'
+  398-566 ms; in two
+  earlier rounds of the same code before bench retried busy commits, raw output in the Task
+  13 report, the slowest window 10ms commit was 562-615 ms with maintenance against 239-282 ms
+  without).
+- Under Off, the defaults ran at most once per 6000 commits (generation_log_objects_max
+  999-1009): p99 4.60 / 2.23 ms on against 3.29 / 2.88 ms off. Every Off run's slowest commit
+  (7.5-9.3 s, commit #4-#8, maintenance on or off) is start-up lock contention between the 8
+  connections in the engine (inferred, as in the 2000-commit runs above).
+- Off with a low threshold is expensive: at lo200 the 26-29 runs drained for up to 365-437
+  ms each (statements in flight wait in the engine's busy handler while they hold the
+  gate), commit p99 rose to 565-601 ms and throughput fell from 644-667 to 390-407 commits/s.
+  Round a also skipped one run (bench does not print the reason) and its generation reached
+  988 log objects before the next. The default threshold (1000) keeps runs rare under Off.

@@ -224,6 +224,59 @@ pub enum Batching {
 - Each `durable.upload` span carries the number of commits and bytes that PUT held (see Telemetry).
 - `soak --batching-file` changes the setting of a running process, and `--stats-every` prints the stats as it goes (see CLI).
 
+### Maintenance checkpoint
+
+**Why it exists.** A generation ends, and the restore it costs stops growing, only when the WAL restarts: the seal then uploads its pages, and a restore reads only the new generation's log. turso_core 0.8.3 restarts the WAL only when the next writer finds it fully backfilled with no reader on it (`storage/wal.rs:5289-5316`). Window releases the write lock before the upload, so under sustained commits from several connections the commits overlap and that moment never comes. Before this checkpoint was added, the final review's runs with 8 Window connections sealed 0 times in 6000–20000 commits at 1–10 ms windows, the WAL grew to 68–229 MB, and a restore needed about one GET per 2.8 commits. The engine does restart it at times, more often at longer windows (see the figures below). A writer open now seals such a generation itself. Measured on a laptop with 8 connections under `window 1ms 64 1MiB` (`results/batching-knob.txt`): in 6000 commits, a generation held 1889–1945 log objects without it and at most 1005 with it; in the system test, a soak killed after 3000 acks restored 936–943 log objects without it and 1 with it (threshold 200, killed right after a maintenance seal).
+
+**What a run does.** Every writer open with maintenance on runs a background thread, `turso-durable-maintenance`; a read-only open never does. When the current generation is due, the thread:
+1. closes the gate (below) and waits for the statements in flight to leave;
+2. runs `checkpoint(TRUNCATE)` on its own engine connection, which seals the generation exactly as `Connection::checkpoint(CheckpointMode::Truncate)` does: it uploads the waiting Window commits first, then the pages, the manifest and the head;
+3. opens the gate again.
+
+**When a generation is due.** Either measure can trigger a run. 0 turns a measure off, and both 0 turn maintenance off.
+- Its log holds at least `maintenance_log_objects` objects (default 1000, `DURABLE_MAINTENANCE_LOG_OBJECTS`). This bounds a restore to about 3 + 1000 GETs, plus the few objects that land while a run drains and seals.
+- The local `-wal` has reached `maintenance_wal_bytes` (default 64 MiB, `DURABLE_MAINTENANCE_WAL_MIB`, in MiB).
+- Every `Connection` call checks this when it ends (a few atomic loads), and wakes the thread when the generation is due.
+
+**The gate.**
+- Every public `Connection` call (`execute`, `query`, `execute_batch`, `transaction`, `transaction_with`, `checkpoint`, `close`) passes the gate around its engine work only. A Window commit's ack wait runs outside it, so an ack wait never holds maintenance up.
+- An open explicit transaction counts as in flight until it commits or rolls back: `transaction()`, `transaction_with()`, or `BEGIN` through `execute`, `query` or `execute_batch`. Statements inside a transaction that is already open pass a closed gate. Only new transactions and autocommit statements wait.
+- The drain waits at most `maintenance_gate_wait` (default 500 ms, `DURABLE_MAINTENANCE_GATE_WAIT_MS`). `Config` refuses 0 while maintenance is on. If anything is still in flight then (a transaction open longer than that, say), the gate reopens and the run is skipped as `gate_timeout`.
+- **The hold bound.** A run holds new statements back for at most `maintenance_gate_wait` while it drains, plus the seal's duration (its page, manifest and head uploads). Only if the seal itself runs into a new outage can the seal take up to `retry_deadline` (30 s by default).
+
+**When it does not run, and retries.**
+- No run starts while the bucket is degraded or its last operation failed. The run is skipped as `bucket degraded` or `last bucket operation failed`, with no `MaintenanceStarted`, and the gate stays open. A failed operation is cleared by the next one that succeeds; on an idle database the uploader probes the bucket every 2 s (`MAX_BACKOFF`) with one head GET, which writes nothing, until it answers.
+- After a skipped run the next waits at least 1 s (`MAINTENANCE_RETRY`). Gate timeouts and busy refusals in a row double that: 1, 2, 4, 8, 16, then 30 s (`MAINTENANCE_RETRY_MAX`). A seal resets it. After a failed run (`error: …`) the next waits 1 s, or runs sooner once the generation has grown by one more threshold. Both values are fixed, in `mod defaults`.
+- `busy` means the engine refused the TRUNCATE: engine work outside the gate (a new connection being opened by `Database::connect`, or the prefetch) held the WAL.
+
+**When a maintenance seal fails.** Maintenance never returns an error to a caller; it logs a warning and retries later. But a failed maintenance seal passes its error to the next commit, as a failed `checkpoint(Truncate)` has done since stage 1. The engine restarts the WAL in memory before the seal runs at `truncate(0)`, so the next commit must seal first, and while page PUTs still fail it gets the seal's error. An outage that also fails log PUTs fails commits either way; only an outage that fails page PUTs alone turns into commit failures. Nothing acked is lost.
+
+**It applies in every mode.** Under Off the engine usually restarts the WAL by itself, so the trigger rarely fires (see the figures below).
+
+**Seeing it.**
+- Events (`#[doc(hidden)]`, like the others; see Guarantees): `MaintenanceStarted { generation, log_objects, wal_bytes }`; `MaintenanceFinished { generation, gate_wait, elapsed }`, which means the run sealed (`gate_wait` is the drain, `elapsed` the whole run with its seal); `MaintenanceSkipped { generation, reason }`, where `reason` is `bucket degraded`, `last bucket operation failed`, `gate_timeout`, `busy`, `closed` (the database was closing), `panic` or `error: <message>`.
+- The `durable.maintenance` span, one per run (see Telemetry), with outcome `sealed`, `bucket_failing`, `gate_timeout`, `busy`, `closed` or `error`. A failed or panicked run logs a WARN record; routine skips log at INFO.
+- `soak` prints the events as lines and `bench` counts them (see CLI).
+
+**What it costs.** Laptop figures (Apple M4 Max, RustFS in podman on the same Mac), from `results/batching-knob.txt`: 6000 commits of 1 KB on 8 connections, two rounds per row, shown as "a / b". "on" is the defaults, "off" sets both thresholds to 0, and "200" sets `maintenance_log_objects` to 200; with the defaults, `window 50ms` never ran maintenance and Off ran it at most once.
+
+| Batching | Maintenance | Runs | Max gate wait | Commit p99 | Slowest commit | Most log objects in a generation |
+|---|---|---|---|---|---|---|
+| `off` | on | 1 / 0 | 82 ms / – | 4.6 / 2.2 ms | 7.5 / 8.9 s | 1009 / 999 |
+| `off` | off | 0 / 0 | – | 3.3 / 2.9 ms | 8.2 / 9.3 s | 1488 / 2000 |
+| `off` | 200 | 26 / 29 | 437 / 365 ms | 565 / 601 ms | 2212 / 954 ms | 988 / 209 |
+| `window 1ms 64 1MiB` | on | 1 / 1 | 31 / 14 ms | 71.3 / 64.9 ms | 382 / 464 ms | 1005 / 1005 |
+| `window 1ms 64 1MiB` | off | 0 / 0 | – | 65.6 / 50.3 ms | 230 / 269 ms | 1945 / 1889 |
+| `window 10ms 64 1MiB` | on | 1 / 0 | 15 ms / – | 72.8 / 81.1 ms | 528 / 478 ms | 956 / 350 |
+| `window 10ms 64 1MiB` | off | 0 / 0 | – | 68.0 / 79.8 ms | 566 / 398 ms | 699 / 354 |
+| `window 50ms 64 1MiB` | off | 0 / 0 | – | 76.8 / 79.0 ms | 425 / 410 ms | 358 / 265 |
+| `window 50ms 64 1MiB` | 200 | 1 / 2 | 24 / 41 ms | 120.9 / 119.2 ms | 319 / 248 ms | 202 / 202 |
+
+- Under Window a run holds statements for its gate wait (14–41 ms here) plus its seal: at 1 ms, commit p99 rose by 6–15 ms and the slowest commit by 150–200 ms, about the maintenance seal's 243–267 ms for about 1140 pages. A bigger generation makes a longer seal (467 ms for 2057 pages at 10 ms). At 10 and 50 ms the differences are inside the run-to-run noise.
+- The engine still restarts the WAL by itself at times under Window (at 10 and 50 ms here), and then maintenance has nothing to do.
+- Under Off a low threshold is expensive: statements in flight wait in the engine's busy handler while they hold the gate, so each drain took up to 365–437 ms, commit p99 rose to 565–601 ms and throughput fell from 644–667 to 390–407 commits/s. The default threshold keeps runs rare under Off. Every Off run's slowest commit (7.5–9.3 s, among the first 8 commits, with or without maintenance) is start-up lock contention in the engine (inferred).
+- With 8 Off connections the engine also refuses a commit as `database is busy (locked)` now and then, before its 5 s busy timeout, with or without maintenance (3–7 per 6000 commits here). `bench` retries those (`busy_retries`); an application has to retry them too.
+
 ## CLI
 
 `turso-durable <command> --dir DIR …`. S3 settings come from the `DURABLE_*` variables. Build it with `cargo build --release --locked -p turso-durable-cli`.
@@ -235,7 +288,7 @@ pub enum Batching {
 | `sql --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, or restored and never opened) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. There is no read-only fallback; use `verify` to read. |
 | `stats --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer like `sql` (the same `--claim` rule), runs each SQL argument as its own `execute`, then prints `Database::upload_stats()` as `key=value` lines: `commits_acked`, `commits_uploaded`, `log_puts`, `log_put_bytes`, `commits_per_log_put`, `bytes_per_log_put`, `ack_wait_p50_ms`, `ack_wait_p95_ms`, `ack_wait_p99_ms`. |
 | `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N] [--connections N] [--batching SPEC] [--batching-file PATH] [--stats-every N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors, printing `error <message>`. More below. |
-| `bench --dir DIR --commits N [--connections N] [--batching SPEC]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, and each seal's ms and page count. |
+| `bench --dir DIR --commits N [--connections N] [--batching SPEC]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, each seal's ms and page count, then the maintenance checkpoint's `maintenance_runs` (runs started), `maintenance_sealed`, `maintenance_skipped`, `maintenance_gate_wait_max_ms` (the longest drain of a run that sealed), and `generation_log_objects_max` (the highest log seq seen before the close: the most log objects a generation held, which a restore of it reads). |
 
 `SPEC` is the PRAGMA's text, `off` or `window <max_wait> <max_commits> <max_bytes>` (for example `'window 10ms 64 1MiB'`). `--batching` sets it with `Database::set_batching` after open; without it, `DURABLE_BATCHING` applies.
 
@@ -243,7 +296,9 @@ pub enum Batching {
 - `--connections N`: N threads, one connection each. Thread `i` commits ids `start + i + k·N`.
 - `--batching-file PATH`: re-read before each commit when the file's mtime or length changed. A valid setting is set on the database and printed as `batching <setting>`. An unreadable file or a bad setting prints one `error: …` line on stderr and keeps the current setting.
 - `--stats-every N`: every N acks, prints the upload stats as `stats <key>=<value>` lines (the `stats` keys), taken while no commit runs.
-- It prints `event seal-started` and `event seal-finished` around each seal. With `--batching` or `--batching-file` it also prints `event batch-waiting <n>` when a Window commit joins a batch of n, and `event log-uploaded <commits>` (commit numbers such as `4,5,6`, or `-` for none) when a log record is confirmed.
+- It prints `event seal-started` and `event seal-finished` around each seal. With `--batching` or `--batching-file` it also prints:
+  - `event batch-waiting <n>` when a Window commit joins a batch of n, and `event log-uploaded <commits>` (commit numbers such as `4,5,6`, or `-` for none) when a log record is confirmed;
+  - for the maintenance checkpoint, `event maintenance-started log_objects=<n> wal_bytes=<n>`, `event maintenance-finished gate_wait_ms=<ms> ms=<ms>` (it sealed; the drain and the whole run, 3 decimals) and `event maintenance-skipped <reason>`.
 
 Every command exports telemetry when `DURABLE_OTEL=1` (see Telemetry). If the export cannot start, it prints `warning: telemetry off: …` on stderr and runs without it.
 
@@ -270,6 +325,9 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_TRIM_GRACE_SECS` | `trim_grace` | 10 min | How long an unreferenced object stays before it is deleted. A writer idle for half of it checks the head before its next append (one GET). Fencing an old writer after a restore depends on it (see "Restore and the claim"):<br>• Every process that opens a prefix as a writer must use the same value. A claimer's must never be smaller than the old writer's.<br>• It must exceed 2 × (`retry_deadline` + `request_timeout`), 80 s with the defaults. `Config` refuses a smaller value with an error.<br>• `0` (every commit checks the head) is for tests only, so it stays allowed. It is unsafe while an old writer may still be running.<br>Nothing enforces the same-value rule; stage 3's lease replaces it. |
 | `DURABLE_PREFETCH` | `prefetch` | `false` | After open, fetch every sealed page in the background. |
 | `DURABLE_BATCHING` | `batching` | `off` | The database's batching setting at open, in the PRAGMA's text: `off` or `window <max_wait> <max_commits> <max_bytes>` (see Batching). A bad value fails with `Config`. |
+| `DURABLE_MAINTENANCE_LOG_OBJECTS` | `maintenance_log_objects` | 1000 | A maintenance checkpoint seals the generation once its log holds this many objects (see "Maintenance checkpoint"). 0 turns this measure off. |
+| `DURABLE_MAINTENANCE_WAL_MIB` | `maintenance_wal_bytes` | 64 MiB | … or once the local `-wal` reaches this size. The variable is in MiB; the field is in bytes. 0 turns this measure off; with both 0, maintenance is off. |
+| `DURABLE_MAINTENANCE_GATE_WAIT_MS` | `maintenance_gate_wait` | 500 ms | The longest a maintenance run holds new statements back while it waits for those in flight (and open transactions) to end; then it reopens the gate and retries later. `Config` refuses 0 while maintenance is on. |
 
 `TelemetryConfig::from_env()` reads the telemetry variables (`Config::from_env` does not):
 
@@ -284,6 +342,7 @@ Where the defaults live:
 - `crates/turso_durable/src/config.rs`, `mod defaults`, holds every default above.
 - The retry backoff is fixed and cannot be configured. It starts at 50 ms (`FIRST_BACKOFF`), doubles, and is capped at 2 s (`MAX_BACKOFF`). Both are in `mod defaults` too. `RetryPolicy::default` in `crates/turso_durable/src/store/retry.rs` takes all three retry values from there.
 - The batching default, `Off`, is `BATCHING` in `mod defaults`. It stays `Off` until there are numbers from real S3. The 60 s cap on a window's `max_wait` is `MAX_BATCH_WAIT`, there too; it cannot be configured. The telemetry defaults are there too (`OTEL`, `OTEL_ENDPOINT`, `OTEL_LEVEL`), with the fixed export limits: one export times out after 1 s (`OTEL_EXPORT_TIMEOUT`), shutdown waits at most 2 s (`OTEL_SHUTDOWN`), and each queue holds 2048 spans or log records (`OTEL_QUEUE`).
+- The maintenance defaults are `MAINTENANCE_LOG_OBJECTS`, `MAINTENANCE_WAL_BYTES` and `MAINTENANCE_GATE_WAIT` in `mod defaults`, with the fixed retry delays: 1 s after a skipped or failed run (`MAINTENANCE_RETRY`), doubled for gate timeouts and busy refusals in a row up to 30 s (`MAINTENANCE_RETRY_MAX`).
 - The busy timeout between connections is fixed at 5 s. It lives in `crates/turso_durable/src/conn.rs` (`BUSY_TIMEOUT`).
 
 ## Telemetry
@@ -301,10 +360,11 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `durable.upload` | the first commit's `durable.commit` | One per log PUT: `durable.commits`, `durable.bytes`, `durable.generation`, `durable.seq`, `durable.retries`, `s3.status` |
 | `durable.checkpoint_upload` | the caller's span | One per seal: `durable.generation`, `durable.seq` (the seal-start record's), `durable.pages`, `durable.retries`, `s3.status` |
 | `durable.restore` | the caller's span | `durable.generation`, `durable.seq` (the highest log seq replayed, 0 when the log is empty), `durable.log_objects`, `durable.gets`, `durable.bytes`, `durable.retries`, `s3.status` |
+| `durable.maintenance` | none (the maintenance thread) | One per maintenance run: `durable.generation`, `durable.log_objects`, `durable.wal_bytes` (the measures that made it due), `durable.gate_wait_ms` (the drain; absent when the run did not start), `durable.outcome` (`sealed`, `bucket_failing`, `gate_timeout`, `busy`, `closed` or `error`). The seal's `durable.checkpoint_upload` is its descendant. |
 
 Every span and log record also carries `test_run_id` when one is set (`DURABLE_TEST_RUN_ID`).
 
-**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR).
+**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR). Maintenance logs `maintenance checkpoint not started; retrying later` and `maintenance checkpoint skipped; retrying later` (INFO), and `maintenance checkpoint failed; retrying later` and `maintenance checkpoint panicked; retrying later` (WARN).
 - Each record keeps its own time. Without one it gets its observed time, and without that the current time.
 - Log records carry no trace or span ids. Adding them would need an experimental OpenTelemetry feature.
 
@@ -322,7 +382,7 @@ Every span and log record also carries `test_run_id` when one is set (`DURABLE_T
 
 **The ClickHouse check.** `scripts/otel-check.sh RUN_ID` checks that one run's telemetry reached the observability stack.
 - It runs read-only `SELECT`s, as the stack's read-only ClickHouse user, on `otel.otel_traces` and `otel.otel_logs`, for `ServiceName = 'turso-durable'` and that `test_run_id`.
-- It passes when every span name above has at least one span, at least one log record is dated today, and no log record is dated before 2000-01-01. It polls for up to 60 s.
+- It passes when every span name above except `durable.maintenance` (its short workload never makes a generation due) has at least one span, at least one log record is dated today, and no log record is dated before 2000-01-01. It polls for up to 60 s.
 - Settings: `DURABLE_CH_URL` (default `http://localhost:8123`), `DURABLE_CH_USER` (default `hyperdx_ro`) and `DURABLE_CH_PASSWORD`. Without `DURABLE_CH_PASSWORD`, it reads the password at run time from the stack's users SQL file (`~/Dev/p/sre/stack/clickhouse/00_database_users.sql`). The password reaches curl only on stdin; it is never printed, written to a file or put on a command line.
 - It prints one line: `otel check PASSED: …` (exit 0), `otel check FAILED: …` (exit 1), or, when ClickHouse or the collector port 4317 does not answer, `otel check SKIPPED: observability stack not running` (exit 0). A missing `nc` is `otel check FAILED: nc not found`.
 
@@ -454,11 +514,12 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 - Stage 1: in the 5000-commit bench, the commit p50 was 1.33 ms, while the slowest commit took 69.8 ms. That commit is most likely the one that crossed the first boundary (bench does not record which commit triggered a seal), whose seal took 39.4 ms for 169 pages.
 - Stage 1: each in-run seal took 37–44 ms for 169–172 pages.
 - You can move this wait off a latency-sensitive path by calling `Connection::checkpoint(CheckpointMode::Truncate)` at a quiet moment.
+- A maintenance checkpoint seals inside its own TRUNCATE too. No commit carries that seal; new statements wait at the gate while it runs instead (see "Maintenance checkpoint" for the bound).
 
 **Limits.**
 - Without `prefetch`, a restored database fetches pages lazily in every process that opens it, until a prefetch completes. Each process fetches each page it reads once. Only a finished prefetch in a writer open marks the directory `complete`.
 - Short-lived processes never trim. The trimmer waits `trim_grace` (10 min by default) after each seal, and close stops it. A process that exits sooner than `trim_grace` after its seals deletes nothing, so the bucket grows until a long-lived process trims or stage 3's `gc` runs.
-- Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large (a long-running reader that blocks checkpoints, for example) makes the seal large too. `CheckpointMode::Truncate` at quiet moments keeps generations small.
+- Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large makes the seal large too. The maintenance checkpoint seals once the `-wal` reaches `maintenance_wal_bytes` (64 MiB by default), but a transaction held open past `maintenance_gate_wait` keeps it from running (it retries with backoff). `CheckpointMode::Truncate` at quiet moments keeps generations small.
 - Never copy a live database directory (`cp -r`, a VM or disk clone). The copy has the same writer id, so fencing cannot tell the two processes apart. Restore into a new directory instead.
 
 **Edge cases.**
@@ -472,6 +533,8 @@ MVCC is unsupported. It is also refused at open: from bytes 18/19 of a local `ap
 ## Costs (measured)
 
 ### Stage 2: batching
+
+The maintenance checkpoint's costs are under Batching, "Maintenance checkpoint".
 
 Source: `results/batching-knob.txt`. These are laptop figures (Apple M4 Max, RustFS in podman on the same Mac), not production numbers. Each run made 2000 commits of `INSERT OR REPLACE` with a 1 KB blob, on 1 or 8 connections, with telemetry off (`DURABLE_OTEL` unset). There was one run per row, so small differences are noise.
 
@@ -491,7 +554,7 @@ Source: `results/batching-knob.txt`. These are laptop figures (Apple M4 Max, Rus
 - One connection gains nothing from a window: one commit per PUT, and every commit waits out the window.
 - With 8 connections, a window shares PUTs: 3.1, 6.0 and 7.9 commits per PUT at 1, 10 and 50 ms. Each connection has at most one commit waiting, so a PUT held at most about 8 here. Only the 1 ms window also raised throughput over Off (1038 against 631 commits/s).
 - At 10 and 50 ms, acks waited several ms longer than the window plus one PUT. The cause was not investigated. A review found no cause in the code; the excess grows with the window (about 0.4, 5.6 and 11.8 ms at 1, 10 and 50 ms), which fits macOS timer coalescing on the uploader's `recv_timeout` (a hypothesis, unverified).
-- Checkpoint uploads: with one connection, each in-run seal took 41–45 ms (Off) and 43–75 ms (Window) for 170 pages. With 8 Window connections, no WAL restart happened during the run, so the run's 696–728 pages were sealed once, at close, in 177–186 ms.
+- Checkpoint uploads: with one connection, each in-run seal took 41–45 ms (Off) and 43–75 ms (Window) for 170 pages. With 8 Window connections, no WAL restart happened during the run, so the run's 696–728 pages were sealed once, at close, in 177–186 ms. These runs predate the maintenance checkpoint, which now seals such a generation during the run (see "Maintenance checkpoint").
 - Restore of the 1-connection Off database (generation 6): 24 ms, 4 GETs (`3 + 1` log object), 1 LIST, 4.4 KB downloaded. A full `verify` of the fresh restore took 0.23 s of wall time.
 
 ### Stage 1
@@ -534,9 +597,9 @@ These are the design decisions behind stage 1. The evidence is turso_core 0.8.3 
 ## Test command
 
 - `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests.
-- `./scripts/test.sh`: the above, then starts RustFS (`scripts/rustfs.sh up`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, and collector-down runs).
+- `./scripts/test.sh`: the above, then starts RustFS (`scripts/rustfs.sh up`) and runs the RustFS-backed `--ignored` tests with `--test-threads=1`. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs).
   - It runs them with `DURABLE_OTEL=1` under one `DURABLE_TEST_RUN_ID` (`turso-durable-<timestamp>-<pid>`, printed as `test run id: …`).
-  - Then it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then a `restore`), so every span kind is exported.
+  - Then it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then a `restore`), so every span kind except `durable.maintenance` is exported.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
 - `scripts/rustfs.sh up|down|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it.
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
