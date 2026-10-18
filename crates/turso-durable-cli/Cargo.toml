@@ -9,6 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 turso_durable = { path = "../turso_durable" }
+turso-durable-server = { path = "../turso-durable-server" }
 
 [dev-dependencies]
 tempfile.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+turso-durable-hrana-client = { path = "../turso-durable-hrana-client" }
