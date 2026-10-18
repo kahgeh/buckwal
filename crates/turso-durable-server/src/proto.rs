@@ -212,9 +212,18 @@ pub fn to_value(v: &HValue) -> Result<turso_durable::Value, ProtoError> {
     use turso_durable::Value;
     Ok(match v {
         HValue::Null => Value::Null,
-        HValue::Integer { value } => Value::from_i64(value.parse::<i64>().map_err(|e| {
-            ProtoError::new("PROTO_ERROR", format!("invalid integer {value:?}: {e}"))
-        })?),
+        HValue::Integer { value } => {
+            let digits = value.strip_prefix('-').unwrap_or(value);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ProtoError::new(
+                    "PROTO_ERROR",
+                    format!("invalid integer {value:?}"),
+                ));
+            }
+            Value::from_i64(value.parse::<i64>().map_err(|e| {
+                ProtoError::new("PROTO_ERROR", format!("invalid integer {value:?}: {e}"))
+            })?)
+        }
         HValue::Float { value } => {
             if value.is_nan() {
                 return Err(ProtoError::new("PROTO_ERROR", "float is NaN"));
@@ -253,7 +262,13 @@ pub fn from_value(v: &turso_durable::Value) -> Result<HValue, ProtoError> {
         });
     }
     let f = v.as_float();
-    if !f.is_finite() {
+    if f.is_nan() {
+        return Err(ProtoError::new(
+            "UNSUPPORTED",
+            "NaN float cannot be represented in JSON",
+        ));
+    }
+    if f.is_infinite() {
         return Err(ProtoError::new(
             "UNSUPPORTED",
             "infinite float cannot be represented in JSON",
@@ -530,11 +545,37 @@ mod tests {
             r#"{"type":"integer","value":"1.5"}"#,
             r#"{"type":"integer","value":"99999999999999999999"}"#,
             r#"{"type":"blob","base64":"!!"}"#,
+            r#"{"type":"integer","value":"+5"}"#,
+            r#"{"type":"integer","value":" 5"}"#,
+            r#"{"type":"integer","value":"5 "}"#,
+            r#"{"type":"integer","value":""}"#,
+            r#"{"type":"integer","value":"-"}"#,
         ] {
             let h: HValue = serde_json::from_str(json).unwrap();
             let e = to_value(&h).unwrap_err();
             assert_eq!(e.code.as_deref(), Some("PROTO_ERROR"), "{json}");
         }
+    }
+
+    #[test]
+    fn json_integer_float_becomes_float() {
+        let h: HValue = serde_json::from_str(r#"{"type":"float","value":1}"#).unwrap();
+        let v = to_value(&h).unwrap();
+        assert_eq!(v.as_int(), None);
+        assert_eq!(v.as_float().to_bits(), 1.0f64.to_bits());
+        assert_eq!(from_value(&v).unwrap(), HValue::Float { value: 1.0 });
+    }
+
+    #[test]
+    fn batch_result_skipped_steps_are_null() {
+        let r = BatchResult {
+            step_results: vec![None],
+            step_errors: vec![None],
+        };
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            serde_json::json!({"step_results":[null],"step_errors":[null]})
+        );
     }
 
     #[test]
