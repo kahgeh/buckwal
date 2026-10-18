@@ -122,6 +122,10 @@ fn child(dir: &Path, stage: &str) {
     let st = c.wal_state().unwrap();
     println!("[{stage}] start: wal_state={st:?} rows={}", count(&c));
     match stage {
+        "report" => {
+            let (gi, how) = read_pos(dir);
+            println!("[{stage}] after the kill: pos file = generation index {gi} {how}, local WAL {st:?} (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)");
+        }
         "resume_seq" | "resume_pos" => {
             let start_rows = count(&c);
             let (gi, have, pending) = if stage == "resume_seq" {
@@ -188,7 +192,7 @@ fn main() {
     for i in 11..14 {
         b.w.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(100))", &[Value::from_i64(i)]).unwrap();
     }
-    bulk(100, 140, 3000);
+    bulk(10000, 11500, 3000); // about 4,500 frames, so the local checkpoint takes a measurable time
     b.w.checkpoint(CheckpointMode::Truncate).unwrap(); // seal: WAL restarts with new salts
     let g1 = b.wdb.generation();
     b.w.execute("INSERT INTO t(id, v) VALUES (300, zeroblob(10))", &[]).unwrap();
@@ -227,7 +231,8 @@ fn main() {
     };
     let stages = [
         "mid:0", "end:0", "ckpt:0", "mid:1", "end:1", "ckpt:1", "mid:2",
-        "inckpt:300", "inckpt:1500", "inckpt:4000", "inckpt:9000", "none",
+        "inckpt:1000", "inckpt:3000", "inckpt:6000", "inckpt:10000", "inckpt:15000", "inckpt:25000", "inckpt:40000", "inckpt:70000",
+        "none",
     ];
     let mut failures = [0, 0];
     for (n, stage) in stages.iter().enumerate() {
@@ -242,6 +247,11 @@ fn main() {
             let o = Command::new(&exe).args(["child", killed.to_str().unwrap(), stage]).output().unwrap();
             print!("{}", String::from_utf8_lossy(&o.stdout));
             println!("[{stage}] child exit: {:?}", o.status);
+            if stage.starts_with("inckpt:") {
+                // where did the kill land? ask a child to report the replica's WAL state
+                let o = Command::new(&exe).args(["child", killed.to_str().unwrap(), "report"]).output().unwrap();
+                print!("{}", String::from_utf8_lossy(&o.stdout));
+            }
         }
         for (k, policy) in ["resume_seq", "resume_pos"].iter().enumerate() {
             let run_dir = inputs.join(format!("killed{n}-{policy}"));

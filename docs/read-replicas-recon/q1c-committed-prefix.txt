@@ -1,0 +1,11 @@
+big transaction: Err(Config("rollback on purpose"))
+writer rows [[Numeric(Integer(24))]]
+  sync 1: image has 0 whole frames, committed prefix 0, uncommitted tail 0, applied so far 0
+  sync 2: image has 0 whole frames, committed prefix 0, uncommitted tail 0, applied so far 0
+  sync 3: image has 5120 whole frames, committed prefix 1, uncommitted tail 5119, applied so far 0
+  sync 4: image has 5120 whole frames, committed prefix 2, uncommitted tail 5118, applied so far 1
+  sync 5: image has 5120 whole frames, committed prefix 3, uncommitted tail 5117, applied so far 2
+  sync 6: image has 5120 whole frames, committed prefix 4, uncommitted tail 5116, applied so far 3
+  sync 7: image has 5120 whole frames, committed prefix 17, uncommitted tail 5103, applied so far 4
+syncs 7, applied 17 frames, largest uncommitted tail held back (never applied) 5119 frames
+replica rows 24 integrity [[Text(Text { value: "ok", subtype: Text })]] local wal_state WalState { checkpoint_seq_no: 0, max_frame: 17 }

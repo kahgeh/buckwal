@@ -116,4 +116,52 @@ fn main() {
     println!("final rows {} (want {want}) integrity {}", count(&fresh), integrity(&fresh));
     // the reader that started before sees the new data on its next transaction
     println!("old reader connection, new transaction: rows {}", count(&reader));
+
+    // ---- second scenario: a reader that begins AFTER some frames (a non-zero read mark)
+    println!("--- reader with a non-zero read mark");
+    // a second baseline: the first replica copy has been changed by the first scenario
+    let b2 = baseline("q6c", Batching::Off);
+    for i in 11..14 {
+        b2.w.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(100))", &[Value::from_i64(i)]).unwrap();
+    }
+    b2.w.transaction(|t| {
+        for i in 100..140 {
+            t.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(3000))", &[Value::from_i64(i)])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let fr = frames_of(b2.store.as_ref(), b2.gen);
+    let (db2, ap2) = open_core(&b2.replica_db_path);
+    let rd2 = db2.connect().unwrap();
+    // apply the first three single-row commits, then start the reader on that snapshot
+    let first_txs: usize = {
+        let mut n = 0;
+        let mut txs = 0;
+        for (i, f) in fr.iter().enumerate() {
+            if is_commit(f) {
+                txs += 1;
+                if txs == 3 {
+                    n = i + 1;
+                    break;
+                }
+            }
+        }
+        n
+    };
+    apply(&ap2, &fr[..first_txs]);
+    rd2.execute("BEGIN").unwrap();
+    println!("reader BEGIN after {first_txs} frames, rows seen {}", count(&rd2));
+    apply(&ap2, &fr[first_txs..]);
+    let t = Instant::now();
+    let p = ap2.checkpoint(M::Passive { upper_bound_inclusive: None });
+    println!("PASSIVE with that reader open: {:?} in {:?}", p.as_ref().map(|r| (r.wal_max_frame, r.wal_total_backfilled, r.wal_checkpoint_backfilled)).map_err(|e| format!("{e:?}")), t.elapsed());
+    println!("  reader rows (same tx) {} | integrity on a new connection {}", count(&rd2), integrity(&db2.connect().unwrap()));
+    let t = Instant::now();
+    let tr = ckpt_truncate(&ap2);
+    println!("TRUNCATE with that reader open: {:?} in {:?}", tr.as_ref().map(|r| r.wal_max_frame).map_err(|e| format!("{e:?}")), t.elapsed());
+    println!("  reader rows (same tx) {} | wal_state {:?}", count(&rd2), ap2.wal_state().unwrap());
+    rd2.execute("COMMIT").unwrap();
+    let busy = ckpt_retry(&ap2);
+    println!("after the reader's COMMIT: TRUNCATE ok after {busy} Busy answers, wal_state {:?}, rows {}", ap2.wal_state().unwrap(), count(&db2.connect().unwrap()));
 }

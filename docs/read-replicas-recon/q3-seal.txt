@@ -9,156 +9,254 @@ warning: value assigned to `ckpt_pending` is never read
     |
     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
 
-writer: generations 2 3 4, expected rows 85
-generation index 0 (log gen 2): 46 frames
+writer: generations 2 3 4, expected rows 1545
+generation index 0 (log gen 2): 1509 frames
 generation index 1 (log gen 3): 16 frames
-generation index 2 (log gen 4): 9 frames
+generation index 2 (log gen 4): 11 frames
 === kill stage mid:0
 [mid:0] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [mid:0] child exit: ExitStatus(unix_wait_status(9))
 [resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 3 } rows=13
 [resume_seq] resuming at generation index 0, frame 3, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_seq: OK rows=85 integrity ok, no step back
+  (checkpoint answered Busy 5 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
 [resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 3 } rows=13
 [resume_pos] pos file: generation index 0, applying
 [resume_pos] resuming at generation index 0, frame 3, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+  (checkpoint answered Busy 1 times before it ran)
+  (checkpoint answered Busy 1 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage end:0
 [end:0] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [end:0] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 46 } rows=53
-[resume_seq] resuming at generation index 0, frame 46, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_seq: OK rows=85 integrity ok, no step back
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 46 } rows=53
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 1509 } rows=1513
+[resume_seq] resuming at generation index 0, frame 1509, ckpt_pending=false
+  (checkpoint answered Busy 2 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 1509 } rows=1513
 [resume_pos] pos file: generation index 0, applying
-[resume_pos] resuming at generation index 0, frame 46, ckpt_pending=false
-  (checkpoint answered Busy 1 times before it ran)
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+[resume_pos] resuming at generation index 0, frame 1509, ckpt_pending=false
+  (checkpoint answered Busy 2 times before it ran)
+  (checkpoint answered Busy 3 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage ckpt:0
 [ckpt:0] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [ckpt:0] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=40
-resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 40
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+  (checkpoint answered Busy 1 times before it ran)
+  (checkpoint answered Busy 5 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_pos] pos file: generation index 1, applying
 [resume_pos] resuming at generation index 1, frame 0, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+  (checkpoint answered Busy 2 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage mid:1
 [mid:1] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [mid:1] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 1 } rows=54
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 1 } rows=1514
 [resume_seq] resuming at generation index 1, frame 1, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_seq: OK rows=85 integrity ok, no step back
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 1 } rows=54
+  (checkpoint answered Busy 6 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 1 } rows=1514
 [resume_pos] pos file: generation index 1, applying
 [resume_pos] resuming at generation index 1, frame 1, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+  (checkpoint answered Busy 4 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage end:1
 [end:1] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [end:1] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 16 } rows=74
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 16 } rows=1534
 [resume_seq] resuming at generation index 1, frame 16, ckpt_pending=false
-  (checkpoint answered Busy 1 times before it ran)
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_seq: OK rows=85 integrity ok, no step back
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 16 } rows=74
+  (checkpoint answered Busy 5 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 16 } rows=1534
 [resume_pos] pos file: generation index 1, applying
 [resume_pos] resuming at generation index 1, frame 16, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+  (checkpoint answered Busy 3 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage ckpt:1
 [ckpt:1] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [ckpt:1] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=74
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1534
 [resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-  (checkpoint answered Busy 1 times before it ran)
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=62
-resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 62
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=74
+  (checkpoint answered Busy 4 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1521
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1521
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1534
 [resume_pos] pos file: generation index 2, applying
 [resume_pos] resuming at generation index 2, frame 0, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage mid:2
 [mid:2] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [mid:2] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 1 } rows=75
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 1 } rows=1535
 [resume_seq] resuming at generation index 2, frame 1, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_seq: OK rows=85 integrity ok, no step back
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 1 } rows=75
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 1 } rows=1535
 [resume_pos] pos file: generation index 2, applying
 [resume_pos] resuming at generation index 2, frame 1, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
-=== kill stage inckpt:300
-[inckpt:300] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
-[inckpt:300] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:1000
+[inckpt:1000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:1000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 1509 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 1509 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 1509 } rows=1513
+[resume_seq] resuming at generation index 0, frame 1509, ckpt_pending=false
+  (checkpoint answered Busy 1 times before it ran)
+  (checkpoint answered Busy 2 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 1509 } rows=1513
+[resume_pos] pos file: generation index 1, ckpt_pending
+[resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
+  (checkpoint answered Busy 4 times before it ran)
+  (checkpoint answered Busy 4 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:3000
+[inckpt:3000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:3000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=40
-resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 40
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+  (checkpoint answered Busy 2 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_pos] pos file: generation index 1, ckpt_pending
 [resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
   (checkpoint answered Busy 1 times before it ran)
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
-=== kill stage inckpt:1500
-[inckpt:1500] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
-[inckpt:1500] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:6000
+[inckpt:6000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:6000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=41
-resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 41
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+  (checkpoint answered Busy 11 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_pos] pos file: generation index 1, ckpt_pending
 [resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
-=== kill stage inckpt:4000
-[inckpt:4000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
-[inckpt:4000] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+  (checkpoint answered Busy 21 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:10000
+[inckpt:10000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:10000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=41
-resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 41
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
-[resume_pos] pos file: generation index 1, ckpt_pending
-[resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
-  (checkpoint answered Busy 1 times before it ran)
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
-=== kill stage inckpt:9000
-[inckpt:9000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
-[inckpt:9000] child exit: ExitStatus(unix_wait_status(9))
-[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
-[resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=40
-resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 40
-[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=53
+  (checkpoint answered Busy 4 times before it ran)
+  (checkpoint answered Busy 7 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
 [resume_pos] pos file: generation index 1, ckpt_pending
 [resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
   (checkpoint answered Busy 1 times before it ran)
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:15000
+[inckpt:15000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:15000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
+  (checkpoint answered Busy 4 times before it ran)
+  (checkpoint answered Busy 4 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_pos] pos file: generation index 1, ckpt_pending
+[resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
+  (checkpoint answered Busy 1 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:25000
+[inckpt:25000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:25000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
+  (checkpoint answered Busy 4 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_pos] pos file: generation index 1, ckpt_pending
+[resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
+  (checkpoint answered Busy 6 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:40000
+[inckpt:40000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:40000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
+  (checkpoint answered Busy 1 times before it ran)
+  (checkpoint answered Busy 3 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_pos] pos file: generation index 1, ckpt_pending
+[resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
+  (checkpoint answered Busy 8 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+=== kill stage inckpt:70000
+[inckpt:70000] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
+[inckpt:70000] child exit: ExitStatus(unix_wait_status(9))
+[report] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[report] after the kill: pos file = generation index 1 ckpt_pending, local WAL WalState { checkpoint_seq_no: 0, max_frame: 0 } (max_frame > 0 means the kill landed before the WAL was truncated, 0 means after)
+[resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
+  (checkpoint answered Busy 10 times before it ran)
+  (checkpoint answered Busy 6 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=1500
+resume_seq: FINAL OK BUT READERS SAW ROWS STEP BACK by up to 1500
+[resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=1513
+[resume_pos] pos file: generation index 1, ckpt_pending
+[resume_pos] resuming at generation index 1, frame 0, ckpt_pending=true
+  (checkpoint answered Busy 4 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 1, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
 === kill stage none
 [resume_seq] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [resume_seq] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_seq: OK rows=85 integrity ok, no step back
+  (checkpoint answered Busy 5 times before it ran)
+  (checkpoint answered Busy 4 times before it ran)
+[resume_seq] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_seq: OK rows=1545 integrity ok, no step back
 [resume_pos] start: wal_state=WalState { checkpoint_seq_no: 0, max_frame: 0 } rows=10
 [resume_pos] pos file: generation index 0, applying
 [resume_pos] resuming at generation index 0, frame 0, ckpt_pending=false
-[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 9 } rows=85 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
-resume_pos: OK rows=85 integrity ok, no step back
-SUMMARY stages=12 failures: seq-only=6 pos-file=0
+  (checkpoint answered Busy 1 times before it ran)
+  (checkpoint answered Busy 5 times before it ran)
+[resume_pos] done: wal_state=WalState { checkpoint_seq_no: 2, max_frame: 11 } rows=1545 integrity=[[Text(Text { value: "ok", subtype: Text })]] worst_visible_row_drop=0
+resume_pos: OK rows=1545 integrity ok, no step back
+SUMMARY stages=16 failures: seq-only=9 pos-file=0
