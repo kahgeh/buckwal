@@ -91,12 +91,26 @@ pub fn execute_request(
             error: ProtoError::new("STREAM_CLOSED", "the stream is closed"),
         };
     }
-    let req = match serde_json::from_value::<StreamRequest>(req) {
+    let req = match serde_json::from_value::<StreamRequest>(req.clone()) {
         Ok(r) => r,
         Err(e) => {
-            return StreamResult::Error {
-                error: ProtoError::new("PROTO_ERROR", format!("invalid request: {e}")),
-            }
+            const KNOWN: [&str; 8] = [
+                "close",
+                "execute",
+                "batch",
+                "sequence",
+                "describe",
+                "store_sql",
+                "close_sql",
+                "get_autocommit",
+            ];
+            let error = match req.get("type").and_then(|t| t.as_str()) {
+                Some(t) if !KNOWN.contains(&t) => {
+                    ProtoError::new("UNSUPPORTED", format!("unsupported request type {t:?}"))
+                }
+                _ => ProtoError::new("PROTO_ERROR", format!("invalid request: {e}")),
+            };
+            return StreamResult::Error { error };
         }
     };
     match handle(st, v, req, fence) {
@@ -172,7 +186,7 @@ fn resolve_sql(
             ProtoError::new("SQL_INPUT_ERROR", format!("no stored SQL with id {id}"))
         }),
         _ => Err(ProtoError::new(
-            "PROTO_ERROR",
+            "SQL_INPUT_ERROR",
             "exactly one of sql and sql_id must be given",
         )),
     }
@@ -189,10 +203,8 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
 
     if st.conn.is_autocommit() {
         if let Some(parsed) = batching_set(&sql) {
-            let applied = parsed.and_then(|b| {
-                b.validate()?;
-                st.conn.set_batching(Some(b))
-            });
+            // `set_batching` validates.
+            let applied = parsed.and_then(|b| st.conn.set_batching(Some(b)));
             applied.map_err(|e| note(st, fence, &e))?;
             return Ok(StmtResult {
                 cols: Vec::new(),
@@ -487,11 +499,11 @@ mod tests {
                 Version::V3,
                 json!({"type":"execute","stmt":{"sql":"SELECT 1","sql_id":1}})
             ),
-            "PROTO_ERROR"
+            "SQL_INPUT_ERROR"
         );
         assert_eq!(
             f.err(Version::V3, json!({"type":"execute","stmt":{}})),
-            "PROTO_ERROR"
+            "SQL_INPUT_ERROR"
         );
     }
 
@@ -613,12 +625,75 @@ mod tests {
     }
 
     #[test]
-    fn unknown_request_type_is_proto_error() {
+    fn unknown_request_type_is_unsupported_and_malformed_is_proto_error() {
         let mut f = fx();
         assert_eq!(
             f.err(Version::V3, json!({"type":"open_cursor"})),
-            "PROTO_ERROR"
+            "UNSUPPORTED"
         );
+        for bad in [json!({}), json!({"type":5}), json!({"type":"execute"})] {
+            assert_eq!(f.err(Version::V3, bad.clone()), "PROTO_ERROR", "{bad}");
+        }
+    }
+
+    #[test]
+    fn batching_pragma_variants_are_not_intercepted() {
+        let mut f = fx();
+        for sql in [
+            "PRAGMA durable_batching = 'off'; SELECT 1",
+            "EXPLAIN PRAGMA durable_batching = 'off'",
+            "PRAGMA temp.durable_batching = 'off'",
+        ] {
+            f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+            f.err(Version::V3, json!({"type":"execute","stmt":{"sql":sql}}));
+            assert_eq!(setting(&mut f), "window 20ms 64 1MiB", "{sql}");
+        }
+    }
+
+    #[test]
+    fn fenced_inside_a_batch_sets_the_fence_and_later_steps_answer_fenced() {
+        let mem = Arc::new(MemStore::new());
+        let dir_a = tempfile::tempdir().unwrap();
+        let db = open_with_store(config(&dir_a.path().join("db")), mem.clone()).unwrap();
+        let mut st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let fence = Fence::new();
+        st.conn.execute("CREATE TABLE t(id INTEGER)", &[]).unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        takeover_with_store(config(&dir_b.path().join("db")), mem).unwrap();
+        let r = execute_request(
+            &mut st,
+            Version::V3,
+            json!({"type":"batch","batch":{"steps":[
+                step("INSERT INTO t VALUES (1)", None),
+                step("SELECT 1", None),
+                step("SELECT 2", None)]}}),
+            &fence,
+        );
+        let StreamResult::Ok {
+            response: StreamResponse::Batch { result },
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        assert!(fence.is_set());
+        assert!(st.closed);
+        for i in 0..3 {
+            assert!(result.step_results[i].is_none(), "{i}");
+            let code = result.step_errors[i].as_ref().unwrap().code.as_deref();
+            assert_eq!(code, Some("FENCED"), "{i}");
+        }
+    }
+
+    #[test]
+    fn batch_condition_on_the_current_step_is_proto_error() {
+        let mut f = fx();
+        let code = f.err(
+            Version::V3,
+            json!({"type":"batch","batch":{"steps":[
+                step("SELECT 1", None),
+                step("SELECT 2", Some(json!({"type":"ok","step":1})))]}}),
+        );
+        assert_eq!(code, "PROTO_ERROR");
     }
 
     #[test]
