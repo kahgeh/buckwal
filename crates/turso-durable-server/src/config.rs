@@ -155,7 +155,9 @@ impl Token {
                 "DURABLE_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)"
             ));
         }
-        let text = std::str::from_utf8(text).expect("visible ASCII is UTF-8");
+        let text = std::str::from_utf8(text).map_err(|_| {
+            format!("DURABLE_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)")
+        })?;
         Ok(Token::from_text(text))
     }
 
@@ -311,21 +313,27 @@ mod tests {
         let missing = d.path().join("nope");
         let e = Token::load(&missing).unwrap_err();
         assert!(e.contains(missing.to_str().unwrap()), "{e}");
-        let cases: [(&[u8], &str); 5] = [
-            (b"", ""),
-            (b"\n", ""),
-            (b"SHORTSECRET123", "SHORTSECRET123"),
-            (b"INNERSECRET ab cdefgh", "INNERSECRET"),
-            (b"LINE1SECRETabcdef\nLINE2SECRETabcdef", "LINE1SECRET"),
+        let cases: [(&[u8], &str, &str); 5] = [
+            (b"", "file is empty", "\0"),
+            (b"\n", "file is empty", "\n"),
+            (b"SHORTSECRET123", "shorter than 16", "SHORTSECRET123"),
+            (b"INNERSECRET ab cdefgh", "whitespace", "INNERSECRET"),
+            (
+                b"LINE1SECRETabcdef\nLINE2SECRETabcdef",
+                "whitespace",
+                "LINE1SECRET",
+            ),
         ];
-        for (content, needle) in cases {
+        for (content, text, needle) in cases {
             let (_d, p) = token_file(content);
             let e = Token::load(&p).unwrap_err();
-            assert!(e.contains(p.to_str().unwrap()), "{e}");
-            if !needle.is_empty() {
-                assert!(!e.contains(needle), "{e}");
-                assert!(!e.contains("LINE2SECRET"), "{e}");
-            }
+            assert!(
+                e.starts_with(&format!("DURABLE_SERVE_TOKEN_FILE {}", p.display())),
+                "{e}"
+            );
+            assert!(e.contains(text), "{e}");
+            assert!(!e.contains(needle), "{e}");
+            assert!(!e.contains("LINE2SECRET"), "{e}");
         }
     }
 
