@@ -240,18 +240,31 @@ fn replayed_baton_is_refused_and_does_not_run() {
     s.stop().unwrap();
 }
 
+/// The body limit is checked as the body is read, so the 413 comes once the server has read
+/// one byte past 16 MiB. A client still sending then may see its connection reset instead
+/// (the server closes with the rest unread), so this sends exactly one byte over the limit
+/// on a raw connection: every byte sent is read, and the 413 always arrives.
 #[test]
 fn oversized_body_is_413() {
+    use std::io::Read;
     let s = start(Opts::default());
     let c = s.client(None);
-    let body = vec![b' '; 17 << 20];
-    match c.post_raw("/v2/pipeline", body, None) {
-        Ok(r) => {
-            assert_eq!(r.status, 413, "{}", r.body);
-            assert_eq!(code(&r), "PAYLOAD_TOO_LARGE");
-        }
-        Err(e) => panic!("expected a 413 reply, got a transport error: {e}"),
-    }
+    let len = (16 << 20) + 1;
+    let mut tcp = std::net::TcpStream::connect(s.addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(
+        tcp,
+        "POST /v2/pipeline HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {len}\r\n\r\n"
+    )
+    .unwrap();
+    tcp.write_all(&vec![b' '; len]).unwrap();
+    let mut reply = Vec::new();
+    // `Connection: close`: the server closes the connection after the reply.
+    tcp.read_to_end(&mut reply).unwrap();
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("HTTP/1.1 413 "), "{reply}");
+    assert!(reply.contains(r#""code":"PAYLOAD_TOO_LARGE""#), "{reply}");
     let h = c.get("/health").unwrap();
     assert_eq!(h.status, 200, "the server stays up");
     // A body just under the limit is read and parsed (and is malformed here).
@@ -522,19 +535,26 @@ fn bind_fails_fast() {
     assert!(e.contains("DURABLE_SERVE_TLS_CERT"), "{e}");
 }
 
+/// Once the port is free, another test running in parallel (or another process) can bind
+/// the same ephemeral port, and the connect then reaches its listener. A listener left open
+/// by `serve` would answer on every attempt, so the check fails only if all attempts connect.
 #[test]
 fn open_error_is_returned_and_the_port_closes() {
-    let s = start(Opts {
-        open_error: Some("open failed on purpose".into()),
-        ..Opts::default()
-    });
-    let addr = s.addr;
-    let e = s.stop().unwrap_err();
-    assert_eq!(e, "open failed on purpose");
-    assert!(
-        std::net::TcpStream::connect(addr).is_err(),
-        "nothing listens after serve returned"
-    );
+    let mut reached = Vec::new();
+    for _ in 0..5 {
+        let s = start(Opts {
+            open_error: Some("open failed on purpose".into()),
+            ..Opts::default()
+        });
+        let addr = s.addr;
+        let e = s.stop().unwrap_err();
+        assert_eq!(e, "open failed on purpose");
+        if std::net::TcpStream::connect(addr).is_err() {
+            return;
+        }
+        reached.push(addr);
+    }
+    panic!("something listened after serve returned, on every attempt: {reached:?}");
 }
 
 #[test]
