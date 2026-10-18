@@ -45,11 +45,15 @@ impl Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut b = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
             .no_proxy();
         if let Some(path) = ca_pem {
             let pem = std::fs::read(path).map_err(|e| format!("CA {}: {e}", path.display()))?;
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|e| format!("CA {}: {e}", path.display()))?;
+            if certs.is_empty() {
+                return Err(format!("CA {}: no certificate in the file", path.display()));
+            }
             for c in certs {
                 b = b.add_root_certificate(c);
             }
@@ -264,7 +268,7 @@ pub fn get_autocommit() -> Value {
 }
 
 /// The batch body (`{"steps":[...]}`) of @libsql/client 0.15.15 hrana.js transactions.
-/// Usable as a cursor `batch`, or wrap with `json!({"type":"batch","batch":..})` for a pipeline.
+/// Usable as a cursor `batch`; [`tx_batch_request`] wraps it for a pipeline.
 pub fn tx_batch(stmts: &[Value]) -> Value {
     let mut steps = vec![(None, stmt("BEGIN", &[]))];
     for (i, s) in stmts.iter().enumerate() {
@@ -274,6 +278,12 @@ pub fn tx_batch(stmts: &[Value]) -> Value {
     steps.push((Some(cond_ok(stmts.len())), stmt("COMMIT", &[])));
     steps.push((Some(cond_not(cond_ok(commit))), stmt("ROLLBACK", &[])));
     batch_body(steps)
+}
+
+/// The pipeline request of @libsql/client 0.15.15 hrana.js transactions: [`tx_batch`] as a
+/// `batch` request.
+pub fn tx_batch_request(stmts: &[Value]) -> Value {
+    json!({"type":"batch","batch": tx_batch(stmts)})
 }
 
 fn from_hrana(v: &Value) -> Result<Value, String> {
@@ -404,6 +414,28 @@ mod tests {
                 {"condition":{"type":"not","cond":{"type":"ok","step":3}},"stmt":{"sql":"ROLLBACK","args":[],"want_rows":true}}
             ]})
         );
+    }
+
+    #[test]
+    fn tx_batch_request_wraps_the_body() {
+        let a = stmt("A", &[]);
+        assert_eq!(
+            tx_batch_request(std::slice::from_ref(&a)),
+            json!({"type":"batch","batch": tx_batch(&[a])})
+        );
+    }
+
+    #[test]
+    fn ca_file_without_a_certificate_is_refused() {
+        let dir = std::env::temp_dir().join(format!("hrana-client-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.pem");
+        std::fs::write(&path, b"not a certificate\n").unwrap();
+        let r = Client::new("https://localhost:1", None, Some(&path));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        let e = r.err().expect("an empty CA bundle must be refused");
+        assert!(e.contains("no certificate"), "{e}");
     }
 
     #[test]
