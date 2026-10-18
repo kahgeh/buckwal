@@ -121,6 +121,10 @@ The API:
 | `Connection::execute(sql, params) -> Result<u64>` | Runs one statement and returns the number of changed rows. `sql` must hold exactly one statement. |
 | `Connection::execute_batch(sql)` | Runs several statements, with no parameters. If the guard refuses any statement, none of them runs. |
 | `Connection::query(sql, params) -> Result<Vec<Vec<Value>>>` | Runs one statement and collects its rows. |
+| `Connection::run(sql, args, named) -> Result<StmtOutput>` | Runs one statement and returns its columns, rows, changed-row count and last inserted rowid. `args` bind parameters 1..=n in order, then `named` bind the rest by name (`:a`, `@b`, `$c`, `?4`, or bare, which tries `:`, `@`, `$` in that order); every parameter must be bound exactly once (`Config` otherwise). The same guard, gate and ack wait as `execute`: it returns only after its commit is in the bucket. |
+| `Connection::is_autocommit() -> bool` | `true` when no transaction is open, also after the engine rolled one back or an upload failure did. |
+| `StmtOutput` | What `run` returns: `columns` (`Vec<Column>`), `rows` (`Vec<Vec<Value>>`), `changes` (`u64`) and `last_insert_rowid` (`i64`). |
+| `Column` | A result column of `run`: `name` and `decltype` (`Option<String>`, the declared type of the table column; `None` for an expression). |
 | `Connection::transaction(\|tx\| …)` | `BEGIN`, your closure (`tx.execute`, `tx.query`), then `COMMIT`. It runs `ROLLBACK` if the closure or the commit fails. |
 | `Connection::transaction_with(Batching, \|tx\| …)` | `transaction`, committing with this setting whatever the connection's and the database's are. The next statement or transaction is back to them. `Config` when the setting is invalid, before anything runs. |
 | `Connection::set_batching(Option<Batching>) -> Result<()>` | This connection's own setting, from its next commit. `None` falls back to the database's. `Config` when the setting is invalid. |

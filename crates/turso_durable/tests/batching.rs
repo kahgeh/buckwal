@@ -1604,3 +1604,62 @@ fn maintenance_skips_while_the_bucket_fails_and_reads_never_wait() {
     c.close().unwrap();
     db.close().unwrap();
 }
+
+/// `Connection::run` is acked like `execute`: a write returns only after its log PUT is
+/// confirmed, and an upload failure is an `Err`, never an `Ok`.
+fn run_write_waits_for_its_log_put(batching: Batching) {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let (_d, db) = open_with(fault.clone(), Recorder::default(), |c| {
+        c.batching = batching;
+        c.retry_deadline = Duration::from_millis(200);
+        c.request_timeout = Duration::from_millis(50);
+    });
+    let c = db.connect().unwrap();
+    create(&c);
+    fault.only_keys_containing("log/");
+    fault.delay_puts(Duration::from_millis(300));
+    let before = mem
+        .list("")
+        .unwrap()
+        .iter()
+        .filter(|k| k.contains("log/"))
+        .count();
+    let t = Instant::now();
+    let out = c
+        .run(
+            "INSERT INTO t VALUES (:x)",
+            &[],
+            &[("x".to_string(), Value::from_i64(1))],
+        )
+        .unwrap();
+    assert!(
+        t.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(out.changes, 1);
+    let after = mem
+        .list("")
+        .unwrap()
+        .iter()
+        .filter(|k| k.contains("log/"))
+        .count();
+    assert!(after > before, "no log key stored by the time run returned");
+    assert_eq!(restore_rows(mem.clone()), vec![1]);
+
+    fault.delay_puts(Duration::ZERO);
+    fault.fail_next_puts_permanently(1);
+    let r = c.run("INSERT INTO t VALUES (2)", &[], &[]);
+    assert!(r.is_err(), "{r:?}");
+}
+
+#[test]
+fn run_write_returns_only_after_its_log_put_off() {
+    run_write_waits_for_its_log_put(Batching::Off);
+}
+
+#[test]
+fn run_write_returns_only_after_its_log_put_window() {
+    run_write_waits_for_its_log_put(w(50, 64, 1 << 20));
+}

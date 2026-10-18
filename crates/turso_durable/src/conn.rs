@@ -54,6 +54,25 @@ impl CheckpointMode {
     }
 }
 
+/// One result column of [`Connection::run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Column {
+    pub name: String,
+    /// The declared type of the table column it comes from; `None` for an expression.
+    pub decltype: Option<String>,
+}
+
+/// What [`Connection::run`] returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StmtOutput {
+    pub columns: Vec<Column>,
+    pub rows: Vec<Vec<Value>>,
+    /// Rows the statement changed (0 for a read).
+    pub changes: u64,
+    /// The connection's last inserted rowid, after the statement.
+    pub last_insert_rowid: i64,
+}
+
 /// One connection to a [`crate::Database`]; open one per thread. Dropping it closes it.
 pub struct Connection {
     /// None once closed.
@@ -245,7 +264,16 @@ impl Connection {
     /// durable_batching` (the engine never sees that one). `single`: `sql` must hold only that
     /// statement (the engine would silently ignore the rest); otherwise it is the first of
     /// the rest of a split `execute_batch`.
-    fn prepare(&self, sql: &str, params: &[Value], single: bool) -> Result<Prepared> {
+    ///
+    /// `named`: `None` binds `params` as exactly the statement's parameters (`execute`,
+    /// `query`); `Some` binds them first, then the named ones, every slot once (`run`).
+    fn prepare(
+        &self,
+        sql: &str,
+        params: &[Value],
+        named: Option<&[(String, Value)]>,
+        single: bool,
+    ) -> Result<Prepared> {
         stash::clear();
         let pragma = if single {
             guard::check_sql(sql)?;
@@ -255,7 +283,7 @@ impl Connection {
             guard::first_batching_pragma(sql)
         };
         if let Some((pragma, tail)) = pragma {
-            check_params(params.len(), 0)?;
+            check_params(params.len() + named.map_or(0, <[_]>::len), 0)?;
             let rows = self.batching_pragma(pragma)?;
             return Ok(Prepared::Batching { rows, tail });
         }
@@ -269,10 +297,15 @@ impl Connection {
         if self.shared.read_only && !stmt.get_program().is_readonly() {
             return Err(Error::Unsupported(READ_ONLY));
         }
-        check_params(params.len(), stmt.parameters_count())?;
-        for (i, v) in params.iter().enumerate() {
-            let at = NonZero::new(i + 1).expect("i + 1 > 0");
-            stmt.bind_at(at, v.clone()).map_err(engine_error)?;
+        match named {
+            None => {
+                check_params(params.len(), stmt.parameters_count())?;
+                for (i, v) in params.iter().enumerate() {
+                    let at = NonZero::new(i + 1).expect("i + 1 > 0");
+                    stmt.bind_at(at, v.clone()).map_err(engine_error)?;
+                }
+            }
+            Some(named) => bind_all(&mut stmt, params, named)?,
         }
         Ok(Prepared::Engine(Box::new(stmt)))
     }
@@ -327,7 +360,7 @@ impl Connection {
     /// durable_batching`).
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         self.call(self.effective_batching(), || {
-            let Prepared::Engine(mut stmt) = self.prepare(sql, params, true)? else {
+            let Prepared::Engine(mut stmt) = self.prepare(sql, params, None, true)? else {
                 return Ok(0);
             };
             self.step_all(&mut stmt, |_| {})?;
@@ -364,7 +397,7 @@ impl Connection {
     fn execute_batch_split(&self, sql: &str) -> Result<()> {
         let mut rest = sql;
         while holds_a_statement(rest) {
-            let tail = match self.prepare(rest, &[], false)? {
+            let tail = match self.prepare(rest, &[], None, false)? {
                 Prepared::Engine(mut stmt) => {
                     self.step_all(&mut stmt, |_| {})?;
                     stmt.tail_offset()
@@ -380,7 +413,7 @@ impl Connection {
     /// Run one statement and collect its rows.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>> {
         self.call(self.effective_batching(), || {
-            let mut stmt = match self.prepare(sql, params, true)? {
+            let mut stmt = match self.prepare(sql, params, None, true)? {
                 Prepared::Engine(stmt) => stmt,
                 Prepared::Batching { rows, .. } => return Ok(rows),
             };
@@ -388,6 +421,50 @@ impl Connection {
             self.step_all(&mut stmt, |r| rows.push(r))?;
             Ok(rows)
         })
+    }
+
+    /// Run one statement and return its columns, rows, changed-row count and last inserted
+    /// rowid. `args` bind parameters 1..=n in order, then `named` bind the rest by name: with
+    /// its prefix (`:a`, `@b`, `$c`, `?4`), or bare, which tries `:`, `@`, `$` in that order.
+    /// Every parameter must be bound exactly once, or it is `Config`. The SQL guard, the
+    /// maintenance gate and the ack wait are those of [`Connection::execute`].
+    pub fn run(&self, sql: &str, args: &[Value], named: &[(String, Value)]) -> Result<StmtOutput> {
+        self.call(self.effective_batching(), || {
+            let mut stmt = match self.prepare(sql, args, Some(named), true)? {
+                Prepared::Engine(stmt) => stmt,
+                Prepared::Batching { rows, .. } => {
+                    return Ok(StmtOutput {
+                        columns: vec![Column {
+                            name: "durable_batching".into(),
+                            decltype: None,
+                        }],
+                        rows,
+                        changes: 0,
+                        last_insert_rowid: self.core().last_insert_rowid(),
+                    });
+                }
+            };
+            let columns = (0..stmt.num_columns())
+                .map(|i| Column {
+                    name: stmt.get_column_name(i).into_owned(),
+                    decltype: stmt.get_column_decltype(i),
+                })
+                .collect();
+            let mut rows = Vec::new();
+            self.step_all(&mut stmt, |r| rows.push(r))?;
+            Ok(StmtOutput {
+                columns,
+                rows,
+                changes: stmt.n_change().max(0) as u64,
+                last_insert_rowid: self.core().last_insert_rowid(),
+            })
+        })
+    }
+
+    /// No transaction is open: true outside `BEGIN`…`COMMIT`, and again after the engine
+    /// rolled a transaction back by itself or an upload failure did.
+    pub fn is_autocommit(&self) -> bool {
+        self.core.as_ref().is_none_or(|c| c.get_auto_commit())
     }
 
     /// `BEGIN`, then `f`, then `COMMIT`; `ROLLBACK` when `f` or the commit fails, and `f`'s
@@ -488,6 +565,54 @@ fn check_params(given: usize, want: usize) -> Result<()> {
     Ok(())
 }
 
+/// Bind `args` at 1..=n, then each `named` by its slot; every slot `1..=parameters_count()`
+/// must end up bound exactly once.
+fn bind_all(stmt: &mut Statement, args: &[Value], named: &[(String, Value)]) -> Result<()> {
+    let count = stmt.parameters_count();
+    if args.len() > count {
+        return Err(Error::Config(format!(
+            "{} positional arguments given; the statement takes {count} parameters",
+            args.len()
+        )));
+    }
+    let mut bound = vec![false; count + 1];
+    let slots = args.iter().enumerate().map(|(i, v)| (i + 1, v));
+    let mut binds: Vec<(usize, &Value)> = slots.collect();
+    for (name, v) in named {
+        let at = param_slot(stmt, name)?;
+        binds.push((at, v));
+    }
+    for (at, v) in binds {
+        if at > count || std::mem::replace(&mut bound[at], true) {
+            return Err(Error::Config(format!(
+                "parameter {at} is bound twice (or is out of range)"
+            )));
+        }
+        let at = NonZero::new(at).expect("slots start at 1");
+        stmt.bind_at(at, v.clone()).map_err(engine_error)?;
+    }
+    if let Some(missing) = (1..=count).find(|i| !bound[*i]) {
+        return Err(Error::Config(format!("parameter {missing} is not bound")));
+    }
+    Ok(())
+}
+
+/// The slot `name` stands for: as written when it has a prefix, else with `:`, `@`, `$` tried
+/// in that order.
+fn param_slot(stmt: &Statement, name: &str) -> Result<usize> {
+    let params = stmt.parameters();
+    let found = if name.starts_with([':', '@', '$', '?']) {
+        params.index(name)
+    } else {
+        [':', '@', '$']
+            .iter()
+            .find_map(|p| params.index(format!("{p}{name}")))
+    };
+    found
+        .map(NonZero::get)
+        .ok_or_else(|| Error::Config(format!("the statement has no parameter named {name:?}")))
+}
+
 /// `rest` holds another statement (not just whitespace, `;` or comments). Text that does not
 /// parse counts as one, so it is reported rather than skipped.
 fn holds_a_statement(rest: &str) -> bool {
@@ -570,5 +695,223 @@ mod tests {
             conn.query("SELECT count(*) FROM t", &[]).unwrap()[0][0].as_int(),
             Some(0)
         );
+    }
+
+    fn open_mem() -> (tempfile::TempDir, crate::Database) {
+        let t = tempfile::tempdir().unwrap();
+        let c = Config::new(t.path(), "http://127.0.0.1:1", "b", "k", "s");
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        (t, db)
+    }
+
+    fn int(n: i64) -> Value {
+        Value::from_i64(n)
+    }
+
+    fn named(n: &str, v: i64) -> (String, Value) {
+        (n.to_string(), int(v))
+    }
+
+    fn ints(rows: &[Vec<Value>]) -> Vec<Vec<i64>> {
+        rows.iter()
+            .map(|r| r.iter().map(|v| v.as_int().unwrap()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn run_returns_columns_rows_changes_and_rowid() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT)", &[])
+            .unwrap();
+        let out = conn
+            .run(
+                "INSERT INTO t(body) VALUES (?)",
+                &[Value::from_text("a".to_string())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!((out.changes, out.last_insert_rowid), (1, 1));
+        assert!(out.columns.is_empty());
+        let out = conn
+            .run("SELECT id, body AS b, 1+1 FROM t", &[], &[])
+            .unwrap();
+        let col = |n: &str, d: Option<&str>| Column {
+            name: n.to_string(),
+            decltype: d.map(str::to_string),
+        };
+        assert_eq!(
+            out.columns,
+            vec![
+                col("id", Some("INTEGER")),
+                col("b", Some("TEXT")),
+                col("1+1", None)
+            ]
+        );
+        assert_eq!(
+            out.rows,
+            vec![vec![int(1), Value::from_text("a".to_string()), int(2)]]
+        );
+    }
+
+    #[test]
+    fn run_binds_named_parameters_with_and_without_prefix() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let named = [
+            named("a", 1),
+            named("@b", 2),
+            named("$c", 3),
+            named("?4", 4),
+        ];
+        let out = conn.run("SELECT :a, @b, $c, ?4", &[], &named).unwrap();
+        assert_eq!(ints(&out.rows), vec![vec![1, 2, 3, 4]]);
+    }
+
+    #[test]
+    fn run_mixes_positional_then_named() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let out = conn
+            .run("SELECT ?, :x", &[int(1)], &[named("x", 2)])
+            .unwrap();
+        assert_eq!(ints(&out.rows), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn run_refuses_bad_bindings() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        type Case = (&'static str, Vec<Value>, Vec<(String, Value)>);
+        let cases: [Case; 5] = [
+            ("SELECT :x", vec![], vec![named("nope", 1)]),
+            ("SELECT :x", vec![int(1)], vec![named("x", 2)]),
+            ("SELECT ?, ?", vec![int(1)], vec![]),
+            ("SELECT ?", vec![int(1), int(2)], vec![]),
+            ("SELECT 1", vec![], vec![named("x", 1)]),
+        ];
+        for (sql, args, named) in cases {
+            let r = conn.run(sql, &args, &named);
+            assert!(matches!(r, Err(Error::Config(_))), "{sql}: {r:?}");
+        }
+        assert_eq!(conn.query("SELECT 1", &[]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_takes_one_statement() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let r = conn.run("SELECT 1; SELECT 2", &[], &[]);
+        assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
+    }
+
+    #[test]
+    fn run_guard_checks_text_whatever_the_args() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let text = |s: &str| ("f".to_string(), Value::from_text(s.to_string()));
+        let r = conn.run("ATTACH :f AS x", &[], &[text("x.db")]);
+        assert_eq!(r, Err(Error::Unsupported("ATTACH")));
+        // The guard reads the text before any binding: a literal it refuses is refused with
+        // arguments that bind nothing, too.
+        let r = conn.run("PRAGMA journal_mode = delete", &[], &[text("delete")]);
+        assert_eq!(r, Err(Error::Unsupported("journal_mode other than WAL")));
+        let r = conn.run("PRAGMA hexkey = '00'", &[int(1)], &[text("00")]);
+        assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
+        // A parameter in a PRAGMA value is not valid SQL for the engine, so it never runs.
+        for sql in ["PRAGMA journal_mode = :f", "PRAGMA hexkey = :f"] {
+            assert!(conn.run(sql, &[], &[text("delete")]).is_err(), "{sql}");
+        }
+        conn.execute("BEGIN", &[]).unwrap();
+        let r = conn.run("PRAGMA durable_batching = off", &[], &[text("off")]);
+        assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
+        assert!(conn
+            .run("PRAGMA durable_batching = :f", &[], &[text("off")])
+            .is_err());
+        conn.execute("ROLLBACK", &[]).unwrap();
+        assert_eq!(conn.query("SELECT 1", &[]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_pragma_durable_batching_reads_with_a_column() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let out = conn.run("PRAGMA durable_batching", &[], &[]).unwrap();
+        assert_eq!(
+            out.columns,
+            vec![Column {
+                name: "durable_batching".to_string(),
+                decltype: None
+            }]
+        );
+        assert_eq!(out.rows, vec![vec![Value::from_text("off".to_string())]]);
+        assert_eq!(out.changes, 0);
+    }
+
+    #[test]
+    fn is_autocommit_tracks_begin_commit_rollback() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        assert!(conn.is_autocommit());
+        conn.execute("BEGIN", &[]).unwrap();
+        assert!(!conn.is_autocommit());
+        conn.execute("COMMIT", &[]).unwrap();
+        assert!(conn.is_autocommit());
+        conn.execute("BEGIN", &[]).unwrap();
+        assert!(!conn.is_autocommit());
+        conn.execute("ROLLBACK", &[]).unwrap();
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn is_autocommit_after_engine_side_rollback() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT)", &[])
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER r BEFORE INSERT ON t WHEN NEW.body = 'boom' \
+             BEGIN SELECT RAISE(ROLLBACK, 'no'); END",
+            &[],
+        )
+        .unwrap();
+        conn.execute("BEGIN", &[]).unwrap();
+        conn.execute("INSERT INTO t(body) VALUES ('ok')", &[])
+            .unwrap();
+        assert!(!conn.is_autocommit());
+        let r = conn.execute("INSERT INTO t(body) VALUES ('boom')", &[]);
+        assert!(r.is_err(), "{r:?}");
+        assert!(conn.is_autocommit());
+        let n = conn.query("SELECT count(*) FROM t", &[]).unwrap();
+        assert_eq!(n[0][0].as_int(), Some(0));
+    }
+
+    #[test]
+    fn is_autocommit_after_upload_failure_rollback() {
+        use crate::store::fault::FaultStore;
+        let t = tempfile::tempdir().unwrap();
+        let mem = Arc::new(MemStore::new());
+        let fault = Arc::new(FaultStore::new(mem));
+        let mut c = Config::new(t.path(), "http://127.0.0.1:1", "b", "k", "s");
+        c.retry_deadline = Duration::from_millis(200);
+        c.request_timeout = Duration::from_millis(50);
+        let db = crate::open_with_store(c, fault.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+        fault.only_keys_containing("log/");
+        conn.execute("BEGIN", &[]).unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+        fault.fail_next_puts_permanently(1);
+        let r = conn.execute("COMMIT", &[]);
+        assert!(
+            matches!(
+                r,
+                Err(Error::UploadFailed(_) | Error::Timeout(_) | Error::Fenced(_))
+            ),
+            "{r:?}"
+        );
+        assert!(conn.is_autocommit());
+        let n = conn.query("SELECT count(*) FROM t", &[]).unwrap();
+        assert_eq!(n[0][0].as_int(), Some(0));
     }
 }
