@@ -259,3 +259,34 @@ pub fn gen_syncs(store: &dyn ObjectStore, gen: u64) -> Vec<(u64, Option<Vec<Op>>
     }
     out
 }
+
+/// TRUNCATE checkpoint that retries `Busy` (a reader is mid-transaction), up to 5 s. Returns the
+/// number of Busy answers seen.
+pub fn ckpt_retry(c: &Arc<CoreConn>) -> u32 {
+    let start = std::time::Instant::now();
+    let mut busy = 0;
+    loop {
+        match ckpt_truncate(c) {
+            Ok(_) => return busy,
+            Err(turso_core::LimboError::Busy) => {
+                busy += 1;
+                assert!(start.elapsed() < Duration::from_secs(5), "checkpoint stayed Busy for 5 s");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => panic!("checkpoint: {e:?}"),
+        }
+    }
+}
+
+/// Every `id` in table t, sorted.
+pub fn ids(c: &Arc<CoreConn>) -> Vec<i64> {
+    let mut st = c.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    st.run_collect_rows()
+        .unwrap()
+        .iter()
+        .map(|r| match &r[0] {
+            CoreValue::Numeric(Numeric::Integer(i)) => *i,
+            v => panic!("{v:?}"),
+        })
+        .collect()
+}

@@ -1,0 +1,19 @@
+=== batching Off
+takeover report: TakeoverReport { generation: 3, epoch: 2, fence_seq: 589, writer_id: "4b991e6ba8987061eec3cfe29baf3bff", restore: RestoreReport { generation: 3, log_objects: 493, gets: 496, lists: 1, bytes: 2834536, elapsed: 39.888916ms }, quiet: 0ns, elapsed: 129.703166ms }
+A acked 1315 commits, refused: [(2315, "fenced by a newer writer: db/log/0000000003/00000000000000000589 holds another writer's record")]
+B generation 3 acked 40 rows
+log generation 2: 731 objects (seq 1..731), seq 731 empty (seal start)
+log generation 3: 600 objects (seq 1..600), seq 589 FENCE epoch 2
+applied generation 2: 1001 frames, 0 fence record(s) skipped
+local TRUNCATE checkpoint before generation 3 (Busy answers: 0)
+applied generation 3: 852 frames, 1 fence record(s) skipped
+replica rows 1365 expected (baseline + A acked + B acked) 1365 missing=[] extra(not acked, in log before fence)=[] integrity=[[Text(Text { value: "ok", subtype: Text })]]
+RESULT every acked commit is on the replica
+=== batching Window { max_wait: 5ms, max_commits: 64, max_bytes: 1048576 }
+takeover report: TakeoverReport { generation: 2, epoch: 2, fence_seq: 57, writer_id: "18c5fc17b2990d5d3542a1393ac53715", restore: RestoreReport { generation: 2, log_objects: 48, gets: 51, lists: 1, bytes: 276920, elapsed: 24.034167ms }, quiet: 0ns, elapsed: 101.483292ms }
+A acked 55 commits, refused: [(1055, "fenced by a newer writer: db/log/0000000002/00000000000000000057 holds another writer's record")]
+B generation 2 acked 40 rows
+log generation 2: 68 objects (seq 1..68), seq 57 FENCE epoch 2
+applied generation 2: 121 frames, 1 fence record(s) skipped
+replica rows 105 expected (baseline + A acked + B acked) 105 missing=[] extra(not acked, in log before fence)=[] integrity=[[Text(Text { value: "ok", subtype: Text })]]
+RESULT every acked commit is on the replica
