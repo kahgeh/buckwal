@@ -40,6 +40,9 @@ const IO_WORKERS: usize = 2;
 pub struct ShutdownReport {
     /// Every request finished and the database closed (its uploads drained).
     pub clean: bool,
+    /// A takeover fenced this server while it ran: a library call answered `Fenced`. An idle
+    /// server never sees the fence, so it stays false until a write hits it.
+    pub fenced: bool,
     /// Pipelines still running when shutdown gave up on them.
     pub in_flight_failed: usize,
     /// Idle streams closed at shutdown.
@@ -188,11 +191,17 @@ impl Bound {
         let in_flight_failed = stop_serving(&app, &stop_tx, accept, cfg.shutdown_timeout).await;
         let _ = reaper.await;
         let report = tokio::task::spawn_blocking(move || close(&streams, in_flight_failed)).await;
-        Ok(report.unwrap_or(ShutdownReport {
+        let report = report.unwrap_or(ShutdownReport {
             clean: false,
+            fenced: false,
             in_flight_failed,
             streams_closed: 0,
-        }))
+        });
+        // Read after every request finished or was abandoned, so a late `Fenced` counts.
+        Ok(ShutdownReport {
+            fenced: app.fenced(),
+            ..report
+        })
     }
 }
 
@@ -299,6 +308,7 @@ fn close(streams: &Streams, in_flight_failed: usize) -> ShutdownReport {
     }
     ShutdownReport {
         clean,
+        fenced: false,
         in_flight_failed,
         streams_closed,
     }

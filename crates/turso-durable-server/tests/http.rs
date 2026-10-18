@@ -62,6 +62,7 @@ fn version_probes() {
     assert_eq!(h.body, json!({"status":"ready"}));
     let report = s.stop().unwrap();
     assert!(report.clean, "{report:?}");
+    assert!(!report.fenced, "{report:?}");
 }
 
 #[test]
@@ -456,7 +457,11 @@ fn fenced_server_reports_unhealthy() {
     let (_, code) = result_error(&r, 0).expect("every request is fenced");
     assert_eq!(code.as_deref(), Some("FENCED"));
     assert_eq!(r.body["baton"], Value::Null);
-    s.stop().unwrap();
+    let report = s.stop().unwrap();
+    assert!(
+        report.fenced,
+        "a fenced stop must not look like success: {report:?}"
+    );
 }
 
 #[test]
@@ -480,6 +485,7 @@ fn stream_cap_returns_503() {
         report,
         ShutdownReport {
             clean: true,
+            fenced: false,
             in_flight_failed: 0,
             streams_closed: 1
         },
@@ -807,6 +813,7 @@ fn client_disconnect_mid_request_gives_the_stream_back() {
         report,
         ShutdownReport {
             clean: true,
+            fenced: false,
             in_flight_failed: 0,
             streams_closed: 1
         },

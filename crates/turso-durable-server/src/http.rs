@@ -83,6 +83,11 @@ impl App {
             .compare_exchange(STARTING, READY, Ordering::SeqCst, Ordering::SeqCst);
     }
 
+    /// Whether a library call answered `Fenced` during the run.
+    pub(crate) fn fenced(&self) -> bool {
+        self.fence.is_set()
+    }
+
     /// Health reports `shutting_down` and new pipelines get 503 `SHUTTING_DOWN`.
     pub(crate) fn begin_shutdown(&self) {
         self.phase.store(SHUTTING_DOWN, Ordering::SeqCst);

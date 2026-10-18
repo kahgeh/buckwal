@@ -227,13 +227,20 @@ impl ServerProc {
         fs::read_to_string(&self.stderr).unwrap_or_default()
     }
 
+    /// The last output, for failure messages, with the token replaced by `<token>`.
     fn tail(&self) -> String {
         let from = self.lines.len().saturating_sub(20);
-        format!(
+        let text = format!(
             "last stdout lines: {:?}\nstderr:\n{}",
             &self.lines[from..],
             self.stderr()
-        )
+        );
+        redact(&text, self.access.token.as_deref())
+    }
+
+    /// The `serve stopped …` line, once the process has exited.
+    fn stop_line(&self) -> Option<&String> {
+        self.lines.iter().find(|l| l.starts_with("serve stopped "))
     }
 
     /// Read lines until one `p` accepts, which is returned; fails on EOF or after `WAIT`.
@@ -286,13 +293,13 @@ impl ServerProc {
         exited
     }
 
-    /// SIGTERM; the server must stop clean (exit 0, `serve stopped clean=true`).
+    /// SIGTERM; the server must stop clean (exit 0, `serve stopped clean=true fenced=false`).
     fn stop_clean(&mut self) {
         let status = self.sigterm();
         assert_eq!(status.code(), Some(0), "serve exit\n{}", self.tail());
-        let stopped = self.lines.iter().find(|l| l.starts_with("serve stopped "));
+        let stopped = self.stop_line();
         assert!(
-            stopped.is_some_and(|l| l.starts_with("serve stopped clean=true ")),
+            stopped.is_some_and(|l| l.starts_with("serve stopped clean=true fenced=false ")),
             "{stopped:?}\n{}",
             self.tail()
         );
@@ -302,6 +309,14 @@ impl ServerProc {
         self.child.kill().expect("SIGKILL serve");
         self.child.wait().expect("reap serve");
         self.drain();
+    }
+}
+
+/// `text` with every occurrence of `token` replaced by `<token>`.
+fn redact(text: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() => text.replace(t, "<token>"),
+        _ => text.to_string(),
     }
 }
 
@@ -662,10 +677,16 @@ fn serve_takeover_fences_the_old_server() {
     acks.extend((21..=40).map(|id| must_ack(&mut st_b, id)));
 
     let status_a = a.sigterm();
+    let stopped_a = a.stop_line();
     println!(
-        "serve_takeover_fences_the_old_server: A exited {status_a} after SIGTERM, {:?}",
-        a.lines.iter().find(|l| l.starts_with("serve stopped "))
+        "serve_takeover_fences_the_old_server: A exited {status_a} after SIGTERM, {stopped_a:?}"
     );
+    assert!(
+        stopped_a.is_some_and(|l| l.contains(" fenced=true ")),
+        "A's stop line must say it was fenced: {stopped_a:?}\n{}",
+        a.tail()
+    );
+    assert_eq!(status_a.code(), Some(1), "a fenced A exits 1\n{}", a.tail());
     b.stop_clean();
     let v = restore_verify(&ctx, &acks);
     assert_eq!(v.acked, 40, "{v:?}");
@@ -697,10 +718,7 @@ fn serve_sigterm_during_load_loses_no_ack() {
     let workers = load.join();
     println!(
         "serve_sigterm_during_load_loses_no_ack: exit after {took:?}, {:?}",
-        server
-            .lines
-            .iter()
-            .find(|l| l.starts_with("serve stopped "))
+        server.stop_line()
     );
     let acks = all_acks("serve_sigterm_during_load_loses_no_ack", &workers);
     lose_disk(&ctx, &dir);
@@ -793,7 +811,7 @@ fn serve_security_bind_rules_and_token() {
             .spawn()
             .expect("spawn serve");
         let status = wait_exit(&mut child, label, Duration::from_secs(30));
-        let stderr = fs::read_to_string(&err).unwrap();
+        let stderr = redact(&fs::read_to_string(&err).unwrap(), Some(&token));
         assert_eq!(status.code(), Some(2), "{label}: {stderr}");
         for setting in ["DURABLE_SERVE_TLS_CERT", "DURABLE_SERVE_TOKEN_FILE"] {
             assert!(stderr.contains(setting), "{label}: {setting} in {stderr}");

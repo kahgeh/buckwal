@@ -2,14 +2,14 @@
 use crate::{open_writer, say};
 use std::path::{Path, PathBuf};
 use turso_durable::Batching;
-use turso_durable_server::{bind, os_signals, ServeConfig};
+use turso_durable_server::{bind, os_signals, ServeConfig, ShutdownReport};
 
 /// Why `serve` ended without a clean stop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Failure {
     /// The settings are wrong (exit 2).
     Usage(String),
-    /// A refused directory, an open error or an unclean stop (exit 1).
+    /// A refused directory, an open error, an unclean stop or a fenced server (exit 1).
     Failed(String),
 }
 
@@ -67,16 +67,26 @@ fn run_with(
             os_signals(),
         )
         .map_err(Failure::Failed)?;
-    say(&format!(
-        "serve stopped clean={} in_flight_failed={} streams_closed={}",
-        report.clean, report.in_flight_failed, report.streams_closed
-    ));
-    if report.clean {
-        return Ok(());
-    }
-    Err(Failure::Failed(
-        "shutdown was not clean: a request or the final upload did not finish in time".to_string(),
-    ))
+    let (line, result) = stopped(&report);
+    say(&line);
+    result
+}
+
+/// The stop line, and the exit: 0 only when the stop was clean and no takeover fenced the
+/// server, else 1.
+fn stopped(report: &ShutdownReport) -> (String, Result<(), Failure>) {
+    let line = format!(
+        "serve stopped clean={} fenced={} in_flight_failed={} streams_closed={}",
+        report.clean, report.fenced, report.in_flight_failed, report.streams_closed
+    );
+    let why = match (report.fenced, report.clean) {
+        (false, true) => return (line, Ok(())),
+        (true, _) => "this server was fenced by a takeover: its writes after it were refused",
+        (false, false) => {
+            "shutdown was not clean: a request or the final upload did not finish in time"
+        }
+    };
+    (line, Err(Failure::Failed(why.to_string())))
 }
 
 #[cfg(test)]
@@ -112,5 +122,34 @@ mod tests {
             assert_eq!(e.message(), sql_e, "same message as sql");
         }
         assert!(!t.path().join("missing").exists(), "created the directory");
+    }
+
+    fn report(clean: bool, fenced: bool) -> ShutdownReport {
+        ShutdownReport {
+            clean,
+            fenced,
+            in_flight_failed: 0,
+            streams_closed: 2,
+        }
+    }
+
+    #[test]
+    fn stop_line_names_the_fence_and_only_a_clean_unfenced_stop_exits_0() {
+        let (line, r) = stopped(&report(true, false));
+        assert_eq!(
+            line,
+            "serve stopped clean=true fenced=false in_flight_failed=0 streams_closed=2"
+        );
+        assert_eq!(r, Ok(()));
+        for (clean, fenced) in [(true, true), (false, true), (false, false)] {
+            let (line, r) = stopped(&report(clean, fenced));
+            assert!(
+                line.starts_with(&format!("serve stopped clean={clean} fenced={fenced} ")),
+                "{line}"
+            );
+            let e = r.unwrap_err();
+            assert_eq!(e.exit_code(), 1, "clean={clean} fenced={fenced}: {e:?}");
+            assert_eq!(e.message().contains("fenced"), fenced, "{}", e.message());
+        }
     }
 }
