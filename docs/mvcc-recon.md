@@ -56,15 +56,18 @@ Your choice: approve stage 2 for new MVCC databases with these limits, or keep t
     (`crates/turso_durable/src/conn.rs:305-323`), so an autocommit read waits out the upload
     (P2: `reader id=2 (the held row): blocked>2000ms`). That wait spins on `Yield`, which the
     busy timeout does not cap (P2: `Yield steps 3544728, 2.003091417s`).
-  - A read inside an explicit `BEGIN` or `BEGIN CONCURRENT` returns at once. This comes from the
-    coordinator's review probe p2b_review, whose output is not in this branch's evidence (as
-    reported: `reader inside BEGIN: … Done value=1 (126µs)`).
+  - A read inside an explicit `BEGIN` or `BEGIN CONCURRENT` returns at once. The coordinator's
+    review probe p2b_review
+    (`/private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-main/8dc4d662-160f-4307-a3e1-746a9db9e0a0/scratchpad/p2b_review_output.txt`,
+    source `/private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-main/8dc4d662-160f-4307-a3e1-746a9db9e0a0/scratchpad/probe/src/bin/p2b_review.rs`): `REVIEW reader inside BEGIN: SELECT id=2 before release -> Done value=1 (169µs)`.
   - No transaction that read it can commit first: it waits on the dependency
     (`turso_core-0.8.3/mvcc/database/mod.rs:3316-3331`).
 - **A failed upload keeps the commit.** Every connection sees it at once. P3: `failed commit: Err(Internal error: probe: log sync refused (sync Err))`,
   then `same connection: autocommit=true sees id=2: Ok([["1"]])` and `fresh connection sees id=2: Ok("1")`.
   The library ships it with the next sync or at reconcile. It is lost only if this disk is lost,
-  or this writer is fenced, before its next sync confirms it. It is never a lost ack.
+  or this writer is fenced, before its next sync confirms it, or if the process stops before any record of its
+  generation is confirmed, including while a seal's head is not yet adopted (reconcile then treats it as an older generation's bytes, as
+  for the WAL today, `crates/turso_durable/src/reconcile.rs:120-128`). It is never a lost ack.
 - **README promises that break in MVCC mode:**
   - line 182: an Off commit that fails with `Timeout` "is rolled back locally";
   - line 231: Window's read-before-durable gap, "Off has no such gap";
@@ -314,11 +317,17 @@ for a custom storage, `turso_core-0.8.3/storage/journal_mode.rs:85-100`), and wr
     the checkpoint's frames, but all of them are backfilled into the sealed pages (steps 4-5 run
     before step 6). Their local truncate (step 8, or the engine's reconciliation at the next open)
     is never shipped.
-  - After a crash between the seal and the WAL truncate, reconcile uploads the local `-wal`'s
-    backfilled frames into the new generation as Ahead (`crates/turso_durable/src/reconcile.rs:8-9`),
-    so a restore of it may hold WAL frames. They equal the sealed pages, and the bootstrap re-applies
-    them at open (with the header repair if the log copy is empty, and the read-only change for
-    verify). That is safe, and `verify --acked` on every restore covers it.
+  - After a crash between the seal and the WAL truncate, reconcile finds the new generation's
+    `-wal` image empty and the local `-wal` not, so `holds_older_generation`
+    (`crates/turso_durable/src/reconcile.rs:128`, used at `:75`) makes it `NewGeneration`: the local
+    `-wal` is replaced with the empty image and nothing reaches the new generation. That is safe:
+    those frames were backfilled, synced and are covered by the sealed manifest.
+  - **Choice for the `.db-log` in the same crash:** the same rule. A new-generation `.db-log` image
+    that is empty next to a non-empty local `.db-log` is `NewGeneration`, and the local file is
+    replaced with the empty image. It cannot hold an acked commit: no sync returns Ok before its
+    ops are in that image (even after an adopt, which ships the whole file first). Both files
+    empty then open (P5 d k=10: `open: ok, journal_mode=mvcc, rows=10, integrity_check=ok`).
+    A non-empty image is compared as today: Level, Behind or Ahead.
   - Today `ShippingFile` records every truncate as an op (`crates/turso_durable/src/io/wal_file.rs:339-352`).
     In MVCC mode the `-wal` and `.db-log` wrappers do not record the truncates of a generation
     change. One recorded anyway would be harmless: a truncate to 0 of an image already empty.
@@ -355,8 +364,9 @@ for a custom storage, `turso_core-0.8.3/storage/journal_mode.rs:85-100`), and wr
 - Reconcile runs Level, Behind, Ahead per file. An Ahead `.db-log` uploads as kind 3, as the WAL
   does today (`crates/turso_durable/src/reconcile.rs:8-9`). The same "WAL frames + empty log"
   repair runs on a local directory before the engine opens it (a crash between steps 6 and 8).
-- A crash between the seal and the log truncate leaves the old frames locally. By the invariant,
-  reconcile uploads them as Ahead into the new generation. That is harmless, since recovery skips
+- A crash between the seal and the log truncate leaves the old frames locally. The new
+  generation's `.db-log` image is still empty, so reconcile replaces them (`NewGeneration`, the
+  choice above). Every one of them is in the sealed pages: recovery would skip them anyway, as
   frames at or below `persistent_tx_ts_max`
   (`turso_core-0.8.3/mvcc/persistent_storage/logical_log.rs:138-140`).
 
@@ -401,6 +411,14 @@ truncate) go through locally, and are never shipped and never seal. The wrapper'
 the read-only `ShippingFile` (`crates/turso_durable/src/io/wal_file.rs:243-249`), `BucketDbStorage`
 (`crates/turso_durable/src/io/db_storage.rs:376-379`) and the new `LogShippingFile`. Verify then
 reads the acked rows back (Q7).
+- Verify now changes the local directory (the bootstrap's writes), so stage 2 updates the README's
+  "Verify never claims, never seals and never writes to the bucket" (README line 316, still true
+  for the bucket, add the local writes), the `open_read_only` doc comment
+  (`crates/turso_durable/src/db.rs:256-258`) and the reconcile comment
+  (`crates/turso_durable/src/reconcile.rs:81-86`, which says a read-only directory never checkpointed).
+- The early WAL truncate probably runs on every MVCC open with no WAL frames (`DriveEarlyTruncate`,
+  `turso_core-0.8.3/mvcc/database/mod.rs:8890-8894`), so verify writes locally even on a plain
+  restore.
 
 **What stays refused.**
 
@@ -416,7 +434,8 @@ reads the acked rows back (Q7).
   (including between the seal and the log truncate, and between the log truncate and the WAL
   truncate). Delete the local disk, restore: every acked commit present, `integrity_check` ok.
   `verify --acked` (`crates/turso-durable-cli/tests/system.rs:727-731`) runs on every restore,
-  mid-checkpoint ones included, and must pass. 8 writer threads, all `BEGIN CONCURRENT`, and mixed.
+  mid-checkpoint ones included, and must pass. Also `verify --acked` on a plain restore (no WAL
+  frames), which still meets the early WAL truncate. 8 writer threads, all `BEGIN CONCURRENT`, and mixed.
 - One failed PUT under group commit: no ack lost. The `Err`'d commit is present or absent, but
   local equals restored after reopen.
 - A PUT that stores and then fails under group commit, then a takeover before the next commit:
