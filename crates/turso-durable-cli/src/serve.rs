@@ -35,6 +35,16 @@ pub fn run(
     batching: Option<Batching>,
 ) -> Result<(), Failure> {
     let cfg = ServeConfig::from_env(listen).map_err(Failure::Usage)?;
+    run_with(cfg, dir, claim, batching)
+}
+
+/// Everything after the settings are read.
+fn run_with(
+    cfg: ServeConfig,
+    dir: &Path,
+    claim: bool,
+    batching: Option<Batching>,
+) -> Result<(), Failure> {
     // Before any TLS or token file is read.
     cfg.check_bind().map_err(Failure::Usage)?;
     // Before binding, so a refused directory never touches the bucket or the port. The
@@ -54,7 +64,7 @@ pub fn run(
         .serve(
             move || open_writer(&dir, claim, batching),
             |db| say(&format!("serve ready generation={}", db.generation())),
-            async { os_signals().await },
+            os_signals(),
         )
         .map_err(Failure::Failed)?;
     say(&format!(
@@ -73,10 +83,15 @@ pub fn run(
 mod tests {
     use super::*;
 
+    /// A config from no environment at all, so the tests do not depend on the shell.
+    fn cfg(listen: &str) -> ServeConfig {
+        ServeConfig::from_lookup(Some(listen), |_| None).unwrap()
+    }
+
     #[test]
     fn serve_refuses_non_loopback_without_tls_and_token() {
         let t = tempfile::tempdir().unwrap();
-        let e = run(t.path(), Some("0.0.0.0:0"), false, None).unwrap_err();
+        let e = run_with(cfg("0.0.0.0:0"), t.path(), false, None).unwrap_err();
         assert_eq!(e.exit_code(), 2, "{e:?}");
         for var in [
             "DURABLE_SERVE_TLS_CERT",
@@ -91,7 +106,7 @@ mod tests {
     fn serve_refuses_an_unclaimed_directory_without_claim() {
         let t = tempfile::tempdir().unwrap();
         for dir in [t.path().to_path_buf(), t.path().join("missing")] {
-            let e = run(&dir, Some("127.0.0.1:0"), false, None).unwrap_err();
+            let e = run_with(cfg("127.0.0.1:0"), &dir, false, None).unwrap_err();
             assert_eq!(e.exit_code(), 1, "{e:?}");
             let sql_e = crate::sql(&dir, &["SELECT 1".to_string()], false, None).unwrap_err();
             assert_eq!(e.message(), sql_e, "same message as sql");
