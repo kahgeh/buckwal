@@ -2,70 +2,88 @@
 
 Base `main` at 1c357f8, turso_core =0.8.3. Cites are `turso_core-0.8.3/<path>:<line>` (the
 crate source in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`) and
-`crates/turso_durable/<path>:<line>` (this repo). Probes P1-P8g ran in a scratchpad crate
+`crates/<crate>/<path>:<line>` (this repo). Probes P1-P8g ran in a scratchpad crate
 against local temp dirs, with the library's turso_core features and lock (nothing merged).
 "Pn: `...`" quotes their printed output.
 
 ## Finding: Partial
 
 MVCC databases can be made durable through turso_core 0.8.3's public APIs, **for databases
-created new in MVCC mode**: concurrent writers (`BEGIN CONCURRENT`), batching Off, encryption,
-fencing, takeover, GC, trim, restore and verify work by the design below (what is probed and
-what is argued: next table). **Switching an existing WAL database
-to MVCC stays refused**: the switch is not crash safe through the IO hooks (P7), and making it
-safe needs an engine change. **Window batching stays refused in MVCC mode**, but group commit
-gives the batching instead: one PUT per group of commits (P4). The stage-2 design is a hybrid:
-the commit point stays the `.db-log` `File::sync`, as for the WAL, and the generation seal moves
-into a public `DurableStorage` wrapper's `truncate`, which runs before the engine cuts the log.
+created new in MVCC mode**, with concurrent writers (`BEGIN CONCURRENT`), batching Off,
+encryption, fencing, takeover, GC, trim, restore and verify. **Switching an existing WAL database
+to MVCC stays refused**: it is not crash safe through the IO hooks (P7), and fixing that needs an
+engine change. **Window batching stays refused**, and group commit gives one PUT per group instead
+(P4). Design: the commit point stays the `.db-log` `File::sync`, and the seal moves into a public
+`DurableStorage` wrapper's `truncate`, which runs before the engine cuts the log.
 
 | Claim | Status |
 |---|---|
 | A commit waits for its `.db-log` sync | probed (P2) |
-| Each sync holds whole records, no waiter acked before a covering sync | probed (P4) |
+| A sync holds whole records, no waiter acked before a covering sync | probed (P4) |
 | A failed log sync keeps the commit | probed (P3) |
-| The seal in `DurableStorage::truncate`, failing before it delegates, loses nothing | probed (P8f) |
-| A database plus the log up to any sync restores every synced row | probed (P5 a), plain files, not the library's restore |
+| Sealing in `truncate` before it delegates loses nothing | probed (P8f) |
+| A database plus the log up to any sync restores every synced row | probed (P5 a), plain files |
 | The log is encrypted | probed (P6, P8e) |
 | The WAL to MVCC switch is not crash safe | probed (P7) |
-| A slow upload stalls other writers | probed (P8g), parked in `on_log_write_complete`, not `File::sync` |
-| A sync returns Ok only when every op is confirmed | argued from code (`crates/turso_durable/src/bucket.rs:57-61`) |
-| Fencing and takeover | argued from code (`crates/turso_durable/src/bucket.rs:1224-1242`) |
-| GC and trim unchanged | argued from code (`turso_core-0.8.3/mvcc/database/mod.rs:6632-6633`) |
-| Verify | argued from code (`turso_core-0.8.3/mvcc/database/mod.rs:8847-8853`) |
-| Restore through the library, format v2 | argued from code (`crates/turso_durable/src/restore.rs:258-260`) |
+| A slow upload stalls other writers | probed (P8g), parked in `on_log_write_complete` |
+| A sync returns Ok only when every op is confirmed | argued (`crates/turso_durable/src/bucket.rs:57-61`) |
+| Fencing and takeover | argued (`crates/turso_durable/src/bucket.rs:1224-1242`) |
+| GC and trim unchanged | argued (`crates/turso_durable/src/trim.rs:27-54`) |
+| Verify of a mid-checkpoint restore, after a read-only change | argued (`crates/turso_durable/src/engine.rs:152`) |
+| Restore through the library, format v2 | argued (`crates/turso_durable/src/restore.rs:258-260`) |
 
-The probes used plain IO and the engine's own `app.db` storage (not `BucketDbStorage`), and
-modelled a process crash (every completed write kept), not power loss. Stage 2 proves the argued rows.
+Probes used plain IO and the engine's own `app.db` storage, and modelled a process crash, not
+power loss. Stage 2 proves the argued rows.
 
-Limits you need to know before choosing:
+Limits (details in the next section):
 
-- **Readers can see a commit before it is acked.** Another connection in the same process can
-  read a row while its commit waits for the upload (MVCC speculative reads).
-  P2: `rows_seen_before_release=["Row id=1", "Row id=2"] select_done_before_release=false`.
-  No transaction that read it can commit first (it waits on the dependency,
-  `turso_core-0.8.3/mvcc/database/mod.rs:3316-3331`). The README's "Off has no gap" does not
-  hold in MVCC mode.
-- **A commit whose upload fails returns `Err` but may still be committed.** The engine keeps it
-  in the local log, and every connection sees it at once. P3: `failed commit: Err(Internal error: probe: log sync refused (sync Err))`,
-  then `same connection: autocommit=true sees id=2: Ok([["1"]])` and `fresh connection sees id=2: Ok("1")`.
-  The library ships it with the next sync or at reconcile. It is lost only if this disk is lost
-  before the next sync confirms it. This is "outcome unknown", like a failed Window ack today.
-  It is never a lost ack.
-- **One upload at a time per database.** The group's lead holds the commit lock during its PUT
-  (`turso_core-0.8.3/mvcc/database/mod.rs:2040-2066`). Throughput comes from group commit.
-- **A slow upload stalls every writer.** While a plain (autocommit or `BEGIN`) commit waits,
-  `BEGIN CONCURRENT` writers fail at once, even with the library's 5 s busy timeout.
-  P8g: `thread 1 id=1000: Err("Write-write conflict") latency=1.372333ms finished_before_release=true`.
-  `BEGIN CONCURRENT` behind `BEGIN CONCURRENT` waits and succeeds
-  (P8g: `thread 1 id=1000: Ok("Ok") latency=2.0014885s`). **In MVCC mode, use `BEGIN CONCURRENT`
-  for every write.**
-- **A checkpoint stops every transaction, readers included.** During a blocking checkpoint every
-  begin, read transactions too, is `Busy` (`turso_core-0.8.3/mvcc/database/mod.rs:6585`,
-  `:6610-6612`). The seal's uploads (and any takeover quiet) run inside that window, so a slow seal
-  can fail readers with `Busy` after the 5 s busy timeout (`crates/turso_durable/src/conn.rs:31`).
-  `checkpoint(Passive)`, mapped to Truncate, stops the world too.
+- Reads inside `BEGIN` or `BEGIN CONCURRENT`, and reads of a commit whose upload failed, can see
+  it before it is acked. Autocommit reads wait out the upload, with no busy-timeout cap.
+- A commit whose upload fails returns `Err` but may still be committed: "outcome unknown".
+- One upload at a time. A slow upload stalls every writer: **use `BEGIN CONCURRENT` for every write,
+  so writers wait rather than fail.**
+- A checkpoint stops every transaction, readers included. A slow seal can fail them with `Busy`.
+- Four README promises about Off do not hold in MVCC mode.
 
 Your choice: approve stage 2 for new MVCC databases with these limits, or keep the refusal.
+
+## Limits in detail
+
+- **Reads before the ack.** Another connection can read a row while its commit waits for the
+  upload (MVCC speculative reads). P2's streaming reader:
+  `rows_seen_before_release=["Row id=1", "Row id=2"] select_done_before_release=false`.
+  - The library's `query()` steps to `Done` before it returns rows
+    (`crates/turso_durable/src/conn.rs:305-323`), so an autocommit read waits out the upload
+    (P2: `reader id=2 (the held row): blocked>2000ms`). That wait spins on `Yield`, which the
+    busy timeout does not cap (P2: `Yield steps 3544728, 2.003091417s`).
+  - A read inside an explicit `BEGIN` or `BEGIN CONCURRENT` returns at once. This comes from the
+    coordinator's review probe p2b_review, whose output is not in this branch's evidence (as
+    reported: `reader inside BEGIN: … Done value=1 (126µs)`).
+  - No transaction that read it can commit first: it waits on the dependency
+    (`turso_core-0.8.3/mvcc/database/mod.rs:3316-3331`).
+- **A failed upload keeps the commit.** Every connection sees it at once. P3: `failed commit: Err(Internal error: probe: log sync refused (sync Err))`,
+  then `same connection: autocommit=true sees id=2: Ok([["1"]])` and `fresh connection sees id=2: Ok("1")`.
+  The library ships it with the next sync or at reconcile. It is lost only if this disk is lost,
+  or this writer is fenced, before its next sync confirms it. It is never a lost ack.
+- **README promises that break in MVCC mode:**
+  - line 182: an Off commit that fails with `Timeout` "is rolled back locally";
+  - line 231: Window's read-before-durable gap, "Off has no such gap";
+  - line 241: "A failed Off commit is rolled back locally";
+  - line 523: with Off, an error means "rolled back locally".
+- **One upload at a time.** The group's lead holds the commit lock during its PUT
+  (`turso_core-0.8.3/mvcc/database/mod.rs:2040-2066`). While a plain (autocommit or `BEGIN`) commit
+  waits, `BEGIN CONCURRENT` writers fail at once, even with the 5 s busy timeout. P8g:
+  `thread 1 id=1000: Err("Write-write conflict") latency=1.372333ms finished_before_release=true`.
+  `BEGIN CONCURRENT` behind `BEGIN CONCURRENT` waits and succeeds
+  (P8g: `thread 1 id=1000: Ok("Ok") latency=2.0014885s`).
+- **Checkpoints stop the world.** During a blocking checkpoint every begin, read transactions too,
+  is `Busy` (`turso_core-0.8.3/mvcc/database/mod.rs:6585`, `:6610-6612`). The seal's uploads (and any
+  takeover quiet) run inside that window, so a slow seal can fail readers after the 5 s busy timeout
+  (`crates/turso_durable/src/conn.rs:31`). Every explicit checkpoint mode runs as a blocking Truncate
+  in MVCC (`turso_core-0.8.3/connection.rs:2392-2406`).
+- **After a seal whose head reply was lost**, commits fail until one adopts the published head
+  (Stage-2 design, Commit). That lasts only as long as the bucket is unreachable. No stall remains
+  after it.
 
 ## Answers
 
@@ -178,9 +196,11 @@ The checkpoint, in blocking TRUNCATE mode (P1 ops 36-46, and
 
 ### Q6. Concurrency in one process: works through public APIs, here is how
 
-- The wrapper does not serialize writers. The engine does: `pager_commit_lock` admits one log
-  writer from the first `pwrite` to the sync (`turso_core-0.8.3/mvcc/database/mod.rs:2040-2066`,
-  `:3403-3426`). So the uploader's single FIFO (`crates/turso_durable/src/uploader.rs:166-185`)
+- The wrapper does not serialize writers. The engine does, one log writer at a time. A
+  non-exclusive commit takes `pager_commit_lock` at commit (`turso_core-0.8.3/mvcc/database/mod.rs:2040-2066`,
+  `:3403-3413`). An exclusive one skips that branch (`turso_core-0.8.3/mvcc/database/mod.rs:3389`),
+  having taken the lock at begin (`turso_core-0.8.3/mvcc/database/mod.rs:6488-6489`), and is refused
+  while another transaction is Preparing (`turso_core-0.8.3/mvcc/database/mod.rs:7485-7487`). So the uploader's single FIFO (`crates/turso_durable/src/uploader.rs:166-185`)
   gets records in the engine's durability order, across both files.
 - A group's upload runs on the lead's thread, so it lands in the lead's per-thread commit
   context (`crates/turso_durable/src/batching.rs:196-273`).
@@ -198,9 +218,11 @@ The checkpoint, in blocking TRUNCATE mode (P1 ops 36-46, and
 - The maintenance gate is unchanged. The engine's `blocking_checkpoint_lock` keeps commits out of a
   checkpoint (`turso_core-0.8.3/mvcc/database/mod.rs:6632-6633`).
 - Checkpoints are driven by the library's maintenance, which measures `.db-log` bytes (the `-wal`
-  is near 0 in MVCC). The engine's auto-checkpoint is off (`PRAGMA mvcc_checkpoint_threshold = -1`,
-  `turso_core-0.8.3/translate/pragma.rs:684-693`), because its error is swallowed inside the commit
-  (`turso_core-0.8.3/mvcc/database/mod.rs:3747-3751`) and a failed seal would go unseen.
+  is near 0 in MVCC). The engine's auto-checkpoint is off: the wrapper's `should_checkpoint()`
+  returns false (`turso_core-0.8.3/mvcc/persistent_storage/mod.rs:96`, read at
+  `turso_core-0.8.3/mvcc/database/mod.rs:3692`), whatever `mvcc_checkpoint_threshold` says. An
+  auto-checkpoint's error is swallowed inside the commit (`turso_core-0.8.3/mvcc/database/mod.rs:3747-3751`),
+  so a failed seal would go unseen.
 - Smaller effects: stats count one commit per sync, so they need a
   per-record count. `Storage::sync` holds the log's write lock during the upload
   (`turso_core-0.8.3/mvcc/persistent_storage/mod.rs:212-214`).
@@ -212,7 +234,7 @@ The checkpoint, in blocking TRUNCATE mode (P1 ops 36-46, and
 | Fencing, takeover | works through public APIs, here is how | `.db-log` records take the same `Uploader` to `put_if_absent` path. A 412 with other bytes is `Fenced` (`crates/turso_durable/src/bucket.rs:1224-1242`), and it sticks (`crates/turso_durable/src/bucket.rs:684-705`). A fenced lead's sync fails the commit, and each follower's own prefix sync meets the same fence. Takeover is restore (now with `app.db-log`), claim, fence, reconcile. |
 | Encryption | works through public APIs, here is how | The log payload is encrypted by turso's codec (`turso_core-0.8.3/mvcc/persistent_storage/logical_log.rs:792-807`). P6: `needle in .db-log: false (385 bytes); "CREATE TABLE" in .db-log: false`, control run `needle in .db-log: true`. Frame headers stay plaintext: commit timestamps, op counts, sizes (`turso_core-0.8.3/mvcc/persistent_storage/logical_log.rs:810-841`). The wrapper must report the encryption context, or the open fails (`turso_core-0.8.3/storage/journal_mode.rs:73-83`). P8e: `Err("encrypted MVCC requires the custom DurableStorage to be configured with encryption")`. |
 | GC and trim | works through public APIs, here is how | Unchanged, as long as the only seal is the wrapper's (Stage-2 design). Trim keeps only the sealed generation's manifest, pages and log (`crates/turso_durable/src/trim.rs:27-54`). At the seal every log frame is already in the pages: no commit runs during the checkpoint (`turso_core-0.8.3/mvcc/database/mod.rs:6632-6633`), and recovery skips frames at or below `persistent_tx_ts_max` (`turso_core-0.8.3/mvcc/persistent_storage/logical_log.rs:138-140`). The next generation's `.db-log` image is the local file at the seal (empty after the normal truncate, see the invariant in the Stage-2 design). |
-| Verify (read-only) | works through public APIs, here is how | A read-only `.db-log` wrapper, and the auto-checkpoint off with `PRAGMA mvcc_checkpoint_threshold = -1` (`turso_core-0.8.3/translate/pragma.rs:684-693`). A restored image caught mid-checkpoint is refused by the engine itself in read-only mode (`turso_core-0.8.3/mvcc/database/mod.rs:8847-8853`), and verify reports that error. `integrity_check` sees only the B-tree, so verify also reads the acked rows back. |
+| Verify (read-only) | works through public APIs, here is how | The library opens the engine with `OpenFlags::Create` even read-only (`crates/turso_durable/src/engine.rs:152`), so the engine's own read-only checks never run (`turso_core-0.8.3/database.rs:2631-2633`). A restore taken mid-checkpoint (WAL frames in the image) goes through the writable bootstrap: backfill, log header rewrite, WAL truncate (`DriveCheckpoint`, `RetryHeader`, `DriveFinalTruncate`: `turso_core-0.8.3/mvcc/database/mod.rs:8901-8911`, `:8963-8976`, `:9031-9032`). Today the read-only `ShippingFile` and `BucketDbStorage` refuse those writes (`crates/turso_durable/src/io/wal_file.rs:243-249`, `crates/turso_durable/src/io/db_storage.rs:376-379`), so that open would fail. Stage 2 lets them through locally, never shipped and never sealing (Stage-2 design, Verify). `integrity_check` sees only the B-tree, so verify also reads the acked rows back (`--acked`). |
 | `synchronous` FULL | works through public APIs, here is how | FULL is set on every connection and the guard refuses lower values (`crates/turso_durable/src/conn.rs:87-88`, `crates/turso_durable/src/guard.rs:113-119`). Under FULL every commit syncs the log (`turso_core-0.8.3/mvcc/database/mod.rs:1977-1979`). |
 
 ## Why a hybrid design
@@ -249,11 +271,17 @@ for a custom storage, `turso_core-0.8.3/storage/journal_mode.rs:85-100`), and wr
     the frame and chains from it (P3: `range Some(311)..Some(367) (this sync failed)`, next
     `Some(367)..Some(416)`). Dropping them loses later acked commits (P3: `restore from app.db + shipped ranges without the failed sync's bytes: ... rows=1`).
     Today's WAL rule drops them (`crates/turso_durable/src/uploader.rs:484-499`).
-  - Ops in doubt (`unsent: None`, `crates/turso_durable/src/bucket.rs:57-61`) are settled first,
-    with the bucket's existing `catch_up` (`crates/turso_durable/src/bucket.rs:963-967`). The sync
-    then checks that the bucket's in-doubt set is empty, not just that `catch_up` returned Ok, since `catch_up`
-    returns Ok without settling when a pending seal's head is published
-    (`crates/turso_durable/src/bucket.rs:986-989`). Otherwise the sync fails.
+  - The sync settles first, with the bucket's existing `catch_up` (`crates/turso_durable/src/bucket.rs:963-967`).
+    This covers ops in doubt (`unsent: None`, `crates/turso_durable/src/bucket.rs:57-61`). It returns
+    Ok only once the in-doubt set is empty, not merely when `catch_up` says Ok.
+  - If the bucket holds a published pending seal (`catch_up` returns Ok without settling,
+    `crates/turso_durable/src/bucket.rs:986-989`), the sync adopts it before it appends, and the
+    generation-change invariant applies. An unpublished one is a failed seal, and the generation
+    continues. If the adopt fails, that commit fails as in any bucket outage, and the next retries.
+  - The sync cannot wait for a checkpoint to adopt it: a pending seal makes the bucket degraded
+    (`crates/turso_durable/src/bucket.rs:997-999`), so `bucket_failing` reports it
+    (`crates/turso_durable/src/uploader.rs:219-227`) and maintenance skips every run
+    (`crates/turso_durable/src/maintenance.rs:489-491`).
   - An empty sync while anything is unconfirmed does the same (no early Ok).
   - A 412 from another writer fences for good: nothing is requeued, every later sync fails.
 - `on_log_write_complete` is not overridden (the default yield).
@@ -263,10 +291,10 @@ for a custom storage, `turso_core-0.8.3/storage/journal_mode.rs:85-100`), and wr
   then delegates. A failed seal returns `Err` before the engine touches the salt or offset (P8f).
 - A seal whose head PUT stored but was not confirmed leaves the head maybe published, and every
   append is refused until a seal adopts it (`crates/turso_durable/src/bucket.rs:948-955`, `:962`).
-  So the wrapper's `on_checkpoint_start` adopts or redoes a pending seal before any WAL write of
-  the checkpoint (it runs first, `turso_core-0.8.3/mvcc/database/checkpoint_state_machine.rs:2222`,
-  P8a: `-- hook: on_checkpoint_start` before `2 Pwrite { file: "app.db-wal", off: 0, len: 32 }`).
-  The seal's flush runs after that adopt. Until then commits fail: nothing is acked, nothing is lost.
+  The next commit's sync adopts it (Commit, above). The wrapper's `on_checkpoint_start` makes the
+  same adopt, as a backstop, before any WAL write of the checkpoint (it runs first,
+  `turso_core-0.8.3/mvcc/database/checkpoint_state_machine.rs:2222`, P8a: `-- hook: on_checkpoint_start`
+  before `2 Pwrite { file: "app.db-wal", off: 0, len: 32 }`). The seal's flush runs after that adopt.
 - The seal takes its pages from `BucketDbStorage::seal` (`crates/turso_durable/src/io/db_storage.rs:313-316`),
   the page source the WAL seal uses today (`crates/turso_durable/src/io/wal_file.rs:221`).
 - In an MVCC database `ShippingFile` never seals: not at `truncate(0)`
@@ -282,6 +310,18 @@ for a custom storage, `turso_core-0.8.3/storage/journal_mode.rs:85-100`), and wr
     header, counts as unconfirmed ops of the new generation and ships before any sync returns Ok
     (the confirmed-sync rule), as reconcile's Ahead does at open. Otherwise a restore would lack the
     log header and fail closed (`turso_core-0.8.3/mvcc/database/mod.rs:8871-8877`).
+  - The new generation's `-wal` image is empty. At the wrapper's seal the local `-wal` still holds
+    the checkpoint's frames, but all of them are backfilled into the sealed pages (steps 4-5 run
+    before step 6). Their local truncate (step 8, or the engine's reconciliation at the next open)
+    is never shipped.
+  - After a crash between the seal and the WAL truncate, reconcile uploads the local `-wal`'s
+    backfilled frames into the new generation as Ahead (`crates/turso_durable/src/reconcile.rs:8-9`),
+    so a restore of it may hold WAL frames. They equal the sealed pages, and the bootstrap re-applies
+    them at open (with the header repair if the log copy is empty, and the read-only change for
+    verify). That is safe, and `verify --acked` on every restore covers it.
+  - Today `ShippingFile` records every truncate as an op (`crates/turso_durable/src/io/wal_file.rs:339-352`).
+    In MVCC mode the `-wal` and `.db-log` wrappers do not record the truncates of a generation
+    change. One recorded anyway would be harmless: a truncate to 0 of an image already empty.
 - A local truncate, or the step-7 local fsync, that fails after a successful seal poisons the
   database until reopen. The poison refuses at `pwrite`, so a poisoned commit rolls back cleanly
   (P3 variant C: `fresh connection sees id=2: Ok("0")`). It refuses checkpoints and seals too. The
@@ -346,12 +386,21 @@ library's `EncryptionOpts` (`crates/turso_durable/src/engine.rs:150-161`) and re
 **Takeover and fencing.** No change of their own beyond restore and reconcile learning
 `app.db-log` and kind 3. The fence path learns that another writer's kind-3 record occupies a seq.
 
-**GC and trim.** Only decoding a format-2 head, and the single seal above. Map the library's `checkpoint(Passive)` to Truncate in MVCC mode
-(`crates/turso_durable/src/conn.rs:43-54`): core Passive asserts without the experimental flag
-(`turso_core-0.8.3/mvcc/database/checkpoint_state_machine.rs:769-772`).
+**GC and trim.** Only decoding a format-2 head, and the single seal above. Checkpoint modes need
+no change: `Connection::checkpoint` already runs every mode as Truncate in MVCC
+(`turso_core-0.8.3/connection.rs:2392-2406`), and `PRAGMA wal_checkpoint(PASSIVE)` returns an error
+(`turso_core-0.8.3/translate/pragma.rs:943-948`).
 
-**Verify.** Read-only `LogShippingFile`, `PRAGMA mvcc_checkpoint_threshold = -1`, the engine's own
-refusal of a mid-checkpoint image, read the acked rows back (Q7).
+**Guard.** In MVCC mode also refuse `PRAGMA journal_mode = wal`, which passes today
+(`crates/turso_durable/src/guard.rs:106-110`). `mvcc_checkpoint_threshold` need not be refused or
+set: the wrapper's `should_checkpoint()` returns false (Q6).
+
+**Verify.** In a read-only open the bootstrap's recovery writes (backfill, log header rewrite, WAL
+truncate) go through locally, and are never shipped and never seal. The wrapper's
+`on_checkpoint_start` and `truncate` seal do nothing in read-only mode. That is a stage-2 change to
+the read-only `ShippingFile` (`crates/turso_durable/src/io/wal_file.rs:243-249`), `BucketDbStorage`
+(`crates/turso_durable/src/io/db_storage.rs:376-379`) and the new `LogShippingFile`. Verify then
+reads the acked rows back (Q7).
 
 **What stays refused.**
 
@@ -366,7 +415,8 @@ refusal of a mid-checkpoint image, read the acked rows back (Q7).
 - MVCC crash matrix: kill at every op boundary of a commit, a group commit and a checkpoint
   (including between the seal and the log truncate, and between the log truncate and the WAL
   truncate). Delete the local disk, restore: every acked commit present, `integrity_check` ok.
-  8 writer threads, all `BEGIN CONCURRENT`, and mixed.
+  `verify --acked` (`crates/turso-durable-cli/tests/system.rs:727-731`) runs on every restore,
+  mid-checkpoint ones included, and must pass. 8 writer threads, all `BEGIN CONCURRENT`, and mixed.
 - One failed PUT under group commit: no ack lost. The `Err`'d commit is present or absent, but
   local equals restored after reopen.
 - A PUT that stores and then fails under group commit, then a takeover before the next commit:
@@ -376,6 +426,8 @@ refusal of a mid-checkpoint image, read the acked rows back (Q7).
 - A seal head PUT that stores and then fails, then commits, then a checkpoint: no stall past that
   next checkpoint, no ack lost. Then the pending seal adopted, that checkpoint's WAL upload
   failing, more commits, the local disk deleted and a restore: every acked commit present.
+- No explicit checkpoint: a seal head PUT stores and its reply is lost, then commits only. The
+  next commit adopts the head and is acked. Delete the local disk, restore: every acked commit present.
 - A crash at each step of creation, then an open here and a restore elsewhere.
 - Refusals: the switch (SQL guard and open), Window in MVCC, the passive flag.
 - Fencing and takeover with an MVCC writer. GC and trim across MVCC generations. Verify.
@@ -398,8 +450,8 @@ flowchart LR
     ds["DurableStorage wrapper<br/>truncate seals first"]:::new
     logship["LogShippingFile (.db-log)<br/>Ok only when all ops confirmed"]:::new
     dio["DurableIo<br/>.db-log only via the wrapper"]:::changed
-    walship["ShippingFile (-wal)<br/>never seals in MVCC"]:::changed
-    dbs["BucketDbStorage (app.db)"]:::existing
+    walship["ShippingFile (-wal)<br/>never seals in MVCC<br/>read-only lets recovery through"]:::changed
+    dbs["BucketDbStorage (app.db)<br/>read-only lets recovery through"]:::changed
     up["Uploader<br/>kind 3 records"]:::changed
     rest["Restore and reconcile<br/>two images, header repair"]:::changed
     gc["GC and trim<br/>reads format 2 head"]:::changed
@@ -421,6 +473,7 @@ flowchart LR
   pager -- "WAL frames" --> walship
   pager -- "pages" --> dbs
   ds -- "seal" --> up
+  ds -- "seal reads pages" --> dbs
   logship --> up
   walship --> up
   up --> bucket
@@ -499,6 +552,8 @@ sequenceDiagram
   participant DS as DurableStorage wrapper
   participant LS as LogShippingFile (.db-log)
   participant S3 as Bucket
+  CK->>DS: on_checkpoint_start
+  DS->>S3: adopt a pending seal, if any
   CK->>WAL: rows as WAL frames, sync
   WAL->>S3: PUT log/G/seq kind 1
   S3-->>WAL: 200
@@ -512,13 +567,18 @@ sequenceDiagram
     CK->>DS: sync
     DS->>LS: File sync, local only
     CK->>WAL: truncate 0, local only, no seal
-    Note over CK,LS: nothing shipped, the G+1 log image is the truncated local file
+    Note over CK,LS: truncates not recorded, nothing shipped, G+1 images are empty
     Note over CK,LS: a local truncate failing now poisons the database until reopen
-  else seal fails
+  else seal fails before its head PUT
     S3-->>DS: error
     DS-->>CK: Err before delegating
     Note over CK,LS: salt and offset untouched, log and WAL keep their frames
     Note over CK,LS: later commits ack normally, the next checkpoint retries (P8f)
+  else head PUT stored, reply lost
+    S3-->>DS: error or timeout
+    DS-->>CK: Err before delegating
+    Note over CK,LS: commits fail until a sync adopts the published head
+    Note over CK,LS: then the whole local log ships into G+1
   end
 ```
 
