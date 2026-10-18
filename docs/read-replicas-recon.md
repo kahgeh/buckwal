@@ -137,13 +137,13 @@ What the probes found:
   and no truncate, with the header write alone (`io/wal_file.rs:224-239`, read, not probed).
   The per-generation image handles both.
 - **Exception, found by the follow-up probe** (`q1b-rollback.txt`): a transaction big enough to
-  spill dirty pages into the WAL and then roll back leaves its frames in the shipped image
-  (5,119 uncommitted frames in a 21 MB image). They are not committed. The writer's next commit
-  rewinds to the last commit point and overwrites them. So syncs can end on a non-commit frame, and later writes
-  land below the end of the image (3 of them in the probe). None landed below a commit frame
-  (0 of 3). **So the follower applies only the committed prefix of the image: frames up to the
-  last one with `db_size != 0`, and nothing after it.** Frames past that point are held back and
-  dropped when a later write rewinds below them.
+  spill dirty pages into the WAL and then roll back leaves its frames in the shipped image (5,119
+  uncommitted frames in a 21 MB image). They are not committed. The writer's next commit rewinds to
+  the last commit point and overwrites them. So syncs can end on a non-commit frame, and later
+  writes land below the end of the image (3 of them in the probe). None landed below a commit frame
+  (0 of 3). **So the follower applies only the committed prefix of the image: frames up to the last
+  one with `db_size != 0`, and nothing after it.** Frames past that point are held back and dropped
+  when a later write rewinds below them.
 
 ### 2. Applying through `wal_insert_frame`: works, here is how
 
@@ -521,14 +521,16 @@ conditions: the probe uses the repo's `Cargo.lock`, `--offline`, only `turso_cor
 
 **To re-run a probe safely.** Copy `probe/` to a directory outside this repo, change the
 `turso_durable` path in its `Cargo.toml` to the absolute path of `crates/turso_durable`, copy this
-repo's `Cargo.lock` into it, set `CARGO_TARGET_DIR` to a directory of your own, and run
-`cargo run --offline --bin q3_seal` (and so on). Do not pass `--locked` the first time: the probe
-is its own root package, so cargo has to rewrite the copied lock. Then diff that lock against the
-repo's. Only three entries may differ: `probe 0.0.0` added, and `turso-durable-cli 0.1.0` and
-`tokio-macros 2.7.2` dropped, with no version changes (the auditor's check). Any other difference
-voids the audit. After that, `--locked` works. Do not add a dependency either. The probes write scratch files under `<probe dir>/work/` (`fresh_dir` in `lib.rs` uses
-`CARGO_MANIFEST_DIR/work`), and `docs/read-replicas-recon/.gitignore` ignores `work/` and
-`target/` in case someone runs one in place. Probes use no RustFS and no container.
+repo's `Cargo.lock` into it, set `CARGO_TARGET_DIR` to a directory of your own, and run `cargo run
+--offline --bin q3_seal` (and so on). Do not pass `--locked` the first time: the probe is its own
+root package, so cargo has to rewrite the copied lock. Then diff that lock against the repo's. Only
+three entries may differ: `probe 0.0.0` added, and `turso-durable-cli 0.1.0` and `tokio-macros
+2.7.2` dropped, with no version changes (what an offline build without `--locked` changes, measured
+in review, not an auditor finding). Any other difference voids the audit. After that, `--locked`
+works. Do not add a dependency either. The probes write scratch files under `<probe dir>/work/`
+(`fresh_dir` in `lib.rs` uses `CARGO_MANIFEST_DIR/work`), and `docs/read-replicas-recon/.gitignore`
+ignores `work/` and `target/` in case someone runs one in place. Probes use no RustFS and no
+container.
 
 The compiler warning that printed at the top of the first capture of `q3-seal.txt` was removed
 from the file (it was not probe output). Nothing else in the outputs was edited.
