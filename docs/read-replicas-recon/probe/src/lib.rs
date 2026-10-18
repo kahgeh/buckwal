@@ -227,12 +227,19 @@ pub struct Baseline {
 }
 
 pub fn baseline(name: &str, batching: Batching) -> Baseline {
+    baseline_with(name, batching, None)
+}
+
+/// Same, with the writer's `encryption_key_file` set (aegis256 default cipher).
+pub fn baseline_with(name: &str, batching: Batching, key_file: Option<PathBuf>) -> Baseline {
     let store = mem();
     let root = fresh_dir(name);
     let wdir = root.join("writer");
     let rdir = root.join("replica");
     std::fs::create_dir_all(&rdir).unwrap();
-    let wdb = turso_durable::open_with_store(config(&wdir, batching), store.clone()).unwrap();
+    let mut cfg = config(&wdir, batching);
+    cfg.encryption_key_file = key_file;
+    let wdb = turso_durable::open_with_store(cfg, store.clone()).unwrap();
     let w = wdb.connect().unwrap();
     w.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
     for i in 1..=10 {
@@ -289,4 +296,26 @@ pub fn ids(c: &Arc<CoreConn>) -> Vec<i64> {
             v => panic!("{v:?}"),
         })
         .collect()
+}
+
+/// Open an encrypted (aegis256) plain-file database with turso_core directly, as the library's
+/// engine does (engine.rs: db option, cipher and hex key at open, key again on the connection).
+pub fn open_core_enc(db_path: &Path, key: [u8; 32]) -> (Arc<CoreDb>, Arc<CoreConn>) {
+    use turso_core::{DatabaseOpts, EncryptionKey, EncryptionOpts, OpenOptions};
+    let io: Arc<dyn turso_core::IO> = Arc::new(PlatformIO::new().unwrap());
+    let hexkey: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let opts = OpenOptions::new(Arc::new(SqliteDialect))
+        .db_opts(DatabaseOpts::new().with_encryption(true))
+        .encryption(EncryptionOpts { cipher: "aegis256".to_string(), hexkey });
+    let db = CoreDb::open(io, db_path.to_str().unwrap(), opts).unwrap();
+    let c = db.connect_with_encryption(Some(EncryptionKey::new_256(key))).unwrap();
+    (db, c)
+}
+
+/// A hex key file (64 hex digits) for the writer, returning its path.
+pub fn write_key_file(dir: &Path, key: [u8; 32]) -> PathBuf {
+    let p = dir.join("db.key");
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(&p, hex).unwrap();
+    p
 }

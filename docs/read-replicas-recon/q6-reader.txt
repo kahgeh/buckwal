@@ -1,0 +1,13 @@
+writer generations 2 3, rows at the end 73, frames 46 + 13
+reader BEGIN, rows seen 10
+follower applied generation 2: 4 transactions in 2.013291ms, no Busy, while the reader holds its snapshot
+  reader rows (same tx) 10 | new connection rows 53
+PASSIVE checkpoint while reader open: Err(Busy) in 22.459µs
+  reader rows (same tx) 10 | integrity on new connection [[Text(Text { value: "ok", subtype: Text })]]
+TRUNCATE checkpoint while reader open: Err("Busy") answered in 5.333µs (no wait)
+TRUNCATE retried 169 times over 2.0069095s, still Busy while the reader is open
+generation 3 applied without a WAL restart: 1 transactions in 2.484875ms, local max_frame 46 -> 59
+  reader rows (same tx) 10 | new connection rows 73 (want 73)
+reader COMMIT, then TRUNCATE: ok after 0 Busy answers in 1.636583ms; wal_state WalState { checkpoint_seq_no: 1, max_frame: 0 }
+final rows 73 (want 73) integrity [[Text(Text { value: "ok", subtype: Text })]]
+old reader connection, new transaction: rows 73
