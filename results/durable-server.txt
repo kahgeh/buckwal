@@ -1,0 +1,70 @@
+# turso_durable durable-server: the full test command run
+# date: 2026-10-18T22:03:40 local (test run id turso-durable-20261018220340-53912)
+# git: 4621d4e60a23eb28dd3a8cf14e5e03b9c7741fe2 (durable-server), with this commit's script
+#   changes in the working tree: scripts/otel-check.sh (SPANS gains durable.server.request) and
+#   a comment in scripts/test.sh; the rest of the working-tree diff was README.md only
+# engine: turso_core 0.8.3 (features fs, json, uuid, encryption)
+# RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+# build: cargo test --locked (debug profile, rustc 1.97.1)
+# machine: Apple M4 Max, macOS 27.0.1
+# laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
+# telemetry: DURABLE_OTEL=1 for the RustFS passes (scripts/test.sh), exported to the local
+#   observability stack, which was up, so the ClickHouse check ran.
+#
+# Command: ( time ./scripts/test.sh ) in the background, output in a scratch log outside the repo.
+# rc=0; wall time 12:01.50 (`208.52s user 82.92s system 40% cpu 12:01.50 total`, 721.5 s).
+#
+# unit (fmt, clippy -D warnings, cargo test --workspace --locked):
+#   turso-durable (cli bin): 28 passed
+#   turso-durable-hrana-client: 6 passed
+#   turso-durable-server: lib 62 passed; tests/http.rs 21 passed (3.96 s); tests/span.rs 1 passed
+#   turso_durable: lib 389 passed (51.19 s); batching 33 (14.31 s); fencing 5 (3.06 s); otel_down 1
+#   (ignored there: server 5, system 38, s3_rustfs 12)
+#
+# pass 1 (plain HTTP, no encryption; --skip tls_):
+#   server (serve system tests): "test result: ok. 5 passed; 0 failed" (7.10 s)
+#   system: "test result: ok. 38 passed; 0 failed" (286.41 s)
+#   s3_rustfs: "test result: ok. 8 passed; 0 failed; ... 4 filtered out" (2.88 s; the 4 tls_* tests)
+#   scan: 44068 objects, 555509124 bytes
+#   CREATE TABLE: found in 13612 objects
+#   SQLite header: found in 13612 objects
+#   bench payload: found in 1996 objects
+#   peak turso-durable-objects: 721 MB (plain)
+#
+# pass 2 (HTTPS + encryption, every test; serve over HTTPS with a bearer token):
+#   server: "test result: ok. 5 passed; 0 failed" (6.79 s)
+#   system: "test result: ok. 38 passed; 0 failed" (298.09 s)
+#   s3_rustfs: "test result: ok. 12 passed; 0 failed" (3.68 s)
+#   scan: 45464 objects, 565005580 bytes
+#   CREATE TABLE: not found
+#   SQLite header: not found
+#   bench payload: not found
+#   marker 1: not found
+#   the encryption key: not found
+#   peak turso-durable-objects: 735 MB (https+encryption)
+#
+# otel check PASSED: durable.ack_wait=86088 durable.checkpoint_upload=530 durable.commit=86086
+#   durable.fence=23 durable.gc=818 durable.local_fsync=86243 durable.local_write=86291
+#   durable.maintenance=111 durable.restore=154 durable.server.request=2176 durable.takeover=23
+#   durable.upload=52233 logs=1045
+#
+# The serve system tests' `acked=… unacked_present=…` lines are println! output, which
+# cargo test shows only for a failing test, so this run printed none. Each test asserts them:
+# serve_client_writes_off_window_and_txn_batching, serve_sigkill_mid_load_restores_every_ack,
+# serve_takeover_fences_the_old_server (acked=40) and serve_sigterm_during_load_loses_no_ack
+# check that every acked row restores (unacked_present=0 asserted in the takeover test). A
+# separate run of the takeover test with --nocapture, against RustFS, printed:
+#   serve_takeover_fences_the_old_server: A exited exit status: 1 after SIGTERM,
+#     Some("serve stopped clean=true fenced=true in_flight_failed=0 streams_closed=1")
+#   serve_takeover_fences_the_old_server: acked=40 unacked_present=0
+#
+# Against the stage 4 canonical run (results/durable-transport.txt, b4afb8f: 11:43, peaks 684
+# and 708 MB): the 5 serve tests add about 7 s per pass; the peaks are 37 and 27 MB higher.
+#
+# The run before this one (same code before 4621d4e) failed in the unit step:
+# open_error_is_returned_and_the_port_closes ("nothing listens after serve returned"), a test
+# race (a parallel test bound the freed ephemeral port), fixed in 4621d4e together with the
+# reset race of oversized_body_is_413.
+#
+# After the run: RustFS plain and empty (rustfs.sh reset on exit), no turso-durable-* dirs in
+# $TMPDIR.

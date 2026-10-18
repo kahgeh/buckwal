@@ -13,7 +13,7 @@ RUN_ID="${1:-}"
 CH_URL="${DURABLE_CH_URL:-http://localhost:8123}"
 CH_USER="${DURABLE_CH_USER:-hyperdx_ro}"
 USERS_SQL="$HOME/Dev/p/sre/stack/clickhouse/00_database_users.sql"
-SPANS="durable.commit durable.local_write durable.local_fsync durable.ack_wait durable.upload durable.checkpoint_upload durable.restore durable.takeover durable.fence durable.gc"
+SPANS="durable.commit durable.local_write durable.local_fsync durable.ack_wait durable.upload durable.checkpoint_upload durable.restore durable.takeover durable.fence durable.gc durable.server.request"
 DEADLINE=60
 
 fail() { echo "otel check FAILED: $*"; exit 1; }

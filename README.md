@@ -4,7 +4,7 @@ Make a tursodb database durable in an S3 bucket. A Rust library (`turso_durable`
 
 Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
 
-This is stage 4: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export. Stage 4 adds transport and encryption: HTTPS with a CA bundle you name (`DURABLE_CA_BUNDLE`) or the platform's trust store, and encryption of the database with a key from a local file (`DURABLE_ENCRYPTION_KEY_FILE`), so the bucket holds ciphertext. It is tested against RustFS on a laptop, over plain HTTP and over HTTPS with encryption (not on AWS S3).
+This is stage 4: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export. Stage 4 adds transport and encryption: HTTPS with a CA bundle you name (`DURABLE_CA_BUNDLE`) or the platform's trust store, and encryption of the database with a key from a local file (`DURABLE_ENCRYPTION_KEY_FILE`), so the bucket holds ciphertext. A server, `turso-durable serve`, serves the database to libSQL clients over Hrana over HTTP, so apps in other languages and several processes can use it (see Server). It is tested against RustFS on a laptop, over plain HTTP and over HTTPS with encryption (not on AWS S3).
 
 ## How it works
 
@@ -321,6 +321,7 @@ pub enum Batching {
 | `sql --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, restored and never opened, or holding an interrupted takeover) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. With `--claim`, such a directory is taken over exactly as `takeover` does it (or created, when the prefix holds no database), and an interrupted takeover resumes. There is no read-only fallback; use `verify` to read. |
 | `stats --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer like `sql` (the same `--claim` rule), runs each SQL argument as its own `execute`, then prints `Database::upload_stats()` as `key=value` lines: `commits_acked`, `commits_uploaded`, `log_puts`, `log_put_bytes`, `commits_per_log_put`, `bytes_per_log_put`, `ack_wait_p50_ms`, `ack_wait_p95_ms`, `ack_wait_p99_ms`. |
 | `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N] [--connections N] [--batching SPEC] [--batching-file PATH] [--stats-every N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors, printing `error <message>`. More below. |
+| `serve --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC]` | Serves the database over Hrana over HTTP until SIGTERM or SIGINT, as the writer (the same `--claim` rule as `sql`). It reads `DURABLE_SERVE_*` too, and prints `serve listening …`, `serve ready …` and `serve stopped …` lines (see Server). |
 | `bench --dir DIR --commits N [--connections N] [--batching SPEC]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, `busy_retries` (commits the engine refused as `database is busy`, each retried after 10 ms for up to 10 s, after which bench fails with the error; latency runs from the first attempt), commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, each seal's ms and page count, then the maintenance checkpoint's `maintenance_runs` (runs started), `maintenance_sealed`, `maintenance_skipped`, `maintenance_gate_wait_max_ms` (the longest drain of a run that sealed), and `generation_log_objects_max` (the highest log seq seen before the close: the most log objects a generation held, which a restore of it reads). |
 
 `SPEC` is the PRAGMA's text, `off` or `window <max_wait> <max_commits> <max_bytes>` (for example `'window 10ms 64 1MiB'`). `--batching` sets it with `Database::set_batching` after open; without it, `DURABLE_BATCHING` applies.
@@ -335,9 +336,207 @@ pub enum Batching {
 
 Every command exports telemetry when `DURABLE_OTEL=1` (see Telemetry). If the export cannot start, it prints `warning: telemetry off: …` on stderr and runs without it.
 
-Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on bad arguments.
+Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on bad arguments. `serve` exits 1 also when its stop was not clean or it was fenced (see Server).
 
 **Warning:** `takeover`, and `sql --claim` on a restored or empty directory, take the database over. The old writer is fenced, and its next commit fails. `soak` and `bench` always open as the writer, so run them only on their own prefix.
+
+## Server
+
+`turso-durable serve` runs one process that owns the database: it is the single writer, holds the lease and talks to the bucket. Apps in other languages, or several app processes on the machine, connect to it with a libSQL client over Hrana over HTTP instead of embedding the library. The server sends a result only after the library call returned, so a client hears success only once the commit is in the bucket, as with the library.
+
+```sh
+eval "$(scripts/rustfs.sh env)"     # or your own DURABLE_* settings (see Settings)
+turso-durable serve --dir /var/lib/myapp/db [--listen 127.0.0.1:9295] [--claim] [--batching SPEC]
+```
+
+A libSQL client then uses the URL `http://127.0.0.1:9295` (with its auth token when the server has one). `--claim` and `--batching` work as in `sql`: without `--claim`, a directory that holds no database this writer owns is refused with `sql`'s message, before the port is bound or the bucket is touched.
+
+It prints three lines on stdout:
+- `serve listening addr=<ip:port> tls=<bool> auth=<bool>`, once the port is bound (the real port when `--listen` asks for port 0). `/health` answers `starting` from here on.
+- `serve ready generation=<n>`, once the database is open (any takeover quiet has started by then).
+- `serve stopped clean=<bool> fenced=<bool> in_flight_failed=<n> streams_closed=<n>`, at the end (see Shutdown below).
+
+```mermaid
+flowchart LR
+  client["App in any language<br/>libSQL client (Hrana over HTTP)"]:::existing
+  subgraph serve["turso-durable serve (one process)"]
+    http["HTTP listener<br/>127.0.0.1 by default, TLS + token to bind wider"]:::new
+    hrana["Hrana handler<br/>pipeline, batches, streams"]:::new
+    streams["Stream → Connection map<br/>timeouts, shutdown"]:::new
+    health["GET /health"]:::new
+  end
+  lib["turso_durable library<br/>open, Connection, batching, fencing"]:::existing
+  bucket[("Bucket<br/>format unchanged")]:::existing
+  otel["Telemetry<br/>+ span durable.server.request"]:::changed
+  cli["turso-durable CLI<br/>+ serve command"]:::changed
+  client -- "POST /v2|v3/pipeline" --> http --> hrana --> streams --> lib --> bucket
+  http --> health
+  serve -.-> otel
+  cli --> serve
+  subgraph legend["Legend"]
+    l1["new"]:::new
+    l2["changed"]:::changed
+    l3["existing"]:::existing
+  end
+  classDef new fill:#d9f2e3,stroke:#1f7a4a,color:#10301f
+  classDef changed fill:#fdebc8,stroke:#a86b00,color:#3d2700
+  classDef existing fill:#e6e9ec,stroke:#6b7480,color:#22272e
+```
+
+**Settings.** `serve` reads the library's `DURABLE_*` variables (see Settings) and these. An empty value counts as unset. Each number must be an integer of at least 1.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DURABLE_SERVE_LISTEN` | `127.0.0.1:9295` | `IP:PORT`, no host names. `--listen` wins over it. A non-loopback IP (anything but 127.0.0.0/8 and `::1`) needs TLS and a token (see Security below). |
+| `DURABLE_SERVE_TLS_CERT` | unset | The PEM certificate chain. Set, the server speaks HTTPS only. Needs `DURABLE_SERVE_TLS_KEY`. |
+| `DURABLE_SERVE_TLS_KEY` | unset | The PEM private key. Needs `DURABLE_SERVE_TLS_CERT`. |
+| `DURABLE_SERVE_TOKEN_FILE` | unset (no auth) | A local file holding the bearer token. Set, both pipelines and the cursor need it. |
+| `DURABLE_SERVE_STREAM_TIMEOUT_MS` | 10000 | A stream idle this long is closed. |
+| `DURABLE_SERVE_SHUTDOWN_MS` | 45000 | How long shutdown waits for in-flight requests: the retry deadline (30 s) + the request timeout (10 s) + 5 s. |
+| `DURABLE_SERVE_BUSY_TIMEOUT_MS` | 5000 | `PRAGMA busy_timeout` of each stream's connection. |
+| `DURABLE_SERVE_MAX_STREAMS` | 256 | The most streams open at once, idle and busy together. One more gets 503 `TOO_MANY_STREAMS`. |
+| `DURABLE_SERVE_WORKERS` | 32 | The most pipelines running at once. Each runs on a blocking thread; the rest wait. |
+
+Fixed limits: a request body of at most 16 MiB (413 `PAYLOAD_TOO_LARGE`, sent once the server has read past the limit, so a client still sending the rest may see its connection reset instead), read within 30 s (408 `PROTO_ERROR`, and the connection is closed); at most 1024 connections at once; a TLS handshake within 10 s; at most 1024 stored SQL texts per stream (`SQL_INPUT_ERROR` past it). The server's async runtime has 2 threads, which only do I/O.
+
+**Endpoints.**
+
+| Endpoint | Token | What it does |
+|---|---|---|
+| `GET /health` | no | The server's state as JSON (see Health below). |
+| `GET /v2`, `GET /v3` | no | Version probes: 200 `{}`. |
+| `POST /v2/pipeline` | when set | Hrana 2 over HTTP (JSON). |
+| `POST /v3/pipeline` | when set | Hrana 3 over HTTP (JSON). |
+| `POST /v3/cursor` | when set | Hrana 3's cursor: one batch, answered as NDJSON (`application/x-ndjson`): the baton line, then `step_begin`, `row`, `step_end`, `step_error` and `error` entries. |
+
+Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. hrana-client probes `GET /v3-protobuf` and falls back to `/v2/pipeline` on the 404.
+
+**Protocol coverage.** What the current clients send, from their sources:
+
+| Client | What it uses |
+|---|---|
+| `@libsql/client` (TypeScript) 0.15.15, through hrana-client 0.9.0 | `/v2/pipeline` (JSON): `execute`, `batch` (`ok`, `not`, `and` conditions), `sequence`, `store_sql`, `close_sql`, `close`. Never `describe` or `get_autocommit`. |
+| `libsql` Rust crate 0.10.0 remote (also Python `libsql`, which wraps it) | `/v3/pipeline` and `/v3/cursor` (JSON): `batch` (an `execute` is a batch), queries through the cursor, `get_autocommit` after batches, `sequence`, `store_sql`, `close_sql`, `close`, and `describe` only from `Statement` metadata calls. |
+| `libsql-client-go` | `/v2/pipeline`: `execute`, `batch`, `close`. |
+
+- Built: the endpoints above, and the requests `execute`, `batch` (all six conditions: `ok`, `error`, `not`, `and`, `or`, `is_autocommit`), `sequence`, `store_sql`, `close_sql`, `close`, and on v3 `get_autocommit`. A statement takes `sql` or `sql_id`, `args`, `named_args` and `want_rows`; unknown fields are ignored (libsql sends `replication_index`).
+- Left out: the WebSocket transport, `/v3-protobuf`, and the cursor's WebSocket requests (`open_cursor` and the rest). `describe` gets `UNSUPPORTED` (it needs a prepare-only library call, and no client uses it on a write path). sqld's v1 HTTP (`/v1/execute`, `/v1/batch`, `POST /`), `/version`, namespaces, dump and replication. `get_autocommit` and the `is_autocommit` condition on `/v2/pipeline` get `UNSUPPORTED` (they are Hrana 3 only).
+- In every statement result, `rows_read` and `rows_written` are always 0, `query_duration_ms` is measured, and `last_insert_rowid` is a string. `base_url` is always null.
+- A malformed request in a pipeline fails alone with `PROTO_ERROR`, and an unknown request type with `UNSUPPORTED`; the other requests still run. A body that is not a pipeline at all gets 400 `PROTO_ERROR`.
+
+**Error codes.** A library error becomes a Hrana error whose `code` is stable and whose `message` is the error's text.
+
+| Source | `code` |
+|---|---|
+| `Error::Fenced` | `FENCED` |
+| `Error::Timeout` | `TIMEOUT` |
+| `Error::UploadFailed` | `UPLOAD_FAILED` |
+| `Error::Unsupported` | `UNSUPPORTED` |
+| `Error::Engine` with "constraint failed" | `SQLITE_CONSTRAINT` |
+| `Error::Engine` with "busy" | `SQLITE_BUSY` |
+| other `Error::Engine` | `SQLITE_ERROR` |
+| `Error::Config` | `SQL_INPUT_ERROR` |
+| `Error::Bucket` / `Io` / `Corrupt` / `Encryption` | `BUCKET_ERROR` / `IO_ERROR` / `CORRUPT` / `ENCRYPTION_ERROR` |
+| `NotFound` / `Locked` / `AlreadyOpen` | `INTERNAL_ERROR` |
+| a malformed request (the body, or one request) | `PROTO_ERROR` (the body: HTTP 400) |
+| an unknown, expired, closed, in-use or replayed baton | `STREAM_EXPIRED` (HTTP 400) |
+| an unknown `sql_id`; both or neither of `sql` and `sql_id` | `SQL_INPUT_ERROR` |
+| a request after `close` in the same pipeline | `STREAM_CLOSED` |
+| `describe`; a v3-only request on v2; an unknown request type | `UNSUPPORTED` |
+| a missing or wrong token | `UNAUTHORIZED` (HTTP 401) |
+| a body over 16 MiB | `PAYLOAD_TOO_LARGE` (HTTP 413) |
+| before ready / during shutdown / at the stream cap | `NOT_READY` / `SHUTTING_DOWN` / `TOO_MANY_STREAMS` (HTTP 503) |
+| a new stream whose connection cannot be opened | the library error's code (HTTP 503) |
+
+**Streams.**
+- Each Hrana stream owns one `turso_durable::Connection`, opened on the stream's first request with `PRAGMA busy_timeout` set. So transactions, the SQL guard and `PRAGMA durable_batching` work as in the library.
+- The baton is `<id>.<secret>`, random, and it changes on every response. A null baton means the stream is closed. A baton used twice, or one for a stream another request holds, gets 400 `STREAM_EXPIRED`.
+- A stream is checked out of the registry for the whole pipeline, and the blocking task gives it back, so a client that drops its connection mid-request never leaks the stream.
+- A reaper closes streams idle past `DURABLE_SERVE_STREAM_TIMEOUT_MS`, checking every `min(timeout / 2, 1 s)`. Closing rolls back any open transaction and frees the write lock. A stream in use is never reaped.
+- Pipelines run on blocking threads behind `DURABLE_SERVE_WORKERS` permits.
+- **The anchor connection.** The server holds one extra connection from open until shutdown. The last connection to close runs a TRUNCATE checkpoint, which seals; with the anchor, a stream's close is never the last, so closing a stream never seals. Generations still end at the engine's own checkpoints and the maintenance checkpoint, and the anchor's close at shutdown seals the last one.
+
+**Batching.** The levels of Batching, through the protocol:
+- Per transaction: `BEGIN`, then `PRAGMA durable_batching = '<spec>'` on the stream, as in the library. It lasts until the transaction ends.
+- Per stream: the same PRAGMA as its own statement while the stream is in autocommit. The library refuses that; the server catches it and calls `Connection::set_batching(Some(b))`, so the setting lasts for the stream's life.
+- Reading: `PRAGMA durable_batching` with no value returns the stream's effective setting.
+- Database-wide: `DURABLE_BATCHING`, or `serve --batching`.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as libSQL client
+  participant S as serve (HTTP + Hrana)
+  participant Conn as turso_durable Connection
+  participant Up as Uploader
+  participant B as Bucket
+  C->>S: POST /v3/pipeline {execute "INSERT …"} (Bearer token)
+  S->>S: check the token, find or open the stream's Connection
+  S->>Conn: execute("INSERT …")
+  Conn->>Up: WAL sync: upload the commit's log record
+  Up->>B: PUT log/G/seq (If-None-Match: *)
+  B-->>Up: 200
+  Up-->>Conn: confirmed (then the local fsync)
+  Conn-->>S: Ok(1 row)
+  S-->>C: 200 {result, baton}
+  Note over C,S: In Window mode the PUT may carry other connections' commits,<br/>but this response still waits for this commit's own PUT.
+```
+
+**Health.** `GET /health` needs no token.
+
+| State | HTTP | When |
+|---|---|---|
+| `{"status":"starting"}` | 503 | From the bind until the database is open. |
+| `{"status":"ready"}` | 200 | The database is open. |
+| `{"status":"fenced"}` | 503 | A library call returned `Fenced`. From then on every request on every stream gets `FENCED` without calling the library, and its stream closes. |
+| `{"status":"shutting_down"}` | 503 | Shutdown has begun (this wins over `fenced`). |
+
+**Limit: an idle fenced server reports `ready` until a write hits the fence.** The server learns it is fenced only from a library call that returns `Fenced`. Check `/health` after a write, or watch for `FENCED` errors.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Op as Operator
+  participant New as new server (machine B)
+  participant B as Bucket
+  participant Old as old server (machine A)
+  participant C as client of A
+  Op->>New: turso-durable takeover --dir … then serve
+  New->>B: head: new writer id, epoch+1 (If-Match)
+  New->>B: fence record at log/G/k (If-None-Match)
+  C->>Old: POST /v3/pipeline {execute "INSERT …"}
+  Old->>B: PUT log/G/k (If-None-Match: *)
+  B-->>Old: 412 (the fence record is there)
+  Old->>Old: the library returns Fenced and the commit rolls back locally
+  Old-->>C: error FENCED (never a success)
+  Old->>Old: /health reports unhealthy, later writes fail at once
+```
+
+**Shutdown.** On SIGTERM or SIGINT, in this order:
+1. Health turns `shutting_down`, and new pipelines get 503 `SHUTTING_DOWN`.
+2. Accepting stops.
+3. In-flight pipelines get up to `DURABLE_SERVE_SHUTDOWN_MS` to finish.
+4. Past the bound, their connections are aborted. A response not yet written is never sent, so nothing is acked without its upload. Each one counts in `in_flight_failed`.
+5. Idle streams, then the anchor, close. `Database::close` (which drains the uploader) runs only when no request still holds a connection.
+
+Past the bound, a library call still running cannot be cancelled: it keeps running detached on its blocking thread, and the process exits without `Database::close` (`clean=false`). Its commit, unacked, may or may not be in the bucket. A signal while the database is still opening waits for the open, then shuts down at once.
+
+The stop line's `clean` is true when every request finished and the database closed. `fenced` is true when a library call returned `Fenced` during the run (so it stays false for a server that was taken over but never wrote again).
+
+| Exit | When |
+|---|---|
+| 0 | A clean stop, not fenced. |
+| 1 | A directory refused without `--claim`; a TLS file or token file that cannot be loaded; the port in use; an error opening the database; a stop that was not clean; or a fenced server. One `error: …` line on stderr. |
+| 2 | Bad arguments or settings, or a non-loopback listen without TLS and a token. Nothing is opened or bound. |
+
+**Security.**
+- **Bind rule.** The default is loopback only, with no authentication. A non-loopback IP is refused with exit 2, before any file is read or the database opens, unless both TLS and a token are configured.
+- **TLS.** rustls with the ring provider (the stack the library already uses), TLS 1.2 and 1.3, ALPN `http/1.1`. A missing, unreadable or mismatched certificate or key fails at start. With TLS set, the port speaks HTTPS only.
+- **Token.** Read once from `DURABLE_SERVE_TOKEN_FILE`, with ASCII whitespace around it trimmed. It must be at least 16 bytes of visible ASCII (0x21-0x7E). It is kept only as its SHA-256 and compared in constant time, so neither its content nor its length leaks. It is never logged; errors name the file, never its content. Clients send `Authorization: Bearer <token>` (the scheme in any case). Missing or wrong: 401 `UNAUTHORIZED` with `WWW-Authenticate: Bearer`.
+- **Open routes.** `GET /health`, `GET /v2` and `GET /v3` need no token (hrana-client probes without the header). Both pipelines and the cursor need it.
+- No span or log carries SQL text, arguments, a baton or the token.
+
+**Telemetry.** One `durable.server.request` span per pipeline or cursor request (see Telemetry). The library's `durable.commit` spans of that request are its children.
 
 ## Settings
 
@@ -376,6 +575,8 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 | `DURABLE_OTEL_LEVEL` | `level` | `info` | The least severe log record exported: `trace`, `debug`, `info`, `warn` or `error`. Spans are always INFO. |
 | `DURABLE_TEST_RUN_ID` | `test_run_id` | unset | Added as the `test_run_id` attribute to every span and log record. An empty value counts as unset. |
 
+`serve` also reads the `DURABLE_SERVE_*` variables (see Server).
+
 Where the defaults live:
 - `crates/turso_durable/src/config.rs`, `mod defaults`, holds every default above.
 - The retry backoff is fixed and cannot be configured. It starts at 50 ms (`FIRST_BACKOFF`), doubles, and is capped at 2 s (`MAX_BACKOFF`). Both are in `mod defaults` too. `RetryPolicy::default` in `crates/turso_durable/src/store/retry.rs` takes all three retry values from there.
@@ -391,7 +592,7 @@ Where the defaults live:
 
 The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` exports it over OTLP/gRPC to `endpoint` (`http://localhost:4317` by default), with `service.name = turso-durable`, through a global `tracing` subscriber. It is off unless `enabled` (`DURABLE_OTEL=1`). The CLI calls it at start.
 
-**Spans.** These names and attributes are a contract: the HyperDX searches depend on them. Every span is INFO, with target `turso_durable`.
+**Spans.** These names and attributes are a contract: the HyperDX searches depend on them. Every span is INFO, with target `turso_durable` (`turso_durable::server` for `durable.server.request`).
 
 | Span | Parent | Attributes |
 |---|---|---|
@@ -405,11 +606,12 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `durable.maintenance` | none (the maintenance thread) | One per maintenance run: `durable.generation`, `durable.log_objects`, `durable.wal_bytes` (the measures that made it due), `durable.gate_wait_ms` (the drain; absent when the run did not start), `durable.outcome` (`sealed`, `bucket_failing`, `takeover_quiet`, `gate_timeout`, `busy`, `closed` or `error`). The seal's `durable.checkpoint_upload` is its descendant. |
 | `durable.takeover` | the caller's span (`takeover`, or the `open` that takes a directory over) | One per takeover, around its head write, attach and fence record (the restore before it has its own `durable.restore`), and one around the fence of a takeover an `open` resumes (its head write landed, its fence did not): `durable.generation` (the restored generation), `durable.epoch` (the new epoch, recorded once the head write has landed, so a takeover that fails after it still shows it), `durable.seq` (the fence record's), `durable.retries`, `s3.status`, `durable.outcome` (`ok` or `error`) |
 | `durable.fence` | the caller's span (`durable.takeover`, or the writer open that appends one) | One per fence record: `durable.generation`, `durable.seq`, `durable.epoch`, `durable.retries`, `s3.status` |
+| `durable.server.request` | none (one per pipeline or cursor request to `serve`) | `http.route`, `http.status`, `durable.stream` (the stream's numeric id, never the baton), `durable.statements` (one per `execute` or `sequence`, a batch's steps), `durable.outcome` (`ok`, `error`, `fenced`, `unauthorized`, `bad_request`, `stream_expired`, `not_ready`, `shutting_down` or `too_many_streams`). No SQL text, arguments, baton or token. The request's `durable.commit` spans are its children. |
 | `durable.gc` | the caller's span for `gc`; none on a writer's GC thread | One per GC pass: `durable.generation` (the head's), `durable.manifest` (the manifest trimmed against; absent otherwise), `durable.age_ms` (as `GcReport::age`), `durable.deleted`, `durable.outcome` (`trimmed`, `too_young`, `nothing` or `error`) |
 
 Every span and log record also carries `test_run_id` when one is set (`DURABLE_TEST_RUN_ID`).
 
-**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR). A takeover logs `took over` (INFO, with `generation`, `epoch`, `fence_seq` and `writer_id`), and `takeover quiet: the old writer's seal may still be uploading` (INFO) when it sets a quiet; an open that finds a quiet still pending logs `takeover quiet: pending at open, waited again in full` (INFO, with `generation` and `ms`); a seal that waits one out logs `seal waits out the takeover quiet` (INFO). An open that finds its own earlier process's seal landed logs `a seal of an earlier process landed during the open; attaching again` (INFO). A failed GC pass on a writer's thread logs `gc pass failed` (WARN). Maintenance logs `maintenance checkpoint not started; retrying later` and `maintenance checkpoint skipped; retrying later` (INFO), and `maintenance checkpoint failed; retrying later` and `maintenance checkpoint panicked; retrying later` (WARN).
+**Log records** have the target `turso_durable`: `database opened`, `seal finished` and `restore finished` (INFO), `log upload failed` (WARN) and `writer fenced` (ERROR). A takeover logs `took over` (INFO, with `generation`, `epoch`, `fence_seq` and `writer_id`), and `takeover quiet: the old writer's seal may still be uploading` (INFO) when it sets a quiet; an open that finds a quiet still pending logs `takeover quiet: pending at open, waited again in full` (INFO, with `generation` and `ms`); a seal that waits one out logs `seal waits out the takeover quiet` (INFO). An open that finds its own earlier process's seal landed logs `a seal of an earlier process landed during the open; attaching again` (INFO). A failed GC pass on a writer's thread logs `gc pass failed` (WARN). Maintenance logs `maintenance checkpoint not started; retrying later` and `maintenance checkpoint skipped; retrying later` (INFO), and `maintenance checkpoint failed; retrying later` and `maintenance checkpoint panicked; retrying later` (WARN). The server logs, with target `turso_durable::server`, `shutdown bound reached; in-flight requests aborted`, `shutdown bound reached; exiting without draining`, `database close failed` and `cannot install the SIGTERM handler; only Ctrl-C stops the server` (WARN), and `request panicked; its stream is closed` (ERROR).
 - Each record keeps its own time. Without one it gets its observed time, and without that the current time.
 - Log records carry no trace or span ids. Adding them would need an experimental OpenTelemetry feature.
 
@@ -427,7 +629,7 @@ Every span and log record also carries `test_run_id` when one is set (`DURABLE_T
 
 **The ClickHouse check.** `scripts/otel-check.sh RUN_ID` checks that one run's telemetry reached the observability stack.
 - It runs read-only `SELECT`s, as the stack's read-only ClickHouse user, on `otel.otel_traces` and `otel.otel_logs`, for `ServiceName = 'turso-durable'` and that `test_run_id`.
-- It passes when every span name above except `durable.maintenance` (its short workload never makes a generation due) has at least one span, at least one log record is dated today, and no log record is dated before 2000-01-01. It polls for up to 60 s.
+- It passes when every span name above except `durable.maintenance` (its short workload never makes a generation due) has at least one span, `durable.server.request` included (the `serve` system tests export it), at least one log record is dated today, and no log record is dated before 2000-01-01. It polls for up to 60 s.
 - Settings: `DURABLE_CH_URL` (default `http://localhost:8123`), `DURABLE_CH_USER` (default `hyperdx_ro`) and `DURABLE_CH_PASSWORD`. Without `DURABLE_CH_PASSWORD`, it reads the password at run time from the stack's users SQL file (`~/Dev/p/sre/stack/clickhouse/00_database_users.sql`). The password reaches curl only on stdin; it is never printed, written to a file or put on a command line.
 - It prints one line: `otel check PASSED: …` (exit 0), `otel check FAILED: …` (exit 1), or, when ClickHouse or the collector port 4317 does not answer, `otel check SKIPPED: observability stack not running` (exit 0). A missing `nc` is `otel check FAILED: nc not found`.
 
@@ -525,6 +727,8 @@ Stores known to support both conditional PUTs (`If-None-Match: *` and `If-Match`
 - When `execute`, `execute_batch`, `transaction`, `transaction_with` or `COMMIT` returns `Ok`, the commit is in the bucket and in the local fsynced WAL, under every batching setting. A restore on another machine includes it.
 - `synchronous` is FULL only. `PRAGMA synchronous` set to `OFF`, `NORMAL`, `0` or `1` is refused with `Unsupported("synchronous below FULL")`. A connection whose mode drops anyway has its statement refused, and FULL is put back.
 - A commit that returns an error was not acknowledged. With `Off` (or a Window commit that took the Off path), it is rolled back locally and the connection stays usable; a Window commit whose ack failed stays in the local database instead (see Batching). Its upload may still have landed, though, because a request can succeed after its reply is lost. Such a record is settled at the same log position before anything else is written, so the log never forks. Treat an error as "outcome unknown", as with any remote database.
+- Through `serve`, the same: a success from the server (a 200 with an `ok` result) means the commit is in the bucket, because the server answers only after the library call returned.
+- The server never retries a request. A response lost on the way (a dropped connection, or one aborted past the shutdown bound) leaves the outcome unknown, and a client's retry is a new statement, which can apply a write twice. Make retried writes idempotent (see Batching).
 
 **What is refused.** The `Connection` wrapper parses every SQL string with `turso_parser` and refuses these before the engine sees them (D5, D7, D16):
 
@@ -685,7 +889,7 @@ Source: `results/durable-transport.txt`. These are laptop figures (Apple M4 Max,
 - Seals took 44-66 ms for 169-170 pages under Off and 53-68 ms under the window, in all three setups (the setup close's 2-page seal 6.5-7.5 ms in (b) and (c); setup (a)'s, the first run after the build, took 22 ms, not investigated).
 - Restore of the 1000-commit database (generation 4): 4 GETs (`3 + 1` log object), 1 LIST and 4404 bytes, 21-23 ms, with and without encryption. An encrypted page is the size of a plaintext one.
 - The first writer open of a directory restored by `restore` or `takeover` is where stage 4 added requests: the encryption check needs page 1, and a directory that holds none GETs the head, the manifest and page 1 first (this happens without a key too). Opening the restored 1000-commit directory made 2 PUTs, 11 GETs and 3 LISTs (37-73 ms), the same with and without a key. The stage-3 row below, re-measured with its request lines, shows the same 3 extra GETs on the first open after a takeover.
-- The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took 11.7 min (`real 703.27` s, 11:43), and the larger pass held 708 MB in RustFS at its peak (the canonical final run, at b4afb8f; the earlier run at 5215309 took 11.5 min and peaked at 711 MB; see Test command).
+- The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took 11.7 min (`real 703.27` s, 11:43), and the larger pass held 708 MB in RustFS at its peak (the canonical final run, at b4afb8f; the earlier run at 5215309 took 11.5 min and peaked at 711 MB). With the server's tests it now takes 12.0 min and peaks at 735 MB (`results/durable-server.txt`; see Test command).
 
 ### Stage 3: takeover, lease and GC
 
@@ -775,15 +979,15 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
 
 ## Test command
 
-- `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests. These include the in-memory takeover tests in `crates/turso_durable/tests/fencing.rs`, each under Off and a Window setting.
-- `./scripts/test.sh`: the above, then runs the RustFS-backed `--ignored` tests with `--test-threads=1` twice, each time on an emptied RustFS (`scripts/rustfs.sh reset`): pass 1 over plain HTTP without encryption (the `tls_*` tests skipped), pass 2 over HTTPS with encryption, every test. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs). Stage 3 adds: a takeover of a running `soak` under Off and under a Window setting (`takeover_fences_a_running_soak`, `takeover_window_fences_a_running_soak`), an old writer paused with SIGSTOP across a takeover and GC (`paused_old_writer_is_fenced_after_resume`), `gc` after short-lived processes (`gc_cli_trims_after_short_lived_processes`), Window crash rows for PASSIVE, FULL and RESTART, and the S3 test `stat_reports_etag_and_age`.
+- `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests. These include the in-memory takeover tests in `crates/turso_durable/tests/fencing.rs`, each under Off and a Window setting, and the server's HTTP tests over an in-memory store (`crates/turso-durable-server/tests/http.rs`: the endpoints, streams and batons, auth, health, a fenced server, the stream cap, TLS, SIGTERM with requests in flight and the shutdown bound).
+- `./scripts/test.sh`: the above, then runs the RustFS-backed `--ignored` tests with `--test-threads=1` twice, each time on an emptied RustFS (`scripts/rustfs.sh reset`): pass 1 over plain HTTP without encryption (the `tls_*` tests skipped), pass 2 over HTTPS with encryption, every test. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs). Stage 3 adds: a takeover of a running `soak` under Off and under a Window setting (`takeover_fences_a_running_soak`, `takeover_window_fences_a_running_soak`), an old writer paused with SIGSTOP across a takeover and GC (`paused_old_writer_is_fenced_after_resume`), `gc` after short-lived processes (`gc_cli_trims_after_short_lived_processes`), Window crash rows for PASSIVE, FULL and RESTART, and the S3 test `stat_reports_etag_and_age`. The server adds the `serve` system tests (`crates/turso-durable-cli/tests/server.rs`), plain HTTP on loopback without a token in pass 1 and HTTPS with a token in pass 2: a libSQL-shaped client's writes under Off, per-stream Window and per-transaction batching (`serve_client_writes_off_window_and_txn_batching`), SIGKILL under load and then the loss of the disk (`serve_sigkill_mid_load_restores_every_ack`), a takeover that fences the old server, which then stops with `fenced=true` and exit 1 (`serve_takeover_fences_the_old_server`), SIGTERM under load (`serve_sigterm_during_load_loses_no_ack`), and the bind rule and the token, which never reaches the server's output (`serve_security_bind_rules_and_token`). In the first four, every acked row must restore.
   - It runs both passes with `DURABLE_OTEL=1` under one `DURABLE_TEST_RUN_ID` (`turso-durable-<timestamp>-<pid>`, printed as `test run id: …`).
   - For pass 2, `scripts/tls-material.sh` makes a CA, RustFS's certificate and an encryption key in a `mktemp -d` directory (`turso-durable-tls.*` under `$TMPDIR`), and the script exports `TURSO_DURABLE_TLS_DIR` (RustFS serves HTTPS, and the system tests' own `rustfs.sh stop/start/pause/unpause` keep that mode) and `DURABLE_ENCRYPTION_KEY_FILE`. `scripts/rustfs.sh env` adds `DURABLE_CA_BUNDLE`. The tests pass `DURABLE_CA_BUNDLE`, `DURABLE_ENCRYPTION_KEY_FILE` and `DURABLE_ENCRYPTION_CIPHER` on to their CLI children and in-process databases; `TURSO_DURABLE_TLS_DIR` is inherited by their `rustfs.sh` calls.
   - The tests keep their bucket prefixes (`DURABLE_KEEP_PREFIXES=1`; the two cleanup tests turn it off), and each pass ends with a whole-bucket scan, `turso-durable scan --all`, which GETs every object and looks for plaintext. Pass 1 must find `CREATE TABLE` (the control). Pass 2 must find none of `CREATE TABLE`, `SQLite format 3\0`, 64 bytes of `0xab` (bench's payload), the run's marker row, and the key as lower-case hex, upper-case hex or raw bytes. It prints `scan: <n> objects, <bytes> bytes` and one line per needle, `<label>: not found` or `<label>: found in <k> objects (first: <key>)`; the key is never printed.
   - In pass 2, after the tests, it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then `sql` creating table `marker` with the row `turso-durable-marker-<run id>` and a `wal_checkpoint(TRUNCATE)`, then `restore`, `takeover` and `gc`), so every span kind except `durable.maintenance` is exported, then the scan.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
   - On exit, pass or fail, it empties RustFS's storage again in plain mode (`scripts/rustfs.sh reset`) and removes the TLS material. A failed reset is reported on stderr and the exit code stays the tests'.
-  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured by the canonical final run of stage 4 at b4afb8f (`results/durable-transport.txt`, "Final test-command run (after the merge fixes)"; laptop, RustFS): 684 MB (plain) and 708 MB (https+encryption), a whole run 11.7 min (`real 703.27` s, 11:43). The earlier run at 5215309: 673 and 711 MB, 11.5 min. With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
+  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured with the server at 4621d4e (`results/durable-server.txt`; laptop, RustFS): 721 MB (plain) and 735 MB (https+encryption), a whole run 12.0 min (12:01.5). Each pass ran 5 `serve` tests (about 7 s), 38 system tests and the S3 tests (8 in pass 1, 12 in pass 2); the unit step ran 546 tests. Stage 4's canonical run at b4afb8f (`results/durable-transport.txt`): 684 and 708 MB, 11.7 min (11:43). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
   - Outside `test.sh`, each RustFS-backed test deletes its bucket prefix when it ends. `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
 - `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `down` removes the container and its volume `turso-durable-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it. With `TURSO_DURABLE_TLS_DIR` set to a directory from `scripts/tls-material.sh DIR`, it runs RustFS over HTTPS (a container is plain or TLS for its whole life; `reset` switches).
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
@@ -791,9 +995,11 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
 ## Layout
 
 - `crates/turso_durable`: the library.
+- `crates/turso-durable-server`: the Hrana-over-HTTP server behind `serve` (`ServeConfig`, `bind`, `Bound::serve`).
+- `crates/turso-durable-hrana-client`: a minimal Hrana client for the tests only (`publish = false`), sending the request shapes of the libSQL clients.
 - `crates/turso-durable-cli`: the `turso-durable` binary (with the test command's `scan`, `src/scan.rs`, the whole-bucket plaintext scan), the system tests and `examples/stage3_costs.rs` (the request counts of stages 3 and 4).
 - `scripts/`: `test.sh`, `rustfs.sh` (local S3), `tls-material.sh` (test CA, certificate and key), `s3-gate.sh`, `otel-check.sh` (the ClickHouse check).
-- `results/`: `rustfs-gate.txt` (conditional-PUT gate), `rustfs-gate-tls.txt` (the same gate over HTTPS), `durable-core.txt` (stage 1 measurements), `batching-knob.txt` (stage 2 measurements), `writer-lease.txt` (stage 3 measurements) and `durable-transport.txt` (stage 4 measurements, and the canonical full test run).
+- `results/`: `rustfs-gate.txt` (conditional-PUT gate), `rustfs-gate-tls.txt` (the same gate over HTTPS), `durable-core.txt` (stage 1 measurements), `batching-knob.txt` (stage 2 measurements), `writer-lease.txt` (stage 3 measurements) `durable-transport.txt` (stage 4 measurements) and `durable-server.txt` (the server's full test run, now the canonical one).
 - `LICENSES/`: third-party licences.
 
 ## Provenance

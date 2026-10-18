@@ -1,15 +1,16 @@
 # turso-durable
 
-Rust library `turso_durable` (crates/turso_durable) plus CLI `turso-durable` (crates/turso-durable-cli) that makes a tursodb database durable in an S3 bucket.
+Rust library `turso_durable` (crates/turso_durable) plus CLI `turso-durable` (crates/turso-durable-cli) that makes a tursodb database durable in an S3 bucket. `turso-durable serve` (crates/turso-durable-server) serves it over Hrana over HTTP; crates/turso-durable-hrana-client is its test-only client.
 
 ## Tests
 
-- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests. Fast.
-- `./scripts/test.sh`: the above, then starts RustFS and runs `--ignored` tests with `--test-threads=1` in two passes: plain HTTP (`--skip tls_`), then HTTPS with encryption (all). About 12 min (11:43).
+- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (546, the server's HTTP tests included). Fast.
+- `./scripts/test.sh`: the above, then starts RustFS and runs `--ignored` tests with `--test-threads=1` in two passes: plain HTTP (`--skip tls_`), then HTTPS with encryption (all). Each pass runs 5 `serve` tests, 38 system tests and the S3 tests (8, then 12). About 12 min (12:01).
+- The `serve` system tests (crates/turso-durable-cli/tests/server.rs) join both passes: plain HTTP without a token in pass 1, HTTPS with a token in pass 2. `serve` defaults to `127.0.0.1:9295`; tests always use port 0 and read the port from the `serve listening` line.
 - Pass 2's TLS material and key are made in a `mktemp -d` dir (`turso-durable-tls.*`) and removed on exit; it exports `TURSO_DURABLE_TLS_DIR` and `DURABLE_ENCRYPTION_KEY_FILE`.
 - Each pass ends with `turso-durable scan --all` over every object: pass 1 must find `CREATE TABLE`, pass 2 no plaintext needle (the key is never printed). Tests keep their prefixes (`DURABLE_KEEP_PREFIXES=1`) for it.
 - `./scripts/test.sh` runs the ignored tests with `DURABLE_OTEL=1` and ends with `scripts/otel-check.sh`, the ClickHouse check of that run's telemetry; it prints `otel check SKIPPED: observability stack not running` and passes when the stack is down.
-- `./scripts/test.sh` empties RustFS (`scripts/rustfs.sh reset`) before each pass and on exit, and prints each pass's `peak turso-durable-objects` (about 684 MB and 708 MB). Outside it, each RustFS test deletes its prefix, and `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix (name on stderr).
+- `./scripts/test.sh` empties RustFS (`scripts/rustfs.sh reset`) before each pass and on exit, and prints each pass's `peak turso-durable-objects` (about 721 MB and 735 MB). Outside it, each RustFS test deletes its prefix, and `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix (name on stderr).
 - Always pass `--locked` to cargo. The script sets `SDKROOT` on macOS (newest CLT SDK does not link) and `SOURCE_DATE_EPOCH`.
 
 ## RustFS resource rules

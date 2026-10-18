@@ -11,6 +11,8 @@
 #             Tests keep their bucket prefixes (DURABLE_KEEP_PREFIXES=1) so the scans see
 #             everything; RustFS's storage is emptied (scripts/rustfs.sh reset) before each
 #             pass and again on exit, pass or fail. The volume's peak size is printed per pass.
+#             Both passes run the `serve` system tests (crates/turso-durable-cli/tests/server.rs):
+#             plain HTTP without a token in pass 1, HTTPS with a token in pass 2.
 #   unit      fmt, clippy, unit tests only
 set -euo pipefail
 cd "$(dirname "$0")/.."
