@@ -4,7 +4,7 @@ Spec: `.superpowers/specs/read-replicas.md` (approved 2026-10-18). Base: `main` 
 turso_core 0.8.3 (`~/.cargo/registry/src/*/turso_core-0.8.3`, read only). Probe sources and
 outputs are in `docs/read-replicas-recon/` and are cited by file name below.
 
-## Finding: go, with six conditions
+## Finding: go, with seven conditions
 
 A replica can follow the bucket by turning the writer's log records into WAL frames and applying
 them with `wal_insert_begin`, `wal_insert_frame` and `wal_insert_end`. Probes against a real writer
@@ -12,7 +12,7 @@ showed this works across commits, a seal, a takeover that fenced a still-running
 `kill -9` of the follower between and inside the steps. Encrypted databases work too, but only if
 the follower decrypts each log frame before inserting it, because the API encrypts on the way in.
 
-The spec's plan needs six corrections, found by probes (1 to 4) or by reading the code (5 and 6),
+The spec's plan needs seven corrections, found by probes (1 to 4) or by reading the code (5 to 7),
 and all in the stage-2 design below:
 
 1. The follower must apply only the **committed prefix** of what the log rebuilds (a rolled-back
@@ -27,6 +27,9 @@ and all in the stage-2 design below:
 5. The follower can only reach the frame API from **inside `turso_durable`** (the library's engine
    type is crate-private), and its page reads go through the library's lazy page storage.
 6. `conn_raw_api` is **not a public or documented API**. It is pinned by the `=0.8.3` version.
+7. The library's IO layer has two modes, writer and read-only, and the follower needs a **third,
+   replica mode**: the writer's would upload to the bucket on every frame commit and local
+   checkpoint, and the read-only one would refuse them.
 
 ## Claim table
 
@@ -44,7 +47,7 @@ and all in the stage-2 design below:
 | 2 | An applied frame again: same content is `Ok`, different content is `Conflict`. A gap is `InvalidArgument`. Uncommitted frames vanish on `wal_insert_end(false)` | Probed, and `wal.rs:4010-4065`, `connection.rs:2315-2316` | `q2-apply.txt` |
 | 3 | Apply rest of G, local TRUNCATE checkpoint, apply G+1 from frame 1, survives `kill -9` at 15 points (and a run with no kill) when the position is a file | Probed | `q3-seal.txt` |
 | 3 | The same plan with the position taken from the WAL alone steps readers backward | Probed | `q3-seal.txt` |
-| 3 | A kill while the local checkpoint is running or not yet run (WAL still full, position `ckpt_pending`) resumes correctly by running the checkpoint again | Probed (1 of 8 timed kills landed there, 7 landed after it) | `q3-seal.txt` |
+| 3 | A kill when the local checkpoint is not yet run or not finished (WAL still full, position `ckpt_pending`) resumes correctly by running the checkpoint again | Probed (1 of 8 timed kills landed there, 7 landed after it) | `q3-seal.txt` |
 | 3 | The position file's base-frame offset, and resume after the follower kept numbering frames on or deferred a checkpoint | Argued, not probed with kills (the probe's file held only generation and stage) | below |
 | 3 | The TRUNCATE checkpoint answers `Busy` while a reader is open | Probed (reader at read mark 0, and at a later snapshot) | `q3-seal-before-busy-retry.txt`, `q6-reader.txt` |
 | 1 | Only the committed prefix is applied: a 5,119-frame uncommitted tail is held back, later commits overwrite it, the replica ends with the writer's row count and `integrity_check` ok | Probed | `q1c-committed-prefix.txt` |
@@ -56,6 +59,7 @@ and all in the stage-2 design below:
 | 6 | After a seal with a reader open, the follower can keep numbering frames on and truncate later | Probed | `q6-reader.txt` |
 | 7 | `conn_raw_api = []` has no dependencies and no documentation. tursodb's sync engine enables it | Argued | `Cargo.toml:36`, below |
 | - | Frame API with the library's lazy page storage (restored `app.db` fetches pages from the bucket) | Argued, not probed | below |
+| - | The library's writer-mode IO wrappers upload and seal on the follower's inserts and checkpoints, and read-only mode refuses them, so a third replica mode is needed | Argued from `io/wal_file.rs` and `io/db_storage.rs`, not probed (the probes used turso_core's plain IO) | below |
 | - | Re-restore after GC trimmed the log | Not probed (the spec's design, unchanged) | - |
 | - | Behaviour in a release build, and after power loss (probes kill the process, not the machine) | Not probed | - |
 
@@ -65,11 +69,20 @@ and all in the stage-2 design below:
   only in the sense that this repo pins `turso_core =0.8.3`. Any upgrade means re-running these
   probes. The same feature is used by tursodb's own sync engine (question 7), so it is unlikely to
   vanish, but it can change.
-- **Probed on plain local files, not on the library's lazy storage.** A restore leaves `app.db`
-  empty and fetches pages from the bucket on first read. The probes used a complete copy of the
-  writer's `app.db`. The frame API itself doesn't read old pages (it writes frames), so this
-  should hold, but stage 2 must prove it with the library's storage layer. A replica that reads
-  an old page after the writer's GC deleted it needs a re-restore (the spec's lag bound).
+- **Probed on plain local files, through turso_core's own IO, not through the library's IO and
+  lazy storage.** A restore leaves `app.db` empty and fetches pages from the bucket on first
+  read. The probes used a complete copy of the writer's `app.db`. The frame API itself doesn't
+  read old pages (it writes frames), so this should hold, but stage 2 must prove it with the
+  library's storage layer. A replica that reads an old page after the writer's GC deleted it
+  needs a re-restore (the spec's lag bound).
+- **The library's IO layer has no mode for a replica.** In writer mode the WAL wrapper uploads on
+  every WAL `fsync` and seals on `truncate(0)` or a changed header (`io/wal_file.rs:324-345`,
+  `226-239`), so the follower's `wal_insert_end` and its local TRUNCATE checkpoint would PUT to
+  the bucket and could fence or seal the real writer. In read-only mode every WAL and `app.db`
+  write is refused (`io/wal_file.rs:291, 307, 340`, `io/db_storage.rs:418, 430, 446`), so frame
+  inserts and checkpoints would fail. Stage 2 adds a third **replica mode**: local WAL and
+  `app.db` writes, lazy page reads from the bucket, no upload, no seal, no claim. Argued from
+  those lines, not probed.
 - **Position file.** The replica must keep a small file (`generation`, a stage, a frame offset),
   written and fsynced at fixed points. A replica directory copied without it can't resume
   safely and must re-restore. The probe fsyncs the temp file and renames it. Stage 2 should also
@@ -125,7 +138,7 @@ What the probes found:
   The per-generation image handles both.
 - **Exception, found by the follow-up probe** (`q1b-rollback.txt`): a transaction big enough to
   spill dirty pages into the WAL and then roll back leaves its frames in the shipped image
-  (5,123 frames, 21 MB). They are not committed. The writer's next commit rewinds to the last
+  (5,119 uncommitted frames in a 21 MB image). They are not committed. The writer's next commit rewinds to the last
   commit point and overwrites them. So syncs can end on a non-commit frame, and later writes
   land below the end of the image (3 of them in the probe). None landed below a commit frame
   (0 of 3). **So the follower applies only the committed prefix of the image: frames up to the
@@ -272,7 +285,10 @@ Nothing else changes. Unencrypted replicas need none of it.
 - **A reader on a later snapshot** (second scenario in `q6-reader.txt`, began after 3 frames):
   PASSIVE returned `Ok` and backfilled 3 of the 46 frames, the most it can without passing the
   reader (`wal.rs:1197-1221`, `determine_max_safe_checkpoint_frame`). TRUNCATE still answered `Busy`
-  in about 10 us, and the WAL stayed at 46 frames until the reader's `COMMIT`. So "any open reader
+  in about 10 us, and the WAL stayed at 46 frames until the reader's `COMMIT`. Two places in the
+  code give that answer: a TRUNCATE that did not backfill everything returns `Busy`
+  (`wal.rs:5168-5169`), and `begin_restart` takes read marks 1 to 4 exclusively and returns
+  `Busy` if any is held (`wal.rs:1227-1233`). So "any open reader
   blocks the truncate" holds for both read marks probed. Other read marks are argued from the same
   lines.
   `integrity_check` from another connection was ok throughout.
@@ -324,23 +340,35 @@ Corrections and additions:
    inside `crates/turso_durable`. The follower owns one internal apply connection, never handed
    out. `Cargo.toml` gains `conn_raw_api` on `turso_core` (own audit row, already done for the
    feature in stage 1).
-2. **Frame rebuild** (question 1): per generation, an in-memory WAL image fed sync by sync, a
+2. **Replica IO mode** (limits above): a third mode in the library's IO layer
+   (`io/wal_file.rs`, `io/db_storage.rs`). It allows local WAL and `app.db` writes (the follower's
+   frame inserts and local checkpoints), reads pages lazily from the bucket, and does not upload,
+   seal, claim or delete. A replica never PUTs to or DELETEs from the bucket. Stage-2 test: a
+   replica run against the store's request counts shows zero PUTs and zero DELETEs, and the
+   bucket's objects are unchanged by it (the spec already lists the request-count check, this ties
+   it to the IO mode).
+3. **Frame rebuild** (question 1): per generation, an in-memory WAL image fed sync by sync, a
    frame emitted once it is whole, and only the committed prefix applied (probed in
    `q1c-committed-prefix.txt`). Frames after the last commit frame are held until later commits
    overwrite them, as the probe's rolled-back transaction showed.
-3. **One insert session per committed transaction**: `wal_insert_begin`, a `wal_insert_frame` for
-   each frame (`frame_no` = local `max_frame` + 1), `wal_insert_end(true)`. Re-delivery is harmless
-   (`Ok` on identical content).
-4. **Position file** (question 3): `generation`, `stage`, `offset`, with the extended protocol
+4. **One insert session per committed transaction**: `wal_insert_begin`, a `wal_insert_frame` for
+   each frame, `wal_insert_end(true)`. The frame number is the **generation frame number plus the
+   position file's offset** (the protocol under question 3), never local `max_frame` + 1. A frame
+   whose number is at or below local `max_frame` is not appended: it is compared, which returns
+   `Ok` for identical content and `Conflict` otherwise (`wal.rs:4017-4065`, probed in
+   `q2-apply.txt`), or skipped. That is what makes re-delivery harmless. Numbering from
+   `max_frame` + 1 would append a re-delivered older frame after newer ones and put an old page
+   version on top.
+5. **Position file** (question 3): `generation`, `stage`, `offset`, with the extended protocol
    above, and resume by re-reading the current generation from seq 1.
-5. **Seal handling** (questions 3 and 6): apply all of G, write `ckpt_pending`, TRUNCATE checkpoint
+6. **Seal handling** (questions 3 and 6): apply all of G, write `ckpt_pending`, TRUNCATE checkpoint
    with a bounded retry on `Busy`, write `applying` with offset 0 after a successful truncate or
    the local `max_frame` if readers prevented it, then apply G+1. Retry the checkpoint on later
    polls, with the deferred-checkpoint rows of the protocol table.
-6. **Encrypted replicas supported** (question 5): decrypt each frame page before insert. The stage-2
+7. **Encrypted replicas supported** (question 5): decrypt each frame page before insert. The stage-2
    test already planned for pass 2 (HTTPS with encryption) then tests a working replica instead of a
    refusal, and checks the plaintext scan still passes (the replica writes only its own files).
-7. **Open items for stage 2** (not answered here): the frame API on top of the library's lazy
+8. **Open items for stage 2** (not answered here): the frame API on top of the library's lazy
    page storage, the re-restore swap, the kill matrix for the deferred checkpoint, and a rolled-back large
    transaction under real polling (its log object is as large as the spilled range).
 
@@ -369,6 +397,7 @@ flowchart LR
       stats["Replica stats and poll span"]:::new
     end
     core["turso_core 0.8.3<br/>wal_insert_frame API (conn_raw_api)"]:::existing
+    rio["Library IO layer<br/>new replica mode: local WAL and app.db writes, lazy page reads, no upload or seal"]:::changed
     cli["CLI follow command"]:::new
   end
   wapp --> wlib --> bucket
@@ -377,6 +406,8 @@ flowchart LR
   rebuild -- "unencrypted frames" --> core
   follow <--> pos
   rest --> core
+  core -- "file IO" --> rio
+  rio -- "lazy page GETs only" --> bucket
   follow --> rest
   rapp --> ropen --> core
   follow --> stats
@@ -472,6 +503,24 @@ sequenceDiagram
 All in `docs/read-replicas-recon/`. The probe crate (`probe/`) depends on `turso_core =0.8.3`
 (features `fs, json, uuid, encryption, conn_raw_api`) and this workspace's `turso_durable` by path.
 It was built offline against the audited `Cargo.lock`, outside this repo.
+
+**Audit record.** The `rust-supply-chain-auditor` approved enabling `conn_raw_api` on
+`turso_core =0.8.3` on 2026-10-18, before any probe was built: the feature is `conn_raw_api = []`,
+adds no crate and no feature beyond itself, changes no version against `Cargo.lock`, and breaks
+none of the repo's rules (no aws-lc, openssl or native-tls, no `--cfg antithesis`). Its
+conditions: the probe uses the repo's `Cargo.lock`, `--offline`, only `turso_core` and
+`turso_durable` as dependencies, and stays out of the repo's workspace.
+
+**To re-run a probe safely.** Copy `probe/` to a directory outside this repo, change the
+`turso_durable` path in its `Cargo.toml` to the absolute path of `crates/turso_durable`, copy this
+repo's `Cargo.lock` into it, set `CARGO_TARGET_DIR` to a directory of your own, and run
+`cargo run --offline --locked --bin q3_seal` (and so on). Do not add a dependency: that voids the
+audit. The probes write scratch files under `<probe dir>/work/` (`fresh_dir` in `lib.rs` uses
+`CARGO_MANIFEST_DIR/work`), and `docs/read-replicas-recon/.gitignore` ignores `work/` and
+`target/` in case someone runs one in place. Probes use no RustFS and no container.
+
+The compiler warning that printed at the top of the first capture of `q3-seal.txt` was removed
+from the file (it was not probe output). Nothing else in the outputs was edited.
 
 | Question | Source (`probe/src/bin/`) | Output |
 |---|---|---|
