@@ -138,8 +138,8 @@ What the probes found:
   The per-generation image handles both.
 - **Exception, found by the follow-up probe** (`q1b-rollback.txt`): a transaction big enough to
   spill dirty pages into the WAL and then roll back leaves its frames in the shipped image
-  (5,119 uncommitted frames in a 21 MB image). They are not committed. The writer's next commit rewinds to the last
-  commit point and overwrites them. So syncs can end on a non-commit frame, and later writes
+  (5,119 uncommitted frames in a 21 MB image). They are not committed. The writer's next commit
+  rewinds to the last commit point and overwrites them. So syncs can end on a non-commit frame, and later writes
   land below the end of the image (3 of them in the probe). None landed below a commit frame
   (0 of 3). **So the follower applies only the committed prefix of the image: frames up to the
   last one with `db_size != 0`, and nothing after it.** Frames past that point are held back and
@@ -353,12 +353,19 @@ Corrections and additions:
    overwrite them, as the probe's rolled-back transaction showed.
 4. **One insert session per committed transaction**: `wal_insert_begin`, a `wal_insert_frame` for
    each frame, `wal_insert_end(true)`. The frame number is the **generation frame number plus the
-   position file's offset** (the protocol under question 3), never local `max_frame` + 1. A frame
-   whose number is at or below local `max_frame` is not appended: it is compared, which returns
-   `Ok` for identical content and `Conflict` otherwise (`wal.rs:4017-4065`, probed in
-   `q2-apply.txt`), or skipped. That is what makes re-delivery harmless. Numbering from
-   `max_frame` + 1 would append a re-delivered older frame after newer ones and put an old page
-   version on top.
+   position file's offset** (the protocol under question 3), never local `max_frame` + 1. Per frame,
+   with `n` = generation frame number + offset:
+   - `n` is 0 or below: skip it. After a deferred checkpoint the offset is `-k`, so on a resume
+     the generation's first `k` frames land here. They are already in `app.db`, and the API can't
+     take them: frame 0 trips a "Frame ID must be 1-based" assertion (`wal.rs:4889-4890`, reached
+     through the compare branch) and the argument is a `u64`.
+   - `n` is from 1 to local `max_frame`: compare, don't append. It returns `Ok` for identical
+     content and `Conflict` otherwise (`wal.rs:4017-4065`, probed in `q2-apply.txt`).
+   - `n` is `max_frame` + 1: append.
+   - `n` is beyond that: a gap, which the API refuses (`wal.rs:4010-4016`).
+
+   That is what makes re-delivery harmless. Numbering from `max_frame` + 1 would append a
+   re-delivered older frame after newer ones and put an old page version on top.
 5. **Position file** (question 3): `generation`, `stage`, `offset`, with the extended protocol
    above, and resume by re-reading the current generation from seq 1.
 6. **Seal handling** (questions 3 and 6): apply all of G, write `ckpt_pending`, TRUNCATE checkpoint
@@ -395,9 +402,9 @@ flowchart LR
       pos[("Position file<br/>generation, stage, offset")]:::new
       rest["Restore<br/>also the re-restore after a gap"]:::changed
       stats["Replica stats and poll span"]:::new
+      rio["Library IO layer<br/>new replica mode: local WAL and app.db writes, lazy page reads, no upload or seal"]:::changed
     end
     core["turso_core 0.8.3<br/>wal_insert_frame API (conn_raw_api)"]:::existing
-    rio["Library IO layer<br/>new replica mode: local WAL and app.db writes, lazy page reads, no upload or seal"]:::changed
     cli["CLI follow command"]:::new
   end
   wapp --> wlib --> bucket
@@ -509,13 +516,17 @@ It was built offline against the audited `Cargo.lock`, outside this repo.
 adds no crate and no feature beyond itself, changes no version against `Cargo.lock`, and breaks
 none of the repo's rules (no aws-lc, openssl or native-tls, no `--cfg antithesis`). Its
 conditions: the probe uses the repo's `Cargo.lock`, `--offline`, only `turso_core` and
-`turso_durable` as dependencies, and stays out of the repo's workspace.
+`turso_durable` as dependencies, stays out of the repo's workspace, and is never built with
+`--cfg antithesis`.
 
 **To re-run a probe safely.** Copy `probe/` to a directory outside this repo, change the
 `turso_durable` path in its `Cargo.toml` to the absolute path of `crates/turso_durable`, copy this
 repo's `Cargo.lock` into it, set `CARGO_TARGET_DIR` to a directory of your own, and run
-`cargo run --offline --locked --bin q3_seal` (and so on). Do not add a dependency: that voids the
-audit. The probes write scratch files under `<probe dir>/work/` (`fresh_dir` in `lib.rs` uses
+`cargo run --offline --bin q3_seal` (and so on). Do not pass `--locked` the first time: the probe
+is its own root package, so cargo has to rewrite the copied lock. Then diff that lock against the
+repo's. Only three entries may differ: `probe 0.0.0` added, and `turso-durable-cli 0.1.0` and
+`tokio-macros 2.7.2` dropped, with no version changes (the auditor's check). Any other difference
+voids the audit. After that, `--locked` works. Do not add a dependency either. The probes write scratch files under `<probe dir>/work/` (`fresh_dir` in `lib.rs` uses
 `CARGO_MANIFEST_DIR/work`), and `docs/read-replicas-recon/.gitignore` ignores `work/` and
 `target/` in case someone runs one in place. Probes use no RustFS and no container.
 
