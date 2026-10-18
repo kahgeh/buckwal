@@ -399,6 +399,8 @@ flowchart LR
 
 Fixed limits: a request body of at most 16 MiB (413 `PAYLOAD_TOO_LARGE`, sent once the server has read past the limit, so a client still sending the rest may see its connection reset instead), read within 30 s (408 `PROTO_ERROR`, and the connection is closed); at most 1024 connections at once; a TLS handshake within 10 s; at most 1024 stored SQL texts per stream (`SQL_INPUT_ERROR` past it). The server's async runtime has 2 threads, which only do I/O.
 
+**Memory.** Results are buffered in memory, and the cursor is not streamed: a very large `SELECT` result is held whole before it is sent, so page large reads with `LIMIT` and `OFFSET`. Up to 1024 connections may each hold a request body of up to 16 MiB at the same time.
+
 **Endpoints.**
 
 | Endpoint | Token | What it does |
@@ -438,6 +440,8 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. hra
 | `Error::Config` | `SQL_INPUT_ERROR` |
 | `Error::Bucket` / `Io` / `Corrupt` / `Encryption` | `BUCKET_ERROR` / `IO_ERROR` / `CORRUPT` / `ENCRYPTION_ERROR` |
 | `NotFound` / `Locked` / `AlreadyOpen` | `INTERNAL_ERROR` |
+| a panic, or a worker job that failed (HTTP 500) | `INTERNAL_ERROR` |
+| an unknown path or method (HTTP 404) | `NOT_FOUND` |
 | a malformed request (the body, or one request) | `PROTO_ERROR` (the body: HTTP 400) |
 | an unknown, expired, closed, in-use or replayed baton | `STREAM_EXPIRED` (HTTP 400) |
 | an unknown `sql_id`; both or neither of `sql` and `sql_id` | `SQL_INPUT_ERROR` |
@@ -519,9 +523,11 @@ sequenceDiagram
 4. Past the bound, their connections are aborted. A response not yet written is never sent, so nothing is acked without its upload. Each one counts in `in_flight_failed`.
 5. Idle streams, then the anchor, close. `Database::close` (which drains the uploader) runs only when no request still holds a connection.
 
+`DURABLE_SERVE_SHUTDOWN_MS` bounds only step 3, the in-flight drain. Step 5 runs after it with no bound: closing the streams, the anchor's close-time seal and `Database::close` (which can wait out a takeover quiet). Set a supervisor's grace period (for example systemd's `TimeoutStopSec` or Kubernetes' `terminationGracePeriodSeconds`) above the bound plus that time. The data is safe either way: a kill during step 5 loses nothing that was acked.
+
 Past the bound, a library call still running cannot be cancelled: it keeps running detached on its blocking thread, and the process exits without `Database::close` (`clean=false`). Its commit, unacked, may or may not be in the bucket. A signal while the database is still opening waits for the open, then shuts down at once.
 
-The stop line's `clean` is true when every request finished and the database closed. `fenced` is true when a library call returned `Fenced` during the run (so it stays false for a server that was taken over but never wrote again).
+The stop line's `clean` is true when every request finished and every close, the database's included, succeeded. A close that fails, or one that answers `Fenced`, makes it false; a `Fenced` close also makes `fenced` true. `fenced` is true when a library call returned `Fenced` during the run (so it stays false for a server that was taken over but never wrote again).
 
 | Exit | When |
 |---|---|
