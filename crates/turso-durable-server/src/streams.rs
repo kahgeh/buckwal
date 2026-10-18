@@ -9,7 +9,7 @@
 use crate::exec::{open_stream, StreamState};
 use rustls::crypto::ring::default_provider;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -46,8 +46,10 @@ pub enum Checkout {
     Stream(Leased),
     /// The baton is unknown, stale, forged, malformed, or its stream is busy or timed out.
     Expired,
-    /// The stream cap is reached (or a new connection could not be opened).
+    /// The stream cap is reached.
     Full,
+    /// A new stream could not be opened, or the registry is shutting down.
+    Failed(turso_durable::Error),
 }
 
 // Busy is a short-lived marker in a map of mostly idle streams.
@@ -67,6 +69,8 @@ pub struct Streams {
     slots: Mutex<HashMap<u64, Slot>>,
     next_id: AtomicU64,
     anchor: Mutex<Option<Connection>>,
+    /// Set under the slot lock by `close_all`; read under it.
+    closing: AtomicBool,
 }
 
 fn new_secret() -> String {
@@ -81,6 +85,12 @@ fn new_secret() -> String {
 
 fn parse_baton(baton: &str) -> Option<(u64, &str)> {
     let (id, secret) = baton.split_once('.')?;
+    let canonical = !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && (id == "0" || !id.starts_with('0'));
+    if !canonical {
+        return None;
+    }
     Some((id.parse().ok()?, secret))
 }
 
@@ -88,9 +98,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn warn_close(e: &turso_durable::Error) {
+    tracing::warn!(target: "turso_durable::server", error = %e, "stream close failed");
+}
+
 fn close_state(st: StreamState) {
-    // A failed close of a stream is nothing a caller can act on.
-    let _ = st.conn.close();
+    if let Err(e) = st.conn.close() {
+        warn_close(&e);
+    }
 }
 
 impl Streams {
@@ -102,6 +117,7 @@ impl Streams {
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             anchor: Mutex::new(Some(anchor)),
+            closing: AtomicBool::new(false),
         })
     }
 
@@ -128,6 +144,11 @@ impl Streams {
     fn open_new(&self) -> Checkout {
         let id = {
             let mut slots = lock(&self.slots);
+            if self.closing.load(Ordering::SeqCst) {
+                return Checkout::Failed(turso_durable::Error::Config(
+                    "the server is shutting down".into(),
+                ));
+            }
             if slots.len() >= self.cfg.max {
                 return Checkout::Full;
             }
@@ -139,8 +160,7 @@ impl Streams {
             Ok(state) => Checkout::Stream(Leased { id, state }),
             Err(e) => {
                 lock(&self.slots).remove(&id);
-                tracing::warn!(error = %e, "could not open a stream");
-                Checkout::Full
+                Checkout::Failed(e)
             }
         }
     }
@@ -152,6 +172,9 @@ impl Streams {
         let mut stale = None;
         let out = {
             let mut slots = lock(&self.slots);
+            if self.closing.load(Ordering::SeqCst) {
+                return Checkout::Expired;
+            }
             match slots.get(&id) {
                 Some(Slot::Idle {
                     secret: want,
@@ -185,8 +208,15 @@ impl Streams {
     /// The new baton, or `None` when the stream is over (its connection is then closed).
     pub fn give_back(&self, leased: Leased) -> Option<String> {
         let Leased { id, state } = leased;
-        if state.closed {
-            lock(&self.slots).remove(&id);
+        let over = {
+            let mut slots = lock(&self.slots);
+            let over = state.closed || self.closing.load(Ordering::SeqCst);
+            if over {
+                slots.remove(&id);
+            }
+            over
+        };
+        if over {
             close_state(state);
             return None;
         }
@@ -234,6 +264,7 @@ impl Streams {
     pub fn close_all(&self) -> usize {
         let idle = {
             let mut slots = lock(&self.slots);
+            self.closing.store(true, Ordering::SeqCst);
             let ids: Vec<u64> = slots
                 .iter()
                 .filter(|(_, s)| matches!(s, Slot::Idle { .. }))
@@ -251,7 +282,9 @@ impl Streams {
         }
         let anchor = lock(&self.anchor).take();
         if let Some(a) = anchor {
-            let _ = a.close();
+            if let Err(e) = a.close() {
+                warn_close(&e);
+            }
         }
         n
     }
@@ -356,6 +389,8 @@ mod tests {
             String::new(),
             format!("999.{secret}"),
             format!("-1.{secret}"),
+            format!("+1.{secret}"),
+            format!("01.{secret}"),
             format!("x.{secret}"),
             format!(".{secret}"),
         ] {
@@ -455,6 +490,68 @@ mod tests {
             f.streams.give_back(l).unwrap();
         }
         assert_eq!(f.streams.close_all(), 2);
+        let Fx { streams, .. } = f;
+        let Streams { db, .. } = streams;
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn streams_is_send_and_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<Streams>();
+    }
+
+    #[test]
+    fn stale_idle_stream_expires_on_checkout_then_reap_finds_nothing() {
+        let f = fx_with(30, 10);
+        let l = lease(f.streams.checkout(None));
+        let b = f.streams.give_back(l).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(is_expired(f.streams.checkout(Some(&b))));
+        assert_eq!(f.streams.reap(), 0);
+    }
+
+    #[test]
+    fn failed_connect_is_failed_and_frees_the_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemStore::new());
+        let db = open_with_store(config(&dir.path().join("db")), store).unwrap();
+        let other = db.clone();
+        let streams = Streams::new(
+            db,
+            StreamsCfg {
+                timeout: Duration::from_secs(60),
+                busy: Duration::from_millis(200),
+                max: 5,
+            },
+        )
+        .unwrap();
+        // Close the anchor, then the shared database, so connect fails.
+        streams.close_all();
+        streams.closing.store(false, Ordering::SeqCst);
+        other.close().unwrap();
+        match streams.checkout(None) {
+            Checkout::Failed(turso_durable::Error::Config(_)) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(streams.busy(), 0);
+        assert!(lock(&streams.slots).is_empty());
+    }
+
+    #[test]
+    fn give_back_after_close_all_closes_the_stream() {
+        let f = fx();
+        let l = lease(f.streams.checkout(None));
+        assert_eq!(f.streams.close_all(), 0);
+        assert!(f.streams.give_back(l).is_none());
+        assert_eq!(f.streams.busy(), 0);
+        match f.streams.checkout(None) {
+            Checkout::Failed(turso_durable::Error::Config(m)) => {
+                assert_eq!(m, "the server is shutting down")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(is_expired(f.streams.checkout(Some("1.00"))));
         let Fx { streams, .. } = f;
         let Streams { db, .. } = streams;
         db.close().unwrap();
