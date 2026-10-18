@@ -19,6 +19,7 @@ pub mod streams;
 
 pub use config::{ServeConfig, TlsFiles, Token};
 
+use crate::exec::Fence;
 use crate::http::App;
 use crate::listener::{race, Either, MAX_CONNECTIONS};
 use crate::streams::{Streams, StreamsCfg};
@@ -190,7 +191,9 @@ impl Bound {
         }
         let in_flight_failed = stop_serving(&app, &stop_tx, accept, cfg.shutdown_timeout).await;
         let _ = reaper.await;
-        let report = tokio::task::spawn_blocking(move || close(&streams, in_flight_failed)).await;
+        let fence = app.fence();
+        let report =
+            tokio::task::spawn_blocking(move || close(&streams, in_flight_failed, &fence)).await;
         let report = report.unwrap_or(ShutdownReport {
             clean: false,
             fenced: false,
@@ -286,16 +289,28 @@ fn spawn_reaper(
     })
 }
 
+/// A close error makes the stop unclean; a `Fenced` one also trips the latch.
+fn note_close_error(fence: &Fence, clean: &mut bool, e: &turso_durable::Error) {
+    if matches!(e, turso_durable::Error::Fenced(_)) {
+        fence.set();
+    }
+    *clean = false;
+}
+
 /// Close the idle streams and the anchor, then the database when no stream is still busy.
-/// Clean only when nothing failed in flight and the database closed.
-fn close(streams: &Streams, in_flight_failed: usize) -> ShutdownReport {
-    let streams_closed = streams.close_all();
+/// Clean only when nothing failed in flight and every close succeeded. A `Fenced` close error
+/// trips `fence`, so the report says fenced.
+fn close(streams: &Streams, in_flight_failed: usize, fence: &Fence) -> ShutdownReport {
+    let closed = streams.close_all();
     let busy = streams.busy();
     let mut clean = in_flight_failed == 0;
+    if let Some(e) = &closed.error {
+        note_close_error(fence, &mut clean, e);
+    }
     if busy == 0 {
         if let Err(e) = streams.database().clone().close() {
             tracing::warn!(target: "turso_durable::server", error = %e, "database close failed");
-            clean = false;
+            note_close_error(fence, &mut clean, &e);
         }
     } else {
         // A library call is still running on a blocking thread and cannot be cancelled.
@@ -308,9 +323,9 @@ fn close(streams: &Streams, in_flight_failed: usize) -> ShutdownReport {
     }
     ShutdownReport {
         clean,
-        fenced: false,
+        fenced: fence.is_set(),
         in_flight_failed,
-        streams_closed,
+        streams_closed: closed.streams,
     }
 }
 
@@ -332,4 +347,35 @@ pub async fn os_signals() {
         );
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fenced_close_error_trips_the_latch_and_unsets_clean() {
+        let fence = Fence::new();
+        let mut clean = true;
+        note_close_error(
+            &fence,
+            &mut clean,
+            &turso_durable::Error::Fenced("x".into()),
+        );
+        assert!(fence.is_set());
+        assert!(!clean);
+    }
+
+    #[test]
+    fn another_close_error_unsets_clean_only() {
+        let fence = Fence::new();
+        let mut clean = true;
+        note_close_error(
+            &fence,
+            &mut clean,
+            &turso_durable::Error::Config("x".into()),
+        );
+        assert!(!fence.is_set());
+        assert!(!clean);
+    }
 }

@@ -83,6 +83,11 @@ impl App {
             .compare_exchange(STARTING, READY, Ordering::SeqCst, Ordering::SeqCst);
     }
 
+    /// The shared latch, for shutdown to trip on a `Fenced` close error.
+    pub(crate) fn fence(&self) -> Fence {
+        self.fence.clone()
+    }
+
     /// Whether a library call answered `Fenced` during the run.
     pub(crate) fn fenced(&self) -> bool {
         self.fence.is_set()
@@ -650,7 +655,7 @@ mod tests {
         };
         assert_eq!(n, 7);
         assert!(baton.is_some());
-        assert_eq!(streams.close_all(), 1);
+        assert_eq!(streams.close_all().streams, 1);
         streams.database().clone().close().unwrap();
     }
 

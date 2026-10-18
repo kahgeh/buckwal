@@ -473,7 +473,7 @@ mod tests {
             "the server closed the connection"
         );
         s.stop();
-        assert_eq!(streams.close_all(), 0);
+        assert_eq!(streams.close_all().streams, 0);
         streams.database().clone().close().unwrap();
     }
 }

@@ -807,7 +807,8 @@ fn shutdown_bound_fails_in_flight_rather_than_ack() {
 }
 
 #[test]
-fn client_disconnect_mid_request_gives_the_stream_back() {
+// Checks the end state (the stream is free and usable again), not when it was given back.
+fn stream_is_given_back_after_a_client_disconnect() {
     let s = start(Opts {
         fault: true,
         ..Opts::default()

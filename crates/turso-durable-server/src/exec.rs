@@ -91,7 +91,8 @@ pub fn execute_request(
             error: ProtoError::new("STREAM_CLOSED", "the stream is closed"),
         };
     }
-    let req = match serde_json::from_value::<StreamRequest>(req.clone()) {
+    let kind = req.get("type").and_then(|t| t.as_str()).map(str::to_owned);
+    let req = match serde_json::from_value::<StreamRequest>(req) {
         Ok(r) => r,
         Err(e) => {
             const KNOWN: [&str; 8] = [
@@ -104,7 +105,7 @@ pub fn execute_request(
                 "close_sql",
                 "get_autocommit",
             ];
-            let error = match req.get("type").and_then(|t| t.as_str()) {
+            let error = match kind.as_deref() {
                 Some(t) if !KNOWN.contains(&t) => {
                     ProtoError::new("UNSUPPORTED", format!("unsupported request type {t:?}"))
                 }
@@ -201,7 +202,8 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
     let want_rows = stmt.want_rows.unwrap_or(true);
     let start = Instant::now();
 
-    if st.conn.is_autocommit() {
+    // With arguments the statement goes to the library, which refuses it.
+    if st.conn.is_autocommit() && stmt.args.is_empty() && stmt.named_args.is_empty() {
         if let Some(parsed) = batching_set(&sql) {
             // `set_batching` validates.
             let applied = parsed.and_then(|b| st.conn.set_batching(Some(b)));
@@ -747,6 +749,23 @@ mod tests {
         assert_eq!(setting(&mut f), "off");
         f.sql("COMMIT");
         assert_eq!(setting(&mut f), "window 20ms 64 1MiB");
+    }
+
+    #[test]
+    fn batching_pragma_with_args_is_not_intercepted() {
+        let mut f = fx();
+        f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+        let arg = json!({"type":"integer","value":"1"});
+        for stmt in [
+            json!({"sql":"PRAGMA durable_batching = 'off'","args":[arg]}),
+            json!({"sql":"PRAGMA durable_batching = 'off'","named_args":[{"name":"a","value":arg}]}),
+        ] {
+            match f.req(Version::V3, json!({"type":"execute","stmt":stmt})) {
+                StreamResult::Error { .. } => {}
+                other => panic!("{stmt}: {other:?}"),
+            }
+            assert_eq!(setting(&mut f), "window 20ms 64 1MiB", "{stmt}");
+        }
     }
 
     #[test]

@@ -98,14 +98,50 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A `Slot::Busy` inserted for a stream being opened; dropped armed, it removes the slot.
+struct Reservation<'a> {
+    slots: &'a Mutex<HashMap<u64, Slot>>,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            lock(self.slots).remove(&self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next `open_new` on this thread panic after it reserved its slot.
+    static INJECT_OPEN_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn warn_close(e: &turso_durable::Error) {
     tracing::warn!(target: "turso_durable::server", error = %e, "stream close failed");
 }
 
-fn close_state(st: StreamState) {
-    if let Err(e) = st.conn.close() {
-        warn_close(&e);
+/// Close one stream's connection; a failure is logged (the error only) and returned.
+fn close_state(st: StreamState) -> Option<turso_durable::Error> {
+    match st.conn.close() {
+        Ok(()) => None,
+        Err(e) => {
+            warn_close(&e);
+            Some(e)
+        }
     }
+}
+
+/// What closing the connections at shutdown did.
+#[derive(Debug)]
+pub struct CloseOutcome {
+    /// Idle streams closed.
+    pub streams: usize,
+    /// The first close error, a stream's or the anchor's (the anchor's close checkpoints and
+    /// seals).
+    pub error: Option<turso_durable::Error>,
 }
 
 impl Streams {
@@ -156,12 +192,22 @@ impl Streams {
             slots.insert(id, Slot::Busy);
             id
         };
+        // Frees the reservation if `open_stream` errors or panics.
+        let mut reservation = Reservation {
+            slots: &self.slots,
+            id,
+            armed: true,
+        };
+        #[cfg(test)]
+        if INJECT_OPEN_PANIC.with(|c| c.replace(false)) {
+            panic!("injected panic in open_new");
+        }
         match open_stream(&self.db, self.cfg.busy) {
-            Ok(state) => Checkout::Stream(Leased { id, state }),
-            Err(e) => {
-                lock(&self.slots).remove(&id);
-                Checkout::Failed(e)
+            Ok(state) => {
+                reservation.armed = false;
+                Checkout::Stream(Leased { id, state })
             }
+            Err(e) => Checkout::Failed(e),
         }
     }
 
@@ -258,7 +304,7 @@ impl Streams {
 
     /// Refuse new work, then close idle streams and the anchor; returns how many streams.
     /// Busy streams are closed by their holders' `give_back`.
-    pub fn close_all(&self) -> usize {
+    pub fn close_all(&self) -> CloseOutcome {
         {
             // Under the slot lock, so `give_back` sees the flag and the map consistently.
             let _slots = lock(&self.slots);
@@ -268,7 +314,7 @@ impl Streams {
     }
 
     /// Close idle streams and the anchor without touching `closing`.
-    fn close_connections(&self) -> usize {
+    fn close_connections(&self) -> CloseOutcome {
         let idle = {
             let mut slots = lock(&self.slots);
             let ids: Vec<u64> = slots
@@ -281,18 +327,24 @@ impl Streams {
                 .collect::<Vec<_>>()
         };
         let n = idle.len();
+        let mut first = None;
         for s in idle {
             if let Slot::Idle { state, .. } = s {
-                close_state(state);
+                let e = close_state(state);
+                first = first.or(e);
             }
         }
         let anchor = lock(&self.anchor).take();
         if let Some(a) = anchor {
             if let Err(e) = a.close() {
                 warn_close(&e);
+                first = first.or(Some(e));
             }
         }
-        n
+        CloseOutcome {
+            streams: n,
+            error: first,
+        }
     }
 }
 
@@ -495,10 +547,32 @@ mod tests {
             let l = lease(f.streams.checkout(None));
             f.streams.give_back(l).unwrap();
         }
-        assert_eq!(f.streams.close_all(), 2);
+        assert_eq!(f.streams.close_all().streams, 2);
         let Fx { streams, .. } = f;
         let Streams { db, .. } = streams;
         db.close().unwrap();
+    }
+
+    #[test]
+    fn open_new_panic_frees_the_reservation() {
+        let f = fx_with(60_000, 1);
+        INJECT_OPEN_PANIC.with(|c| c.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.streams.checkout(None)));
+        assert!(r.is_err(), "the injected panic did not fire");
+        assert_eq!(f.streams.busy(), 0, "a Busy slot leaked");
+        assert!(lock(&f.streams.slots).is_empty());
+        // The cap of 1 is still free.
+        assert!(matches!(f.streams.checkout(None), Checkout::Stream(_)));
+    }
+
+    #[test]
+    fn close_all_without_faults_has_no_error() {
+        let f = fx();
+        let l = lease(f.streams.checkout(None));
+        f.streams.give_back(l).unwrap();
+        let out = f.streams.close_all();
+        assert_eq!(out.streams, 1);
+        assert!(out.error.is_none(), "{:?}", out.error);
     }
 
     #[test]
@@ -549,7 +623,7 @@ mod tests {
     fn give_back_after_close_all_closes_the_stream() {
         let f = fx();
         let l = lease(f.streams.checkout(None));
-        assert_eq!(f.streams.close_all(), 0);
+        assert_eq!(f.streams.close_all().streams, 0);
         assert!(f.streams.give_back(l).is_none());
         assert_eq!(f.streams.busy(), 0);
         match f.streams.checkout(None) {
