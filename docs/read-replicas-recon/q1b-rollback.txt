@@ -1,0 +1,13 @@
+big transaction: Err(Config("rollback on purpose"))
+rows after: [[Numeric(Integer(4))]]
+  sync: image 32 bytes, 0 frames, committed prefix 0 frames, uncommitted tail 0 frames
+  sync: image 8272 bytes, 2 frames, committed prefix 2 frames, uncommitted tail 0 frames
+  sync: image 12392 bytes, 3 frames, committed prefix 3 frames, uncommitted tail 0 frames
+  sync: image 21106792 bytes, 5123 frames, committed prefix 4 frames, uncommitted tail 5119 frames
+  sync: image 21106792 bytes, 5123 frames, committed prefix 5 frames, uncommitted tail 5118 frames
+  sync: image 21106792 bytes, 5123 frames, committed prefix 6 frames, uncommitted tail 5117 frames
+  sync: image 0 bytes, 0 frames, committed prefix 0 frames, uncommitted tail 0 frames
+log objects 8 syncs 7 largest WAL image 21106792 bytes
+writes landing below the end of the image so far (rewrites of shipped frames): 3
+syncs ending on a non-commit frame: 3
+writes landing below the last commit frame (rewrites of committed frames): 0
