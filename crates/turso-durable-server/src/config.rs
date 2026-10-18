@@ -126,8 +126,8 @@ fn positive(get: &impl Fn(&str) -> Option<String>, var: &str, default: u64) -> R
 pub struct Token([u8; 32]);
 
 impl Token {
-    /// Read the token from `path`: surrounding whitespace is trimmed, and what remains must
-    /// be at least 16 bytes with no whitespace inside. Errors name the path, never the content.
+    /// Read the token from `path`: surrounding ASCII whitespace is trimmed, and what remains must
+    /// be at least 16 bytes of visible ASCII (0x21 to 0x7E, so no whitespace inside). Errors name the path, never the content.
     pub fn load(path: &Path) -> Result<Token, String> {
         let shown = path.display();
         let bytes = std::fs::read(path).map_err(|e| {
@@ -136,9 +136,7 @@ impl Token {
                 e.kind()
             )
         })?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| format!("DURABLE_SERVE_TOKEN_FILE {shown}: not UTF-8 text"))?
-            .trim();
+        let text = bytes.trim_ascii();
         if text.is_empty() {
             return Err(format!("DURABLE_SERVE_TOKEN_FILE {shown}: file is empty"));
         }
@@ -147,11 +145,17 @@ impl Token {
                 "DURABLE_SERVE_TOKEN_FILE {shown}: token is shorter than {MIN_TOKEN_LEN} bytes"
             ));
         }
-        if text.chars().any(char::is_whitespace) {
+        if text.iter().any(u8::is_ascii_whitespace) {
             return Err(format!(
                 "DURABLE_SERVE_TOKEN_FILE {shown}: token contains whitespace"
             ));
         }
+        if !text.iter().all(|b| (0x21..=0x7e).contains(b)) {
+            return Err(format!(
+                "DURABLE_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)"
+            ));
+        }
+        let text = std::str::from_utf8(text).expect("visible ASCII is UTF-8");
         Ok(Token::from_text(text))
     }
 
@@ -307,25 +311,43 @@ mod tests {
         let missing = d.path().join("nope");
         let e = Token::load(&missing).unwrap_err();
         assert!(e.contains(missing.to_str().unwrap()), "{e}");
-        for content in [
-            &b""[..],
-            b"\n",
-            b"123456789012345",
-            b"abcdefghij klmnopqrst",
-            b"abcdefghijklmnopqrst\nuvwxyz0123456789",
-        ] {
+        let cases: [(&[u8], &str); 5] = [
+            (b"", ""),
+            (b"\n", ""),
+            (b"SHORTSECRET123", "SHORTSECRET123"),
+            (b"INNERSECRET ab cdefgh", "INNERSECRET"),
+            (b"LINE1SECRETabcdef\nLINE2SECRETabcdef", "LINE1SECRET"),
+        ];
+        for (content, needle) in cases {
             let (_d, p) = token_file(content);
             let e = Token::load(&p).unwrap_err();
             assert!(e.contains(p.to_str().unwrap()), "{e}");
-            let text = String::from_utf8_lossy(content);
-            if text.trim().len() >= 16 {
-                assert!(!e.contains(text.trim()), "{e}");
+            if !needle.is_empty() {
+                assert!(!e.contains(needle), "{e}");
+                assert!(!e.contains("LINE2SECRET"), "{e}");
             }
         }
-        let (_d, p) = token_file(b"abcdefghij klmnopqrst");
-        let e = Token::load(&p).unwrap_err();
-        assert!(!e.contains("abcdefghij"), "{e}");
-        assert!(!e.contains("klmnopqrst"), "{e}");
+    }
+
+    #[test]
+    fn token_must_be_visible_ascii() {
+        let cases: [(&[u8], &str); 6] = [
+            ("éééééééé".as_bytes(), "éé"),
+            (b"CTRLSECRET\x07abcdefg", "CTRLSECRET"),
+            (b"NULSECRET\0abcdefgh", "NULSECRET"),
+            ("\u{a0}EDGESECRETabcdefg".as_bytes(), "EDGESECRET"),
+            ("EDGESECRETabcdefg\u{a0}".as_bytes(), "EDGESECRET"),
+            (b"BINSECRET\xff\xfeabcdefg", "BINSECRET"),
+        ];
+        for (content, needle) in cases {
+            let (_d, p) = token_file(content);
+            let e = Token::load(&p).unwrap_err();
+            assert!(e.contains(p.to_str().unwrap()), "{e}");
+            assert!(e.contains("visible ASCII"), "{e}");
+            assert!(!e.contains(needle), "{e}");
+        }
+        let (_d, p) = token_file(b"  \tabcdefghijklmnop0123\r\n");
+        assert!(Token::load(&p).unwrap().matches("abcdefghijklmnop0123"));
     }
 
     #[test]
