@@ -527,7 +527,7 @@ sequenceDiagram
 
 Past the bound, a library call still running cannot be cancelled: it keeps running detached on its blocking thread, and the process exits without `Database::close` (`clean=false`). Its commit, unacked, may or may not be in the bucket. A signal while the database is still opening waits for the open, then shuts down at once.
 
-The stop line's `clean` is true when every request finished and every close, the database's included, succeeded. A close that fails, or one that answers `Fenced`, makes it false; a `Fenced` close also makes `fenced` true. `fenced` is true when a library call returned `Fenced` during the run (so it stays false for a server that was taken over but never wrote again).
+The stop line's `clean` is true when every request finished, no stream's or the anchor's close returned an error, and `Database::close` ran. A close error makes it false, and a `Fenced` close error also makes `fenced` true. With the current library these close errors are not expected in practice: a close does not report a failed close-time seal or a takeover, and `Database::close` does not report a failed final upload. So `clean=true` does not prove the seal or the final upload reached the bucket. Acked commits are in the bucket either way. `fenced` is true when a library call returned `Fenced` during the run, so it stays false for a server that was taken over but never wrote again.
 
 | Exit | When |
 |---|---|

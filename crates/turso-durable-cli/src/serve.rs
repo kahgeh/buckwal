@@ -83,7 +83,7 @@ fn stopped(report: &ShutdownReport) -> (String, Result<(), Failure>) {
         (false, true) => return (line, Ok(())),
         (true, _) => "this server was fenced by a takeover: its writes after it were refused",
         (false, false) => {
-            "shutdown was not clean: a request, a close or the final upload did not finish or failed"
+            "shutdown was not clean: a request or the final upload did not finish in time, or a close failed"
         }
     };
     (line, Err(Failure::Failed(why.to_string())))
