@@ -192,7 +192,7 @@ fn main() {
     for i in 11..14 {
         b.w.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(100))", &[Value::from_i64(i)]).unwrap();
     }
-    bulk(10000, 11500, 3000); // about 4,500 frames, so the local checkpoint takes a measurable time
+    bulk(10000, 11500, 3000); // about 1,500 frames, so the local checkpoint takes a measurable time
     b.w.checkpoint(CheckpointMode::Truncate).unwrap(); // seal: WAL restarts with new salts
     let g1 = b.wdb.generation();
     b.w.execute("INSERT INTO t(id, v) VALUES (300, zeroblob(10))", &[]).unwrap();

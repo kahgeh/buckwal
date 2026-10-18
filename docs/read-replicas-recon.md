@@ -47,7 +47,7 @@ and all in the stage-2 design below:
 | 3 | A kill while the local checkpoint is running or not yet run (WAL still full, position `ckpt_pending`) resumes correctly by running the checkpoint again | Probed (1 of 8 timed kills landed there, 7 landed after it) | `q3-seal.txt` |
 | 3 | The position file's base-frame offset, and resume after the follower kept numbering frames on or deferred a checkpoint | Argued, not probed with kills (the probe's file held only generation and stage) | below |
 | 3 | The TRUNCATE checkpoint answers `Busy` while a reader is open | Probed (reader at read mark 0, and at a later snapshot) | `q3-seal-before-busy-retry.txt`, `q6-reader.txt` |
-| 1 | Only the committed prefix is applied: a 5,119-frame uncommitted tail is held back, later commits overwrite it, the replica ends equal to the writer | Probed | `q1c-committed-prefix.txt` |
+| 1 | Only the committed prefix is applied: a 5,119-frame uncommitted tail is held back, later commits overwrite it, the replica ends with the writer's row count and `integrity_check` ok | Probed | `q1c-committed-prefix.txt` |
 | 4 | The fence record is skipped and records either side apply in log order, every acked commit visible, the refused commit absent | Probed (Off and Window) | `q4-takeover.txt` |
 | 5 | Ciphertext frames as stored are not accepted | Probed (debug build panic), release build argued | `q5-encrypted.txt`, `encryption.rs:744-750` |
 | 5 | Decrypting each frame page with the key, then inserting, works and a wrong key is refused (when the connection is made) | Probed | `q5-encrypted.txt` |
@@ -215,7 +215,8 @@ at that instant (turso's checkpoint only ever `try`s its locks, it never waits:
 `wal.rs:1118-1165`). The position-file policy would have hit the same `Busy` and was only luckier
 in that run. The follower must retry. See question 6 for what to do when readers
 don't go away. After adding a bounded retry, no resume in `q3-seal.txt` failed with `Busy` (it
-shows 40 `Busy` answers absorbed by the retry), and the position-file policy has 0 failures. The
+shows 40 checkpoints that answered `Busy` before they ran, 168 `Busy` answers in all, absorbed by
+the retry), and the position-file policy has 0 failures. The
 position-from-the-WAL policy still shows its 9 step-backs there, which is Addition 1.
 
 ### 4. Across a takeover: works, here is how
