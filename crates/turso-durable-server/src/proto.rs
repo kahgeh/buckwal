@@ -12,8 +12,6 @@ const LENIENT: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-// Unused until the HTTP layer (Task 7) / cursor (Task 6).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PipelineReq {
     #[serde(default)]
@@ -22,8 +20,6 @@ pub struct PipelineReq {
     pub requests: Vec<serde_json::Value>,
 }
 
-// Unused until the HTTP layer (Task 7) / cursor (Task 6).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PipelineResp {
     pub baton: Option<String>,
@@ -148,8 +144,6 @@ pub struct BatchResult {
     pub step_errors: Vec<Option<ProtoError>>,
 }
 
-// Unused until the HTTP layer (Task 7) / cursor (Task 6).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CursorReq {
     #[serde(default)]
@@ -157,16 +151,12 @@ pub struct CursorReq {
     pub batch: Batch,
 }
 
-// Unused until the HTTP layer (Task 7) / cursor (Task 6).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CursorRespBody {
     pub baton: Option<String>,
     pub base_url: Option<String>,
 }
 
-// Unused until the HTTP layer (Task 7) / cursor (Task 6).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CursorEntry {
