@@ -18,21 +18,26 @@ use crate::streams::{Checkout, Leased, Streams};
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
+use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Serialize;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::field::Empty;
 use tracing::Span;
 
 /// The largest request body, in bytes.
 pub(crate) const BODY_LIMIT: usize = 16 << 20;
+
+/// How long reading a request body may take. A slower body is answered 408 and its
+/// connection closed, so it cannot hold a connection (or stall shutdown) for long.
+pub(crate) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -47,10 +52,15 @@ pub(crate) struct App {
     /// One permit per worker: a pipeline holds one while it runs in `spawn_blocking`.
     permits: Arc<Semaphore>,
     workers: u32,
+    body_timeout: Duration,
+    /// Shutdown gave up waiting: a pipeline dropped from now on counts as failed.
+    past_bound: AtomicBool,
+    /// Pipelines dropped unanswered after the bound (see [`Unanswered`]).
+    failed: AtomicUsize,
 }
 
 impl App {
-    pub(crate) fn new(token: Option<Token>, workers: usize) -> Arc<App> {
+    pub(crate) fn new(token: Option<Token>, workers: usize, body_timeout: Duration) -> Arc<App> {
         let workers = u32::try_from(workers.clamp(1, Semaphore::MAX_PERMITS)).unwrap_or(u32::MAX);
         Arc::new(App {
             phase: AtomicU8::new(STARTING),
@@ -59,6 +69,9 @@ impl App {
             token,
             permits: Arc::new(Semaphore::new(workers as usize)),
             workers,
+            body_timeout,
+            past_bound: AtomicBool::new(false),
+            failed: AtomicUsize::new(0),
         })
     }
 
@@ -81,6 +94,18 @@ impl App {
             all.forget();
         }
         self.permits.close();
+    }
+
+    /// The shutdown bound is reached: no pipeline starts any more, and each one dropped
+    /// unanswered from now on (its connection aborted) counts in [`App::failed`].
+    pub(crate) fn give_up(&self) {
+        self.past_bound.store(true, Ordering::SeqCst);
+        self.permits.close();
+    }
+
+    /// Pipelines dropped unanswered after [`App::give_up`].
+    pub(crate) fn failed(&self) -> usize {
+        self.failed.load(Ordering::SeqCst)
     }
 
     fn phase(&self) -> u8 {
@@ -238,6 +263,20 @@ fn body_rejection(rej: BytesRejection) -> Done {
     )
 }
 
+fn body_timeout() -> Done {
+    let mut done = error(
+        StatusCode::REQUEST_TIMEOUT,
+        "PROTO_ERROR",
+        "the request body was not received in time",
+        "bad_request",
+    );
+    // The rest of the body is never read, so the connection cannot be reused.
+    done.resp
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    done
+}
+
 fn bad_json(e: serde_json::Error) -> Done {
     error(
         StatusCode::BAD_REQUEST,
@@ -319,9 +358,40 @@ impl Counted for CursorReq {
     }
 }
 
-/// Admit the request, read and parse its body, take a worker permit, then run `work` in
-/// `spawn_blocking` inside `span`.
+/// Counts a pipeline as failed when its handler is dropped unanswered (its connection
+/// aborted) after the shutdown bound. A drop before the bound is a client that went away,
+/// not a failure: its blocking job, if any, still runs to the end and gives its stream back.
+struct Unanswered {
+    app: Arc<App>,
+    answered: bool,
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if !self.answered && self.app.past_bound.load(Ordering::SeqCst) {
+            self.app.failed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Run the pipeline handler, tracked by [`Unanswered`].
 async fn parse_then_run<T, F>(app: Arc<App>, req: Request, span: &Span, work: F) -> Response
+where
+    T: serde::de::DeserializeOwned + Counted + Send + 'static,
+    F: FnOnce(&App, &Streams, T) -> Done + Send + 'static,
+{
+    let mut pending = Unanswered {
+        app: app.clone(),
+        answered: false,
+    };
+    let resp = admit_then_run(app, req, span, work).await;
+    pending.answered = true;
+    resp
+}
+
+/// Admit the request, read (within the body timeout) and parse its body, take a worker
+/// permit, then run `work` in `spawn_blocking` inside `span`.
+async fn admit_then_run<T, F>(app: Arc<App>, req: Request, span: &Span, work: F) -> Response
 where
     T: serde::de::DeserializeOwned + Counted + Send + 'static,
     F: FnOnce(&App, &Streams, T) -> Done + Send + 'static,
@@ -330,9 +400,11 @@ where
         Ok(s) => s,
         Err(done) => return finish(span, done),
     };
-    let body = match Bytes::from_request(req, &()).await {
-        Ok(b) => b,
-        Err(rej) => return finish(span, body_rejection(rej)),
+    let read = tokio::time::timeout(app.body_timeout, Bytes::from_request(req, &()));
+    let body = match read.await {
+        Ok(Ok(b)) => b,
+        Ok(Err(rej)) => return finish(span, body_rejection(rej)),
+        Err(_) => return finish(span, body_timeout()),
     };
     let parsed: T = match serde_json::from_slice(&body) {
         Ok(p) => p,
@@ -538,7 +610,6 @@ mod tests {
     #[test]
     fn a_panic_closes_the_stream_and_gives_it_back() {
         use crate::streams::StreamsCfg;
-        use std::time::Duration;
         use turso_durable::store::MemStore;
         let dir = tempfile::tempdir().unwrap();
         let mut c =

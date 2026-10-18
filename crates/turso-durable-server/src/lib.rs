@@ -1,9 +1,15 @@
 //! Hrana-over-HTTP server for `turso_durable` databases.
 //!
-//! [`bind`] takes the port and loads the token, so a bad setting fails before the database
-//! is opened. [`Bound::serve`] then runs the server on its own tokio runtime: `/health`
-//! answers `starting` at once, the database opens on a blocking thread, and pipelines are
-//! served from then until the `shutdown` future resolves.
+//! [`bind`] takes the port and loads the TLS files and the token, so a bad setting fails
+//! before the database is opened. [`Bound::serve`] then runs the server on its own tokio
+//! runtime: `/health` answers `starting` at once, the database opens on a blocking thread,
+//! and pipelines are served from then until the `shutdown` future resolves.
+//!
+//! Shutdown, in order: health turns `shutting_down` and new pipelines get 503
+//! `SHUTTING_DOWN`; accepting stops; in-flight pipelines get up to `shutdown_timeout`, past
+//! which their connections are aborted (a response not yet written is never sent); idle
+//! streams and the anchor close; and the database closes only when no request still holds
+//! a connection.
 pub mod config;
 pub mod exec;
 mod http;
@@ -14,7 +20,7 @@ pub mod streams;
 pub use config::{ServeConfig, TlsFiles, Token};
 
 use crate::http::App;
-use crate::listener::{race, Either};
+use crate::listener::{race, Either, MAX_CONNECTIONS};
 use crate::streams::{Streams, StreamsCfg};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -23,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 use turso_durable::Database;
 
 /// Tokio worker threads: they only do I/O, the statements run on blocking threads.
@@ -45,6 +52,7 @@ pub struct Bound {
     addr: SocketAddr,
     cfg: ServeConfig,
     token: Option<Token>,
+    tls: Option<TlsAcceptor>,
 }
 
 impl std::fmt::Debug for Bound {
@@ -57,12 +65,11 @@ impl std::fmt::Debug for Bound {
     }
 }
 
-/// Bind the listener (a port in use fails here) and load the token.
+/// Load the TLS files (a missing, unreadable or mismatched one fails here) and the token,
+/// and bind the listener (a port in use fails here).
 pub fn bind(cfg: ServeConfig) -> Result<Bound, String> {
     cfg.check_bind()?;
-    if cfg.tls.is_some() {
-        return Err("TLS listener lands in Task 8".to_string());
-    }
+    let tls = cfg.tls.as_ref().map(listener::tls_acceptor).transpose()?;
     let token = cfg.token_file.as_deref().map(Token::load).transpose()?;
     let listener = std::net::TcpListener::bind(cfg.listen)
         .map_err(|e| format!("cannot listen on {}: {e}", cfg.listen))?;
@@ -77,6 +84,7 @@ pub fn bind(cfg: ServeConfig) -> Result<Bound, String> {
         addr,
         cfg,
         token,
+        tls,
     })
 }
 
@@ -88,7 +96,7 @@ impl Bound {
 
     /// Whether the server speaks HTTPS.
     pub fn tls(&self) -> bool {
-        false
+        self.tls.is_some()
     }
 
     /// Whether pipelines need the bearer token.
@@ -99,6 +107,9 @@ impl Bound {
     /// Serve until `shutdown` resolves. `open` opens the database on a blocking thread
     /// while `/health` answers `starting`; `on_ready` runs once it is open. An `open` error
     /// is returned after the listener stopped.
+    ///
+    /// Past `shutdown_timeout` a library call still running cannot be cancelled: it is left
+    /// on its blocking thread, the database is not closed, and the report says `clean: false`.
     pub fn serve(
         self,
         open: impl FnOnce() -> Result<Database, String> + Send + 'static,
@@ -112,7 +123,11 @@ impl Bound {
             .enable_all()
             .build()
             .map_err(|e| format!("cannot start the server runtime: {e}"))?;
-        rt.block_on(self.run(open, on_ready, shutdown))
+        let report = rt.block_on(self.run(open, on_ready, shutdown));
+        // Dropping the runtime would wait for every blocking task without limit, including a
+        // library call abandoned at the shutdown bound.
+        rt.shutdown_background();
+        report
     }
 
     async fn run(
@@ -125,15 +140,18 @@ impl Bound {
             listener,
             cfg,
             token,
+            tls,
             ..
         } = self;
-        let app = App::new(token, cfg.workers);
+        let app = App::new(token, cfg.workers, http::BODY_READ_TIMEOUT);
         let listener = tokio::net::TcpListener::from_std(listener)
             .map_err(|e| format!("cannot listen on {}: {e}", cfg.listen))?;
         let (stop_tx, stop_rx) = watch::channel(false);
         let accept = tokio::spawn(listener::accept_loop(
             listener,
             http::router(app.clone()),
+            tls,
+            MAX_CONNECTIONS,
             stop_rx.clone(),
         ));
         let streams_cfg = StreamsCfg {
@@ -157,7 +175,7 @@ impl Bound {
         let streams = match opened {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                stop_serving(&app, &stop_tx, accept).await;
+                stop_serving(&app, &stop_tx, accept, cfg.shutdown_timeout).await;
                 return Err(e);
             }
         };
@@ -167,12 +185,12 @@ impl Bound {
             on_ready(streams.database());
             shutdown.await;
         }
-        stop_serving(&app, &stop_tx, accept).await;
+        let in_flight_failed = stop_serving(&app, &stop_tx, accept, cfg.shutdown_timeout).await;
         let _ = reaper.await;
-        let report = tokio::task::spawn_blocking(move || close(&streams)).await;
+        let report = tokio::task::spawn_blocking(move || close(&streams, in_flight_failed)).await;
         Ok(report.unwrap_or(ShutdownReport {
             clean: false,
-            in_flight_failed: 0,
+            in_flight_failed,
             streams_closed: 0,
         }))
     }
@@ -194,14 +212,41 @@ fn open_streams(
 }
 
 /// Health goes to `shutting_down`, accepting stops, open connections finish their requests,
-/// and every pipeline still running on a blocking thread finishes. Task 8 bounds the waits.
-async fn stop_serving(app: &App, stop: &watch::Sender<bool>, accept: JoinHandle<listener::Conns>) {
+/// and every pipeline still running on a blocking thread finishes, all within `bound`. Past
+/// it the connections are aborted; returns how many pipelines that left unanswered.
+async fn stop_serving(
+    app: &App,
+    stop: &watch::Sender<bool>,
+    accept: JoinHandle<listener::Conns>,
+    bound: Duration,
+) -> usize {
     app.begin_shutdown();
     let _ = stop.send(true);
-    if let Ok(conns) = accept.await {
-        conns.finish().await;
+    let deadline = tokio::time::Instant::now() + bound;
+    // The accept loop returns as soon as it sees `stop`.
+    let mut conns = accept.await.ok();
+    let drained = tokio::time::timeout_at(deadline, async {
+        if let Some(c) = conns.as_mut() {
+            c.finish().await;
+        }
+        app.drain().await;
+    })
+    .await;
+    if drained.is_ok() {
+        return 0;
     }
-    app.drain().await;
+    app.give_up();
+    if let Some(c) = conns.as_mut() {
+        c.abort().await;
+    }
+    let failed = app.failed();
+    tracing::warn!(
+        target: "turso_durable::server",
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        in_flight_failed = failed,
+        "shutdown bound reached; in-flight requests aborted"
+    );
+    failed
 }
 
 /// Close idle streams every `min(timeout / 2, 1 s)` until `stop` changes.
@@ -233,25 +278,28 @@ fn spawn_reaper(
 }
 
 /// Close the idle streams and the anchor, then the database when no stream is still busy.
-fn close(streams: &Streams) -> ShutdownReport {
+/// Clean only when nothing failed in flight and the database closed.
+fn close(streams: &Streams, in_flight_failed: usize) -> ShutdownReport {
     let streams_closed = streams.close_all();
     let busy = streams.busy();
-    let mut clean = busy == 0;
-    if clean {
+    let mut clean = in_flight_failed == 0;
+    if busy == 0 {
         if let Err(e) = streams.database().clone().close() {
             tracing::warn!(target: "turso_durable::server", error = %e, "database close failed");
             clean = false;
         }
     } else {
+        // A library call is still running on a blocking thread and cannot be cancelled.
         tracing::warn!(
             target: "turso_durable::server",
             busy,
-            "streams still busy at shutdown; the database is left open"
+            "shutdown bound reached; exiting without draining"
         );
+        clean = false;
     }
     ShutdownReport {
         clean,
-        in_flight_failed: 0,
+        in_flight_failed,
         streams_closed,
     }
 }

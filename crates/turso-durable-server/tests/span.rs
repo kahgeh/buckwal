@@ -131,11 +131,13 @@ fn request_span_has_no_sql_or_token() {
     assert_eq!(f("durable.outcome"), Some("ok"), "{req:?}");
     let stream: u64 = f("durable.stream").unwrap().parse().unwrap();
     assert!(stream >= 1, "{req:?}");
+    // Only the spans opened during the INSERT request: span ids are reused once closed.
+    let during = &spans[from..refused_from];
     assert!(
-        spans
+        during
             .iter()
             .any(|s| s.name == "durable.commit" && s.parent == Some(req.id)),
-        "the library's commit span is a child of the request span: {spans:?}"
+        "the library's commit span is a child of the request span: {during:?}"
     );
     let refused: Vec<&SpanRec> = spans[refused_from..]
         .iter()

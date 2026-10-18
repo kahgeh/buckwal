@@ -2,14 +2,16 @@
 //! client (`turso_durable_hrana_client`), which builds requests in the real clients' shapes.
 mod common;
 
-use common::{db_config, start, Opts, TOKEN};
+use common::{db_config, restored, start, tls_material, Opts, TOKEN};
 use serde_json::{json, Value};
-use std::sync::mpsc;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use turso_durable::takeover_with_store;
 use turso_durable_hrana_client::{
     batch, close, cond_ok, execute, execute_named, get_autocommit, result_error, result_rows, stmt,
-    tx_batch_request, Arg, Proto, Reply,
+    tx_batch_request, Arg, Client, Proto, Reply,
 };
 use turso_durable_server::{bind, ServeConfig, ShutdownReport, TlsFiles};
 
@@ -498,7 +500,11 @@ fn bind_fails_fast() {
         cert: "c.pem".into(),
         key: "k.pem".into(),
     });
-    assert!(bind(tls).is_err());
+    let e = bind(tls).unwrap_err();
+    assert!(
+        e.contains("c.pem"),
+        "the error names the certificate file: {e}"
+    );
     let dir = tempfile::tempdir().unwrap();
     let mut missing = cfg.clone();
     missing.token_file = Some(dir.path().join("no-token"));
@@ -556,4 +562,255 @@ fn shutdown_while_opening_waits_for_open_then_closes() {
         matches!(ready.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
         "on_ready must not run once shutdown began"
     );
+}
+
+/// A TLS handshake with only `version` offered; returns the version and ALPN protocol agreed.
+fn handshake(
+    ca: &std::path::Path,
+    port: u16,
+    version: &'static rustls::SupportedProtocolVersion,
+) -> (rustls::ProtocolVersion, Option<Vec<u8>>) {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_file_iter(ca).unwrap() {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[version])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let name = ServerName::try_from("localhost").unwrap();
+    let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
+    let mut tcp = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).unwrap();
+    }
+    (
+        conn.protocol_version().unwrap(),
+        conn.alpn_protocol().map(<[u8]>::to_vec),
+    )
+}
+
+#[test]
+fn tls_listener_serves_https_and_refuses_plain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(m) = tls_material(tmp.path()) else {
+        return;
+    };
+    let s = start(Opts {
+        tls: Some(m.clone()),
+        ..Opts::default()
+    });
+    let c = s.client(None);
+    let h = c.get("/health").unwrap();
+    assert_eq!(h.status, 200);
+    assert_eq!(h.body, json!({"status":"ready"}));
+    ok_pipeline(
+        &c.stream(Proto::V3)
+            .pipeline(vec![execute("SELECT 1", &[]), close()])
+            .unwrap(),
+    );
+    let port = s.addr.port();
+    let plain = Client::new(&format!("http://127.0.0.1:{port}"), None, None).unwrap();
+    if let Ok(r) = plain.get("/health") {
+        panic!(
+            "plain HTTP must not be served, got {}: {}",
+            r.status, r.body
+        );
+    }
+    let untrusted = Client::new(&s.url(), None, None).unwrap();
+    assert!(
+        untrusted.get("/health").is_err(),
+        "a client that does not trust the CA is refused"
+    );
+    let ca = m.join("ca.pem");
+    for v in [&rustls::version::TLS13, &rustls::version::TLS12] {
+        let (got, alpn) = handshake(&ca, port, v);
+        assert_eq!(got, v.version);
+        assert_eq!(
+            alpn.as_deref(),
+            Some(&b"http/1.1"[..]),
+            "ALPN is http/1.1 only"
+        );
+    }
+    assert_eq!(c.get("/health").unwrap().status, 200, "still serving");
+    let report = s.stop().unwrap();
+    assert!(report.clean, "{report:?}");
+}
+
+/// Create `t` and slow every commit log upload down by `delay`.
+fn slow_commits(s: &common::Server, delay: Duration) {
+    let c = s.client(None);
+    ok_pipeline(
+        &c.stream(Proto::V2)
+            .pipeline(vec![execute(CREATE, &[]), close()])
+            .unwrap(),
+    );
+    let fault = s.fault.as_ref().unwrap();
+    fault.only_keys_containing("log/");
+    fault.delay_puts(delay);
+}
+
+#[test]
+fn sigterm_finishes_in_flight_then_closes() {
+    let mut s = start(Opts {
+        fault: true,
+        ..Opts::default()
+    });
+    slow_commits(&s, Duration::from_millis(500));
+    let url = s.url();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let (acked_tx, acked_rx) = mpsc::channel::<i64>();
+    let workers: Vec<_> = (0..4i64)
+        .map(|w| {
+            let (url, stopping, acked_tx) = (url.clone(), stopping.clone(), acked_tx.clone());
+            std::thread::spawn(move || {
+                let c = Client::new(&url, None, None).unwrap();
+                let mut st = c.stream(Proto::V2);
+                let mut acked_after_stop = 0;
+                let mut refused = Vec::new();
+                for i in 0.. {
+                    let id = w * 1_000_000 + i;
+                    let insert =
+                        execute("INSERT INTO t(id, body) VALUES (?, 'x')", &[Arg::Int(id)]);
+                    let Ok(r) = st.pipeline(vec![insert]) else {
+                        break;
+                    };
+                    if r.status != 200 {
+                        refused.push(r);
+                        break;
+                    }
+                    ok_pipeline(&r);
+                    if stopping.load(SeqCst) {
+                        acked_after_stop += 1;
+                    }
+                    acked_tx.send(id).unwrap();
+                }
+                (acked_after_stop, refused)
+            })
+        })
+        .collect();
+    drop(acked_tx);
+    let mut acked: Vec<i64> = (0..2)
+        .map(|_| acked_rx.recv_timeout(Duration::from_secs(30)).unwrap())
+        .collect();
+    stopping.store(true, SeqCst);
+    s.request_stop();
+    // Once health says so (or the port is closed), a new pipeline is refused.
+    let probe = Client::new(&url, None, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match probe.get("/health") {
+            Ok(h) if h.body == json!({"status":"shutting_down"}) => {
+                assert_eq!(h.status, 503);
+                break;
+            }
+            Ok(h) => assert_eq!(h.body, json!({"status":"ready"})),
+            Err(_) => break,
+        }
+        assert!(Instant::now() < deadline, "health never said shutting_down");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let fresh = Client::new(&url, None, None).unwrap();
+    if let Ok(r) = fresh.post_raw("/v2/pipeline", pipeline_body(), None) {
+        assert_eq!(r.status, 503, "{}", r.body);
+        assert_eq!(code(&r), "SHUTTING_DOWN");
+    }
+    let store = s.store.clone();
+    let report = s.stop().unwrap();
+    let mut acked_after_stop = 0;
+    for w in workers {
+        let (n, refused) = w.join().unwrap();
+        acked_after_stop += n;
+        for r in refused {
+            assert_eq!(r.status, 503, "{}", r.body);
+            assert_eq!(code(&r), "SHUTTING_DOWN");
+        }
+    }
+    acked.extend(acked_rx.iter());
+    assert!(report.clean, "{report:?}");
+    assert_eq!(report.in_flight_failed, 0, "{report:?}");
+    assert!(report.streams_closed >= 1, "{report:?}");
+    assert!(
+        acked_after_stop >= 1,
+        "an insert in flight at the signal finished and was acked"
+    );
+    let durable = restored(&store, "t", "id");
+    for id in &acked {
+        assert!(
+            durable.contains(id),
+            "acked insert {id} is not in the bucket"
+        );
+    }
+}
+
+#[test]
+fn shutdown_bound_fails_in_flight_rather_than_ack() {
+    let s = start(Opts {
+        fault: true,
+        shutdown_timeout: Duration::from_millis(300),
+        ..Opts::default()
+    });
+    slow_commits(&s, Duration::from_secs(3));
+    let seen = s.log_puts();
+    let url = s.url();
+    let insert = std::thread::spawn(move || {
+        let c = Client::new(&url, None, None).unwrap();
+        c.stream(Proto::V2)
+            .pipeline(vec![execute("INSERT INTO t(body) VALUES ('late')", &[])])
+    });
+    s.wait_log_put(seen);
+    let t = Instant::now();
+    let report = s.stop().unwrap();
+    let took = t.elapsed();
+    if let Ok(r) = insert.join().unwrap() {
+        assert_ne!(r.status, 200, "past the bound nothing is acked: {}", r.body);
+    }
+    assert!(!report.clean, "{report:?}");
+    assert_eq!(report.in_flight_failed, 1, "{report:?}");
+    assert!(
+        took < Duration::from_secs(2),
+        "serve returned at the bound, not after the upload: {took:?}"
+    );
+}
+
+#[test]
+fn client_disconnect_mid_request_gives_the_stream_back() {
+    let s = start(Opts {
+        fault: true,
+        ..Opts::default()
+    });
+    slow_commits(&s, Duration::from_millis(500));
+    let seen = s.log_puts();
+    let body =
+        json!({"baton": null, "requests": [execute("INSERT INTO t(body) VALUES ('gone')", &[])]})
+            .to_string();
+    let mut tcp = std::net::TcpStream::connect(s.addr).unwrap();
+    write!(
+        tcp,
+        "POST /v2/pipeline HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    s.wait_log_put(seen);
+    tcp.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(tcp);
+    let store = s.store.clone();
+    let report = s.stop().unwrap();
+    assert_eq!(
+        report,
+        ShutdownReport {
+            clean: true,
+            in_flight_failed: 0,
+            streams_closed: 1
+        },
+        "the abandoned request's stream was given back, then closed at shutdown"
+    );
+    assert_eq!(restored(&store, "t", "id").len(), 1, "its insert committed");
 }
