@@ -208,21 +208,18 @@ impl Streams {
     /// The new baton, or `None` when the stream is over (its connection is then closed).
     pub fn give_back(&self, leased: Leased) -> Option<String> {
         let Leased { id, state } = leased;
-        let over = {
-            let mut slots = lock(&self.slots);
-            let over = state.closed || self.closing.load(Ordering::SeqCst);
-            if over {
-                slots.remove(&id);
-            }
-            over
-        };
-        if over {
+        // One lock acquisition decides and acts: a `close_all` between a separate check and
+        // insert would leave a live connection in the map after shutdown.
+        let mut slots = lock(&self.slots);
+        if state.closed || self.closing.load(Ordering::SeqCst) {
+            slots.remove(&id);
+            drop(slots);
             close_state(state);
             return None;
         }
         let secret = new_secret();
         let baton = format!("{id}.{secret}");
-        lock(&self.slots).insert(
+        slots.insert(
             id,
             Slot::Idle {
                 state,
@@ -259,12 +256,21 @@ impl Streams {
         n
     }
 
-    /// Close idle streams, then the anchor; returns how many streams. Busy streams are
-    /// left for their holders to give back.
+    /// Refuse new work, then close idle streams and the anchor; returns how many streams.
+    /// Busy streams are closed by their holders' `give_back`.
     pub fn close_all(&self) -> usize {
+        {
+            // Under the slot lock, so `give_back` sees the flag and the map consistently.
+            let _slots = lock(&self.slots);
+            self.closing.store(true, Ordering::SeqCst);
+        }
+        self.close_connections()
+    }
+
+    /// Close idle streams and the anchor without touching `closing`.
+    fn close_connections(&self) -> usize {
         let idle = {
             let mut slots = lock(&self.slots);
-            self.closing.store(true, Ordering::SeqCst);
             let ids: Vec<u64> = slots
                 .iter()
                 .filter(|(_, s)| matches!(s, Slot::Idle { .. }))
@@ -527,11 +533,12 @@ mod tests {
         )
         .unwrap();
         // Close the anchor, then the shared database, so connect fails.
-        streams.close_all();
-        streams.closing.store(false, Ordering::SeqCst);
+        streams.close_connections();
         other.close().unwrap();
         match streams.checkout(None) {
-            Checkout::Failed(turso_durable::Error::Config(_)) => {}
+            Checkout::Failed(turso_durable::Error::Config(m)) => {
+                assert_eq!(m, "the database is closed")
+            }
             other => panic!("{other:?}"),
         }
         assert_eq!(streams.busy(), 0);
