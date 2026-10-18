@@ -1,0 +1,61 @@
+baseline: writer generation 2 rows 10
+writer rows: [[Numeric(Integer(52))]]
+replica before: rows=10 integrity=[[Text(Text { value: "ok", subtype: Text })]]
+log 2/1: no frames (header or truncate only)
+log 2/2: no frames (header or truncate only)
+log 2/3: frame_no=1 page=2 db_size_in_hdr=2 info=WalFrameInfo { page_no: 2, db_size: 2 } last_in_sync=true reader_rows=11
+log 2/3: wal_insert_end(true) done. reader_rows=11
+log 2/4: frame_no=2 page=1 db_size_in_hdr=0 info=WalFrameInfo { page_no: 1, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=3 page=2 db_size_in_hdr=0 info=WalFrameInfo { page_no: 2, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=4 page=3 db_size_in_hdr=0 info=WalFrameInfo { page_no: 3, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=5 page=4 db_size_in_hdr=0 info=WalFrameInfo { page_no: 4, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=6 page=5 db_size_in_hdr=0 info=WalFrameInfo { page_no: 5, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=7 page=6 db_size_in_hdr=0 info=WalFrameInfo { page_no: 6, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=8 page=7 db_size_in_hdr=0 info=WalFrameInfo { page_no: 7, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=9 page=8 db_size_in_hdr=0 info=WalFrameInfo { page_no: 8, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=10 page=9 db_size_in_hdr=0 info=WalFrameInfo { page_no: 9, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=11 page=10 db_size_in_hdr=0 info=WalFrameInfo { page_no: 10, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=12 page=11 db_size_in_hdr=0 info=WalFrameInfo { page_no: 11, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=13 page=12 db_size_in_hdr=0 info=WalFrameInfo { page_no: 12, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=14 page=13 db_size_in_hdr=0 info=WalFrameInfo { page_no: 13, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=15 page=14 db_size_in_hdr=0 info=WalFrameInfo { page_no: 14, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=16 page=15 db_size_in_hdr=0 info=WalFrameInfo { page_no: 15, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=17 page=16 db_size_in_hdr=0 info=WalFrameInfo { page_no: 16, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=18 page=17 db_size_in_hdr=0 info=WalFrameInfo { page_no: 17, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=19 page=18 db_size_in_hdr=0 info=WalFrameInfo { page_no: 18, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=20 page=19 db_size_in_hdr=0 info=WalFrameInfo { page_no: 19, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=21 page=20 db_size_in_hdr=0 info=WalFrameInfo { page_no: 20, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=22 page=21 db_size_in_hdr=0 info=WalFrameInfo { page_no: 21, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=23 page=22 db_size_in_hdr=0 info=WalFrameInfo { page_no: 22, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=24 page=23 db_size_in_hdr=0 info=WalFrameInfo { page_no: 23, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=25 page=24 db_size_in_hdr=0 info=WalFrameInfo { page_no: 24, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=26 page=25 db_size_in_hdr=0 info=WalFrameInfo { page_no: 25, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=27 page=26 db_size_in_hdr=0 info=WalFrameInfo { page_no: 26, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=28 page=27 db_size_in_hdr=0 info=WalFrameInfo { page_no: 27, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=29 page=28 db_size_in_hdr=0 info=WalFrameInfo { page_no: 28, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=30 page=29 db_size_in_hdr=0 info=WalFrameInfo { page_no: 29, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=31 page=30 db_size_in_hdr=0 info=WalFrameInfo { page_no: 30, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=32 page=31 db_size_in_hdr=0 info=WalFrameInfo { page_no: 31, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=33 page=32 db_size_in_hdr=0 info=WalFrameInfo { page_no: 32, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=34 page=33 db_size_in_hdr=0 info=WalFrameInfo { page_no: 33, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=35 page=34 db_size_in_hdr=0 info=WalFrameInfo { page_no: 34, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=36 page=35 db_size_in_hdr=0 info=WalFrameInfo { page_no: 35, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=37 page=36 db_size_in_hdr=0 info=WalFrameInfo { page_no: 36, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=38 page=37 db_size_in_hdr=0 info=WalFrameInfo { page_no: 37, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=39 page=38 db_size_in_hdr=0 info=WalFrameInfo { page_no: 38, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=40 page=39 db_size_in_hdr=0 info=WalFrameInfo { page_no: 39, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=41 page=40 db_size_in_hdr=0 info=WalFrameInfo { page_no: 40, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=42 page=41 db_size_in_hdr=0 info=WalFrameInfo { page_no: 41, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=43 page=42 db_size_in_hdr=0 info=WalFrameInfo { page_no: 42, db_size: 0 } last_in_sync=false reader_rows=11
+log 2/4: frame_no=44 page=43 db_size_in_hdr=43 info=WalFrameInfo { page_no: 43, db_size: 43 } last_in_sync=true reader_rows=51
+log 2/4: wal_insert_end(true) done. reader_rows=51
+log 2/5: frame_no=45 page=4 db_size_in_hdr=43 info=WalFrameInfo { page_no: 4, db_size: 43 } last_in_sync=true reader_rows=52
+log 2/5: wal_insert_end(true) done. reader_rows=52
+replica after: rows=52 integrity=[[Text(Text { value: "ok", subtype: Text })]]
+repeat last frame 45 same bytes: Ok(WalFrameInfo { page_no: 4, db_size: 43 })
+repeat last frame 45 changed bytes: Err(Conflict("frame content differs from the WAL: frame_id=45"))
+repeat frame 1 (applied long ago) same bytes: Ok(WalFrameInfo { page_no: 2, db_size: 2 })
+gap: frame 47 when max is 45: Err(InvalidArgument("frame_id is beyond next frame in the WAL: frame_id=47, max_frame=45"))
+after rollback: state=WalState { checkpoint_seq_no: 0, max_frame: 45 } rows=52
+non-commit frame 46: Ok(WalFrameInfo { page_no: 4, db_size: 0 }) state=WalState { checkpoint_seq_no: 0, max_frame: 46 }
+after end(false): state=WalState { checkpoint_seq_no: 0, max_frame: 45 } rows=52 integrity=[[Text(Text { value: "ok", subtype: Text })]]

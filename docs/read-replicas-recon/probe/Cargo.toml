@@ -1,0 +1,8 @@
+[package]
+name = "probe"
+version = "0.0.0"
+edition = "2021"
+[dependencies]
+turso_core = { version = "=0.8.3", default-features = false, features = ["fs","json","uuid","encryption","conn_raw_api"] }
+turso_durable = { path = "../../../crates/turso_durable" }
+[workspace]

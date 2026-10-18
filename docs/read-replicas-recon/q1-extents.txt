@@ -1,0 +1,58 @@
+=== batching Off
+writer generation now 3
+-- generation 1
+log 1/1: sync ops [W@0+32] img 0->32 whole_frames=true frames=0 last_frame_commit=None
+log 1/2: sync ops [W@32+4120 W@4152+4120] img 32->8272 whole_frames=true frames=2 last_frame_commit=Some(true)
+log 1/3: sync ops [W@8272+4120] img 8272->12392 whole_frames=true frames=3 last_frame_commit=Some(true)
+log 1/4: sync ops [W@12392+4120 W@16512+4120 W@20632+4120] img 12392->24752 whole_frames=true frames=6 last_frame_commit=Some(true)
+log 1/5: sync ops [W@24752+4120 W@28872+4120 W@32992+4120 W@37112+4120] img 24752->41232 whole_frames=true frames=10 last_frame_commit=Some(true)
+log 1/6: sync ops [W@41232+4120 W@45352+4120 W@49472+4120 W@53592+4120 W@57712+4120 W@61832+4120 W@65952+4120] img 41232->70072 whole_frames=true frames=17 last_frame_commit=Some(true)
+log 1/7: sync ops [W@70072+4120 W@74192+4120 W@78312+4120 W@82432+4120 W@86552+4120 W@90672+4120 W@94792+4120 W@98912+4120] img 70072->103032 whole_frames=true frames=25 last_frame_commit=Some(true)
+log 1/8: sync ops [W@103032+4120 W@107152+4120 W@111272+4120 W@115392+4120 W@119512+4120 W@123632+4120 W@127752+4120 W@131872+4120 W@135992+4120 W@140112+4120 W@144232+4120 W@148352+4120 W@152472+4120 W@156592+4120 W@160712+4120 W@164832+4120 W@168952+4120 W@173072+4120 W@177192+4120 W@181312+4120 W@185432+4120 W@189552+4120 W@193672+4120 W@197792+4120 W@201912+4120 W@206032+4120 W@210152+4120 W@214272+4120 W@218392+4120 W@222512+4120 W@226632+4120 W@230752+4120 W@234872+4120 W@238992+4120 W@243112+4120 W@247232+4120 W@251352+4120 W@255472+4120 W@259592+4120 W@263712+4120 W@267832+4120 W@271952+4120 W@276072+4120] img 103032->280192 whole_frames=true frames=68 last_frame_commit=Some(true)
+log 1/9: empty (seal start)
+-- generation 2
+log 2/1: sync ops [T0] img 0->0 whole_frames=true frames=0 last_frame_commit=None
+log 2/2: sync ops [W@0+32] img 0->32 whole_frames=true frames=0 last_frame_commit=None
+log 2/3: sync ops [W@32+4120] img 32->4152 whole_frames=true frames=1 last_frame_commit=Some(true)
+log 2/4: sync ops [W@4152+4120] img 4152->8272 whole_frames=true frames=2 last_frame_commit=Some(true)
+log 2/5: sync ops [W@8272+4120 W@12392+4120 W@16512+4120 W@20632+4120] img 8272->24752 whole_frames=true frames=6 last_frame_commit=Some(true)
+log 2/6: sync ops [W@24752+4120] img 24752->28872 whole_frames=true frames=7 last_frame_commit=Some(true)
+log 2/7: sync ops [W@28872+4120] img 28872->32992 whole_frames=true frames=8 last_frame_commit=Some(true)
+log 2/8: empty (seal start)
+-- generation 3
+log 3/1: sync ops [T0] img 0->0 whole_frames=true frames=0 last_frame_commit=None
+log 3/2: sync ops [W@0+32] img 0->32 whole_frames=true frames=0 last_frame_commit=None
+log 3/3: sync ops [W@32+4120] img 32->4152 whole_frames=true frames=1 last_frame_commit=Some(true)
+log 3/4: empty (seal start)
+-- generation 4
+log 4/1: sync ops [T0] img 0->0 whole_frames=true frames=0 last_frame_commit=None
+SUMMARY syncs=19 writes_off_frame_grid=0 syncs_ending_mid_frame=0 syncs_ending_on_noncommit_frame=0 log_objects=22 store_gets=36
+=== batching Window { max_wait: 5ms, max_commits: 64, max_bytes: 1048576 }
+writer generation now 3
+-- generation 1
+log 1/1: sync ops [W@0+32] img 0->32 whole_frames=true frames=0 last_frame_commit=None
+log 1/1: sync ops [W@32+4120 W@4152+4120] img 32->8272 whole_frames=true frames=2 last_frame_commit=Some(true)
+log 1/2: sync ops [W@8272+4120] img 8272->12392 whole_frames=true frames=3 last_frame_commit=Some(true)
+log 1/3: sync ops [W@12392+4120 W@16512+4120 W@20632+4120] img 12392->24752 whole_frames=true frames=6 last_frame_commit=Some(true)
+log 1/4: sync ops [W@24752+4120 W@28872+4120 W@32992+4120 W@37112+4120] img 24752->41232 whole_frames=true frames=10 last_frame_commit=Some(true)
+log 1/5: sync ops [W@41232+4120 W@45352+4120 W@49472+4120 W@53592+4120 W@57712+4120 W@61832+4120 W@65952+4120] img 41232->70072 whole_frames=true frames=17 last_frame_commit=Some(true)
+log 1/6: sync ops [W@70072+4120 W@74192+4120 W@78312+4120 W@82432+4120 W@86552+4120 W@90672+4120 W@94792+4120 W@98912+4120] img 70072->103032 whole_frames=true frames=25 last_frame_commit=Some(true)
+log 1/7: sync ops [W@103032+4120 W@107152+4120 W@111272+4120 W@115392+4120 W@119512+4120 W@123632+4120 W@127752+4120 W@131872+4120 W@135992+4120 W@140112+4120 W@144232+4120 W@148352+4120 W@152472+4120 W@156592+4120 W@160712+4120 W@164832+4120 W@168952+4120 W@173072+4120 W@177192+4120 W@181312+4120 W@185432+4120 W@189552+4120 W@193672+4120 W@197792+4120 W@201912+4120 W@206032+4120 W@210152+4120 W@214272+4120 W@218392+4120 W@222512+4120 W@226632+4120 W@230752+4120 W@234872+4120 W@238992+4120 W@243112+4120 W@247232+4120 W@251352+4120 W@255472+4120 W@259592+4120 W@263712+4120 W@267832+4120 W@271952+4120 W@276072+4120] img 103032->280192 whole_frames=true frames=68 last_frame_commit=Some(true)
+log 1/8: empty (seal start)
+-- generation 2
+log 2/1: sync ops [T0] img 0->0 whole_frames=true frames=0 last_frame_commit=None
+log 2/2: sync ops [W@0+32] img 0->32 whole_frames=true frames=0 last_frame_commit=None
+log 2/2: sync ops [W@32+4120] img 32->4152 whole_frames=true frames=1 last_frame_commit=Some(true)
+log 2/3: sync ops [W@4152+4120] img 4152->8272 whole_frames=true frames=2 last_frame_commit=Some(true)
+log 2/4: sync ops [W@8272+4120 W@12392+4120 W@16512+4120 W@20632+4120] img 8272->24752 whole_frames=true frames=6 last_frame_commit=Some(true)
+log 2/5: sync ops [W@24752+4120] img 24752->28872 whole_frames=true frames=7 last_frame_commit=Some(true)
+log 2/6: sync ops [W@28872+4120] img 28872->32992 whole_frames=true frames=8 last_frame_commit=Some(true)
+log 2/7: empty (seal start)
+-- generation 3
+log 3/1: sync ops [T0] img 0->0 whole_frames=true frames=0 last_frame_commit=None
+log 3/2: sync ops [W@0+32] img 0->32 whole_frames=true frames=0 last_frame_commit=None
+log 3/2: sync ops [W@32+4120] img 32->4152 whole_frames=true frames=1 last_frame_commit=Some(true)
+log 3/3: empty (seal start)
+-- generation 4
+log 4/1: sync ops [T0] img 0->0 whole_frames=true frames=0 last_frame_commit=None
+SUMMARY syncs=19 writes_off_frame_grid=0 syncs_ending_mid_frame=0 syncs_ending_on_noncommit_frame=0 log_objects=19 store_gets=33
