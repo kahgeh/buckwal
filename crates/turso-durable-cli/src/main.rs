@@ -2,6 +2,7 @@
 mod args;
 mod bench;
 mod scan;
+mod serve;
 mod soak;
 
 use args::Command;
@@ -212,18 +213,30 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
     db.close().map_err(err)
 }
 
+/// Refuse a directory the writer does not own (see [`open_writer`]); no bucket call.
+pub(crate) fn claim_check(dir: &Path) -> CliResult<()> {
+    if turso_durable::is_claimed(dir).map_err(err)? {
+        return Ok(());
+    }
+    Err(format!(
+        "{} holds no database this writer owns: opening it would restore or create the \
+         database and take it over from any writer still running, which is then fenced for \
+         good; use `verify --dir` to read it, or pass --claim to take it over",
+        dir.display()
+    ))
+}
+
 /// Open `dir` as the writer, with `batching` set on it when given. Without `claim`, only a
 /// directory the writer already owns: opening any other (empty, or restored and never
 /// opened) restores, claims or creates the database, and fences a writer still running
 /// elsewhere.
-fn open_writer(dir: &Path, claim: bool, batching: Option<Batching>) -> CliResult<Database> {
-    if !claim && !turso_durable::is_claimed(dir).map_err(err)? {
-        return Err(format!(
-            "{} holds no database this writer owns: opening it would restore or create the \
-             database and take it over from any writer still running, which is then fenced for \
-             good; use `verify --dir` to read it, or pass --claim to take it over",
-            dir.display()
-        ));
+pub(crate) fn open_writer(
+    dir: &Path,
+    claim: bool,
+    batching: Option<Batching>,
+) -> CliResult<Database> {
+    if !claim {
+        claim_check(dir)?;
     }
     let db = turso_durable::open(config(dir)?).map_err(err)?;
     if let Some(b) = batching {
@@ -233,7 +246,7 @@ fn open_writer(dir: &Path, claim: bool, batching: Option<Batching>) -> CliResult
 }
 
 /// Run `statements` with `dir` opened as the writer ([`open_writer`]), printing rows.
-fn sql(
+pub(crate) fn sql(
     dir: &Path,
     statements: &[String],
     claim: bool,
@@ -290,6 +303,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Command::Serve {
+        dir,
+        listen,
+        claim,
+        batching,
+    } = &cmd
+    {
+        return match serve::run(dir, listen.as_deref(), *claim, *batching) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(f) => {
+                eprintln!("error: {}", f.message());
+                ExitCode::from(f.exit_code())
+            }
+        };
+    }
     let result = match &cmd {
         Command::Restore { dir } => restore(dir),
         Command::Takeover { dir } => takeover(dir),
@@ -310,6 +338,7 @@ fn main() -> ExitCode {
         Command::Soak(a) => soak::run(a),
         Command::Bench(a) => bench::run(a),
         Command::Scan(a) => scan::run(a),
+        Command::Serve { .. } => unreachable!("handled above"),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

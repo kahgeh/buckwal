@@ -94,6 +94,13 @@ pub enum Command {
     },
     /// Delete what an old enough head no longer reaches; no directory.
     Gc,
+    /// Serve the database over Hrana/HTTP until SIGTERM or SIGINT.
+    Serve {
+        dir: PathBuf,
+        listen: Option<String>,
+        claim: bool,
+        batching: Option<Batching>,
+    },
     Soak(SoakArgs),
     Bench(BenchArgs),
     Scan(ScanArgs),
@@ -110,9 +117,10 @@ pub const USAGE: &str = "usage: turso-durable <command> [options]
           [--start ID] [--count N] [--page-put-delay-ms N] [--connections N]
           [--batching SPEC] [--batching-file PATH] [--stats-every N]
   bench   --dir DIR --commits N [--connections N] [--batching SPEC]
+  serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC]
 SPEC is `off` or `window <max_wait> <max_commits> <max_bytes>` (e.g. 'window 10ms 64 1MiB');
 without --batching, DURABLE_BATCHING applies.
-S3 settings come from the DURABLE_* environment variables.";
+S3 settings come from the DURABLE_* environment variables; serve also reads DURABLE_SERVE_*.";
 
 fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
     v.parse()
@@ -148,6 +156,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut delay = None;
     let mut commits = None;
     let mut claim = false;
+    let mut listen = None;
     let mut connections = 1usize;
     let mut batching_spec = None;
     let mut batching_file = None;
@@ -172,16 +181,20 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 dir = Some(PathBuf::from(value(a)?));
                 true
             }
-            ("sql" | "stats", "--claim") => {
+            ("sql" | "stats" | "serve", "--claim") => {
                 claim = true;
                 true
             }
-            ("sql" | "stats" | "soak" | "bench", "--batching") => {
+            ("sql" | "stats" | "soak" | "bench" | "serve", "--batching") => {
                 batching_spec = Some(batching(a, &value(a)?)?);
                 true
             }
             ("soak" | "bench", "--connections") => {
                 connections = positive(a, &value(a)?)?;
+                true
+            }
+            ("serve", "--listen") => {
+                listen = Some(value(a)?);
                 true
             }
             ("verify", "--acked") => {
@@ -285,6 +298,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         "stats" => Ok(Command::Stats {
             dir,
             sql: positional,
+            claim,
+            batching: batching_spec,
+        }),
+        "serve" => Ok(Command::Serve {
+            dir,
+            listen,
             claim,
             batching: batching_spec,
         }),
@@ -417,6 +436,46 @@ mod tests {
                 batching: None,
             }))
         );
+    }
+
+    #[test]
+    fn parses_serve() {
+        assert_eq!(
+            p(&[
+                "serve",
+                "--dir",
+                "d",
+                "--listen",
+                "127.0.0.1:0",
+                "--claim",
+                "--batching",
+                "off"
+            ]),
+            Ok(Command::Serve {
+                dir: "d".into(),
+                listen: Some("127.0.0.1:0".into()),
+                claim: true,
+                batching: Some(Batching::Off),
+            })
+        );
+        assert_eq!(
+            p(&["serve", "--dir", "d"]),
+            Ok(Command::Serve {
+                dir: "d".into(),
+                listen: None,
+                claim: false,
+                batching: None,
+            })
+        );
+        assert!(p(&["serve"]).is_err());
+        assert!(p(&["serve", "--dir", "d", "extra"]).is_err());
+        assert!(p(&["serve", "--dir", "d", "--listen"]).is_err());
+        for c in ["sql", "stats", "verify", "restore", "soak", "bench"] {
+            assert!(
+                p(&[c, "--dir", "d", "--listen", "127.0.0.1:0", "SELECT 1"]).is_err(),
+                "{c}"
+            );
+        }
     }
 
     #[test]
