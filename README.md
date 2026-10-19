@@ -344,7 +344,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 
 `turso-durable serve` runs one process that owns the database: it is the single writer, holds the lease and talks to the bucket. Apps in other languages, or several app processes on the machine, connect to it with one of tursodb's serverless drivers instead of embedding the library. The server sends a result only after the library call returned, so a client hears success only once the commit is in the bucket, as with the library.
 
-**Protocol.** The server speaks tursodb's "SQL over HTTP v3": `serverless/PROTOCOL.md` in the turso repo at commit `0b2bec917`. Its clients are tursodb's serverless drivers: `@tursodatabase/serverless` (TypeScript), `turso_serverless` (Rust), `tursogo-serverless` (Go) and `turso_serverless` (Python). `/v2/pipeline` is still accepted, as PROTOCOL.md section 2 allows. tursodb's own conformance suite and the Go driver pass against it; the TypeScript and Python drivers were not run (see Clients run and not run below). The protocol descends from libSQL's Hrana, and the server still parses the request shapes libSQL's clients send, but no libSQL client library was run against it.
+**Protocol.** The server speaks tursodb's "SQL over HTTP v3": `serverless/PROTOCOL.md` in the turso repo at commit `0b2bec917`. Its clients are tursodb's serverless drivers: `@tursodatabase/serverless` (TypeScript), `turso_serverless` (Rust), `tursogo-serverless` (Go) and `turso_serverless` (Python). `/v2/pipeline` is still accepted, as PROTOCOL.md section 2 allows. tursodb's own conformance suite and the Go driver passed against it at eb101d9; the TypeScript and Python drivers were not run (see Clients run and not run below). The protocol descends from libSQL's Hrana, and the server still parses the request shapes libSQL's clients send, but no libSQL client library was run against it.
 
 ```sh
 eval "$(scripts/rustfs.sh env)"     # or your own DURABLE_* settings (see Settings)
@@ -426,11 +426,13 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. (li
   - `last_insert_rowid` is `null` unless the statement inserted a row. It is a decimal string in pipeline results and a JSON number in the cursor's `step_end`. The server decides from the statement: an `INSERT` or `REPLACE` (parsed with turso_parser) that changed at least one row inserted one. With an `ON CONFLICT … DO UPDATE` a changed row may be an update, so it counts only if the connection's last rowid moved (read with one extra `SELECT 1` before the statement). The one known gap: such an upsert that inserts a new row whose rowid equals the connection's previous last rowid (possible only after that row was deleted) reports `null`.
   - `rows_written` is the statement's changed-row count, `rows_read` is always 0, `query_duration_ms` is measured, and `base_url` is always null.
 - These fail the whole request with 400 `PROTO_ERROR`, before anything in it runs, and close a stream the baton names, rolling back any transaction left open on it (section 5.3): a `close` that is not the last request of the pipeline, and a batch condition that refers to its own step or a later one, at any depth (pipeline and cursor; on the cursor, before the baton line). A body that is not a pipeline or cursor request at all also gets 400 `PROTO_ERROR`.
-- A malformed request in a pipeline fails alone with `PROTO_ERROR`, and an unknown request type with `UNSUPPORTED`; the other requests still run. A statement with non-empty `args` and non-empty `named_args` fails alone with `SQL_INPUT_ERROR` (an empty array counts as omitted). `get_autocommit` and the `is_autocommit` condition on `/v2/pipeline` fail alone with `UNSUPPORTED` (section 2 lets a server refuse them there).
+- A malformed request in a pipeline fails alone with `PROTO_ERROR`, and an unknown request type with `UNSUPPORTED`; the other requests still run. A statement with non-empty `args` and non-empty `named_args` fails alone with `SQL_INPUT_ERROR` (an empty array counts as omitted). `get_autocommit` and the `is_autocommit` condition on `/v2/pipeline` fail alone with `UNSUPPORTED` (see Remaining differences).
 - Not served: the WebSocket transport, `/v3-protobuf`, and what lies outside the protocol: sqld's v1 HTTP (`/v1/execute`, `/v1/batch`, `POST /`), `/version`, namespaces, dump and replication.
 
 **Remaining differences from PROTOCOL.md.**
 - An expired or unknown baton gets 400 `STREAM_EXPIRED`, where the protocol says "typically 404" (section 4.5). The conformance suite accepts any non-200.
+- Section 5.3 says every protocol-level failure closes the stream and rolls back its transaction. This server closes the stream a baton names only for a `close` that is not the last request and for a batch condition on its own or a later step. A 400 for a malformed body, a 408 (body not read in time), a 413, a 401, or 400 `ENCRYPTION_KEY_NOT_ACCEPTED` leaves that stream, and any transaction open on it, as it was, until it is reaped (`DURABLE_SERVE_STREAM_TIMEOUT_MS`) or used again with its baton.
+- Section 2 lets a server reject `get_autocommit` and the `is_autocommit` condition on `/v2` as a protocol-level failure (the whole HTTP request). This server refuses them per request instead, in-band with `UNSUPPORTED`, and the pipeline's other requests still run.
 - There is no WebSocket transport, and `/v3-protobuf` gets 404.
 - `base_url` is always null (section 4.6).
 - The cursor is buffered, not streamed (section 7): the whole batch runs before the first line is sent (see Memory).
@@ -504,7 +506,7 @@ sequenceDiagram
 |---|---|---|
 | `{"status":"starting"}` | 503 | From the bind until the database is open. |
 | `{"status":"ready"}` | 200 | The database is open. |
-| `{"status":"fenced"}` | 503 | A library call returned `Fenced`. From then on every request in a pipeline, and every statement of a cursor batch, on every stream gets `FENCED` without calling the library, and its stream closes. An empty pipeline or empty cursor batch, which holds none, still gets 200. |
+| `{"status":"fenced"}` | 503 | A library call returned `Fenced`. From then on every request in a pipeline, and every statement that runs in a cursor batch, on every stream gets `FENCED` without calling the library, and its stream closes. An empty pipeline or empty cursor batch, which holds none, still gets 200. |
 | `{"status":"shutting_down"}` | 503 | Shutdown has begun (this wins over `fenced`). |
 
 **Limit: an idle fenced server reports `ready` until a write hits the fence.** The server learns it is fenced only from a library call that returns `Fenced`. Check `/health` after a write, or watch for `FENCED` errors.
@@ -587,7 +589,7 @@ How the suite was run:
    ```sh
    git -C /path/to/turso archive 0b2bec917 serverless | tar -x -C "$SCRATCH"
    ```
-2. Make a scratch Cargo workspace (`$SCRATCH/ws`) with two members: `turso_serverless`, the files of `serverless/rust`, and `conformance`, the files of `serverless/rust/conformance` (`turso_serverless_conformance`). Upstream's manifests inherit from turso's workspace, so spell each inherited key out (`version`, `edition`, `license` and each `workspace = true` dependency). Give reqwest `default-features = false`, with features `["json","stream"]` for `turso_serverless` and `["json"]` for the conformance crate, and point the conformance crate's `turso_serverless` dependency at `../turso_serverless`.
+2. Make a scratch Cargo workspace (`$SCRATCH/ws`) with two members: `turso_serverless`, the files of `serverless/rust`, and `conformance`, the files of `serverless/rust/conformance` (`turso_serverless_conformance`). Upstream's manifests inherit from turso's workspace, so spell out every `*.workspace = true` key (`version`, `authors`, `edition`, `license`, `repository`, and each `workspace = true` dependency). Give reqwest `default-features = false`, with features `["json","stream"]` for `turso_serverless` and `["json"]` for the conformance crate, and point the conformance crate's `turso_serverless` dependency at `../turso_serverless`.
 3. Have the resolved `Cargo.lock` audited (rust-supply-chain-auditor) before building anything. It is not kept in this repo; the run's lock had the sha256 above.
 4. Start `serve` with a token file on 127.0.0.1, on its own prefix:
    ```sh
@@ -598,9 +600,10 @@ How the suite was run:
 5. With no proxy variables set, run the suite and the Go driver against it:
    ```sh
    export TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token>
-   (cd "$SCRATCH/ws" && cargo test --locked -p turso_serverless_conformance)   # and again with -- --test-threads=1
-   (cd "$SCRATCH/serverless/go" && GOTOOLCHAIN=local GOPROXY=off go test ./...)
+   (cd "$SCRATCH/ws" && cargo test --locked -p turso_serverless_conformance -- --nocapture)   # and again with --test-threads=1
+   (cd "$SCRATCH/serverless/go" && GOTOOLCHAIN=local GOPROXY=off go test -v ./...)
    ```
+6. Check that the tests really reached the server. **Both suites skip every test and still report ok when the variables are unset:** each Rust conformance test prints `skipping: set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN …` and returns (it needs both variables), and each Go test calls `t.Skip` when `TURSO_DATABASE_URL` is empty. So no line may contain `skipping` in the cargo output (with `--nocapture`), and no `--- SKIP` may appear in the `go test -v` output.
 
 ## Settings
 
@@ -928,9 +931,9 @@ A is fenced at its next request, but the object it overwrote stays. A possible f
 
 **Server limits.** `serve` adds these (and see Server, Memory and Remaining differences from PROTOCOL.md):
 - A client that dies inside a transaction holds the write lock until its stream is reaped: `DURABLE_SERVE_STREAM_TIMEOUT_MS` (10 s) plus up to 1 s. Writers on other streams wait only `DURABLE_SERVE_BUSY_TIMEOUT_MS` (5 s), then get `SQLITE_BUSY`. Follow-up: an idle timeout below the busy timeout for streams in a transaction.
-- A BUSY wait on the `sequence` path spins one core for the whole wait (turso_core's `run_ignore_rows` ignores the sleep time). `execute` sleeps. Follow-up in the library or upstream.
+- A BUSY wait in a `sequence` spins one core for the whole wait when `Connection::execute_batch` runs the SQL as one engine call (turso_core's `run_ignore_rows` ignores the sleep time). It steps statement by statement instead, and sleeps, in three cases: the SQL mentions `durable_batching`, the open is read-only, or a transaction with its own batching setting is open. `execute` sleeps. Follow-up in the library or upstream.
 - There is no time limit on a running statement.
-- After a fence, every request in a pipeline and every statement of a cursor batch gets `FENCED`, but an empty pipeline or empty cursor batch, which holds none, still gets 200.
+- After a fence, every request in a pipeline and every statement that runs in a cursor batch gets `FENCED` (a step whose condition is then false is skipped), but an empty pipeline or empty cursor batch, which holds none, still gets 200.
 - The per-stream batching PRAGMA is caught through `execute` (and batch steps) but not through `sequence`.
 - During startup or shutdown, an unauthenticated request can get 503 before 401.
 - Once a fresh database is initialised at startup (see Server, Startup), `PRAGMA page_size = N` is silently ignored, because the page size is fixed when page 1 is created.
@@ -963,7 +966,7 @@ Source: `results/durable-transport.txt`. These are laptop figures (Apple M4 Max,
 - Seals took 44-66 ms for 169-170 pages under Off and 53-68 ms under the window, in all three setups (the setup close's 2-page seal 6.5-7.5 ms in (b) and (c); setup (a)'s, the first run after the build, took 22 ms, not investigated).
 - Restore of the 1000-commit database (generation 4): 4 GETs (`3 + 1` log object), 1 LIST and 4404 bytes, 21-23 ms, with and without encryption. An encrypted page is the size of a plaintext one.
 - The first writer open of a directory restored by `restore` or `takeover` is where stage 4 added requests: the encryption check needs page 1, and a directory that holds none GETs the head, the manifest and page 1 first (this happens without a key too). Opening the restored 1000-commit directory made 2 PUTs, 11 GETs and 3 LISTs (37-73 ms), the same with and without a key. The stage-3 row below, re-measured with its request lines, shows the same 3 extra GETs on the first open after a takeover.
-- The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took 11.7 min (`real 703.27` s, 11:43), and the larger pass held 708 MB in RustFS at its peak (the canonical final run, at b4afb8f; the earlier run at 5215309 took 11.5 min and peaked at 711 MB). With the server's tests it now takes 12.0 min and peaks at 735 MB (`results/durable-server.txt`; see Test command).
+- The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took 11.7 min (`real 703.27` s, 11:43), and the larger pass held 708 MB in RustFS at its peak (the canonical final run, at b4afb8f; the earlier run at 5215309 took 11.5 min and peaked at 711 MB). With the server's tests it now takes 12.3 min (12:15, round 3's run at eda0d1d) and peaks at 751 MB (`results/durable-server.txt`; see Test command).
 
 ### Stage 3: takeover, lease and GC
 
@@ -1061,7 +1064,7 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
   - In pass 2, after the tests, it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then `sql` creating table `marker` with the row `turso-durable-marker-<run id>` and a `wal_checkpoint(TRUNCATE)`, then `restore`, `takeover` and `gc`), so every span kind except `durable.maintenance` is exported, then the scan.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
   - On exit, pass or fail, it empties RustFS's storage again in plain mode (`scripts/rustfs.sh reset`) and removes the TLS material. A failed reset is reported on stderr and the exit code stays the tests'.
-  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured with the server at 4621d4e (`results/durable-server.txt`; laptop, RustFS): 721 MB (plain) and 735 MB (https+encryption), a whole run 12.0 min (12:01.5). Each pass ran 5 `serve` tests (about 7 s), 38 system tests and the S3 tests (8 in pass 1, 12 in pass 2); the unit step ran 546 tests (587 now). Stage 4's canonical run at b4afb8f (`results/durable-transport.txt`): 684 and 708 MB, 11.7 min (11:43). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
+  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured in round 3's full run at eda0d1d (`results/durable-server.txt`; laptop, RustFS): 703 MB (plain) and 751 MB (https+encryption), a whole run 12:15. Each pass ran 5 `serve` tests (7-9 s), 38 system tests and the S3 tests (8 in pass 1, 12 in pass 2); the unit step ran 587 tests. The round-2 run at 4621d4e (superseded) peaked at 721 and 735 MB in 12:01.5, with 546 unit tests. Stage 4's canonical run at b4afb8f (`results/durable-transport.txt`): 684 and 708 MB, 11.7 min (11:43). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
   - Outside `test.sh`, each RustFS-backed test deletes its bucket prefix when it ends. `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
 - `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `down` removes the container and its volume `turso-durable-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it. With `TURSO_DURABLE_TLS_DIR` set to a directory from `scripts/tls-material.sh DIR`, it runs RustFS over HTTPS (a container is plain or TLS for its whole life; `reset` switches).
 - tursodb's conformance suite and the Go driver are not part of `test.sh`. They were run by hand against `serve`, outside this repo (see Server, Clients run and not run).

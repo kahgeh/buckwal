@@ -1,6 +1,7 @@
 # turso_durable durable-server: the full test command run
-# The figures below are from 4621d4e (round 2). The full run is redone at the end of round 3;
-#   round 3's client runs are in the section at the end of this file.
+# SUPERSEDED: the figures directly below are round 2's run at 4621d4e. The canonical full run
+#   is now round 3's at eda0d1d (the "Round 3: full test command run" block at the end of this
+#   file). Round 3's client runs are in the section before it.
 # date: 2026-10-18T22:03:40 local (test run id turso-durable-20261018220340-53912)
 # git: 4621d4e60a23eb28dd3a8cf14e5e03b9c7741fe2 (durable-server), with this commit's script
 #   changes in the working tree: scripts/otel-check.sh (SPANS gains durable.server.request) and
@@ -120,3 +121,46 @@
 #   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-parallel.log
 #   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-before.log
 #   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-t2b.log
+#
+# ---------------------------------------------------------------------------------------------
+# Round 3: full test command run (canonical; supersedes the 4621d4e figures at the top)
+# ---------------------------------------------------------------------------------------------
+# date: 2026-10-19 (test run id turso-durable-20261019230210-97811)
+# git: eda0d1d (durable-server); the code is unchanged since 9aec32a (eda0d1d is docs and
+#   comments only)
+# Command: ./scripts/test.sh, run by the controller. exit 0; wall time 12:15.
+# Log (scratch, outside the repo): /private/tmp/claude-502/round3/full-run.log
+#
+# unit (fmt, clippy -D warnings, cargo test --workspace --locked): 587 passed
+#   turso-durable (cli bin) 28; turso-durable-hrana-client 6; turso-durable-server lib 80,
+#   tests/http.rs 36, tests/span.rs 1; turso_durable lib 397, batching 33, fencing 5, otel_down 1
+#
+# pass 1 (plain HTTP, no encryption; --skip tls_):
+#   server: "test result: ok. 5 passed; 0 failed" (7.21 s)
+#   system: "test result: ok. 38 passed; 0 failed" (277.42 s)
+#   s3_rustfs: "test result: ok. 8 passed; 0 failed; ... 4 filtered out" (2.75 s)
+#   scan: 43187 objects, 539638731 bytes
+#   CREATE TABLE: found in 13140 objects (the control: present)
+#   SQLite header: found in 13140 objects
+#   bench payload: found in 1908 objects
+#   peak turso-durable-objects: 703 MB (plain)
+#
+# pass 2 (HTTPS + encryption, every test; serve over HTTPS with a bearer token):
+#   server: "test result: ok. 5 passed; 0 failed" (9.35 s)
+#   system: "test result: ok. 38 passed; 0 failed" (303.79 s)
+#   s3_rustfs: "test result: ok. 12 passed; 0 failed" (4.69 s)
+#   scan: 46002 objects, 578629934 bytes
+#   CREATE TABLE: not found
+#   SQLite header: not found
+#   bench payload: not found
+#   marker 1: not found
+#   the encryption key: not found
+#   peak turso-durable-objects: 751 MB (https+encryption)
+#
+# otel check PASSED: durable.ack_wait=84860 durable.checkpoint_upload=530 durable.commit=84860
+#   durable.fence=23 durable.gc=818 durable.local_fsync=85034 durable.local_write=85070
+#   durable.maintenance=112 durable.restore=154 durable.server.request=2890 durable.takeover=23
+#   durable.upload=52593 logs=1053
+#
+# Against round 2's run (4621d4e: 12:01.5, peaks 721 and 735 MB, 546 unit tests): 41 more unit
+#   tests; the plain peak 18 MB lower and the https+encryption peak 16 MB higher.
