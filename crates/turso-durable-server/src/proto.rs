@@ -73,6 +73,7 @@ pub enum StreamResponse {
     Execute { result: StmtResult },
     Batch { result: BatchResult },
     Sequence,
+    Describe { result: DescribeResult },
     StoreSql,
     CloseSql,
     GetAutocommit { is_autocommit: bool },
@@ -113,6 +114,21 @@ pub struct StmtResult {
 pub struct Col {
     pub name: Option<String>,
     pub decltype: Option<String>,
+}
+
+/// A `describe` result (PROTOCOL.md 6.4).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DescribeResult {
+    pub params: Vec<DescribeParam>,
+    pub cols: Vec<Col>,
+    pub is_explain: bool,
+    pub is_readonly: bool,
+}
+
+/// One bind parameter: `name` is `null` for a positional one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DescribeParam {
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -304,6 +320,26 @@ pub fn stmt_result(
         rows_written: 0,
         query_duration_ms: elapsed.as_secs_f64() * 1000.0,
     })
+}
+
+pub fn describe_result(d: turso_durable::Description) -> DescribeResult {
+    DescribeResult {
+        params: d
+            .params
+            .into_iter()
+            .map(|name| DescribeParam { name })
+            .collect(),
+        cols: d
+            .columns
+            .into_iter()
+            .map(|c| Col {
+                name: Some(c.name),
+                decltype: c.decltype,
+            })
+            .collect(),
+        is_explain: d.is_explain,
+        is_readonly: d.is_readonly,
+    }
 }
 
 pub fn error_code(e: &turso_durable::Error) -> &'static str {

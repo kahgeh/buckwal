@@ -267,6 +267,11 @@ pub fn get_autocommit() -> Value {
     json!({"type":"get_autocommit"})
 }
 
+/// tursodb's serverless drivers send this before every prepare (PROTOCOL.md 6.4).
+pub fn describe(sql: &str) -> Value {
+    json!({"type":"describe","sql":sql})
+}
+
 /// The batch body (`{"steps":[...]}`) of @libsql/client 0.15.15 hrana.js transactions.
 /// Usable as a cursor `batch`; [`tx_batch_request`] wraps it for a pipeline.
 pub fn tx_batch(stmts: &[Value]) -> Value {
@@ -381,6 +386,11 @@ mod tests {
         assert_eq!(sequence("A;B"), json!({"type":"sequence","sql":"A;B"}));
         assert_eq!(close(), json!({"type":"close"}));
         assert_eq!(get_autocommit(), json!({"type":"get_autocommit"}));
+        // tursodb SQL over HTTP v3 (PROTOCOL.md 6.4): describe.
+        assert_eq!(
+            describe("SELECT 1"),
+            json!({"type":"describe","sql":"SELECT 1"})
+        );
         // @libsql/hrana-client 0.9.0: batch conditions.
         let s = stmt("S", &[]);
         assert_eq!(

@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use turso_durable_hrana_client::{
-    execute, result_error, stmt, tx_batch_request, Arg, Client, Proto, Reply, Stream,
+    describe, execute, result_error, result_rows, stmt, tx_batch_request, Arg, Client, Proto,
+    Reply, Stream,
 };
 
 /// How long a server may take to print a line (`serve ready` opens the database, which may
@@ -590,6 +591,28 @@ fn serve_client_writes_off_window_and_txn_batching() {
     assert_eq!(ran, want, "{}", r.body);
     acks.extend(ids.iter().map(|id| format!("ack {id}")));
     assert_eq!(acks.len(), 270);
+
+    // A tursodb serverless driver's prepare, then its query, on one stream: describe, then
+    // execute with as many arguments as it reported. A described INSERT never runs.
+    let mut st8 = c.stream(Proto::V3);
+    let select = "SELECT payload FROM soak WHERE id = ?";
+    let r = must_ok(&mut st8, vec![describe(select), describe(INSERT)]);
+    let described = &r.body["results"][0]["response"]["result"];
+    assert_eq!(
+        described,
+        &json!({"params": [{"name": null}], "cols": [{"name": "payload", "decltype": "BLOB"}],
+            "is_explain": false, "is_readonly": true}),
+        "{}",
+        r.body
+    );
+    let insert = &r.body["results"][1]["response"]["result"];
+    assert_eq!(insert["is_readonly"], json!(false), "{}", r.body);
+    let n = described["params"].as_array().expect("params").len();
+    let r = must_ok(&mut st8, vec![execute(select, &vec![Arg::Int(6001); n])]);
+    assert_eq!(
+        result_rows(&r, 0).expect("rows"),
+        vec![vec![json!(payload(6001))]]
+    );
 
     let mut st7 = c.stream(Proto::V3);
     let count = json!({"steps": [{"stmt": stmt("SELECT count(*) FROM soak", &[])}]});

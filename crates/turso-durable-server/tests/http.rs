@@ -10,8 +10,8 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use turso_durable::takeover_with_store;
 use turso_durable_hrana_client::{
-    batch, close, cond_ok, execute, execute_named, get_autocommit, result_error, result_rows, stmt,
-    tx_batch_request, Arg, Client, Proto, Reply,
+    batch, close, cond_ok, describe, execute, execute_named, get_autocommit, result_error,
+    result_rows, stmt, tx_batch_request, Arg, Client, Proto, Reply,
 };
 use turso_durable_server::{bind, ServeConfig, ShutdownReport, TlsFiles};
 
@@ -314,6 +314,42 @@ fn unknown_request_type_errors_alone() {
     s.stop().unwrap();
 }
 
+/// A driver's prepare, then its query: describe, then execute with as many arguments as the
+/// describe reported, on one stream, on both pipeline endpoints.
+#[test]
+fn describe_then_execute_on_v2_and_v3() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut st = c.stream(Proto::V3);
+    ok_pipeline(
+        &st.pipeline(vec![
+            execute(CREATE, &[]),
+            execute("INSERT INTO t VALUES (7, 'seven')", &[]),
+        ])
+        .unwrap(),
+    );
+    for proto in [Proto::V2, Proto::V3] {
+        let mut st = c.stream(proto);
+        let sql = "SELECT body FROM t WHERE id = ?";
+        let r = st.pipeline(vec![describe(sql)]).unwrap();
+        ok_pipeline(&r);
+        let d = &r.body["results"][0]["response"];
+        assert_eq!(d["type"], "describe", "{proto:?}: {}", r.body);
+        assert_eq!(
+            d["result"],
+            json!({"params":[{"name":null}],"cols":[{"name":"body","decltype":"TEXT"}],
+                "is_explain":false,"is_readonly":true}),
+            "{proto:?}"
+        );
+        let n = d["result"]["params"].as_array().unwrap().len();
+        let args = vec![Arg::Int(7); n];
+        let r = st.pipeline(vec![execute(sql, &args), close()]).unwrap();
+        ok_pipeline(&r);
+        assert_eq!(result_rows(&r, 0).unwrap(), vec![vec![json!("seven")]]);
+    }
+    s.stop().unwrap();
+}
+
 fn pipeline_body() -> Vec<u8> {
     json!({"baton": null, "requests": [execute("SELECT 1", &[]), close()]})
         .to_string()
@@ -470,6 +506,10 @@ fn fenced_server_reports_unhealthy() {
     let (_, code) = result_error(&r, 0).expect("every request is fenced");
     assert_eq!(code.as_deref(), Some("FENCED"));
     assert_eq!(r.body["baton"], Value::Null);
+    let mut fresh = c.stream(Proto::V3);
+    let r = fresh.pipeline(vec![describe("SELECT 1")]).unwrap();
+    let (_, code) = result_error(&r, 0).expect("a describe is fenced too");
+    assert_eq!(code.as_deref(), Some("FENCED"));
     let report = s.stop().unwrap();
     assert!(
         report.fenced,

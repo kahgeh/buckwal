@@ -2,8 +2,8 @@
 //!
 //! SQL text, arguments and tokens are never logged here.
 use crate::proto::{
-    lib_error, stmt_result, to_value, Batch, BatchCond, BatchResult, ProtoError, Stmt, StmtResult,
-    StreamRequest, StreamResponse, StreamResult,
+    describe_result, lib_error, stmt_result, to_value, Batch, BatchCond, BatchResult, ProtoError,
+    Stmt, StmtResult, StreamRequest, StreamResponse, StreamResult,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -144,8 +144,13 @@ fn handle(
                 .map_err(|e| note(st, fence, &e))?;
             Ok(StreamResponse::Sequence)
         }
-        StreamRequest::Describe { .. } => {
-            Err(ProtoError::new("UNSUPPORTED", "describe is not supported"))
+        // Never through the batching intercept: a describe of the PRAGMA changes nothing.
+        StreamRequest::Describe { sql, sql_id } => {
+            let sql = resolve_sql(st, sql, sql_id)?;
+            let d = st.conn.describe(&sql).map_err(|e| note(st, fence, &e))?;
+            Ok(StreamResponse::Describe {
+                result: describe_result(d),
+            })
         }
         StreamRequest::StoreSql { sql_id, sql } => {
             if !st.sql.contains_key(&sql_id) && st.sql.len() >= MAX_STORED_SQL {
@@ -618,12 +623,108 @@ mod tests {
     }
 
     #[test]
-    fn describe_is_unsupported() {
+    fn describe_result_shape() {
         let mut f = fx();
-        assert_eq!(
-            f.err(Version::V3, json!({"type":"describe","sql":"SELECT 1"})),
-            "UNSUPPORTED"
+        f.sql("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)");
+        let r = f.ok(
+            json!({"type":"describe","sql":"SELECT id, name, 1 FROM t WHERE id = :id AND ? > ?3"}),
         );
+        assert_eq!(
+            r,
+            json!({"type":"describe","result":{
+                "params":[{"name":"id"},{"name":null},{"name":null}],
+                "cols":[
+                    {"name":"id","decltype":"INTEGER"},
+                    {"name":"name","decltype":"TEXT"},
+                    {"name":"1","decltype":null}],
+                "is_explain":false,
+                "is_readonly":true}})
+        );
+        let r = f.ok(json!({"type":"describe","sql":"EXPLAIN DELETE FROM t"}));
+        assert_eq!(r["result"]["is_explain"], true);
+        let r = f.ok(json!({"type":"describe","sql":"DELETE FROM t"}));
+        assert_eq!(
+            r["result"],
+            json!({"params":[],"cols":[],"is_explain":false,"is_readonly":false})
+        );
+        // On Hrana 2 too.
+        let StreamResult::Ok { .. } =
+            f.req(Version::V2, json!({"type":"describe","sql":"SELECT 1"}))
+        else {
+            panic!("describe on v2")
+        };
+    }
+
+    #[test]
+    fn describe_by_sql_id_and_bad_sql_choice() {
+        let mut f = fx();
+        f.ok(json!({"type":"store_sql","sql_id":3,"sql":"SELECT ?"}));
+        let r = f.ok(json!({"type":"describe","sql_id":3}));
+        assert_eq!(r["result"]["params"], json!([{"name":null}]));
+        for bad in [
+            json!({"type":"describe","sql_id":4}),
+            json!({"type":"describe","sql":"SELECT 1","sql_id":3}),
+            json!({"type":"describe"}),
+        ] {
+            assert_eq!(f.err(Version::V3, bad.clone()), "SQL_INPUT_ERROR", "{bad}");
+        }
+    }
+
+    #[test]
+    fn describe_of_lower_synchronous_is_an_error_and_sync_stays_full() {
+        let mut f = fx();
+        let r = f.req(
+            Version::V3,
+            json!({"type":"describe","sql":"PRAGMA synchronous=OFF"}),
+        );
+        let StreamResult::Error { error } = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(error.code.as_deref(), Some("UNSUPPORTED"));
+        assert!(error.message.contains("synchronous"), "{error:?}");
+        let r = f.sql("PRAGMA synchronous");
+        assert_eq!(r["rows"][0][0], json!({"type":"integer","value":"2"}));
+    }
+
+    #[test]
+    fn describe_of_batching_pragma_is_fixed_and_not_intercepted() {
+        let mut f = fx();
+        f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+        for sql in ["PRAGMA durable_batching = 'off'", "PRAGMA durable_batching"] {
+            let r = f.ok(json!({"type":"describe","sql":sql}));
+            assert_eq!(
+                r["result"],
+                json!({"params":[],"cols":[{"name":"durable_batching","decltype":null}],
+                    "is_explain":false,"is_readonly":false}),
+                "{sql}"
+            );
+            assert_eq!(setting(&mut f), "window 20ms 64 1MiB", "{sql}");
+        }
+    }
+
+    #[test]
+    fn describe_on_a_fenced_server_is_fenced() {
+        let mem = Arc::new(MemStore::new());
+        let dir_a = tempfile::tempdir().unwrap();
+        let db = open_with_store(config(&dir_a.path().join("db")), mem.clone()).unwrap();
+        let mut st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let fence = Fence::new();
+        st.conn.execute("CREATE TABLE t(id INTEGER)", &[]).unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        takeover_with_store(config(&dir_b.path().join("db")), mem).unwrap();
+        let req = |st: &mut StreamState, r: J| execute_request(st, Version::V3, r, &fence);
+        let insert = json!({"type":"execute","stmt":{"sql":"INSERT INTO t VALUES (1)"}});
+        let StreamResult::Error { error } = req(&mut st, insert) else {
+            panic!("the insert is fenced")
+        };
+        assert_eq!(error.code.as_deref(), Some("FENCED"));
+        let mut fresh = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let describe = json!({"type":"describe","sql":"SELECT id FROM t"});
+        match req(&mut fresh, describe) {
+            StreamResult::Error { error } => assert_eq!(error.code.as_deref(), Some("FENCED")),
+            other => panic!("{other:?}"),
+        }
+        assert!(fresh.closed);
     }
 
     #[test]
