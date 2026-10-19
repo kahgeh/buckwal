@@ -1,10 +1,10 @@
 //! Hrana JSON types, conversion to and from library values, and error codes.
 
 use base64::alphabet;
-use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD_NO_PAD};
 use base64::engine::DecodePaddingMode;
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::time::Duration;
 
 const LENIENT: GeneralPurpose = GeneralPurpose::new(
@@ -220,10 +220,28 @@ impl ProtoError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HValue {
     Null,
-    Integer { value: String },
-    Float { value: f64 },
-    Text { value: String },
-    Blob { base64: String },
+    Integer {
+        value: String,
+    },
+    Float {
+        #[serde(serialize_with = "finite_or_null")]
+        value: f64,
+    },
+    Text {
+        value: String,
+    },
+    Blob {
+        base64: String,
+    },
+}
+
+/// JSON has no NaN or infinity: a non-finite float is written as `null` (PROTOCOL.md 8.2).
+fn finite_or_null<S: Serializer>(f: &f64, s: S) -> Result<S::Ok, S::Error> {
+    if f.is_finite() {
+        s.serialize_f64(*f)
+    } else {
+        s.serialize_none()
+    }
 }
 
 pub fn to_value(v: &HValue) -> Result<turso_durable::Value, ProtoError> {
@@ -259,56 +277,47 @@ pub fn to_value(v: &HValue) -> Result<turso_durable::Value, ProtoError> {
     })
 }
 
-pub fn from_value(v: &turso_durable::Value) -> Result<HValue, ProtoError> {
+/// A library value as a Hrana value: a blob as unpadded base64, a non-finite float kept (it
+/// is written as `null`).
+pub fn from_value(v: &turso_durable::Value) -> HValue {
     use turso_durable::Value;
     if matches!(v, Value::Null) {
-        return Ok(HValue::Null);
+        return HValue::Null;
     }
     if let Some(i) = v.as_int() {
-        return Ok(HValue::Integer {
+        return HValue::Integer {
             value: i.to_string(),
-        });
+        };
     }
     if let Some(t) = v.to_text() {
-        return Ok(HValue::Text {
+        return HValue::Text {
             value: t.to_string(),
-        });
+        };
     }
     if let Some(b) = v.to_blob() {
-        return Ok(HValue::Blob {
-            base64: STANDARD.encode(b),
-        });
+        return HValue::Blob {
+            base64: STANDARD_NO_PAD.encode(b),
+        };
     }
-    let f = v.as_float();
-    if f.is_nan() {
-        return Err(ProtoError::new(
-            "UNSUPPORTED",
-            "NaN float cannot be represented in JSON",
-        ));
+    HValue::Float {
+        value: v.as_float(),
     }
-    if f.is_infinite() {
-        return Err(ProtoError::new(
-            "UNSUPPORTED",
-            "infinite float cannot be represented in JSON",
-        ));
-    }
-    Ok(HValue::Float { value: f })
 }
 
 pub fn stmt_result(
     out: turso_durable::StmtOutput,
     want_rows: bool,
     elapsed: Duration,
-) -> Result<StmtResult, ProtoError> {
+) -> StmtResult {
     let rows = if want_rows {
         out.rows
             .iter()
-            .map(|r| r.iter().map(from_value).collect::<Result<Vec<_>, _>>())
-            .collect::<Result<Vec<_>, _>>()?
+            .map(|r| r.iter().map(from_value).collect())
+            .collect()
     } else {
         Vec::new()
     };
-    Ok(StmtResult {
+    StmtResult {
         cols: out
             .columns
             .into_iter()
@@ -323,7 +332,7 @@ pub fn stmt_result(
         rows_read: 0,
         rows_written: 0,
         query_duration_ms: elapsed.as_secs_f64() * 1000.0,
-    })
+    }
 }
 
 pub fn describe_result(d: turso_durable::Description) -> DescribeResult {
@@ -531,7 +540,7 @@ mod tests {
     fn round_trip(json: &str) -> (Value, HValue) {
         let h: HValue = serde_json::from_str(json).unwrap();
         let v = to_value(&h).unwrap();
-        let back = from_value(&v).unwrap();
+        let back = from_value(&v);
         (v, back)
     }
 
@@ -564,10 +573,11 @@ mod tests {
             let json = format!(r#"{{"type":"blob","base64":"{b}"}}"#);
             let (v, back) = round_trip(&json);
             assert_eq!(v.to_blob(), Some(&[0u8, 1, 2, 255][..]));
+            // Output is unpadded (PROTOCOL.md 8.2).
             assert_eq!(
                 back,
                 HValue::Blob {
-                    base64: "AAEC/w==".into()
+                    base64: "AAEC/w".into()
                 }
             );
         }
@@ -601,7 +611,7 @@ mod tests {
         let v = to_value(&h).unwrap();
         assert_eq!(v.as_int(), None);
         assert_eq!(v.as_float().to_bits(), 1.0f64.to_bits());
-        assert_eq!(from_value(&v).unwrap(), HValue::Float { value: 1.0 });
+        assert_eq!(from_value(&v), HValue::Float { value: 1.0 });
     }
 
     #[test]
@@ -617,10 +627,38 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_float_is_an_error() {
-        let e = from_value(&Value::from_f64(f64::INFINITY)).unwrap_err();
-        assert_eq!(e.code.as_deref(), Some("UNSUPPORTED"));
-        assert!(e.message.contains("infinite"), "{}", e.message);
+    fn non_finite_float_is_null() {
+        for f in [f64::INFINITY, f64::NEG_INFINITY] {
+            let h = from_value(&Value::from_f64(f));
+            assert!(matches!(h, HValue::Float { value } if value == f), "{h:?}");
+        }
+        // The engine stores NaN as NULL, so only infinities reach `from_value`.
+        for f in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let h = HValue::Float { value: f };
+            assert_eq!(
+                serde_json::to_value(&h).unwrap(),
+                serde_json::json!({"type":"float","value":null}),
+                "{f}"
+            );
+            assert_eq!(
+                serde_json::to_string(&h).unwrap(),
+                r#"{"type":"float","value":null}"#,
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_output_is_unpadded_standard_base64() {
+        for (bytes, b64) in [
+            (&[0xde, 0xad, 0xbe, 0xef][..], "3q2+7w"),
+            (&[0xfb, 0xff][..], "+/8"),
+            (&[1, 2, 3][..], "AQID"),
+            (&[][..], ""),
+        ] {
+            let v = Value::from_slice(bytes).unwrap();
+            assert_eq!(from_value(&v), HValue::Blob { base64: b64.into() });
+        }
     }
 
     fn output() -> StmtOutput {
@@ -637,7 +675,7 @@ mod tests {
 
     #[test]
     fn stmt_result_shape() {
-        let r = stmt_result(output(), true, Duration::from_millis(2)).unwrap();
+        let r = stmt_result(output(), true, Duration::from_millis(2));
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["cols"][0]["name"], "id");
         assert_eq!(j["cols"][0]["decltype"], "INTEGER");
@@ -648,7 +686,7 @@ mod tests {
         assert_eq!(j["query_duration_ms"], 2.0);
         assert_eq!(j["rows"][1][0]["value"], "2");
 
-        let r = stmt_result(output(), false, Duration::from_millis(2)).unwrap();
+        let r = stmt_result(output(), false, Duration::from_millis(2));
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["rows"], serde_json::json!([]));
         assert_eq!(j["cols"][0]["name"], "id");

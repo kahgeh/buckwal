@@ -239,7 +239,7 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
         .conn
         .run(&sql, &args, &named)
         .map_err(|e| note(st, fence, &e))?;
-    stmt_result(out, want_rows, start.elapsed())
+    Ok(stmt_result(out, want_rows, start.elapsed()))
 }
 
 /// Run a batch. Conditions are checked up front, so a bad one fails the whole batch.
@@ -470,6 +470,23 @@ mod tests {
         assert_eq!(r["cols"][1]["name"], "name");
         assert_eq!(r["rows"][0][0], json!({"type":"integer","value":"1"}));
         assert_eq!(r["rows"][0][1], json!({"type":"text","value":"a"}));
+    }
+
+    #[test]
+    fn non_finite_results_are_null_floats() {
+        let mut f = fx();
+        let r = f.sql("SELECT 1e999, -1e999");
+        let nf = json!({"type":"float","value":null});
+        assert_eq!(r["rows"][0], json!([nf, nf]));
+        // A write whose RETURNING gives inf is answered (it was committed).
+        f.sql("CREATE TABLE r(x REAL)");
+        let r = f.sql("INSERT INTO r VALUES (1e999) RETURNING x");
+        assert_eq!(r["rows"][0][0], nf);
+        assert_eq!(f.sql("SELECT count(*) FROM r")["rows"][0][0]["value"], "1");
+        // Input is unchanged: a null float value is still not accepted.
+        let arg = json!({"type":"float","value":null});
+        let req = json!({"type":"execute","stmt":{"sql":"SELECT ?","args":[arg]}});
+        assert_eq!(f.err(Version::V3, req), "PROTO_ERROR");
     }
 
     #[test]

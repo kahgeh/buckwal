@@ -232,6 +232,36 @@ fn cursor_bad_condition_is_a_final_error_entry() {
     s.stop().unwrap();
 }
 
+/// A non-finite float is `{"type":"float","value":null}` and a blob is unpadded base64
+/// (PROTOCOL.md 8.2), in pipeline results and in cursor rows. Padded input is still read.
+#[test]
+fn non_finite_floats_are_null_and_blobs_unpadded() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut st = c.stream(Proto::V3);
+    let sql = "SELECT 1e999, -1e999, ?, ?";
+    let padded = json!({"type":"blob","base64":"3q2+7w=="});
+    let unpadded = json!({"type":"blob","base64":"3q2+7w"});
+    let mut q = stmt(sql, &[]);
+    q["args"] = json!([padded, unpadded]);
+    let want = json!([
+        {"type":"float","value":null},
+        {"type":"float","value":null},
+        {"type":"blob","base64":"3q2+7w"},
+        {"type":"blob","base64":"3q2+7w"}
+    ]);
+    let r = st
+        .pipeline(vec![json!({"type":"execute","stmt":q.clone()})])
+        .unwrap();
+    ok_pipeline(&r);
+    assert_eq!(r.body["results"][0]["response"]["result"]["rows"][0], want);
+    let (status, entries) = st.cursor(json!({"steps":[{"stmt":q}]})).unwrap();
+    assert_eq!(status, 200, "{entries:?}");
+    assert_eq!(entries[1]["type"], "row", "{entries:?}");
+    assert_eq!(entries[1]["row"], want);
+    s.stop().unwrap();
+}
+
 #[test]
 fn libsql_client_transaction_batch_commits_once() {
     let s = start(Opts::default());
