@@ -204,6 +204,12 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
         st.closed = true;
         return Err(fenced_error());
     }
+    if !stmt.args.is_empty() && !stmt.named_args.is_empty() {
+        return Err(ProtoError::new(
+            "SQL_INPUT_ERROR",
+            "a statement cannot have both args and named_args",
+        ));
+    }
     let sql = resolve_sql(st, stmt.sql.clone(), stmt.sql_id)?;
     let want_rows = stmt.want_rows.unwrap_or(true);
     let start = Instant::now();
@@ -357,7 +363,8 @@ fn check_cond(c: &BatchCond, at: usize, v: Version) -> Result<(), ProtoError> {
 fn eval_cond(c: &BatchCond, outcome: &[Option<bool>], st: &StreamState) -> bool {
     match c {
         BatchCond::Ok { step } => outcome[*step as usize] == Some(true),
-        BatchCond::Error { step } => outcome[*step as usize] == Some(false),
+        // The negation of `ok`: a skipped step counts too (PROTOCOL.md 6.2.1).
+        BatchCond::Error { step } => outcome[*step as usize] != Some(true),
         BatchCond::Not { cond } => !eval_cond(cond, outcome, st),
         BatchCond::And { conds } => conds.iter().all(|c| eval_cond(c, outcome, st)),
         BatchCond::Or { conds } => conds.iter().any(|c| eval_cond(c, outcome, st)),
@@ -540,6 +547,28 @@ mod tests {
     }
 
     #[test]
+    fn mixed_args_and_named_args_are_sql_input_error() {
+        let mut f = fx();
+        let one = json!({"type":"integer","value":"1"});
+        let named = json!([{"name":"a","value":one}]);
+        let mixed = json!({"sql":"SELECT ?, :a","args":[one],"named_args":named});
+        assert_eq!(
+            f.err(Version::V3, json!({"type":"execute","stmt":mixed})),
+            "SQL_INPUT_ERROR"
+        );
+        let r = f.ok(json!({"type":"batch","batch":{"steps":[{"stmt":mixed}]}}));
+        assert_eq!(r["result"]["step_errors"][0]["code"], "SQL_INPUT_ERROR");
+        // An empty array is the same as leaving the field out.
+        for stmt in [
+            json!({"sql":"SELECT :a","args":[],"named_args":named}),
+            json!({"sql":"SELECT ?","args":[one],"named_args":[]}),
+        ] {
+            let r = f.ok(json!({"type":"execute","stmt":stmt}));
+            assert_eq!(r["result"]["rows"][0][0]["value"], "1", "{stmt}");
+        }
+    }
+
+    #[test]
     fn stored_sql_by_id_and_unknown_id() {
         let mut f = fx();
         f.ok(json!({"type":"store_sql","sql_id":7,"sql":"SELECT 41 + 1"}));
@@ -621,6 +650,32 @@ mod tests {
         );
         let r = f.sql("SELECT count(*) FROM t");
         assert_eq!(r["rows"][0][0]["value"], "0");
+    }
+
+    /// `error` is the negation of `ok`: true for a failed and for a skipped step.
+    #[test]
+    fn batch_error_condition_is_not_ok() {
+        let mut f = fx();
+        let ok = |s: u32| json!({"type":"ok","step":s});
+        let error = |s: u32| json!({"type":"error","step":s});
+        let r = f.ok(json!({"type":"batch","batch":{"steps":[
+            step("SELECT 1", None),
+            step("SELECT * FROM nope", None),
+            step("SELECT 2", Some(ok(0))),
+            step("SELECT 3", Some(ok(1))),
+            step("SELECT 4", Some(error(1))),
+            step("SELECT 5", Some(json!({"type":"not","cond":error(3)}))),
+            step("SELECT 6", Some(error(3))),
+            step("SELECT 7", Some(error(0))),
+        ]}}));
+        let res = &r["result"];
+        let ran: Vec<bool> = (0..8).map(|i| !res["step_results"][i].is_null()).collect();
+        assert_eq!(
+            ran,
+            [true, false, true, false, true, false, true, false],
+            "{res}"
+        );
+        assert!(!res["step_errors"][1].is_null());
     }
 
     #[test]

@@ -336,6 +336,34 @@ fn pipeline_forward_condition_fails_the_whole_pipeline() {
     s.stop().unwrap();
 }
 
+/// The cursor's `error` condition is the negation of `ok`: true for a skipped step too
+/// (PROTOCOL.md 6.2.1).
+#[test]
+fn cursor_error_condition_is_true_for_a_skipped_step() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut st = c.stream(Proto::V3);
+    let error = |n: usize| json!({"type":"error","step":n});
+    let b = batch(vec![
+        (None, stmt("SELECT * FROM nope", &[])),
+        (Some(cond_ok(0)), stmt("SELECT 1", &[])),
+        (Some(error(1)), stmt("SELECT 2", &[])),
+        (
+            Some(json!({"type":"not","cond":error(1)})),
+            stmt("SELECT 3", &[]),
+        ),
+    ]);
+    let (status, entries) = st.cursor(b["batch"].clone()).unwrap();
+    assert_eq!(status, 200, "{entries:?}");
+    let begun: Vec<i64> = entries
+        .iter()
+        .filter(|e| e["type"] == "step_begin")
+        .map(|e| e["step"].as_i64().unwrap())
+        .collect();
+    assert_eq!(begun, [2], "{entries:?}");
+    s.stop().unwrap();
+}
+
 /// A non-finite float is `{"type":"float","value":null}` and a blob is unpadded base64
 /// (PROTOCOL.md 8.2), in pipeline results and in cursor rows. Padded input is still read.
 #[test]
