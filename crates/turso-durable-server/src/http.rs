@@ -530,7 +530,7 @@ fn protocol_error(streams: &Streams, baton: Option<&str>, e: &ProtoError) -> Don
     }
     error(
         StatusCode::BAD_REQUEST,
-        "PROTO_ERROR",
+        e.code.as_deref().unwrap_or("PROTO_ERROR"),
         &e.message,
         "bad_request",
     )
@@ -593,7 +593,7 @@ fn cursor_entries(result: Result<BatchResult, ProtoError>) -> Vec<CursorEntry> {
         entries.extend(r.rows.into_iter().map(|row| CursorEntry::Row { row }));
         entries.push(CursorEntry::StepEnd {
             affected_row_count: r.affected_row_count,
-            last_insert_rowid: r.last_insert_rowid.and_then(|id| id.parse().ok()),
+            last_insert_rowid: r.last_insert_rowid,
         });
     }
     entries.push(CursorEntry::ReplicationIndex {
@@ -658,18 +658,16 @@ mod tests {
         h
     }
 
-    #[test]
-    fn a_panic_closes_the_stream_and_gives_it_back() {
+    /// A registry over a new database in `dir`, on a `MemStore`.
+    fn streams(dir: &std::path::Path) -> Streams {
         use crate::streams::StreamsCfg;
         use turso_durable::store::MemStore;
-        let dir = tempfile::tempdir().unwrap();
-        let mut c =
-            turso_durable::Config::new(dir.path().join("db"), "http://127.0.0.1:1", "b", "k", "s");
+        let mut c = turso_durable::Config::new(dir.join("db"), "http://127.0.0.1:1", "b", "k", "s");
         c.retry_deadline = Duration::from_secs(2);
         c.request_timeout = Duration::from_millis(500);
         c.lease = Duration::from_secs(5);
         let db = turso_durable::open_with_store(c, Arc::new(MemStore::new())).unwrap();
-        let streams = Streams::new(
+        Streams::new(
             db,
             StreamsCfg {
                 timeout: Duration::from_secs(10),
@@ -677,7 +675,13 @@ mod tests {
                 max: 4,
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn a_panic_closes_the_stream_and_gives_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let streams = streams(dir.path());
         let Checkout::Stream(leased) = streams.checkout(None) else {
             panic!("no stream");
         };
@@ -697,6 +701,20 @@ mod tests {
         assert_eq!(n, 7);
         assert!(baton.is_some());
         assert_eq!(streams.close_all().streams, 1);
+        streams.database().clone().close().unwrap();
+    }
+
+    /// The 400 carries the protocol error's own code and message.
+    #[test]
+    fn protocol_error_keeps_the_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let streams = streams(dir.path());
+        let done = protocol_error(&streams, None, &ProtoError::new("SOME_CODE", "bad"));
+        assert_eq!(done.resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(done.outcome, "bad_request");
+        let body = body_json(*done.resp);
+        assert_eq!(body, json!({"message":"bad","code":"SOME_CODE"}));
+        streams.close_all();
         streams.database().clone().close().unwrap();
     }
 
@@ -788,7 +806,7 @@ mod tests {
             }],
             rows: vec![vec![], vec![]],
             affected_row_count: 1,
-            last_insert_rowid: Some("9007199254740993".into()),
+            last_insert_rowid: Some(9007199254740993),
             rows_read: 0,
             rows_written: 1,
             query_duration_ms: 0.0,

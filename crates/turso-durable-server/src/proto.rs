@@ -99,12 +99,14 @@ pub struct NamedArg {
     pub value: HValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StmtResult {
     pub cols: Vec<Col>,
     pub rows: Vec<Vec<HValue>>,
     pub affected_row_count: u64,
-    pub last_insert_rowid: Option<String>,
+    /// A decimal string here (PROTOCOL.md 8.4); the cursor's `step_end` carries the number.
+    #[serde(serialize_with = "decimal_or_null")]
+    pub last_insert_rowid: Option<i64>,
     pub rows_read: u64,
     pub rows_written: u64,
     pub query_duration_ms: f64,
@@ -154,7 +156,7 @@ pub enum BatchCond {
     IsAutocommit,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BatchResult {
     pub step_results: Vec<Option<StmtResult>>,
     pub step_errors: Vec<Option<ProtoError>>,
@@ -241,6 +243,13 @@ fn finite_or_null<S: Serializer>(f: &f64, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_f64(*f)
     } else {
         s.serialize_none()
+    }
+}
+
+fn decimal_or_null<S: Serializer>(id: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match id {
+        Some(id) => s.collect_str(id),
+        None => s.serialize_none(),
     }
 }
 
@@ -331,7 +340,7 @@ pub fn stmt_result(
             .collect(),
         rows,
         affected_row_count: out.changes,
-        last_insert_rowid: inserted.then(|| out.last_insert_rowid.to_string()),
+        last_insert_rowid: inserted.then_some(out.last_insert_rowid),
         rows_read: 0,
         rows_written: out.changes,
         query_duration_ms: elapsed.as_secs_f64() * 1000.0,
@@ -684,6 +693,7 @@ mod tests {
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["cols"][0]["name"], "id");
         assert_eq!(j["cols"][0]["decltype"], "INTEGER");
+        assert_eq!(r.last_insert_rowid, Some(7));
         assert_eq!(j["last_insert_rowid"], "7");
         assert_eq!(j["affected_row_count"], 3);
         assert_eq!(j["rows_read"], 0);
@@ -697,6 +707,17 @@ mod tests {
         assert_eq!(j["cols"][0]["name"], "id");
         assert_eq!(j["last_insert_rowid"], serde_json::Value::Null);
         assert_eq!(j["rows_written"], 3);
+
+        // The decimal string is exact at the edges of i64.
+        for id in [i64::MAX, i64::MIN] {
+            let out = StmtOutput {
+                last_insert_rowid: id,
+                ..output()
+            };
+            let r = stmt_result(out, false, true, Duration::ZERO);
+            let j = serde_json::to_value(&r).unwrap();
+            assert_eq!(j["last_insert_rowid"], id.to_string());
+        }
     }
 
     #[test]

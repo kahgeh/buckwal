@@ -213,11 +213,11 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
     }
     let sql = resolve_sql(st, stmt.sql.clone(), stmt.sql_id)?;
     let want_rows = stmt.want_rows.unwrap_or(true);
-    let start = Instant::now();
 
     // With arguments the statement goes to the library, which refuses it.
     if st.conn.is_autocommit() && stmt.args.is_empty() && stmt.named_args.is_empty() {
         if let Some(parsed) = batching_set(&sql) {
+            let start = Instant::now();
             // `set_batching` validates.
             let applied = parsed.and_then(|b| st.conn.set_batching(Some(b)));
             applied.map_err(|e| note(st, fence, &e))?;
@@ -255,6 +255,8 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
         ),
         _ => None,
     };
+    // After the upsert's extra call, so the duration is the statement's own.
+    let start = Instant::now();
     let out = st
         .conn
         .run(&sql, &args, &named)
@@ -308,7 +310,9 @@ fn mentions(sql: &str, word: &[u8]) -> bool {
         .any(|w| w.eq_ignore_ascii_case(word))
 }
 
-/// Run a batch. Conditions are checked up front, so a bad one fails the whole batch.
+/// Run a batch. Conditions are checked up front, so a bad one fails the whole batch. Both
+/// endpoints refuse a forward condition before this (`check_pipeline`, `check_steps`), so
+/// here that check is a backstop.
 pub fn run_batch(
     st: &mut StreamState,
     v: Version,
