@@ -370,7 +370,8 @@ pub fn error_code(e: &turso_durable::Error) -> &'static str {
             let m = m.to_ascii_lowercase();
             if m.contains("constraint failed") {
                 "SQLITE_CONSTRAINT"
-            } else if m.contains("busy") {
+            } else if m.contains("busy") || m.contains("snapshot is stale") {
+                // turso_core gives a stale snapshot SQLITE_BUSY's code (error.rs:173).
                 "SQLITE_BUSY"
             } else {
                 "SQLITE_ERROR"
@@ -711,6 +712,10 @@ mod tests {
                 "SQLITE_CONSTRAINT",
             ),
             (engine("database is busy"), "SQLITE_BUSY"),
+            (
+                engine("Database snapshot is stale. You must rollback and retry the whole transaction."),
+                "SQLITE_BUSY",
+            ),
             (engine("no such table: t"), "SQLITE_ERROR"),
             (Error::Config("x".into()), "SQL_INPUT_ERROR"),
             (Error::Bucket("x".into()), "BUCKET_ERROR"),

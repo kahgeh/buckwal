@@ -414,6 +414,41 @@ fn last_insert_rowid_and_rows_written_over_http() {
     s.stop().unwrap();
 }
 
+/// A transaction that read, then writes after another stream committed, fails at once on its
+/// stale snapshot; that is `SQLITE_BUSY`, as SQLite's `SQLITE_BUSY_SNAPSHOT` is.
+#[test]
+fn stale_snapshot_write_is_sqlite_busy() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut setup = c.stream(Proto::V2);
+    ok_pipeline(&setup.pipeline(vec![execute(CREATE, &[]), close()]).unwrap());
+    let mut a = c.stream(Proto::V2);
+    ok_pipeline(
+        &a.pipeline(vec![
+            execute("BEGIN", &[]),
+            execute("SELECT count(*) FROM t", &[]),
+        ])
+        .unwrap(),
+    );
+    let mut b = c.stream(Proto::V2);
+    ok_pipeline(
+        &b.pipeline(vec![
+            execute("INSERT INTO t(body) VALUES ('b')", &[]),
+            close(),
+        ])
+        .unwrap(),
+    );
+    let r = a
+        .pipeline(vec![execute("INSERT INTO t(body) VALUES ('a')", &[])])
+        .unwrap();
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (message, code) = result_error(&r, 0).expect("the write fails");
+    assert!(message.contains("snapshot is stale"), "{message}");
+    assert_eq!(code.as_deref(), Some("SQLITE_BUSY"), "{}", r.body);
+    ok_pipeline(&a.pipeline(vec![execute("ROLLBACK", &[]), close()]).unwrap());
+    s.stop().unwrap();
+}
+
 /// A non-finite float is `{"type":"float","value":null}` and a blob is unpadded base64
 /// (PROTOCOL.md 8.2), in pipeline results and in cursor rows. Padded input is still read.
 #[test]
