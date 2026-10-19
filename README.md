@@ -566,7 +566,7 @@ Run against `turso-durable serve` at commit eb101d9, over plain HTTP on 127.0.0.
 | Client | Result | Before this round (2ebcaf5) |
 |---|---|---|
 | tursodb's conformance suite, `serverless/rust/conformance` at 0b2bec917: 24 raw-HTTP protocol tests (`tests/protocol.rs`) and 35 driver tests (`tests/driver.rs`) through the Rust driver `turso_serverless` 0.1.3 | All 59 pass, both with tests in parallel (the suite's default, as upstream CI runs it) and with `--test-threads=1` | 46/59 with tests run serially; 34/59 in parallel (most of those from `SQLITE_BUSY`, which a failed describe caused by leaving a write transaction open) |
-| The Go driver `tursogo-serverless` (`serverless/go` at 0b2bec917, stdlib only, Go 1.24.3): its 35 tests (`go test ./...`) | All 35 pass | 32/35 |
+| The Go driver `tursogo-serverless` (`serverless/go` at 0b2bec917, stdlib only, Go 1.24.3): its 36 tests (`go test ./...`), 24 of which reach the server (the other 12 are offline encode, decode and DSN tests, and an encryption-header test against its own stub server) | All 36 pass, none skipped (also with `-v` at c5ad4c5) | 33/36 |
 
 The repo's own test client (`crates/turso-durable-hrana-client`) still runs in both passes of `./scripts/test.sh` (plain HTTP, then HTTPS with a token and encryption).
 
@@ -603,7 +603,7 @@ How the suite was run:
    (cd "$SCRATCH/ws" && cargo test --locked -p turso_serverless_conformance -- --nocapture)   # and again with --test-threads=1
    (cd "$SCRATCH/serverless/go" && GOTOOLCHAIN=local GOPROXY=off go test -v ./...)
    ```
-6. Check that the tests really reached the server. **Both suites skip every test and still report ok when the variables are unset:** each Rust conformance test prints `skipping: set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN …` and returns (it needs both variables), and each Go test calls `t.Skip` when `TURSO_DATABASE_URL` is empty. So no line may contain `skipping` in the cargo output (with `--nocapture`), and no `--- SKIP` may appear in the `go test -v` output.
+6. Check that the tests really reached the server. **Both suites skip every test and still report ok when the variables are unset:** each Rust conformance test prints `skipping: set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN …` and returns (it needs both variables), and each Go test that reaches the server (24 of the 36) calls `t.Skip` when `TURSO_DATABASE_URL` is empty. So no line may contain `skipping` in the cargo output (with `--nocapture`), and no `--- SKIP` may appear in the `go test -v` output.
 
 ## Settings
 

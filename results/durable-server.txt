@@ -96,11 +96,12 @@
 #   plain HTTP on loopback, a dummy token, no proxy, --locked, never in this repo's lock.
 #
 # Go driver tursogo-serverless (serverless/go at 0b2bec917, stdlib only, Go 1.24.3,
-#   GOTOOLCHAIN=local GOPROXY=off, no download), go test ./... (35 tests):
-#   before, at 2ebcaf5: 32/35. TestPrepareAndQuery and TestPrepareWrongArgCount
+#   GOTOOLCHAIN=local GOPROXY=off, no download), go test ./... (36 tests, 24 of which reach the server):
+#   before, at 2ebcaf5: 33/36. TestPrepareAndQuery and TestPrepareWrongArgCount
 #     ("turso: describe is not supported"), TestValueRoundtrip/non-finite_result_decodes_as_NaN
 #     ("turso: infinite float cannot be represented in JSON").
-#   after, at eb101d9: 35/35 ("ok turso.tech/database/tursogo-serverless").
+#   after, at eb101d9: 36/36 ("ok turso.tech/database/tursogo-serverless"); again at c5ad4c5
+#     with -v: 36 PASS, 0 FAIL, 0 SKIP (go-final.log).
 #
 # Round 3 commits on the server and library: a6a93b7 56192f2 (describe), eb6ada5 d770a71 d9fdd77
 #   (cursor terminator, non-finite floats as null and unpadded base64, x-turso-encryption-key
@@ -121,13 +122,14 @@
 #   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-parallel.log
 #   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-before.log
 #   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-t2b.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-final.log
 #
 # ---------------------------------------------------------------------------------------------
 # Round 3: full test command run (canonical; supersedes the 4621d4e figures at the top)
 # ---------------------------------------------------------------------------------------------
 # date: 2026-10-19 (test run id turso-durable-20261019230210-97811)
-# git: eda0d1d (durable-server); the code is unchanged since 9aec32a (eda0d1d is docs and
-#   comments only)
+# git: eda0d1d (durable-server); the code is unchanged since 9aec32a (eda0d1d changed docs,
+#   comments, two error message strings ("… needs /v3") and the serve help text)
 # Command: ./scripts/test.sh, run by the controller. exit 0; wall time 12:15.
 # Log (scratch, outside the repo): /private/tmp/claude-502/round3/full-run.log
 #
