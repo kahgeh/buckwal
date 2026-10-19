@@ -182,7 +182,7 @@ pub enum CursorEntry {
     },
     StepEnd {
         affected_row_count: u64,
-        last_insert_rowid: Option<String>,
+        last_insert_rowid: Option<i64>,
     },
     StepError {
         step: u32,
@@ -304,9 +304,12 @@ pub fn from_value(v: &turso_durable::Value) -> HValue {
     }
 }
 
+/// A statement's result (PROTOCOL.md 8.4). `inserted`: the statement inserted a row, so
+/// `last_insert_rowid` is set; `rows_written` is the changed-row count, `rows_read` always 0.
 pub fn stmt_result(
     out: turso_durable::StmtOutput,
     want_rows: bool,
+    inserted: bool,
     elapsed: Duration,
 ) -> StmtResult {
     let rows = if want_rows {
@@ -328,9 +331,9 @@ pub fn stmt_result(
             .collect(),
         rows,
         affected_row_count: out.changes,
-        last_insert_rowid: Some(out.last_insert_rowid.to_string()),
+        last_insert_rowid: inserted.then(|| out.last_insert_rowid.to_string()),
         rows_read: 0,
-        rows_written: 0,
+        rows_written: out.changes,
         query_duration_ms: elapsed.as_secs_f64() * 1000.0,
     }
 }
@@ -675,21 +678,23 @@ mod tests {
 
     #[test]
     fn stmt_result_shape() {
-        let r = stmt_result(output(), true, Duration::from_millis(2));
+        let r = stmt_result(output(), true, true, Duration::from_millis(2));
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["cols"][0]["name"], "id");
         assert_eq!(j["cols"][0]["decltype"], "INTEGER");
         assert_eq!(j["last_insert_rowid"], "7");
         assert_eq!(j["affected_row_count"], 3);
         assert_eq!(j["rows_read"], 0);
-        assert_eq!(j["rows_written"], 0);
+        assert_eq!(j["rows_written"], 3);
         assert_eq!(j["query_duration_ms"], 2.0);
         assert_eq!(j["rows"][1][0]["value"], "2");
 
-        let r = stmt_result(output(), false, Duration::from_millis(2));
+        let r = stmt_result(output(), false, false, Duration::from_millis(2));
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["rows"], serde_json::json!([]));
         assert_eq!(j["cols"][0]["name"], "id");
+        assert_eq!(j["last_insert_rowid"], serde_json::Value::Null);
+        assert_eq!(j["rows_written"], 3);
     }
 
     #[test]
@@ -745,9 +750,16 @@ mod tests {
         assert_eq!(
             j(CursorEntry::StepEnd {
                 affected_row_count: 1,
-                last_insert_rowid: Some("5".into())
+                last_insert_rowid: Some(5)
             }),
-            serde_json::json!({"type":"step_end","affected_row_count":1,"last_insert_rowid":"5"})
+            serde_json::json!({"type":"step_end","affected_row_count":1,"last_insert_rowid":5})
+        );
+        assert_eq!(
+            j(CursorEntry::StepEnd {
+                affected_row_count: 0,
+                last_insert_rowid: None
+            }),
+            serde_json::json!({"type":"step_end","affected_row_count":0,"last_insert_rowid":null})
         );
         assert_eq!(
             j(CursorEntry::StepError {

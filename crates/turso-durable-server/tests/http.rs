@@ -364,6 +364,56 @@ fn cursor_error_condition_is_true_for_a_skipped_step() {
     s.stop().unwrap();
 }
 
+/// `last_insert_rowid` is null without an insert and the rowid with one: a decimal string
+/// in pipeline results (PROTOCOL.md 8.4), a JSON number on the cursor's `step_end` (7.2.3).
+/// `rows_written` is the changed-row count.
+#[test]
+fn last_insert_rowid_and_rows_written_over_http() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut st = c.stream(Proto::V3);
+    let r = st
+        .pipeline(vec![
+            execute(CREATE, &[]),
+            execute("SELECT ? AS n", &[Arg::Int(1)]),
+            batch(vec![
+                (
+                    None,
+                    stmt("INSERT INTO t(body) VALUES (?)", &[Arg::Text("a".into())]),
+                ),
+                (
+                    Some(cond_ok(0)),
+                    stmt("INSERT INTO t(body) VALUES ('b')", &[]),
+                ),
+            ]),
+        ])
+        .unwrap();
+    ok_pipeline(&r);
+    let res = |i: usize| r.body["results"][i]["response"]["result"].clone();
+    assert_eq!(res(1)["last_insert_rowid"], Value::Null, "{}", r.body);
+    assert_eq!(res(1)["rows_written"], 0);
+    let steps = res(2)["step_results"].clone();
+    assert_eq!(steps[0]["last_insert_rowid"], "1", "{}", r.body);
+    assert_eq!(steps[1]["last_insert_rowid"], "2");
+    assert_eq!(steps[0]["rows_written"], 1);
+    let b = batch(vec![
+        (None, stmt("INSERT INTO t VALUES (123, 'c')", &[])),
+        (None, stmt("SELECT count(*) FROM t", &[])),
+    ]);
+    let (status, entries) = st.cursor(b["batch"].clone()).unwrap();
+    assert_eq!(status, 200, "{entries:?}");
+    let ends: Vec<&Value> = entries.iter().filter(|e| e["type"] == "step_end").collect();
+    assert_eq!(
+        ends,
+        [
+            &json!({"type":"step_end","affected_row_count":1,"last_insert_rowid":123}),
+            &json!({"type":"step_end","affected_row_count":0,"last_insert_rowid":null})
+        ],
+        "{entries:?}"
+    );
+    s.stop().unwrap();
+}
+
 /// A non-finite float is `{"type":"float","value":null}` and a blob is unpadded base64
 /// (PROTOCOL.md 8.2), in pipeline results and in cursor rows. Padded input is still read.
 #[test]

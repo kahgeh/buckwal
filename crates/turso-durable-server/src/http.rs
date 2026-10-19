@@ -593,7 +593,7 @@ fn cursor_entries(result: Result<BatchResult, ProtoError>) -> Vec<CursorEntry> {
         entries.extend(r.rows.into_iter().map(|row| CursorEntry::Row { row }));
         entries.push(CursorEntry::StepEnd {
             affected_row_count: r.affected_row_count,
-            last_insert_rowid: r.last_insert_rowid,
+            last_insert_rowid: r.last_insert_rowid.and_then(|id| id.parse().ok()),
         });
     }
     entries.push(CursorEntry::ReplicationIndex {
@@ -787,10 +787,10 @@ mod tests {
                 decltype: None,
             }],
             rows: vec![vec![], vec![]],
-            affected_row_count: 0,
-            last_insert_rowid: None,
+            affected_row_count: 1,
+            last_insert_rowid: Some("9007199254740993".into()),
             rows_read: 0,
-            rows_written: 0,
+            rows_written: 1,
             query_duration_ms: 0.0,
         };
         let e = ProtoError::new("SQLITE_ERROR", "boom");
@@ -816,6 +816,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(entries.last().unwrap()).unwrap(),
             json!({"type":"replication_index","replication_index":null})
+        );
+        // `last_insert_rowid` is a JSON number on the cursor (PROTOCOL.md 7.2.3), exact.
+        assert_eq!(
+            String::from_utf8(to_json(&entries[3])).unwrap(),
+            r#"{"type":"step_end","affected_row_count":1,"last_insert_rowid":9007199254740993}"#
         );
         assert_eq!(outcome_of([&e].into_iter()), "error");
         // A fatal error ends the cursor: no terminator after it.

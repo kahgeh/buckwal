@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use turso_durable::{Batching, Connection, Database, Error, Value};
 use turso_parser::ast::{
-    Cmd, Expr, Literal, PragmaBody, QualifiedName, Stmt as SqlStmt, UnaryOperator,
+    Cmd, Expr, InsertBody, Literal, PragmaBody, QualifiedName, Stmt as SqlStmt, UnaryOperator,
+    Upsert, UpsertDo,
 };
 use turso_parser::parser::Parser;
 
@@ -242,11 +243,69 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
         .iter()
         .map(|a| Ok((a.name.clone(), to_value(&a.value)?)))
         .collect::<Result<Vec<(String, Value)>, ProtoError>>()?;
+    let insert = insert_kind(&sql);
+    // An upsert's changed row may have been updated, which leaves the rowid alone, so it
+    // inserted only if the connection's last rowid moved. Every output carries that rowid.
+    let before = match insert {
+        Some(Insert::Upsert) => Some(
+            st.conn
+                .run("SELECT 1", &[], &[])
+                .map_err(|e| note(st, fence, &e))?
+                .last_insert_rowid,
+        ),
+        _ => None,
+    };
     let out = st
         .conn
         .run(&sql, &args, &named)
         .map_err(|e| note(st, fence, &e))?;
-    Ok(stmt_result(out, want_rows, start.elapsed()))
+    let inserted = out.changes > 0
+        && match insert {
+            None => false,
+            Some(Insert::Plain) => true,
+            Some(Insert::Upsert) => before != Some(out.last_insert_rowid),
+        };
+    Ok(stmt_result(out, want_rows, inserted, start.elapsed()))
+}
+
+/// An `INSERT` or `REPLACE` statement, by how its changed rows count as inserted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Insert {
+    /// Every row it changed it inserted.
+    Plain,
+    /// It has an `ON CONFLICT ... DO UPDATE`: a changed row may be an update.
+    Upsert,
+}
+
+/// The kind of `INSERT` (or `REPLACE`) `sql`'s statement is; `None` for any other statement.
+fn insert_kind(sql: &str) -> Option<Insert> {
+    if !mentions(sql, b"insert") && !mentions(sql, b"replace") {
+        return None;
+    }
+    let Cmd::Stmt(SqlStmt::Insert { body, .. }) = Parser::new(sql.as_bytes()).next()?.ok()? else {
+        return None;
+    };
+    let updates = match &body {
+        InsertBody::Select(_, Some(upsert)) => upsert_updates(upsert),
+        _ => false,
+    };
+    Some(if updates {
+        Insert::Upsert
+    } else {
+        Insert::Plain
+    })
+}
+
+/// Whether any clause of an `ON CONFLICT` chain is a `DO UPDATE`.
+fn upsert_updates(u: &Upsert) -> bool {
+    matches!(u.do_clause, UpsertDo::Set { .. }) || u.next.as_deref().is_some_and(upsert_updates)
+}
+
+/// Whether `sql` holds `word` (lowercase ASCII) in any case.
+fn mentions(sql: &str, word: &[u8]) -> bool {
+    sql.as_bytes()
+        .windows(word.len())
+        .any(|w| w.eq_ignore_ascii_case(word))
 }
 
 /// Run a batch. Conditions are checked up front, so a bad one fails the whole batch.
@@ -376,12 +435,7 @@ fn eval_cond(c: &BatchCond, outcome: &[Option<bool>], st: &StreamState) -> bool 
 /// it asks for (or the error for a value that is not text). `None` for anything else, which
 /// then goes to the library (including a read of the setting).
 fn batching_set(sql: &str) -> Option<turso_durable::Result<Batching>> {
-    const NAME: &[u8] = b"durable_batching";
-    if !sql
-        .as_bytes()
-        .windows(NAME.len())
-        .any(|w| w.eq_ignore_ascii_case(NAME))
-    {
+    if !mentions(sql, b"durable_batching") {
         return None;
     }
     let mut parser = Parser::new(sql.as_bytes());
@@ -533,6 +587,71 @@ mod tests {
         let arg = json!({"type":"float","value":null});
         let req = json!({"type":"execute","stmt":{"sql":"SELECT ?","args":[arg]}});
         assert_eq!(f.err(Version::V3, req), "PROTO_ERROR");
+    }
+
+    /// `last_insert_rowid` is set only when the statement inserted a row (PROTOCOL.md 8.4),
+    /// and `rows_written` is the changed-row count.
+    #[test]
+    fn last_insert_rowid_only_when_the_statement_inserted() {
+        let mut f = fx();
+        let mut check = |sql: &str, rowid: J, changed: u64| {
+            let r = f.sql(sql);
+            assert_eq!(r["last_insert_rowid"], rowid, "{sql}: {r}");
+            assert_eq!(r["affected_row_count"], changed, "{sql}: {r}");
+            assert_eq!(r["rows_written"], changed, "{sql}: {r}");
+            assert_eq!(r["rows_read"], 0, "{sql}: {r}");
+        };
+        let null = J::Null;
+        check(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+            null.clone(),
+            0,
+        );
+        check("CREATE TABLE log(x)", null.clone(), 0);
+        check(
+            "CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (new.id); END",
+            null.clone(),
+            0,
+        );
+        check("INSERT INTO t VALUES (5, 'a')", json!("5"), 1);
+        check("SELECT * FROM t", null.clone(), 0);
+        check("DELETE FROM t WHERE id = 5", null.clone(), 1);
+        // The same rowid again after the DELETE: still an insert.
+        check("INSERT INTO t VALUES (5, 'a')", json!("5"), 1);
+        check("INSERT OR IGNORE INTO t VALUES (5, 'z')", null.clone(), 0);
+        check("INSERT INTO t(v) VALUES ('p'), ('q')", json!("7"), 2);
+        // The trigger's insert into `log` is not this statement's.
+        check("UPDATE t SET v = v || 'x' WHERE id = 5", null.clone(), 1);
+        check("REPLACE INTO t VALUES (6, 'r')", json!("6"), 1);
+        check("INSERT OR REPLACE INTO t VALUES (6, 's')", json!("6"), 1);
+        check(
+            "WITH c AS (SELECT 20 AS i) INSERT INTO t SELECT i, 'w' FROM c",
+            json!("20"),
+            1,
+        );
+        check("EXPLAIN INSERT INTO t VALUES (21, 'e')", null.clone(), 0);
+        // An upsert that only updated inserted nothing; one that inserted did.
+        check(
+            "INSERT INTO t VALUES (30, 'q') ON CONFLICT(v) DO UPDATE SET v = 'q2'",
+            null.clone(),
+            1,
+        );
+        check(
+            "INSERT INTO t VALUES (31, 'new') ON CONFLICT(v) DO UPDATE SET v = 'n2'",
+            json!("31"),
+            1,
+        );
+        check(
+            "INSERT INTO t VALUES (32, 'new') ON CONFLICT(v) DO NOTHING",
+            null.clone(),
+            0,
+        );
+        check("PRAGMA durable_batching = off", null.clone(), 0);
+        let r = f.ok(json!({"type":"execute","stmt":{
+            "sql":"INSERT INTO t VALUES (?, 'arg') RETURNING id",
+            "args":[{"type":"integer","value":"40"}]}}));
+        assert_eq!(r["result"]["last_insert_rowid"], "40");
+        assert_eq!(r["result"]["rows"][0][0]["value"], "40");
     }
 
     #[test]
