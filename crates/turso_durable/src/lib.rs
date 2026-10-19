@@ -29,7 +29,7 @@ pub use config::Config;
 /// Test and diagnostics hooks (`Config::on_event`), not part of the supported API.
 #[doc(hidden)]
 pub use config::{Event, EventHook};
-pub use conn::{CheckpointMode, Column, Connection, StmtOutput, Transaction};
+pub use conn::{CheckpointMode, Column, Connection, Description, StmtOutput, Transaction};
 pub use db::{is_claimed, open, Database};
 #[doc(hidden)]
 pub use db::{open_read_only, open_read_only_with_store, open_with_store};

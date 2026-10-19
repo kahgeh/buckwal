@@ -1,6 +1,7 @@
 //! [`Connection`]: the only way SQL reaches the engine. Every call clears the error stash,
 //! runs the SQL guard, prepares, checks the sync mode (D7), binds, steps to completion, and on
-//! failure returns the typed error the IO layer stashed (D8).
+//! failure returns the typed error the IO layer stashed (D8). [`Connection::describe`] stops
+//! after the check: it never binds or steps.
 //!
 //! Every public call runs the engine inside a commit context (`batching::ctx`) holding its
 //! effective batching setting, which the WAL sync reads. A call returns `Ok` only once every
@@ -25,7 +26,7 @@ use crate::maintenance::GateGuard;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use turso_core::{Statement, StepResult, SyncMode, Value, IO};
+use turso_core::{QueryMode, Statement, StepResult, SyncMode, Value, IO};
 
 /// How long a statement waits for another connection's lock before it fails.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,6 +72,18 @@ pub struct StmtOutput {
     pub changes: u64,
     /// The connection's last inserted rowid, after the statement.
     pub last_insert_rowid: i64,
+}
+
+/// What [`Connection::describe`] returns: a statement's shape, without running it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Description {
+    /// One per parameter slot `1..=n`: the name without its `:`, `@` or `$`; `None` for a
+    /// positional one (`?`, `?NNN`).
+    pub params: Vec<Option<String>>,
+    pub columns: Vec<Column>,
+    /// `EXPLAIN` or `EXPLAIN QUERY PLAN`.
+    pub is_explain: bool,
+    pub is_readonly: bool,
 }
 
 /// One connection to a [`crate::Database`]; open one per thread. Dropping it closes it.
@@ -289,10 +302,8 @@ impl Connection {
         }
         let mut stmt = self.core().prepare(sql).map_err(engine_error)?;
         self.check_sync_mode()?;
-        if single && holds_a_statement(sql.get(stmt.tail_offset()..).unwrap_or("")) {
-            return Err(Error::Config(
-                "execute and query run one statement; use execute_batch for several".into(),
-            ));
+        if single {
+            check_single(sql, &stmt)?;
         }
         if self.shared.read_only && !stmt.get_program().is_readonly() {
             return Err(Error::Unsupported(READ_ONLY));
@@ -434,22 +445,14 @@ impl Connection {
                 Prepared::Engine(stmt) => stmt,
                 Prepared::Batching { rows, .. } => {
                     return Ok(StmtOutput {
-                        columns: vec![Column {
-                            name: "durable_batching".into(),
-                            decltype: None,
-                        }],
+                        columns: vec![batching_column()],
                         rows,
                         changes: 0,
                         last_insert_rowid: self.core().last_insert_rowid(),
                     });
                 }
             };
-            let columns = (0..stmt.num_columns())
-                .map(|i| Column {
-                    name: stmt.get_column_name(i).into_owned(),
-                    decltype: stmt.get_column_decltype(i),
-                })
-                .collect();
+            let columns = columns(&stmt);
             let mut rows = Vec::new();
             self.step_all(&mut stmt, |r| rows.push(r))?;
             Ok(StmtOutput {
@@ -457,6 +460,40 @@ impl Connection {
                 rows,
                 changes: stmt.n_change().max(0) as u64,
                 last_insert_rowid: self.core().last_insert_rowid(),
+            })
+        })
+    }
+
+    /// Describe one statement without running it: its parameters, its result columns, and
+    /// whether it is an `EXPLAIN` and read-only. The SQL guard, the sync-mode check (D7) and
+    /// the maintenance gate are those of [`Connection::run`]. The statement is prepared but
+    /// never stepped, so nothing commits and nothing waits for an ack; it works on a
+    /// read-only database too. `PRAGMA durable_batching` is not run, only described as one
+    /// `durable_batching` column.
+    pub fn describe(&self, sql: &str) -> Result<Description> {
+        self.call(self.effective_batching(), || {
+            stash::clear();
+            guard::check_sql(sql)?;
+            if guard::batching_pragma(sql).is_some() {
+                return Ok(Description {
+                    params: Vec::new(),
+                    columns: vec![batching_column()],
+                    is_explain: false,
+                    is_readonly: false,
+                });
+            }
+            let stmt = self.core().prepare(sql).map_err(engine_error)?;
+            self.check_sync_mode()?;
+            check_single(sql, &stmt)?;
+            let params = stmt.parameters();
+            let params = (1..=stmt.parameters_count())
+                .map(|i| param_name(params.name(NonZero::new(i).expect("slots start at 1"))))
+                .collect();
+            Ok(Description {
+                params,
+                columns: columns(&stmt),
+                is_explain: stmt.get_query_mode() != QueryMode::Normal,
+                is_readonly: stmt.get_program().is_readonly(),
             })
         })
     }
@@ -554,6 +591,40 @@ enum Prepared {
     Engine(Box<Statement>),
     /// The PRAGMA's rows, and the offset in the text just past it.
     Batching { rows: Vec<Vec<Value>>, tail: usize },
+}
+
+/// `sql` holds only `stmt` (the engine would silently ignore the rest).
+fn check_single(sql: &str, stmt: &Statement) -> Result<()> {
+    if holds_a_statement(sql.get(stmt.tail_offset()..).unwrap_or("")) {
+        return Err(Error::Config(
+            "execute and query run one statement; use execute_batch for several".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `stmt`'s result columns.
+fn columns(stmt: &Statement) -> Vec<Column> {
+    (0..stmt.num_columns())
+        .map(|i| Column {
+            name: stmt.get_column_name(i).into_owned(),
+            decltype: stmt.get_column_decltype(i),
+        })
+        .collect()
+}
+
+/// The one column `PRAGMA durable_batching` reads.
+fn batching_column() -> Column {
+    Column {
+        name: "durable_batching".into(),
+        decltype: None,
+    }
+}
+
+/// A parameter's name as PROTOCOL.md 6.4 gives it: `:id` is `id`; a positional one (`?`,
+/// whose engine name is `None`, or `?NNN`) has none.
+fn param_name(engine: Option<String>) -> Option<String> {
+    engine?.strip_prefix([':', '@', '$']).map(str::to_string)
 }
 
 fn check_params(given: usize, want: usize) -> Result<()> {
@@ -846,6 +917,155 @@ mod tests {
         );
         assert_eq!(out.rows, vec![vec![Value::from_text("off".to_string())]]);
         assert_eq!(out.changes, 0);
+    }
+
+    fn col(n: &str, d: Option<&str>) -> Column {
+        Column {
+            name: n.to_string(),
+            decltype: d.map(str::to_string),
+        }
+    }
+
+    /// A database whose `Event::CommitAcked`s are counted.
+    fn open_counting_acks() -> (tempfile::TempDir, crate::Database, Arc<Mutex<u64>>) {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Config::new(t.path(), "http://127.0.0.1:1", "b", "k", "s");
+        let acks = Arc::new(Mutex::new(0));
+        let seen = acks.clone();
+        c.on_event = Some(Arc::new(move |e: &Event| {
+            if matches!(e, Event::CommitAcked { .. }) {
+                *seen.lock().unwrap() += 1;
+            }
+        }));
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        (t, db, acks)
+    }
+
+    #[test]
+    fn describe_gives_params_columns_and_flags() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)", &[])
+            .unwrap();
+        let d = conn
+            .describe("SELECT id, name FROM t WHERE id = :id")
+            .unwrap();
+        assert_eq!(
+            d,
+            Description {
+                params: vec![Some("id".to_string())],
+                columns: vec![col("id", Some("INTEGER")), col("name", Some("TEXT"))],
+                is_explain: false,
+                is_readonly: true,
+            }
+        );
+        let d = conn.describe("DELETE FROM t").unwrap();
+        assert!(!d.is_readonly && !d.is_explain, "{d:?}");
+        let d = conn.describe("EXPLAIN SELECT 1").unwrap();
+        assert!(d.is_explain, "{d:?}");
+        let d = conn.describe("SELECT ?, ?2").unwrap();
+        assert_eq!(d.params, vec![None, None]);
+        let d = conn.describe("SELECT @a, $b, :c").unwrap();
+        let names = ["a", "b", "c"].map(|n| Some(n.to_string()));
+        assert_eq!(d.params, names);
+    }
+
+    #[test]
+    fn describe_runs_the_guard_and_keeps_sync_mode_full() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        for sql in [
+            "PRAGMA synchronous=OFF",
+            "PRAGMA journal_mode='mvcc'",
+            "ATTACH 'x.db' AS x",
+        ] {
+            let r = conn.describe(sql);
+            assert!(matches!(r, Err(Error::Unsupported(_))), "{sql}: {r:?}");
+            assert_eq!(conn.core().get_sync_mode(), SyncMode::Full, "{sql}");
+            let rows = conn.query("PRAGMA synchronous", &[]).unwrap();
+            assert_eq!(rows[0][0].as_int(), Some(2), "{sql}");
+        }
+        // D7's backstop runs after the prepare, as for `run`.
+        conn.core().set_sync_mode(SyncMode::Off);
+        assert_eq!(
+            conn.describe("SELECT 1"),
+            Err(Error::Unsupported("synchronous below FULL"))
+        );
+        assert_eq!(conn.core().get_sync_mode(), SyncMode::Full);
+    }
+
+    #[test]
+    fn describe_never_steps_or_acks() {
+        let (_t, db, acks) = open_counting_acks();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+        let (events, stats) = (*acks.lock().unwrap(), db.upload_stats().commits_acked);
+        assert!(events > 0 && stats > 0, "the hooks see a commit");
+        let d = conn.describe("INSERT INTO t VALUES (1)").unwrap();
+        assert!(!d.is_readonly, "{d:?}");
+        assert!(d.params.is_empty() && d.columns.is_empty(), "{d:?}");
+        assert_eq!(*acks.lock().unwrap(), events);
+        assert_eq!(db.upload_stats().commits_acked, stats);
+        let n = conn.query("SELECT count(*) FROM t", &[]).unwrap();
+        assert_eq!(n[0][0].as_int(), Some(0));
+    }
+
+    #[test]
+    fn describe_takes_one_statement() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let r = conn.describe("SELECT 1; SELECT 2");
+        assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
+        let run = conn.run("SELECT 1; SELECT 2", &[], &[]);
+        assert_eq!(r.map(|_| ()), run.map(|_| ()));
+    }
+
+    #[test]
+    fn describe_of_durable_batching_is_fixed_and_applies_nothing() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        let fixed = Description {
+            params: vec![],
+            columns: vec![col("durable_batching", None)],
+            is_explain: false,
+            is_readonly: false,
+        };
+        let setting = |c: &Connection| c.query("PRAGMA durable_batching", &[]).unwrap();
+        // Outside a transaction a set is refused by `run`; describe still describes it.
+        for sql in ["PRAGMA durable_batching", "PRAGMA durable_batching = 'off'"] {
+            assert_eq!(conn.describe(sql), Ok(fixed.clone()), "{sql}");
+        }
+        conn.execute("BEGIN", &[]).unwrap();
+        let before = setting(&conn);
+        let d = conn.describe("PRAGMA durable_batching = 'window 40ms 64 1MiB'");
+        assert_eq!(d, Ok(fixed));
+        assert_eq!(setting(&conn), before);
+        assert_eq!(*lock(&conn.txn_batching), None);
+        conn.execute("ROLLBACK", &[]).unwrap();
+    }
+
+    #[test]
+    fn describe_works_on_a_read_only_database() {
+        let store = Arc::new(MemStore::new());
+        let w = tempfile::tempdir().unwrap();
+        let c = Config::new(w.path(), "http://127.0.0.1:1", "b", "k", "s");
+        let db = crate::open_with_store(c, store.clone()).unwrap();
+        db.connect()
+            .unwrap()
+            .execute("CREATE TABLE t(x)", &[])
+            .unwrap();
+        db.close().unwrap();
+        let r = tempfile::tempdir().unwrap();
+        let c = Config::new(r.path(), "http://127.0.0.1:1", "b", "k", "s");
+        let db = crate::open_read_only_with_store(c, store).unwrap();
+        let conn = db.connect().unwrap();
+        let d = conn.describe("INSERT INTO t VALUES (1)").unwrap();
+        assert!(!d.is_readonly, "{d:?}");
+        assert!(conn.describe("SELECT x FROM t").unwrap().is_readonly);
+        assert_eq!(
+            conn.execute("INSERT INTO t VALUES (1)", &[]),
+            Err(Error::Unsupported(READ_ONLY))
+        );
     }
 
     #[test]
