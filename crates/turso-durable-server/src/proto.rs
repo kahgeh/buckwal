@@ -368,6 +368,15 @@ pub fn describe_result(d: turso_durable::Description) -> DescribeResult {
     }
 }
 
+/// The whole engine messages that are `SQLITE_BUSY`, matched exactly (a table named `busy_jobs`
+/// must not be): turso_core 0.8.3's `Busy` and `BusySnapshot` (error.rs:78, 92; both code 5,
+/// error.rs:173) and the library's own sleep-then-busy message (conn.rs:363).
+const BUSY_MESSAGES: [&str; 3] = [
+    "Database is busy",
+    "Database snapshot is stale. You must rollback and retry the whole transaction.",
+    "database is busy (locked)",
+];
+
 pub fn error_code(e: &turso_durable::Error) -> &'static str {
     use turso_durable::Error as E;
     match e {
@@ -376,11 +385,9 @@ pub fn error_code(e: &turso_durable::Error) -> &'static str {
         E::UploadFailed(_) => "UPLOAD_FAILED",
         E::Unsupported(_) => "UNSUPPORTED",
         E::Engine(m) => {
-            let m = m.to_ascii_lowercase();
-            if m.contains("constraint failed") {
+            if m.to_ascii_lowercase().contains("constraint failed") {
                 "SQLITE_CONSTRAINT"
-            } else if m.contains("busy") || m.contains("snapshot is stale") {
-                // turso_core gives a stale snapshot SQLITE_BUSY's code (error.rs:173).
+            } else if BUSY_MESSAGES.contains(&m.as_str()) {
                 "SQLITE_BUSY"
             } else {
                 "SQLITE_ERROR"
@@ -732,12 +739,22 @@ mod tests {
                 engine("UNIQUE constraint failed: t.id"),
                 "SQLITE_CONSTRAINT",
             ),
-            (engine("database is busy"), "SQLITE_BUSY"),
+            (engine("Database is busy"), "SQLITE_BUSY"),
+            (engine("database is busy (locked)"), "SQLITE_BUSY"),
             (
                 engine("Database snapshot is stale. You must rollback and retry the whole transaction."),
                 "SQLITE_BUSY",
             ),
             (engine("no such table: t"), "SQLITE_ERROR"),
+            (engine("no such table: busy_jobs"), "SQLITE_ERROR"),
+            (
+                engine("trigger: the snapshot is stale, retry"),
+                "SQLITE_ERROR",
+            ),
+            (
+                engine("Runtime error: Database snapshot is stale. You must rollback and retry the whole transaction. (19)"),
+                "SQLITE_ERROR",
+            ),
             (Error::Config("x".into()), "SQL_INPUT_ERROR"),
             (Error::Bucket("x".into()), "BUCKET_ERROR"),
             (Error::Io("x".into()), "IO_ERROR"),

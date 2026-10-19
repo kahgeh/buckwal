@@ -451,6 +451,22 @@ fn stale_snapshot_write_is_sqlite_busy() {
     s.stop().unwrap();
 }
 
+/// A table whose name holds "busy" is an ordinary error, not `SQLITE_BUSY` (clients retry that).
+#[test]
+fn unknown_table_named_busy_is_sqlite_error() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut a = c.stream(Proto::V2);
+    let r = a
+        .pipeline(vec![execute("SELECT * FROM busy_jobs", &[]), close()])
+        .unwrap();
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (message, code) = result_error(&r, 0).expect("the select fails");
+    assert!(message.contains("busy_jobs"), "{message}");
+    assert_eq!(code.as_deref(), Some("SQLITE_ERROR"), "{}", r.body);
+    s.stop().unwrap();
+}
+
 /// A non-finite float is `{"type":"float","value":null}` and a blob is unpadded base64
 /// (PROTOCOL.md 8.2), in pipeline results and in cursor rows. Padded input is still read.
 #[test]
@@ -958,18 +974,22 @@ fn concurrent_first_writes_to_a_fresh_database_all_succeed() {
 
 /// What the bucket and the library held after the open, and again when the server was ready.
 struct Startup {
-    opened: (UploadStats, BTreeSet<String>),
-    ready: (UploadStats, BTreeSet<String>),
+    opened: Seen,
+    ready: Seen,
     page_count: i64,
 }
 
-fn log_keys(store: &MemStore) -> BTreeSet<String> {
-    store
-        .list("")
-        .unwrap()
-        .into_iter()
-        .filter(|k| k.contains("log/"))
-        .collect()
+/// Upload stats, every bucket key and the bucket's request counts at one moment, so any PUT
+/// (a seal, page objects) shows, not only a `log/` one. Only the writes are compared: the startup may read, and
+/// listing the keys is a request too.
+type Seen = (UploadStats, BTreeSet<String>, (u64, u64, u64));
+
+fn writes(s: &turso_durable::store::StatsSnap) -> (u64, u64, u64) {
+    (s.puts, s.deletes, s.bytes_up)
+}
+
+fn all_keys(store: &MemStore) -> BTreeSet<String> {
+    store.list("").unwrap().into_iter().collect()
 }
 
 /// Serve `cfg`'s database (opened read-only when `read_only`) until it is ready, then stop.
@@ -989,12 +1009,20 @@ fn serve_until_ready(cfg: turso_durable::Config, store: Arc<MemStore>, read_only
                 };
                 let db = db.map_err(|e| e.to_string())?;
                 opened_tx
-                    .send((db.upload_stats(), log_keys(&open_store)))
+                    .send((
+                        db.upload_stats(),
+                        all_keys(&open_store),
+                        writes(&db.bucket_stats()),
+                    ))
                     .unwrap();
                 Ok(db)
             },
             move |db| {
-                let ready = (db.upload_stats(), log_keys(&ready_store));
+                let ready = (
+                    db.upload_stats(),
+                    all_keys(&ready_store),
+                    writes(&db.bucket_stats()),
+                );
                 let c = db.connect().unwrap();
                 let rows = c.query("PRAGMA page_count", &[]).unwrap();
                 ready_tx
@@ -1052,7 +1080,8 @@ fn startup_adds_no_commit_to_an_existing_database() {
         let s = serve_until_ready(startup_config(&dir, key), store.clone(), false);
         assert!(s.page_count > 0, "key={key}: the database is not fresh");
         assert_eq!(commits(&s.opened.0), commits(&s.ready.0), "key={key}");
-        assert_eq!(s.opened.1, s.ready.1, "key={key}: log objects");
+        assert_eq!(s.opened.1, s.ready.1, "key={key}: bucket keys");
+        assert_eq!(s.opened.2, s.ready.2, "key={key}: bucket writes");
     }
 }
 
@@ -1068,7 +1097,8 @@ fn startup_allocates_page_one_of_a_fresh_database_without_a_commit() {
         assert!(started.elapsed() < Duration::from_secs(30), "key={key}");
         assert_eq!(s.page_count, 1, "key={key}: page 1 is allocated");
         assert_eq!(commits(&s.ready.0), (0, 0, 0), "key={key}");
-        assert_eq!(s.opened.1, s.ready.1, "key={key}: log objects");
+        assert_eq!(s.opened.1, s.ready.1, "key={key}: bucket keys");
+        assert_eq!(s.opened.2, s.ready.2, "key={key}: bucket writes");
     }
 }
 

@@ -149,8 +149,9 @@ pub struct CloseOutcome {
 /// first writes to a fresh database on several connections at once can allocate it twice and
 /// panic (pager.rs:3290-3297, 5644-5648). `BEGIN IMMEDIATE` allocates it
 /// (`begin_write_tx`) and `ROLLBACK` commits nothing, so no ack waits on any batching.
-/// A database that is not fresh is only read. A read-only open refuses `BEGIN IMMEDIATE`, and
-/// every other write, so it has nothing to race.
+/// A database that is not fresh is only read: the check is one library call, so a seal already
+/// due at open runs at startup instead of at the first request. A read-only open refuses
+/// `BEGIN IMMEDIATE`, and every other write, so it has nothing to race.
 fn allocate_page_one(conn: &Connection) -> turso_durable::Result<()> {
     let rows = conn.query("PRAGMA page_count", &[])?;
     if rows.first().and_then(|r| r.first()).and_then(Value::as_int) != Some(0) {
