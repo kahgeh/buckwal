@@ -5,6 +5,7 @@ use crate::proto::{
     describe_result, lib_error, stmt_result, to_value, Batch, BatchCond, BatchResult, ProtoError,
     Stmt, StmtResult, StreamRequest, StreamResponse, StreamResult,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -282,6 +283,44 @@ pub fn run_batch(
         step_results: results,
         step_errors: errors,
     })
+}
+
+/// The protocol errors that fail a whole pipeline before anything in it runs (PROTOCOL.md
+/// 5.3): a `close` that is not the last request, or a batch condition on its own or a later
+/// step. A condition that does not parse is left to its request, which then fails alone.
+pub fn check_pipeline(requests: &[serde_json::Value]) -> Result<(), ProtoError> {
+    let last = requests.len().saturating_sub(1);
+    for (i, r) in requests.iter().enumerate() {
+        match r.get("type").and_then(|t| t.as_str()) {
+            Some("close") if i < last => {
+                return Err(ProtoError::new(
+                    "PROTO_ERROR",
+                    format!("request {i} is a close, which must be the last request"),
+                ));
+            }
+            Some("batch") => {
+                let steps = r.pointer("/batch/steps").and_then(|s| s.as_array());
+                for (at, step) in steps.into_iter().flatten().enumerate() {
+                    let cond = step.get("condition").map(BatchCond::deserialize);
+                    if let Some(Ok(c)) = cond {
+                        check_cond(&c, at, Version::V3)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A cursor batch's conditions refer only to earlier steps (PROTOCOL.md 6.2.1).
+pub fn check_steps(batch: &Batch) -> Result<(), ProtoError> {
+    for (at, step) in batch.steps.iter().enumerate() {
+        if let Some(c) = &step.condition {
+            check_cond(c, at, Version::V3)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_cond(c: &BatchCond, at: usize, v: Version) -> Result<(), ProtoError> {
@@ -594,6 +633,64 @@ mod tests {
                 step("SELECT 2", None)]}}),
         );
         assert_eq!(code, "PROTO_ERROR");
+    }
+
+    #[test]
+    fn check_pipeline_close_position() {
+        let close = json!({"type":"close"});
+        let sel = json!({"type":"execute","stmt":{"sql":"SELECT 1"}});
+        for ok in [
+            vec![],
+            vec![close.clone()],
+            vec![sel.clone(), close.clone()],
+        ] {
+            assert_eq!(check_pipeline(&ok), Ok(()), "{ok:?}");
+        }
+        for bad in [
+            vec![close.clone(), sel.clone()],
+            vec![sel.clone(), close.clone(), sel.clone()],
+            vec![close.clone(), close.clone()],
+        ] {
+            let e = check_pipeline(&bad).unwrap_err();
+            assert_eq!(e.code.as_deref(), Some("PROTO_ERROR"), "{bad:?}");
+            assert!(e.message.contains("close"), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn check_pipeline_forward_conditions_at_any_depth() {
+        let b = |cond: J| {
+            vec![json!({"type":"batch","batch":{"steps":[
+                step("SELECT 1", None), step("SELECT 2", Some(cond))]}})]
+        };
+        let ok0 = json!({"type":"ok","step":0});
+        for good in [
+            ok0.clone(),
+            json!({"type":"not","cond":{"type":"error","step":0}}),
+            json!({"type":"and","conds":[ok0.clone(),{"type":"is_autocommit"}]}),
+            // Malformed: left to the request, which fails alone.
+            json!({"type":"bogus"}),
+            json!({"type":"ok","step":"x"}),
+        ] {
+            assert_eq!(check_pipeline(&b(good.clone())), Ok(()), "{good}");
+        }
+        for bad in [
+            json!({"type":"ok","step":1}),
+            json!({"type":"error","step":2}),
+            json!({"type":"or","conds":[ok0.clone(),
+                {"type":"not","cond":{"type":"and","conds":[{"type":"error","step":1}]}}]}),
+        ] {
+            let e = check_pipeline(&b(bad.clone())).unwrap_err();
+            assert_eq!(e.code.as_deref(), Some("PROTO_ERROR"), "{bad}");
+        }
+        // The cursor's batch, already parsed.
+        let batch: Batch = serde_json::from_value(json!({"steps":[
+            step("SELECT 1", Some(json!({"type":"not","cond":{"type":"ok","step":0}})))]}))
+        .unwrap();
+        assert_eq!(
+            check_steps(&batch).unwrap_err().code.as_deref(),
+            Some("PROTO_ERROR")
+        );
     }
 
     #[test]

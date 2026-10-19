@@ -9,7 +9,7 @@
 //! Never logged or put in a span: SQL text, arguments, batons, the token, a client's
 //! encryption key, or a `ProtoError` message (a serde error can quote the input).
 use crate::config::Token;
-use crate::exec::{execute_request, run_batch, Fence, Version};
+use crate::exec::{check_pipeline, check_steps, execute_request, run_batch, Fence, Version};
 use crate::proto::{
     lib_error, BatchResult, CursorEntry, CursorReq, CursorRespBody, PipelineReq, PipelineResp,
     ProtoError, StreamResult,
@@ -517,7 +517,29 @@ fn outcome_of<'a>(errors: impl Iterator<Item = &'a ProtoError>) -> &'static str 
     outcome
 }
 
+/// A protocol error found before anything ran fails the whole request with 400 (PROTOCOL.md
+/// 5.3). No stream is created; the stream a baton names is closed, rolling back any
+/// transaction left open on it, since the client treats the failure as fatal for it.
+fn protocol_error(streams: &Streams, baton: Option<&str>, e: &ProtoError) -> Done {
+    if let Some(b) = baton {
+        if let Checkout::Stream(mut leased) = streams.checkout(Some(b)) {
+            Span::current().record("durable.stream", leased.id);
+            leased.state.closed = true;
+            streams.give_back(leased);
+        }
+    }
+    error(
+        StatusCode::BAD_REQUEST,
+        "PROTO_ERROR",
+        &e.message,
+        "bad_request",
+    )
+}
+
 fn run_pipeline(app: &App, streams: &Streams, v: Version, req: PipelineReq) -> Done {
+    if let Err(e) = check_pipeline(&req.requests) {
+        return protocol_error(streams, req.baton.as_deref(), &e);
+    }
     let leased = match checkout(app, streams, req.baton.as_deref()) {
         Ok(l) => l,
         Err(done) => return done,
@@ -581,6 +603,9 @@ fn cursor_entries(result: Result<BatchResult, ProtoError>) -> Vec<CursorEntry> {
 }
 
 fn run_cursor(app: &App, streams: &Streams, req: CursorReq) -> Done {
+    if let Err(e) = check_steps(&req.batch) {
+        return protocol_error(streams, req.baton.as_deref(), &e);
+    }
     let leased = match checkout(app, streams, req.baton.as_deref()) {
         Ok(l) => l,
         Err(done) => return done,

@@ -216,19 +216,123 @@ fn cursor_body_ends_with_the_terminator() {
     s.stop().unwrap();
 }
 
+/// A condition on its own or a later step, at any depth, fails the whole cursor request
+/// with 400 before the baton line (PROTOCOL.md 6.2.1, 5.3): no NDJSON body, nothing runs,
+/// and the stream the baton named is closed (its transaction rolled back).
 #[test]
-fn cursor_bad_condition_is_a_final_error_entry() {
+fn cursor_forward_condition_is_400_before_the_body() {
     let s = start(Opts::default());
     let c = s.client(None);
+    let mut setup = c.stream(Proto::V2);
+    ok_pipeline(&setup.pipeline(vec![execute(CREATE, &[]), close()]).unwrap());
+    let insert = stmt("INSERT INTO t(body) VALUES ('no')", &[]);
+    let nested =
+        json!({"type":"and","conds":[cond_ok(0),{"type":"not","cond":{"type":"error","step":2}}]});
+    for cond in [cond_ok(1), nested] {
+        let mut st = c.stream(Proto::V3);
+        let b = batch(vec![
+            (None, insert.clone()),
+            (Some(cond), stmt("SELECT 1", &[])),
+        ]);
+        let (status, entries) = st.cursor(b["batch"].clone()).unwrap();
+        assert_eq!(status, 400, "{entries:?}");
+        assert_eq!(entries[0]["code"], "PROTO_ERROR", "{entries:?}");
+        assert!(entries[0].get("baton").is_none(), "{entries:?}");
+    }
     let mut st = c.stream(Proto::V3);
-    // A condition on a later step fails the whole batch before anything runs.
-    let b = batch(vec![(Some(cond_ok(1)), stmt("SELECT 1", &[]))]);
-    let (status, entries) = st.cursor(b["batch"].clone()).unwrap();
-    assert_eq!(status, 200, "{entries:?}");
-    // A fatal error ends the cursor: no terminator follows it.
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["type"], "error");
-    assert_eq!(entries[0]["error"]["code"], "PROTO_ERROR");
+    ok_pipeline(
+        &st.pipeline(vec![
+            execute("BEGIN", &[]),
+            execute("INSERT INTO t(body) VALUES ('txn')", &[]),
+        ])
+        .unwrap(),
+    );
+    let baton = st.baton().unwrap().to_string();
+    let b = batch(vec![(Some(cond_ok(0)), insert.clone())]);
+    let (status, _) = st.cursor(b["batch"].clone()).unwrap();
+    assert_eq!(status, 400);
+    st.set_baton(Some(baton));
+    let r = st.pipeline(vec![execute("SELECT 1", &[])]).unwrap();
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(code(&r), "STREAM_EXPIRED", "the stream was closed");
+    assert_eq!(
+        count(&c, "t"),
+        0,
+        "nothing ran and the transaction rolled back"
+    );
+    s.stop().unwrap();
+}
+
+/// A `close` that is not the last request fails the whole pipeline with 400 before anything
+/// in it runs (PROTOCOL.md 5.3, 6.8). A null baton creates no stream; a baton's stream is
+/// closed, its open transaction rolled back.
+#[test]
+fn close_not_last_fails_the_whole_pipeline() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut setup = c.stream(Proto::V2);
+    ok_pipeline(&setup.pipeline(vec![execute(CREATE, &[]), close()]).unwrap());
+    let insert = || execute("INSERT INTO t(body) VALUES ('no')", &[]);
+    for proto in [Proto::V2, Proto::V3] {
+        for reqs in [
+            vec![close(), insert()],
+            vec![insert(), close(), execute("SELECT 1", &[])],
+            vec![close(), close()],
+        ] {
+            let r = c.stream(proto).pipeline(reqs).unwrap();
+            assert_eq!(r.status, 400, "{proto:?}: {}", r.body);
+            assert_eq!(code(&r), "PROTO_ERROR");
+            assert!(r.body.get("results").is_none(), "{}", r.body);
+        }
+    }
+    ok_pipeline(&c.stream(Proto::V3).pipeline(vec![close()]).unwrap());
+    let mut st = c.stream(Proto::V3);
+    ok_pipeline(&st.pipeline(vec![execute("BEGIN", &[]), insert()]).unwrap());
+    let baton = st.baton().unwrap().to_string();
+    let r = st.pipeline(vec![insert(), close(), insert()]).unwrap();
+    assert_eq!(r.status, 400, "{}", r.body);
+    st.set_baton(Some(baton));
+    let r = st.pipeline(vec![execute("SELECT 1", &[])]).unwrap();
+    assert_eq!(
+        code(&r),
+        "STREAM_EXPIRED",
+        "the stream was closed: {}",
+        r.body
+    );
+    assert_eq!(
+        count(&c, "t"),
+        0,
+        "nothing ran and the transaction rolled back"
+    );
+    let report = s.stop().unwrap();
+    assert_eq!(
+        report.streams_closed, 0,
+        "no stream was left open: {report:?}"
+    );
+}
+
+/// A batch condition on its own or a later step, at any depth, fails the whole pipeline with
+/// 400; the requests before the batch do not run (PROTOCOL.md 6.2.1, 5.3).
+#[test]
+fn pipeline_forward_condition_fails_the_whole_pipeline() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut setup = c.stream(Proto::V2);
+    ok_pipeline(&setup.pipeline(vec![execute(CREATE, &[]), close()]).unwrap());
+    let insert = || execute("INSERT INTO t(body) VALUES ('no')", &[]);
+    let deep = json!({"type":"or","conds":[{"type":"not","cond":{"type":"and","conds":[cond_ok(0),{"type":"error","step":3}]}}]});
+    for proto in [Proto::V2, Proto::V3] {
+        for cond in [cond_ok(1), json!({"type":"error","step":1}), deep.clone()] {
+            let b = batch(vec![
+                (None, stmt("SELECT 1", &[])),
+                (Some(cond.clone()), stmt("SELECT 2", &[])),
+            ]);
+            let r = c.stream(proto).pipeline(vec![insert(), b]).unwrap();
+            assert_eq!(r.status, 400, "{proto:?} {cond}: {}", r.body);
+            assert_eq!(code(&r), "PROTO_ERROR");
+        }
+    }
+    assert_eq!(count(&c, "t"), 0, "the insert before the batch did not run");
     s.stop().unwrap();
 }
 
