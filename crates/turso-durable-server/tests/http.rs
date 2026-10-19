@@ -436,6 +436,111 @@ fn pipeline_body() -> Vec<u8> {
         .into_bytes()
 }
 
+/// POST `body` to `path` with the extra `headers`; the status and the body text.
+fn post_with(url: &str, path: &str, body: &Value, headers: &[(&str, &str)]) -> (u16, String) {
+    let mut req = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{url}{path}"))
+        .body(body.to_string());
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let r = req.send().unwrap();
+    (r.status().as_u16(), r.text().unwrap())
+}
+
+const KEY_HEADER_VALUE: &str = "a2V5LXZhbHVlLXRoYXQtbXVzdC1uZXZlci1iZS1lY2hvZWQ=";
+
+/// `x-turso-encryption-key` (PROTOCOL.md 3.1) is refused with 400 before any stream is
+/// touched: the server encrypts with its own key file. Any case of the name, every endpoint.
+#[test]
+fn encryption_key_header_is_refused_before_any_stream() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut st = c.stream(Proto::V3);
+    ok_pipeline(&st.pipeline(vec![execute(CREATE, &[])]).unwrap());
+    let baton = st.baton().unwrap().to_string();
+    let insert = || execute("INSERT INTO t(body) VALUES ('refused')", &[]);
+    let cursor_batch =
+        json!({"steps": [{"stmt": stmt("INSERT INTO t(body) VALUES ('refused')", &[])}]});
+    let bodies = [
+        (
+            "/v2/pipeline",
+            json!({"baton": null, "requests": [insert()]}),
+        ),
+        (
+            "/v3/pipeline",
+            json!({"baton": null, "requests": [insert()]}),
+        ),
+        (
+            "/v3/pipeline",
+            json!({"baton": baton, "requests": [insert()]}),
+        ),
+        ("/v3/cursor", json!({"baton": null, "batch": cursor_batch})),
+        ("/v3/cursor", json!({"baton": baton, "batch": cursor_batch})),
+    ];
+    for (path, body) in &bodies {
+        for name in ["x-turso-encryption-key", "X-Turso-Encryption-Key"] {
+            let (status, text) = post_with(&s.url(), path, body, &[(name, KEY_HEADER_VALUE)]);
+            assert_eq!(status, 400, "{path} {name}: {text}");
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["code"], "ENCRYPTION_KEY_NOT_ACCEPTED", "{text}");
+            let msg = v["message"].as_str().unwrap();
+            assert!(msg.contains("x-turso-encryption-key"), "{msg}");
+            assert!(
+                !text.contains(KEY_HEADER_VALUE),
+                "the value is echoed: {text}"
+            );
+        }
+    }
+    // An empty value is refused too.
+    let (status, _) = post_with(
+        &s.url(),
+        "/v3/pipeline",
+        &bodies[1].1,
+        &[("x-turso-encryption-key", "")],
+    );
+    assert_eq!(status, 400);
+    // The baton was not used (it still works) and no insert ran.
+    let r = st
+        .pipeline(vec![execute("SELECT count(*) FROM t", &[]), close()])
+        .unwrap();
+    ok_pipeline(&r);
+    assert_eq!(result_rows(&r, 0).unwrap(), vec![vec![json!(0)]]);
+    let report = s.stop().unwrap();
+    assert_eq!(
+        report.streams_closed, 0,
+        "no stream was created: {report:?}"
+    );
+}
+
+/// Authentication comes first: without the token the header gets 401, with it 400.
+#[test]
+fn encryption_key_header_after_auth() {
+    let s = start(Opts {
+        token: true,
+        ..Opts::default()
+    });
+    let body = json!({"baton": null, "requests": [execute("SELECT 1", &[])]});
+    let key = ("x-turso-encryption-key", KEY_HEADER_VALUE);
+    let (status, text) = post_with(&s.url(), "/v3/pipeline", &body, &[key]);
+    assert_eq!(status, 401, "{text}");
+    let auth = format!("Bearer {TOKEN}");
+    let (status, text) = post_with(
+        &s.url(),
+        "/v3/pipeline",
+        &body,
+        &[key, ("Authorization", &auth)],
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("ENCRYPTION_KEY_NOT_ACCEPTED"), "{text}");
+    let (status, text) = post_with(&s.url(), "/v3/pipeline", &body, &[("Authorization", &auth)]);
+    assert_eq!(status, 200, "{text}");
+    s.stop().unwrap();
+}
+
 #[test]
 fn auth_required_when_token_set() {
     let s = start(Opts {

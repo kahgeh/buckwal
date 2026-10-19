@@ -6,8 +6,8 @@
 //! gives the stream back itself, so a client that disconnects mid-request never leaks it.
 //! The response is built only after the library calls returned (the ack rule).
 //!
-//! Never logged or put in a span: SQL text, arguments, batons, the token, or a `ProtoError`
-//! message (a serde error can quote the input).
+//! Never logged or put in a span: SQL text, arguments, batons, the token, a client's
+//! encryption key, or a `ProtoError` message (a serde error can quote the input).
 use crate::config::Token;
 use crate::exec::{execute_request, run_batch, Fence, Version};
 use crate::proto::{
@@ -232,7 +232,10 @@ fn authorized(token: &Token, headers: &HeaderMap) -> bool {
     scheme.eq_ignore_ascii_case("bearer") && token.matches(credentials.trim())
 }
 
-/// The state check, then the token check.
+/// A client's remote encryption key (PROTOCOL.md 3.1). Its value is never read.
+const ENCRYPTION_KEY_HEADER: &str = "x-turso-encryption-key";
+
+/// The state check, the token check, then the refusal of a client encryption key.
 fn admit(app: &App, headers: &HeaderMap) -> Result<Arc<Streams>, Done> {
     match app.phase() {
         SHUTTING_DOWN => return Err(shutting_down()),
@@ -252,6 +255,15 @@ fn admit(app: &App, headers: &HeaderMap) -> Result<Arc<Streams>, Done> {
                 .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             return Err(done);
         }
+    }
+    if headers.contains_key(ENCRYPTION_KEY_HEADER) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "ENCRYPTION_KEY_NOT_ACCEPTED",
+            "x-turso-encryption-key is not accepted: this server encrypts the database with \
+             its own key file; remove the header",
+            "bad_request",
+        ));
     }
     app.streams.get().cloned().ok_or_else(not_ready)
 }
@@ -683,6 +695,50 @@ mod tests {
             assert!(!authorized(&t, &headers(bad)), "{bad}");
         }
         assert!(!authorized(&t, &HeaderMap::new()));
+    }
+
+    fn admit_error(app: &App, h: &HeaderMap) -> (StatusCode, &'static str, serde_json::Value) {
+        let Err(done) = admit(app, h) else {
+            panic!("admitted");
+        };
+        let status = done.resp.status();
+        let body = body_json(*done.resp);
+        (status, done.outcome, body)
+    }
+
+    fn body_json(r: Response) -> serde_json::Value {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let bytes = rt
+            .block_on(axum::body::to_bytes(r.into_body(), usize::MAX))
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn encryption_key_header_is_refused_after_the_token_check() {
+        let (_d, t) = token();
+        let app = App::new(Some(t), 1, Duration::from_secs(1));
+        app.phase.store(READY, Ordering::SeqCst);
+        let mut h = headers("Bearer abcdefghijklmnop0123");
+        h.insert(
+            "X-Turso-Encryption-Key",
+            HeaderValue::from_static("c2VjcmV0"),
+        );
+        let (status, outcome, body) = admit_error(&app, &h);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(outcome, "bad_request");
+        assert_eq!(body["code"], "ENCRYPTION_KEY_NOT_ACCEPTED");
+        let msg = body["message"].as_str().unwrap();
+        assert!(msg.contains("x-turso-encryption-key"), "{msg}");
+        assert!(!msg.contains("c2VjcmV0"), "{msg}");
+        h.remove(AUTHORIZATION);
+        let (status, outcome, _) = admit_error(&app, &h);
+        assert_eq!(
+            (status, outcome),
+            (StatusCode::UNAUTHORIZED, "unauthorized")
+        );
     }
 
     #[test]

@@ -115,6 +115,19 @@ fn request_span_has_no_sql_or_token() {
         )
         .unwrap();
     assert_eq!(r.status, 401, "{}", r.body);
+    let keyed_from = capture.spans.lock().unwrap().len();
+    let key = "KEY-VALUE-9b3f27c4";
+    let keyed = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{}/v3/pipeline", s.url()))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("x-turso-encryption-key", key)
+        .body(body.to_string())
+        .send()
+        .unwrap();
+    assert_eq!(keyed.status().as_u16(), 400);
     s.stop().unwrap();
 
     let spans = capture.spans.lock().unwrap().clone();
@@ -139,7 +152,7 @@ fn request_span_has_no_sql_or_token() {
             .any(|s| s.name == "durable.commit" && s.parent == Some(req.id)),
         "the library's commit span is a child of the request span: {during:?}"
     );
-    let refused: Vec<&SpanRec> = spans[refused_from..]
+    let refused: Vec<&SpanRec> = spans[refused_from..keyed_from]
         .iter()
         .filter(|s| s.name == "durable.server.request")
         .collect();
@@ -148,6 +161,15 @@ fn request_span_has_no_sql_or_token() {
     assert_eq!(g("http.status"), Some("401"), "{refused:?}");
     assert_eq!(g("durable.outcome"), Some("unauthorized"), "{refused:?}");
     assert_eq!(g("durable.stream"), None, "{refused:?}");
+    let keyed: Vec<&SpanRec> = spans[keyed_from..]
+        .iter()
+        .filter(|s| s.name == "durable.server.request")
+        .collect();
+    assert_eq!(keyed.len(), 1, "{keyed:?}");
+    let k = |f: &str| keyed[0].fields.get(f).map(String::as_str);
+    assert_eq!(k("http.status"), Some("400"), "{keyed:?}");
+    assert_eq!(k("durable.outcome"), Some("bad_request"), "{keyed:?}");
+    assert_eq!(k("durable.stream"), None, "{keyed:?}");
     let secret_part = baton.split_once('.').unwrap().1.to_string();
     let events = capture.events.lock().unwrap().clone();
     let values = spans
@@ -155,7 +177,7 @@ fn request_span_has_no_sql_or_token() {
         .flat_map(|s| s.fields.values().cloned())
         .chain(events);
     for v in values {
-        for needle in [marker, TOKEN, &baton, &secret_part] {
+        for needle in [marker, TOKEN, &baton, &secret_part, key] {
             assert!(!v.contains(needle), "telemetry holds {needle:?}: {v}");
         }
     }
