@@ -469,7 +469,9 @@ impl Connection {
     /// the maintenance gate are those of [`Connection::run`]. The statement is prepared but
     /// never stepped, so nothing commits and nothing waits for an ack; it works on a
     /// read-only database too. `PRAGMA durable_batching` is not run, only described as one
-    /// `durable_batching` column.
+    /// `durable_batching` column. Setter PRAGMAs that turso_core applies at prepare (e.g.
+    /// `query_only`, `foreign_keys`) take effect on describe, as they do on `run`; the
+    /// durability ones are refused by the guard. An `EXPLAIN` is read-only, as in SQLite.
     pub fn describe(&self, sql: &str) -> Result<Description> {
         self.call(self.effective_batching(), || {
             stash::clear();
@@ -489,11 +491,12 @@ impl Connection {
             let params = (1..=stmt.parameters_count())
                 .map(|i| param_name(params.name(NonZero::new(i).expect("slots start at 1"))))
                 .collect();
+            let is_explain = stmt.get_query_mode() != QueryMode::Normal;
             Ok(Description {
                 params,
                 columns: columns(&stmt),
-                is_explain: stmt.get_query_mode() != QueryMode::Normal,
-                is_readonly: stmt.get_program().is_readonly(),
+                is_explain,
+                is_readonly: is_explain || stmt.get_program().is_readonly(),
             })
         })
     }
@@ -992,6 +995,58 @@ mod tests {
             Err(Error::Unsupported("synchronous below FULL"))
         );
         assert_eq!(conn.core().get_sync_mode(), SyncMode::Full);
+    }
+
+    /// The guard runs before the engine's prepare, which would apply a key or cipher change
+    /// (translate/pragma.rs:644-655; on a plain database the cipher does change). The
+    /// connection keeps its settings and keeps reading and writing.
+    #[test]
+    fn describe_refuses_encryption_pragmas_before_the_prepare() {
+        for encrypted in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let mut c = Config::new(t.path().join("db"), "http://127.0.0.1:1", "b", "k", "s");
+            if encrypted {
+                let key = t.path().join("key");
+                std::fs::write(&key, "11".repeat(32)).unwrap();
+                c.encryption_key_file = Some(key);
+            }
+            let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+            conn.execute("INSERT INTO t VALUES (1), (2)", &[]).unwrap();
+            let cipher = |c: &Connection| c.query("PRAGMA cipher", &[]).unwrap();
+            let before = cipher(&conn);
+            let what = "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)";
+            for sql in [
+                "PRAGMA cipher = 'aes256gcm'".to_string(),
+                format!("PRAGMA hexkey = '{}'", "22".repeat(32)),
+            ] {
+                let r = conn.describe(&sql);
+                assert_eq!(r, Err(Error::Unsupported(what)), "{encrypted} {sql}");
+            }
+            assert_eq!(cipher(&conn), before, "{encrypted}");
+            let n = conn.query("SELECT count(*) FROM t", &[]).unwrap();
+            assert_eq!(n[0][0].as_int(), Some(2), "{encrypted}");
+            conn.execute("INSERT INTO t VALUES (3)", &[]).unwrap();
+            let n = db.connect().unwrap().query("SELECT count(*) FROM t", &[]);
+            assert_eq!(n.unwrap()[0][0].as_int(), Some(3), "{encrypted}");
+        }
+    }
+
+    /// `EXPLAIN` runs nothing, so it is read-only whatever it explains, as in SQLite.
+    #[test]
+    fn describe_of_explain_is_readonly() {
+        let (_t, db) = open_mem();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)", &[]).unwrap();
+        for sql in [
+            "EXPLAIN DELETE FROM t",
+            "EXPLAIN QUERY PLAN DELETE FROM t",
+            "EXPLAIN INSERT INTO t VALUES (1)",
+        ] {
+            let d = conn.describe(sql).unwrap();
+            assert!(d.is_explain && d.is_readonly, "{sql}: {d:?}");
+        }
     }
 
     #[test]

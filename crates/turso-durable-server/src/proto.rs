@@ -338,6 +338,7 @@ pub fn stmt_result(
     }
 }
 
+/// A library description as a `describe` result (PROTOCOL.md 6.4).
 pub fn describe_result(d: turso_durable::Description) -> DescribeResult {
     DescribeResult {
         params: d

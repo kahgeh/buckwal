@@ -930,6 +930,7 @@ mod tests {
         );
         let r = f.ok(json!({"type":"describe","sql":"EXPLAIN DELETE FROM t"}));
         assert_eq!(r["result"]["is_explain"], true);
+        assert_eq!(r["result"]["is_readonly"], true);
         let r = f.ok(json!({"type":"describe","sql":"DELETE FROM t"}));
         assert_eq!(
             r["result"],
