@@ -4,11 +4,13 @@ mod common;
 
 use common::{db_config, restored, start, tls_material, Opts, TOKEN};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use turso_durable::takeover_with_store;
+use turso_durable::store::{MemStore, ObjectStore};
+use turso_durable::{open_read_only_with_store, open_with_store, takeover_with_store, UploadStats};
 use turso_durable_hrana_client::{
     batch, close, cond_ok, describe, execute, execute_named, get_autocommit, result_error,
     result_rows, stmt, tx_batch_request, Arg, Client, Proto, Reply,
@@ -917,6 +919,172 @@ fn fenced_server_reports_unhealthy() {
         report.fenced,
         "a fenced stop must not look like success: {report:?}"
     );
+}
+
+/// turso_core 0.8.3 panics (pager.rs:5648) when the first writes to a fresh database run at
+/// once on several connections, and the client would get a 500. Each round is a new server
+/// on a fresh database, with every writer on its own stream.
+#[test]
+fn concurrent_first_writes_to_a_fresh_database_all_succeed() {
+    const ROUNDS: usize = 20;
+    const WRITERS: usize = 32;
+    for round in 0..ROUNDS {
+        let s = start(Opts::default());
+        let c = Arc::new(s.client(None));
+        let go = Arc::new(std::sync::Barrier::new(WRITERS));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let (c, go) = (c.clone(), go.clone());
+                std::thread::spawn(move || {
+                    let mut st = c.stream(Proto::V2);
+                    go.wait();
+                    st.pipeline(vec![
+                        execute(&format!("CREATE TABLE f{i}(x INTEGER)"), &[]),
+                        close(),
+                    ])
+                    .unwrap()
+                })
+            })
+            .collect();
+        for w in writers {
+            let r = w.join().unwrap();
+            assert_eq!(r.status, 200, "round {round}: {}", r.body);
+            ok_pipeline(&r);
+        }
+        let report = s.stop().unwrap();
+        assert!(report.clean, "round {round}: {report:?}");
+    }
+}
+
+/// What the bucket and the library held after the open, and again when the server was ready.
+struct Startup {
+    opened: (UploadStats, BTreeSet<String>),
+    ready: (UploadStats, BTreeSet<String>),
+    page_count: i64,
+}
+
+fn log_keys(store: &MemStore) -> BTreeSet<String> {
+    store
+        .list("")
+        .unwrap()
+        .into_iter()
+        .filter(|k| k.contains("log/"))
+        .collect()
+}
+
+/// Serve `cfg`'s database (opened read-only when `read_only`) until it is ready, then stop.
+fn serve_until_ready(cfg: turso_durable::Config, store: Arc<MemStore>, read_only: bool) -> Startup {
+    let bound = bind(ServeConfig::from_lookup(Some("127.0.0.1:0"), |_| None).unwrap()).unwrap();
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (open_store, ready_store) = (store.clone(), store);
+    let report = bound
+        .serve(
+            move || {
+                let s: Arc<dyn ObjectStore> = open_store.clone();
+                let db = match read_only {
+                    false => open_with_store(cfg, s),
+                    true => open_read_only_with_store(cfg, s),
+                };
+                let db = db.map_err(|e| e.to_string())?;
+                opened_tx
+                    .send((db.upload_stats(), log_keys(&open_store)))
+                    .unwrap();
+                Ok(db)
+            },
+            move |db| {
+                let ready = (db.upload_stats(), log_keys(&ready_store));
+                let c = db.connect().unwrap();
+                let rows = c.query("PRAGMA page_count", &[]).unwrap();
+                ready_tx
+                    .send((ready, rows[0][0].as_int().unwrap()))
+                    .unwrap();
+                drop(c);
+                let _ = stop_tx.send(());
+            },
+            async move {
+                let _ = stop_rx.await;
+            },
+        )
+        .unwrap();
+    assert!(report.clean, "{report:?}");
+    let (ready, page_count) = ready_rx.recv().unwrap();
+    Startup {
+        opened: opened_rx.recv().unwrap(),
+        ready,
+        page_count,
+    }
+}
+
+fn commits(s: &UploadStats) -> (u64, u64, u64) {
+    (s.commits_acked, s.commits_uploaded, s.log_puts)
+}
+
+/// The database config, encrypted when `key` (and with a long batching window either way,
+/// so a commit made before ready would hold the startup up).
+fn startup_config(dir: &std::path::Path, key: bool) -> turso_durable::Config {
+    let mut cfg = db_config(dir);
+    cfg.batching = "window 60s 1000 64MiB".parse().unwrap();
+    if key {
+        let file = dir.with_extension("key");
+        std::fs::write(&file, "ab".repeat(32)).unwrap();
+        cfg.encryption_key_file = Some(file);
+    }
+    cfg
+}
+
+/// Before ready, the server only reads a database that is not fresh: the startup adds no
+/// commit, no ack and no log object, encrypted or not.
+#[test]
+fn startup_adds_no_commit_to_an_existing_database() {
+    for key in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemStore::new());
+        let dir = t.path().join("db");
+        let db = open_with_store(startup_config(&dir, key), store.clone()).unwrap();
+        let c = db.connect().unwrap();
+        c.set_batching(Some(turso_durable::Batching::Off)).unwrap();
+        c.execute(CREATE, &[]).unwrap();
+        c.execute("INSERT INTO t(body) VALUES ('a')", &[]).unwrap();
+        drop(c);
+        db.close().unwrap();
+        let s = serve_until_ready(startup_config(&dir, key), store.clone(), false);
+        assert!(s.page_count > 0, "key={key}: the database is not fresh");
+        assert_eq!(commits(&s.opened.0), commits(&s.ready.0), "key={key}");
+        assert_eq!(s.opened.1, s.ready.1, "key={key}: log objects");
+    }
+}
+
+/// A fresh database has page 1 by the time the server is ready, and getting it made no
+/// commit (so no ack waited out the batching window), encrypted or not.
+#[test]
+fn startup_allocates_page_one_of_a_fresh_database_without_a_commit() {
+    for key in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemStore::new());
+        let started = Instant::now();
+        let s = serve_until_ready(startup_config(&t.path().join("db"), key), store, false);
+        assert!(started.elapsed() < Duration::from_secs(30), "key={key}");
+        assert_eq!(s.page_count, 1, "key={key}: page 1 is allocated");
+        assert_eq!(commits(&s.ready.0), (0, 0, 0), "key={key}");
+        assert_eq!(s.opened.1, s.ready.1, "key={key}: log objects");
+    }
+}
+
+/// A read-only open of a database that was never written is fresh too, but it refuses every
+/// write, so there is nothing to allocate and the server still starts.
+#[test]
+fn startup_serves_a_fresh_read_only_open() {
+    let t = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemStore::new());
+    open_with_store(db_config(&t.path().join("w")), store.clone())
+        .unwrap()
+        .close()
+        .unwrap();
+    let s = serve_until_ready(db_config(&t.path().join("r")), store, true);
+    assert_eq!(s.page_count, 0);
+    assert_eq!(commits(&s.ready.0), (0, 0, 0));
 }
 
 #[test]

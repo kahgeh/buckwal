@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use turso_durable::{Connection, Database};
+use turso_durable::{Connection, Database, Value};
 
 #[derive(Clone, Debug)]
 pub struct StreamsCfg {
@@ -144,9 +144,31 @@ pub struct CloseOutcome {
     pub error: Option<turso_durable::Error>,
 }
 
+/// Allocate page 1 of a fresh database (`PRAGMA page_count` is 0) on `conn`, alone, before
+/// any request runs. turso_core 0.8.3 checks, then locks, in `maybe_allocate_page1`, so the
+/// first writes to a fresh database on several connections at once can allocate it twice and
+/// panic (pager.rs:3290-3297, 5644-5648). `BEGIN IMMEDIATE` allocates it
+/// (`begin_write_tx`) and `ROLLBACK` commits nothing, so no ack waits on any batching.
+/// A database that is not fresh is only read. A read-only open refuses `BEGIN IMMEDIATE`, and
+/// every other write, so it has nothing to race.
+fn allocate_page_one(conn: &Connection) -> turso_durable::Result<()> {
+    let rows = conn.query("PRAGMA page_count", &[])?;
+    if rows.first().and_then(|r| r.first()).and_then(Value::as_int) != Some(0) {
+        return Ok(());
+    }
+    match conn.execute("BEGIN IMMEDIATE", &[]) {
+        Err(turso_durable::Error::Unsupported(_)) => return Ok(()),
+        r => r?,
+    };
+    conn.execute("ROLLBACK", &[])?;
+    Ok(())
+}
+
 impl Streams {
+    /// Connect the anchor, and allocate page 1 on it when the database is fresh.
     pub fn new(db: Database, cfg: StreamsCfg) -> turso_durable::Result<Streams> {
         let anchor = db.connect()?;
+        allocate_page_one(&anchor)?;
         Ok(Streams {
             db,
             cfg,
