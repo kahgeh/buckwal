@@ -1,5 +1,6 @@
-//! The axum router: health, the version probes, Hrana `/v2/pipeline`, `/v3/pipeline` and
-//! `/v3/cursor`, the bearer-token check and the `durable.server.request` span.
+//! The axum router: health, the version probes, SQL over HTTP v3's `/v3/pipeline` and
+//! `/v3/cursor` (and `/v2/pipeline`), the bearer-token check and the `durable.server.request`
+//! span.
 //!
 //! A pipeline runs in `spawn_blocking` inside the request span, so the library's commit
 //! spans are its children. The blocking task checks the stream out, runs the requests and

@@ -1,4 +1,4 @@
-//! Runs Hrana stream requests (JSON) on a `turso_durable::Connection`.
+//! Runs SQL over HTTP v3 stream requests (JSON) on a `turso_durable::Connection`.
 //!
 //! SQL text, arguments and tokens are never logged here.
 use crate::proto::{
@@ -18,7 +18,7 @@ use turso_parser::ast::{
 };
 use turso_parser::parser::Parser;
 
-/// Hrana protocol version of the endpoint a request came in on.
+/// The endpoint a request came in on: `/v2/pipeline` or `/v3/...`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Version {
     V2,
@@ -170,10 +170,7 @@ fn handle(
         }
         StreamRequest::GetAutocommit => {
             if v == Version::V2 {
-                return Err(ProtoError::new(
-                    "UNSUPPORTED",
-                    "get_autocommit needs Hrana 3",
-                ));
+                return Err(ProtoError::new("UNSUPPORTED", "get_autocommit needs /v3"));
             }
             Ok(StreamResponse::GetAutocommit {
                 is_autocommit: st.conn.is_autocommit(),
@@ -414,7 +411,7 @@ fn check_cond(c: &BatchCond, at: usize, v: Version) -> Result<(), ProtoError> {
             if v == Version::V2 {
                 Err(ProtoError::new(
                     "UNSUPPORTED",
-                    "the is_autocommit condition needs Hrana 3",
+                    "the is_autocommit condition needs /v3",
                 ))
             } else {
                 Ok(())
@@ -940,7 +937,7 @@ mod tests {
             r["result"],
             json!({"params":[],"cols":[],"is_explain":false,"is_readonly":false})
         );
-        // On Hrana 2 too.
+        // On /v2 too.
         let StreamResult::Ok { .. } =
             f.req(Version::V2, json!({"type":"describe","sql":"SELECT 1"}))
         else {

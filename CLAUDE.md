@@ -1,10 +1,10 @@
 # turso-durable
 
-Rust library `turso_durable` (crates/turso_durable) plus CLI `turso-durable` (crates/turso-durable-cli) that makes a tursodb database durable in an S3 bucket. `turso-durable serve` (crates/turso-durable-server) serves it over Hrana over HTTP; crates/turso-durable-hrana-client is its test-only client.
+Rust library `turso_durable` (crates/turso_durable) plus CLI `turso-durable` (crates/turso-durable-cli) that makes a tursodb database durable in an S3 bucket. `turso-durable serve` (crates/turso-durable-server) serves it over tursodb's SQL over HTTP v3 (`serverless/PROTOCOL.md`, turso 0b2bec917); its clients are tursodb's serverless drivers. tursodb's conformance suite and the Go driver pass against it; the TypeScript and Python drivers and every libSQL client were not run (README, Server, Clients run and not run). crates/turso-durable-hrana-client is its test-only client (the name is historical).
 
 ## Tests
 
-- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (551, the server's HTTP tests included). Fast.
+- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (587, the server's HTTP tests included). Fast.
 - `./scripts/test.sh`: the above, then starts RustFS and runs `--ignored` tests with `--test-threads=1` in two passes: plain HTTP (`--skip tls_`), then HTTPS with encryption (all). Each pass runs 5 `serve` tests, 38 system tests and the S3 tests (8, then 12). About 12 min (12:01).
 - The `serve` system tests (crates/turso-durable-cli/tests/server.rs) join both passes: plain HTTP without a token in pass 1, HTTPS with a token in pass 2. `serve` defaults to `127.0.0.1:9295`; tests always use port 0 and read the port from the `serve listening` line.
 - Pass 2's TLS material and key are made in a `mktemp -d` dir (`turso-durable-tls.*`) and removed on exit; it exports `TURSO_DURABLE_TLS_DIR` and `DURABLE_ENCRYPTION_KEY_FILE`.

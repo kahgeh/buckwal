@@ -1,7 +1,8 @@
-//! System tests of `turso-durable serve` against a real RustFS: a Hrana client in the test
-//! process (`turso_durable_hrana_client`, which builds requests in the libSQL clients' shapes)
-//! talks to the server process. Every row a 200 with an `ok` result acknowledged must
-//! survive SIGKILL plus the loss of the local disk, a takeover and a SIGTERM under load.
+//! System tests of `turso-durable serve` against a real RustFS: the test client of tursodb's SQL
+//! over HTTP v3 in the test process (`turso_durable_hrana_client`, which builds requests in
+//! libSQL's client shapes, still accepted, plus `describe`) talks to the server process. Every
+//! row a 200 with an `ok` result acknowledged must survive SIGKILL plus the loss of the local
+//! disk, a takeover and a SIGTERM under load.
 //!
 //! In the second pass of `scripts/test.sh` (`TURSO_DURABLE_TLS_DIR` set) every server serves
 //! HTTPS with a bearer token from a file in the test's temp directory, and the database is
@@ -530,10 +531,10 @@ fn lose_disk(ctx: &Ctx, dir: &Path) {
 }
 
 /// Stream 1 inserts 50 rows with the database Off; streams 2 to 5, on threads, each set the
-/// Window setting for themselves and insert 50; stream 6 runs one libSQL transaction batch
-/// whose first step after BEGIN sets the Window setting for that transaction, with 20 inserts;
-/// stream 7 counts 270 rows through a v3 cursor. After a clean SIGTERM and the loss of the
-/// disk, every one of the 270 acks restores.
+/// Window setting for themselves and insert 50; stream 6 runs one transaction batch in
+/// @libsql/client's shape, whose first step after BEGIN sets the Window setting for that
+/// transaction, with 20 inserts; stream 7 counts 270 rows through a v3 cursor. After a clean
+/// SIGTERM and the loss of the disk, every one of the 270 acks restores.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn serve_client_writes_off_window_and_txn_batching() {

@@ -1,5 +1,6 @@
-//! Hrana over HTTP against a server on `127.0.0.1:0` over a `MemStore`, through the test
-//! client (`turso_durable_hrana_client`), which builds requests in the real clients' shapes.
+//! tursodb's SQL over HTTP v3 against a server on `127.0.0.1:0` over a `MemStore`, through the
+//! test client (`turso_durable_hrana_client`), which builds requests by hand: libSQL's client
+//! shapes, which the protocol (it descends from libSQL's Hrana) still accepts, and `describe`.
 mod common;
 
 use common::{db_config, restored, start, tls_material, Opts, TOKEN};
@@ -112,6 +113,7 @@ fn v2_execute_and_stream_continuity() {
 }
 
 /// The libsql Rust crate 0.10.0 sends an `execute` as a one-step batch, then `get_autocommit`.
+/// SQL over HTTP v3 descends from libSQL's Hrana, and this shape remains accepted.
 fn libsql_rust_execute(sql: &str, args: &[Arg]) -> Value {
     let mut st = stmt(sql, args);
     st["named_args"] = json!([]);

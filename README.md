@@ -4,7 +4,7 @@ Make a tursodb database durable in an S3 bucket. A Rust library (`turso_durable`
 
 Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
 
-This is stage 4: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export. Stage 4 adds transport and encryption: HTTPS with a CA bundle you name (`DURABLE_CA_BUNDLE`) or the platform's trust store, and encryption of the database with a key from a local file (`DURABLE_ENCRYPTION_KEY_FILE`), so the bucket holds ciphertext. A server, `turso-durable serve`, serves the database to libSQL clients over Hrana over HTTP, so apps in other languages and several processes can use it (see Server). It is tested against RustFS on a laptop, over plain HTTP and over HTTPS with encryption (not on AWS S3).
+This is stage 4: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export. Stage 4 adds transport and encryption: HTTPS with a CA bundle you name (`DURABLE_CA_BUNDLE`) or the platform's trust store, and encryption of the database with a key from a local file (`DURABLE_ENCRYPTION_KEY_FILE`), so the bucket holds ciphertext. A server, `turso-durable serve`, serves the database over tursodb's SQL over HTTP v3 to tursodb's serverless drivers, so apps in other languages and several processes can use it (see Server). It is tested against RustFS on a laptop, over plain HTTP and over HTTPS with encryption (not on AWS S3).
 
 ## How it works
 
@@ -321,7 +321,7 @@ pub enum Batching {
 | `sql --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer, runs each SQL argument, and prints rows tab-separated. Without `--claim`, it runs only on a directory that already holds a writer's own database. For any other directory (missing, empty, restored and never opened, or holding an interrupted takeover) it exits 1 without touching the bucket, because opening it would restore or create the database and take it over from any running writer. It suggests `verify` or `--claim`. With `--claim`, such a directory is taken over exactly as `takeover` does it (or created, when the prefix holds no database), and an interrupted takeover resumes. There is no read-only fallback; use `verify` to read. |
 | `stats --dir DIR [--claim] [--batching SPEC] SQL…` | Opens `DIR` as the writer like `sql` (the same `--claim` rule), runs each SQL argument as its own `execute`, then prints `Database::upload_stats()` as `key=value` lines: `commits_acked`, `commits_uploaded`, `log_puts`, `log_put_bytes`, `commits_per_log_put`, `bytes_per_log_put`, `ack_wait_p50_ms`, `ack_wait_p95_ms`, `ack_wait_p99_ms`. |
 | `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N] [--connections N] [--batching SPEC] [--batching-file PATH] [--stats-every N]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors, printing `error <message>`. More below. |
-| `serve --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC]` | Serves the database over Hrana over HTTP until SIGTERM or SIGINT, as the writer (the same `--claim` rule as `sql`). It reads `DURABLE_SERVE_*` too, and prints `serve listening …`, `serve ready …` and `serve stopped …` lines (see Server). |
+| `serve --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC]` | Serves the database over tursodb's SQL over HTTP v3 until SIGTERM or SIGINT, as the writer (the same `--claim` rule as `sql`). It reads `DURABLE_SERVE_*` too, and prints `serve listening …`, `serve ready …` and `serve stopped …` lines (see Server). |
 | `bench --dir DIR --commits N [--connections N] [--batching SPEC]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, `busy_retries` (commits the engine refused as `database is busy`, each retried after 10 ms for up to 10 s, after which bench fails with the error; latency runs from the first attempt), commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, each seal's ms and page count, then the maintenance checkpoint's `maintenance_runs` (runs started), `maintenance_sealed`, `maintenance_skipped`, `maintenance_gate_wait_max_ms` (the longest drain of a run that sealed), and `generation_log_objects_max` (the highest log seq seen before the close: the most log objects a generation held, which a restore of it reads). |
 
 `SPEC` is the PRAGMA's text, `off` or `window <max_wait> <max_commits> <max_bytes>` (for example `'window 10ms 64 1MiB'`). `--batching` sets it with `Database::set_batching` after open; without it, `DURABLE_BATCHING` applies.
@@ -342,14 +342,16 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 
 ## Server
 
-`turso-durable serve` runs one process that owns the database: it is the single writer, holds the lease and talks to the bucket. Apps in other languages, or several app processes on the machine, connect to it with a libSQL client over Hrana over HTTP instead of embedding the library. The server sends a result only after the library call returned, so a client hears success only once the commit is in the bucket, as with the library.
+`turso-durable serve` runs one process that owns the database: it is the single writer, holds the lease and talks to the bucket. Apps in other languages, or several app processes on the machine, connect to it with one of tursodb's serverless drivers instead of embedding the library. The server sends a result only after the library call returned, so a client hears success only once the commit is in the bucket, as with the library.
+
+**Protocol.** The server speaks tursodb's "SQL over HTTP v3": `serverless/PROTOCOL.md` in the turso repo at commit `0b2bec917`. Its clients are tursodb's serverless drivers: `@tursodatabase/serverless` (TypeScript), `turso_serverless` (Rust), `tursogo-serverless` (Go) and `turso_serverless` (Python). `/v2/pipeline` is still accepted, as PROTOCOL.md section 2 allows. tursodb's own conformance suite and the Go driver pass against it; the TypeScript and Python drivers were not run (see Clients run and not run below). The protocol descends from libSQL's Hrana, and the server still parses the request shapes libSQL's clients send, but no libSQL client library was run against it.
 
 ```sh
 eval "$(scripts/rustfs.sh env)"     # or your own DURABLE_* settings (see Settings)
 turso-durable serve --dir /var/lib/myapp/db [--listen 127.0.0.1:9295] [--claim] [--batching SPEC]
 ```
 
-A libSQL client then uses the URL `http://127.0.0.1:9295` (with its auth token when the server has one). `--claim` and `--batching` work as in `sql`: without `--claim`, a directory that holds no database this writer owns is refused with `sql`'s message, before the port is bound or the bucket is touched.
+A driver then uses the URL `http://127.0.0.1:9295` (with its auth token when the server has one). `--claim` and `--batching` work as in `sql`: without `--claim`, a directory that holds no database this writer owns is refused with `sql`'s message, before the port is bound or the bucket is touched.
 
 It prints three lines on stdout:
 - `serve listening addr=<ip:port> tls=<bool> auth=<bool>`, once the port is bound (the real port when `--listen` asks for port 0). `/health` answers `starting` from here on.
@@ -358,10 +360,10 @@ It prints three lines on stdout:
 
 ```mermaid
 flowchart LR
-  client["App in any language<br/>libSQL client (Hrana over HTTP)"]:::existing
+  client["App in any language<br/>tursodb serverless driver (SQL over HTTP v3)"]:::existing
   subgraph serve["turso-durable serve (one process)"]
     http["HTTP listener<br/>127.0.0.1 by default, TLS + token to bind wider"]:::new
-    hrana["Hrana handler<br/>pipeline, batches, streams"]:::new
+    sqlhttp["SQL over HTTP v3 handler<br/>pipeline, cursor, batches, describe"]:::new
     streams["Stream → Connection map<br/>timeouts, shutdown"]:::new
     health["GET /health"]:::new
   end
@@ -369,7 +371,7 @@ flowchart LR
   bucket[("Bucket<br/>format unchanged")]:::existing
   otel["Telemetry<br/>+ span durable.server.request"]:::changed
   cli["turso-durable CLI<br/>+ serve command"]:::changed
-  client -- "POST /v2|v3/pipeline" --> http --> hrana --> streams --> lib --> bucket
+  client -- "POST /v3/pipeline, /v3/cursor (or /v2/pipeline)" --> http --> sqlhttp --> streams --> lib --> bucket
   http --> health
   serve -.-> otel
   cli --> serve
@@ -401,32 +403,40 @@ Fixed limits: a request body of at most 16 MiB (413 `PAYLOAD_TOO_LARGE`, sent on
 
 **Memory.** Results are buffered in memory, and the cursor is not streamed: a very large `SELECT` result is held whole before it is sent, so page large reads with `LIMIT` and `OFFSET`. Up to 1024 connections may each hold a request body of up to 16 MiB at the same time.
 
+**Startup.** Before `serve ready`, while requests still get 503 `NOT_READY`, the server reads `PRAGMA page_count` on the anchor connection (see Streams). When it is 0 (a fresh database), and only then, it runs `BEGIN IMMEDIATE; ROLLBACK` there once, which allocates page 1 and commits nothing. That avoids a turso_core 0.8.3 race (storage/pager.rs:5648 `! self.db_initialized()`) that otherwise turned concurrent first writes on several streams into HTTP 500 in 7 of 20 runs. It adds no commit, with or without encryption and under any `--batching`. On a database that is not fresh the check is one library call, so a seal that is already due at open can move from the first request to startup. Other embedders (the CLI's `sql` command, library users with several connections) are still exposed to that race until the library or upstream fixes it. Two more side effects are under Guarantees and limits, Server limits.
+
 **Endpoints.**
 
 | Endpoint | Token | What it does |
 |---|---|---|
 | `GET /health` | no | The server's state as JSON (see Health below). |
 | `GET /v2`, `GET /v3` | no | Version probes: 200 `{}`. |
-| `POST /v2/pipeline` | when set | Hrana 2 over HTTP (JSON). |
-| `POST /v3/pipeline` | when set | Hrana 3 over HTTP (JSON). |
-| `POST /v3/cursor` | when set | Hrana 3's cursor: one batch, answered as NDJSON (`application/x-ndjson`): the baton line, then `step_begin`, `row`, `step_end`, `step_error` and `error` entries. |
+| `POST /v3/pipeline` | when set | The pipeline (PROTOCOL.md section 5), JSON. |
+| `POST /v3/cursor` | when set | The cursor (section 7): one batch, answered as NDJSON (`application/x-ndjson`): the baton line, then `step_begin`, `row`, `step_end` and `step_error` entries, then `{"type":"replication_index","replication_index":null}` once the batch has run. |
+| `POST /v2/pipeline` | when set | The same pipeline for older clients (section 2), without `get_autocommit` and the `is_autocommit` condition. |
 
-Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. hrana-client probes `GET /v3-protobuf` and falls back to `/v2/pipeline` on the 404.
+Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. (libSQL's hrana-client probes `GET /v3-protobuf` and, from its source, falls back to `/v2/pipeline` on the 404.)
 
-**Protocol coverage.** What the current clients send, from their sources:
+**Protocol coverage.**
+- Served: the endpoints above, and the requests `execute`, `batch` (all six conditions: `ok`, `error`, `not`, `and`, `or`, `is_autocommit`), `sequence`, `describe`, `store_sql`, `close_sql`, `close`, and on `/v3` `get_autocommit`. A statement takes `sql` or `sql_id`, `args`, `named_args` and `want_rows`; unknown fields are ignored (libSQL's Rust crate sends `replication_index`).
+- `describe` (section 6.4), by `sql` or `sql_id`, on both pipelines, answers `params` (a name without its `:`, `@` or `$`, and `null` for a positional one), `cols`, `is_explain` and `is_readonly`. It runs the library's `Connection::describe`: the SQL guard first, the sync-mode check after the engine's prepare, and it never steps, so nothing commits. Setter PRAGMAs that turso_core applies at prepare (for example `query_only`, `foreign_keys`) take effect on describe, as on execute; the durability ones are refused by the guard. An `EXPLAIN` describes as read-only. A describe of `PRAGMA durable_batching` gives a fixed description and changes no setting.
+- The `error` condition is the negation of `ok`: it is true when the step failed or was skipped (section 6.2.1). This differs from libSQL's Hrana, where `error` is true only for a step that failed.
+- Values (section 8.2): a non-finite float result is sent as `{"type":"float","value":null}`. Blobs go out as standard base64 without padding; padded and unpadded are both accepted. A client must not send a non-finite float: `{"type":"float","value":null}` as an argument fails its request with `PROTO_ERROR`.
+- Statement results (section 8.4):
+  - `last_insert_rowid` is `null` unless the statement inserted a row. It is a decimal string in pipeline results and a JSON number in the cursor's `step_end`. The server decides from the statement: an `INSERT` or `REPLACE` (parsed with turso_parser) that changed at least one row inserted one. With an `ON CONFLICT … DO UPDATE` a changed row may be an update, so it counts only if the connection's last rowid moved (read with one extra `SELECT 1` before the statement). The one known gap: such an upsert that inserts a new row whose rowid equals the connection's previous last rowid (possible only after that row was deleted) reports `null`.
+  - `rows_written` is the statement's changed-row count, `rows_read` is always 0, `query_duration_ms` is measured, and `base_url` is always null.
+- These fail the whole request with 400 `PROTO_ERROR`, before anything in it runs, and close a stream the baton names, rolling back any transaction left open on it (section 5.3): a `close` that is not the last request of the pipeline, and a batch condition that refers to its own step or a later one, at any depth (pipeline and cursor; on the cursor, before the baton line). A body that is not a pipeline or cursor request at all also gets 400 `PROTO_ERROR`.
+- A malformed request in a pipeline fails alone with `PROTO_ERROR`, and an unknown request type with `UNSUPPORTED`; the other requests still run. A statement with non-empty `args` and non-empty `named_args` fails alone with `SQL_INPUT_ERROR` (an empty array counts as omitted). `get_autocommit` and the `is_autocommit` condition on `/v2/pipeline` fail alone with `UNSUPPORTED` (section 2 lets a server refuse them there).
+- Not served: the WebSocket transport, `/v3-protobuf`, and what lies outside the protocol: sqld's v1 HTTP (`/v1/execute`, `/v1/batch`, `POST /`), `/version`, namespaces, dump and replication.
 
-| Client | What it uses |
-|---|---|
-| `@libsql/client` (TypeScript) 0.15.15, through hrana-client 0.9.0 | `/v2/pipeline` (JSON): `execute`, `batch` (`ok`, `not`, `and` conditions), `sequence`, `store_sql`, `close_sql`, `close`. Never `describe` or `get_autocommit`. |
-| `libsql` Rust crate 0.10.0 remote (also Python `libsql`, which wraps it) | `/v3/pipeline` and `/v3/cursor` (JSON): `batch` (an `execute` is a batch), queries through the cursor, `get_autocommit` after batches, `sequence`, `store_sql`, `close_sql`, `close`, and `describe` only from `Statement` metadata calls. |
-| `libsql-client-go` | `/v2/pipeline`: `execute`, `batch`, `close`. |
+**Remaining differences from PROTOCOL.md.**
+- An expired or unknown baton gets 400 `STREAM_EXPIRED`, where the protocol says "typically 404" (section 4.5). The conformance suite accepts any non-200.
+- There is no WebSocket transport, and `/v3-protobuf` gets 404.
+- `base_url` is always null (section 4.6).
+- The cursor is buffered, not streamed (section 7): the whole batch runs before the first line is sent (see Memory).
+- A non-200 response's body is `{"message":…,"code":…}`, with no `error` field (section 9.3 asks for one, and also tells clients not to rely on the shape). No error carries an `extended_code` (optional, section 9.1).
 
-- Built: the endpoints above, and the requests `execute`, `batch` (all six conditions: `ok`, `error`, `not`, `and`, `or`, `is_autocommit`), `sequence`, `store_sql`, `close_sql`, `close`, and on v3 `get_autocommit`. A statement takes `sql` or `sql_id`, `args`, `named_args` and `want_rows`; unknown fields are ignored (libsql sends `replication_index`).
-- Left out: the WebSocket transport, `/v3-protobuf`, and the cursor's WebSocket requests (`open_cursor` and the rest). `describe` gets `UNSUPPORTED` (it needs a prepare-only library call, and no client uses it on a write path). sqld's v1 HTTP (`/v1/execute`, `/v1/batch`, `POST /`), `/version`, namespaces, dump and replication. `get_autocommit` and the `is_autocommit` condition on `/v2/pipeline` get `UNSUPPORTED` (they are Hrana 3 only).
-- In every statement result, `rows_read` and `rows_written` are always 0, `query_duration_ms` is measured, and `last_insert_rowid` is a string. `base_url` is always null.
-- A malformed request in a pipeline fails alone with `PROTO_ERROR`, and an unknown request type with `UNSUPPORTED`; the other requests still run. A body that is not a pipeline at all gets 400 `PROTO_ERROR`.
-
-**Error codes.** A library error becomes a Hrana error whose `code` is stable and whose `message` is the error's text.
+**Error codes.** A library error becomes an error object (section 9.1) whose `code` is stable and whose `message` is the error's text.
 
 | Source | `code` |
 |---|---|
@@ -434,8 +444,8 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. hra
 | `Error::Timeout` | `TIMEOUT` |
 | `Error::UploadFailed` | `UPLOAD_FAILED` |
 | `Error::Unsupported` | `UNSUPPORTED` |
-| `Error::Engine` with "constraint failed" | `SQLITE_CONSTRAINT` |
-| `Error::Engine` with "busy" | `SQLITE_BUSY` |
+| `Error::Engine` whose message contains "constraint failed" (any case) | `SQLITE_CONSTRAINT` (a substring match, so a message that only quotes the words matches too) |
+| `Error::Engine` whose whole message is one of turso_core's busy messages, "Database is busy" or the stale snapshot's "Database snapshot is stale. You must rollback and retry the whole transaction.", or the library's "database is busy (locked)" | `SQLITE_BUSY` (matched exactly: "no such table: busy_jobs" is `SQLITE_ERROR`) |
 | other `Error::Engine` | `SQLITE_ERROR` |
 | `Error::Config` | `SQL_INPUT_ERROR` |
 | `Error::Bucket` / `Io` / `Corrupt` / `Encryption` | `BUCKET_ERROR` / `IO_ERROR` / `CORRUPT` / `ENCRYPTION_ERROR` |
@@ -443,18 +453,20 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. hra
 | a panic, or a worker job that failed (HTTP 500) | `INTERNAL_ERROR` |
 | an unknown path or method (HTTP 404) | `NOT_FOUND` |
 | a malformed request (the body, or one request) | `PROTO_ERROR` (the body: HTTP 400) |
+| a `close` that is not the last request; a batch condition on its own or a later step | `PROTO_ERROR` (HTTP 400, the whole request, before anything runs) |
 | an unknown, expired, closed, in-use or replayed baton | `STREAM_EXPIRED` (HTTP 400) |
-| an unknown `sql_id`; both or neither of `sql` and `sql_id` | `SQL_INPUT_ERROR` |
-| a request after `close` in the same pipeline | `STREAM_CLOSED` |
-| `describe`; a v3-only request on v2; an unknown request type | `UNSUPPORTED` |
+| an unknown `sql_id`; both or neither of `sql` and `sql_id`; non-empty `args` with non-empty `named_args` | `SQL_INPUT_ERROR` |
+| a v3-only request or condition on `/v2/pipeline`; an unknown request type | `UNSUPPORTED` |
+| an `x-turso-encryption-key` header, after the token check | `ENCRYPTION_KEY_NOT_ACCEPTED` (HTTP 400) |
 | a missing or wrong token | `UNAUTHORIZED` (HTTP 401) |
 | a body over 16 MiB | `PAYLOAD_TOO_LARGE` (HTTP 413) |
 | before ready / during shutdown / at the stream cap | `NOT_READY` / `SHUTTING_DOWN` / `TOO_MANY_STREAMS` (HTTP 503) |
 | a new stream whose connection cannot be opened | the library error's code (HTTP 503) |
 
 **Streams.**
-- Each Hrana stream owns one `turso_durable::Connection`, opened on the stream's first request with `PRAGMA busy_timeout` set. So transactions, the SQL guard and `PRAGMA durable_batching` work as in the library.
+- Each stream (section 4) owns one `turso_durable::Connection`, opened on the stream's first request with `PRAGMA busy_timeout` set. So transactions, the SQL guard and `PRAGMA durable_batching` work as in the library.
 - The baton is `<id>.<secret>`, random, and it changes on every response. A null baton means the stream is closed. A baton used twice, or one for a stream another request holds, gets 400 `STREAM_EXPIRED`.
+- A stale snapshot is `SQLITE_BUSY`: a transaction that read, then tries to write after another stream committed, gets turso_core's stale-snapshot error. The client must roll back and retry the whole transaction.
 - A stream is checked out of the registry for the whole pipeline, and the blocking task gives it back, so a client that drops its connection mid-request never leaks the stream.
 - A reaper closes streams idle past `DURABLE_SERVE_STREAM_TIMEOUT_MS`, checking every `min(timeout / 2, 1 s)`. Closing rolls back any open transaction and frees the write lock. A stream in use is never reaped.
 - Pipelines run on blocking threads behind `DURABLE_SERVE_WORKERS` permits.
@@ -462,15 +474,15 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. hra
 
 **Batching.** The levels of Batching, through the protocol:
 - Per transaction: `BEGIN`, then `PRAGMA durable_batching = '<spec>'` on the stream, as in the library. It lasts until the transaction ends.
-- Per stream: the same PRAGMA as its own statement while the stream is in autocommit. The library refuses that; the server catches it and calls `Connection::set_batching(Some(b))`, so the setting lasts for the stream's life.
+- Per stream: the same PRAGMA as its own statement while the stream is in autocommit. The library refuses that; the server catches it in an `execute` or a batch step, without arguments, and calls `Connection::set_batching(Some(b))`, so the setting lasts for the stream's life. It does not catch it in a `sequence`, where the library's refusal comes back as `SQL_INPUT_ERROR`.
 - Reading: `PRAGMA durable_batching` with no value returns the stream's effective setting.
 - Database-wide: `DURABLE_BATCHING`, or `serve --batching`.
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant C as libSQL client
-  participant S as serve (HTTP + Hrana)
+  participant C as tursodb serverless driver
+  participant S as serve (HTTP + SQL over HTTP v3)
   participant Conn as turso_durable Connection
   participant Up as Uploader
   participant B as Bucket
@@ -492,7 +504,7 @@ sequenceDiagram
 |---|---|---|
 | `{"status":"starting"}` | 503 | From the bind until the database is open. |
 | `{"status":"ready"}` | 200 | The database is open. |
-| `{"status":"fenced"}` | 503 | A library call returned `Fenced`. From then on every request on every stream gets `FENCED` without calling the library, and its stream closes. |
+| `{"status":"fenced"}` | 503 | A library call returned `Fenced`. From then on every request in a pipeline, and every statement of a cursor batch, on every stream gets `FENCED` without calling the library, and its stream closes. An empty pipeline or empty cursor batch, which holds none, still gets 200. |
 | `{"status":"shutting_down"}` | 503 | Shutdown has begun (this wins over `fenced`). |
 
 **Limit: an idle fenced server reports `ready` until a write hits the fence.** The server learns it is fenced only from a library call that returns `Fenced`. Check `/health` after a write, or watch for `FENCED` errors.
@@ -539,10 +551,56 @@ The stop line's `clean` is true when every request finished, no stream's or the 
 - **Bind rule.** The default is loopback only, with no authentication. A non-loopback IP is refused with exit 2, before any file is read or the database opens, unless both TLS and a token are configured.
 - **TLS.** rustls with the ring provider (the stack the library already uses), TLS 1.2 and 1.3, ALPN `http/1.1`. A missing, unreadable or mismatched certificate or key fails at start. With TLS set, the port speaks HTTPS only.
 - **Token.** Read once from `DURABLE_SERVE_TOKEN_FILE`, with ASCII whitespace around it trimmed. It must be at least 16 bytes of visible ASCII (0x21-0x7E). It is kept only as its SHA-256 and compared in constant time, so neither its content nor its length leaks. It is never logged; errors name the file, never its content. Clients send `Authorization: Bearer <token>` (the scheme in any case). Missing or wrong: 401 `UNAUTHORIZED` with `WWW-Authenticate: Bearer`.
-- **Open routes.** `GET /health`, `GET /v2` and `GET /v3` need no token (hrana-client probes without the header). Both pipelines and the cursor need it.
-- No span or log carries SQL text, arguments, a baton or the token.
+- **Open routes.** `GET /health`, `GET /v2` and `GET /v3` need no token (libSQL's hrana-client probes them without the header). Both pipelines and the cursor need it.
+- **Client encryption keys.** A request to either pipeline or the cursor that carries `x-turso-encryption-key` (the name in any case, any value) gets 400 `ENCRYPTION_KEY_NOT_ACCEPTED`. It is checked after the token, so a request without a valid token still gets 401 first. Nothing runs and no stream is created or touched, and the header's value is never read, logged or echoed. tursodb's header is for Turso Cloud's customer-managed keys (section 3.1). This server encrypts the database with its own key file (`DURABLE_ENCRYPTION_KEY_FILE`, see Guarantees, Encryption) and never takes a key from a client.
+- No span or log carries SQL text, arguments, a baton, the token or a client's encryption key.
 
 **Telemetry.** One `durable.server.request` span per pipeline or cursor request (see Telemetry). The library's `durable.commit` spans of that request are its children.
+
+### Clients run and not run
+
+Run against `turso-durable serve` at commit eb101d9, over plain HTTP on 127.0.0.1 with a bearer token, on RustFS:
+
+| Client | Result | Before this round (2ebcaf5) |
+|---|---|---|
+| tursodb's conformance suite, `serverless/rust/conformance` at 0b2bec917: 24 raw-HTTP protocol tests (`tests/protocol.rs`) and 35 driver tests (`tests/driver.rs`) through the Rust driver `turso_serverless` 0.1.3 | All 59 pass, both with tests in parallel (the suite's default, as upstream CI runs it) and with `--test-threads=1` | 46/59 with tests run serially; 34/59 in parallel (most of those from `SQLITE_BUSY`, which a failed describe caused by leaving a write transaction open) |
+| The Go driver `tursogo-serverless` (`serverless/go` at 0b2bec917, stdlib only, Go 1.24.3): its 35 tests (`go test ./...`) | All 35 pass | 32/35 |
+
+The repo's own test client (`crates/turso-durable-hrana-client`) still runs in both passes of `./scripts/test.sh` (plain HTTP, then HTTPS with a token and encryption).
+
+Not run:
+- `@tursodatabase/serverless` (TypeScript) and the Python `turso_serverless`.
+- Upstream's differential suites: they need the embedded drivers and Turso Cloud.
+- No real driver was run over HTTPS. The Rust conformance build has no TLS stack, and the Go run used plain HTTP.
+- No real libSQL client library was run: not `@libsql/client`, the `libsql` Rust crate or Python package, and not `libsql-client-go`. The server still parses the request shapes those clients send (unit fixtures copy them), because the protocol descends from libSQL's Hrana, but that is unproven against the real libraries.
+
+How the suite was run:
+- It was built in a scratch Cargo workspace outside this repo, with its own lock (sha256 `b4695b5cd6b77b6a4a8434c3d553d18a113852f94307f4504f681d427e38e9ca`), approved by the rust-supply-chain-auditor.
+- reqwest has no default features, so there is no TLS: plain HTTP only.
+- It has two crates that this repo's audited lock does not: futures 0.3.34, and wasm-streams 0.5.0 (wasm-only, never compiled).
+- The audit's conditions: plain HTTP on loopback, a dummy token, no proxy, `--locked`, and never in this repo's lock.
+- The Go driver needed no download (stdlib only; `GOTOOLCHAIN=local GOPROXY=off`).
+
+### Reproducing the conformance run
+
+1. Export upstream's serverless tree at the run's commit from a turso checkout, into a scratch directory outside this repo:
+   ```sh
+   git -C /path/to/turso archive 0b2bec917 serverless | tar -x -C "$SCRATCH"
+   ```
+2. Make a scratch Cargo workspace (`$SCRATCH/ws`) with two members: `turso_serverless`, the files of `serverless/rust`, and `conformance`, the files of `serverless/rust/conformance` (`turso_serverless_conformance`). Upstream's manifests inherit from turso's workspace, so spell each inherited key out (`version`, `edition`, `license` and each `workspace = true` dependency). Give reqwest `default-features = false`, with features `["json","stream"]` for `turso_serverless` and `["json"]` for the conformance crate, and point the conformance crate's `turso_serverless` dependency at `../turso_serverless`.
+3. Have the resolved `Cargo.lock` audited (rust-supply-chain-auditor) before building anything. It is not kept in this repo; the run's lock had the sha256 above.
+4. Start `serve` with a token file on 127.0.0.1, on its own prefix:
+   ```sh
+   eval "$(scripts/rustfs.sh env)"
+   export DURABLE_PREFIX=conformance-$(date +%s) DURABLE_SERVE_TOKEN_FILE=/path/to/token   # 16+ visible ASCII bytes
+   turso-durable serve --dir "$SCRATCH/db" --listen 127.0.0.1:0 --claim   # the port is in the `serve listening` line
+   ```
+5. With no proxy variables set, run the suite and the Go driver against it:
+   ```sh
+   export TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token>
+   (cd "$SCRATCH/ws" && cargo test --locked -p turso_serverless_conformance)   # and again with -- --test-threads=1
+   (cd "$SCRATCH/serverless/go" && GOTOOLCHAIN=local GOPROXY=off go test ./...)
+   ```
 
 ## Settings
 
@@ -868,6 +926,16 @@ A is fenced at its next request, but the object it overwrote stays. A possible f
 - Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large makes the seal large too. The maintenance checkpoint seals once the `-wal` reaches `maintenance_wal_bytes` (64 MiB by default), but a transaction held open past `maintenance_gate_wait` keeps it from running (it retries with backoff). `CheckpointMode::Truncate` at quiet moments keeps generations small.
 - Never copy a live database directory (`cp -r`, a VM or disk clone). The copy has the same writer id, so fencing cannot tell the two processes apart. Restore into a new directory instead.
 
+**Server limits.** `serve` adds these (and see Server, Memory and Remaining differences from PROTOCOL.md):
+- A client that dies inside a transaction holds the write lock until its stream is reaped: `DURABLE_SERVE_STREAM_TIMEOUT_MS` (10 s) plus up to 1 s. Writers on other streams wait only `DURABLE_SERVE_BUSY_TIMEOUT_MS` (5 s), then get `SQLITE_BUSY`. Follow-up: an idle timeout below the busy timeout for streams in a transaction.
+- A BUSY wait on the `sequence` path spins one core for the whole wait (turso_core's `run_ignore_rows` ignores the sleep time). `execute` sleeps. Follow-up in the library or upstream.
+- There is no time limit on a running statement.
+- After a fence, every request in a pipeline and every statement of a cursor batch gets `FENCED`, but an empty pipeline or empty cursor batch, which holds none, still gets 200.
+- The per-stream batching PRAGMA is caught through `execute` (and batch steps) but not through `sequence`.
+- During startup or shutdown, an unauthenticated request can get 503 before 401.
+- Once a fresh database is initialised at startup (see Server, Startup), `PRAGMA page_size = N` is silently ignored, because the page size is fixed when page 1 is created.
+- A fresh database that is stopped without any request may upload page 1 when it closes.
+
 **Edge cases.**
 - `PRAGMA wal_checkpoint` reports an upload failure as a busy row, not as an error (vdbe/execute.rs:796-803). Use `Connection::checkpoint` to get the error.
 - `close` ignores a failed close-time checkpoint (pager.rs:5458-5472). Nothing acked is lost: the log already holds every acked commit, and the next open or restore replays it.
@@ -986,23 +1054,24 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
 ## Test command
 
 - `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests. These include the in-memory takeover tests in `crates/turso_durable/tests/fencing.rs`, each under Off and a Window setting, and the server's HTTP tests over an in-memory store (`crates/turso-durable-server/tests/http.rs`: the endpoints, streams and batons, auth, health, a fenced server, the stream cap, TLS, SIGTERM with requests in flight and the shutdown bound).
-- `./scripts/test.sh`: the above, then runs the RustFS-backed `--ignored` tests with `--test-threads=1` twice, each time on an emptied RustFS (`scripts/rustfs.sh reset`): pass 1 over plain HTTP without encryption (the `tls_*` tests skipped), pass 2 over HTTPS with encryption, every test. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs). Stage 3 adds: a takeover of a running `soak` under Off and under a Window setting (`takeover_fences_a_running_soak`, `takeover_window_fences_a_running_soak`), an old writer paused with SIGSTOP across a takeover and GC (`paused_old_writer_is_fenced_after_resume`), `gc` after short-lived processes (`gc_cli_trims_after_short_lived_processes`), Window crash rows for PASSIVE, FULL and RESTART, and the S3 test `stat_reports_etag_and_age`. The server adds the `serve` system tests (`crates/turso-durable-cli/tests/server.rs`), plain HTTP on loopback without a token in pass 1 and HTTPS with a token in pass 2: a libSQL-shaped client's writes under Off, per-stream Window and per-transaction batching (`serve_client_writes_off_window_and_txn_batching`), SIGKILL under load and then the loss of the disk (`serve_sigkill_mid_load_restores_every_ack`), a takeover that fences the old server, which then stops with `fenced=true` and exit 1 (`serve_takeover_fences_the_old_server`), SIGTERM under load (`serve_sigterm_during_load_loses_no_ack`), and the bind rule and the token, which never reaches the server's output (`serve_security_bind_rules_and_token`). In the first four, every acked row must restore.
+- `./scripts/test.sh`: the above, then runs the RustFS-backed `--ignored` tests with `--test-threads=1` twice, each time on an emptied RustFS (`scripts/rustfs.sh reset`): pass 1 over plain HTTP without encryption (the `tls_*` tests skipped), pass 2 over HTTPS with encryption, every test. These include the CLI system tests (crash matrix, faults, restart, second process, MVCC, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs). Stage 3 adds: a takeover of a running `soak` under Off and under a Window setting (`takeover_fences_a_running_soak`, `takeover_window_fences_a_running_soak`), an old writer paused with SIGSTOP across a takeover and GC (`paused_old_writer_is_fenced_after_resume`), `gc` after short-lived processes (`gc_cli_trims_after_short_lived_processes`), Window crash rows for PASSIVE, FULL and RESTART, and the S3 test `stat_reports_etag_and_age`. The server adds the `serve` system tests (`crates/turso-durable-cli/tests/server.rs`), plain HTTP on loopback without a token in pass 1 and HTTPS with a token in pass 2: the test client's writes (libSQL's request shapes, which the protocol still accepts, and a `describe`) under Off, per-stream Window and per-transaction batching (`serve_client_writes_off_window_and_txn_batching`), SIGKILL under load and then the loss of the disk (`serve_sigkill_mid_load_restores_every_ack`), a takeover that fences the old server, which then stops with `fenced=true` and exit 1 (`serve_takeover_fences_the_old_server`), SIGTERM under load (`serve_sigterm_during_load_loses_no_ack`), and the bind rule and the token, which never reaches the server's output (`serve_security_bind_rules_and_token`). In the first four, every acked row must restore.
   - It runs both passes with `DURABLE_OTEL=1` under one `DURABLE_TEST_RUN_ID` (`turso-durable-<timestamp>-<pid>`, printed as `test run id: …`).
   - For pass 2, `scripts/tls-material.sh` makes a CA, RustFS's certificate and an encryption key in a `mktemp -d` directory (`turso-durable-tls.*` under `$TMPDIR`), and the script exports `TURSO_DURABLE_TLS_DIR` (RustFS serves HTTPS, and the system tests' own `rustfs.sh stop/start/pause/unpause` keep that mode) and `DURABLE_ENCRYPTION_KEY_FILE`. `scripts/rustfs.sh env` adds `DURABLE_CA_BUNDLE`. The tests pass `DURABLE_CA_BUNDLE`, `DURABLE_ENCRYPTION_KEY_FILE` and `DURABLE_ENCRYPTION_CIPHER` on to their CLI children and in-process databases; `TURSO_DURABLE_TLS_DIR` is inherited by their `rustfs.sh` calls.
   - The tests keep their bucket prefixes (`DURABLE_KEEP_PREFIXES=1`; the two cleanup tests turn it off), and each pass ends with a whole-bucket scan, `turso-durable scan --all`, which GETs every object and looks for plaintext. Pass 1 must find `CREATE TABLE` (the control). Pass 2 must find none of `CREATE TABLE`, `SQLite format 3\0`, 64 bytes of `0xab` (bench's payload), the run's marker row, and the key as lower-case hex, upper-case hex or raw bytes. It prints `scan: <n> objects, <bytes> bytes` and one line per needle, `<label>: not found` or `<label>: found in <k> objects (first: <key>)`; the key is never printed.
   - In pass 2, after the tests, it runs a short workload under that run id (`bench --commits 50 --batching "window 5ms 8 1MiB" --connections 4`, then `sql` creating table `marker` with the row `turso-durable-marker-<run id>` and a `wal_checkpoint(TRUNCATE)`, then `restore`, `takeover` and `gc`), so every span kind except `durable.maintenance` is exported, then the scan.
   - It ends with the ClickHouse check, `scripts/otel-check.sh <run id>` (see Telemetry). The check prints `otel check PASSED: …` or `otel check FAILED: …`, or `otel check SKIPPED: observability stack not running` when the stack is down, which still passes.
   - On exit, pass or fail, it empties RustFS's storage again in plain mode (`scripts/rustfs.sh reset`) and removes the TLS material. A failed reset is reported on stderr and the exit code stays the tests'.
-  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured with the server at 4621d4e (`results/durable-server.txt`; laptop, RustFS): 721 MB (plain) and 735 MB (https+encryption), a whole run 12.0 min (12:01.5). Each pass ran 5 `serve` tests (about 7 s), 38 system tests and the S3 tests (8 in pass 1, 12 in pass 2); the unit step ran 546 tests. Stage 4's canonical run at b4afb8f (`results/durable-transport.txt`): 684 and 708 MB, 11.7 min (11:43). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
+  - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak turso-durable-objects: <MB> MB (plain)` and `(https+encryption)`. Measured with the server at 4621d4e (`results/durable-server.txt`; laptop, RustFS): 721 MB (plain) and 735 MB (https+encryption), a whole run 12.0 min (12:01.5). Each pass ran 5 `serve` tests (about 7 s), 38 system tests and the S3 tests (8 in pass 1, 12 in pass 2); the unit step ran 546 tests (587 now). Stage 4's canonical run at b4afb8f (`results/durable-transport.txt`): 684 and 708 MB, 11.7 min (11:43). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
   - Outside `test.sh`, each RustFS-backed test deletes its bucket prefix when it ends. `DURABLE_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
 - `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`turso-durable-rustfs`, port 9290). `down` removes the container and its volume `turso-durable-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `DURABLE_*` variables for it. With `TURSO_DURABLE_TLS_DIR` set to a directory from `scripts/tls-material.sh DIR`, it runs RustFS over HTTPS (a container is plain or TLS for its whole life; `reset` switches).
+- tursodb's conformance suite and the Go driver are not part of `test.sh`. They were run by hand against `serve`, outside this repo (see Server, Clients run and not run).
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
 
 ## Layout
 
 - `crates/turso_durable`: the library.
-- `crates/turso-durable-server`: the Hrana-over-HTTP server behind `serve` (`ServeConfig`, `bind`, `Bound::serve`).
-- `crates/turso-durable-hrana-client`: a minimal Hrana client for the tests only (`publish = false`), sending the request shapes of the libSQL clients.
+- `crates/turso-durable-server`: the server of tursodb's SQL over HTTP v3 behind `serve` (`ServeConfig`, `bind`, `Bound::serve`).
+- `crates/turso-durable-hrana-client`: a minimal SQL over HTTP v3 client for the tests only (`publish = false`). Most of its requests copy the shapes libSQL's clients send, which the protocol (it descends from libSQL's Hrana) still accepts, plus `describe`. Its name is historical: renaming the crate would change the audited `Cargo.lock`.
 - `crates/turso-durable-cli`: the `turso-durable` binary (with the test command's `scan`, `src/scan.rs`, the whole-bucket plaintext scan), the system tests and `examples/stage3_costs.rs` (the request counts of stages 3 and 4).
 - `scripts/`: `test.sh`, `rustfs.sh` (local S3), `tls-material.sh` (test CA, certificate and key), `s3-gate.sh`, `otel-check.sh` (the ClickHouse check).
 - `results/`: `rustfs-gate.txt` (conditional-PUT gate), `rustfs-gate-tls.txt` (the same gate over HTTPS), `durable-core.txt` (stage 1 measurements), `batching-knob.txt` (stage 2 measurements), `writer-lease.txt` (stage 3 measurements) `durable-transport.txt` (stage 4 measurements) and `durable-server.txt` (the server's full test run, now the canonical one).
@@ -1028,6 +1097,7 @@ Always build with `--locked`. Any `Cargo.lock` change needs a re-audit through t
 Conditions:
 - turso_core 0.8.3 does NOT build with only `["fs"]`. `incremental/dbsp.rs` uses `uuid` without a feature gate, and `vdbe/execute.rs` has a type error in its non-json path. The minimal feature set is `default-features = false, features = ["fs", "json", "uuid"]` (the `encryption` feature is on, row 3; reqwest's `rustls`/`default-tls` (aws-lc) features need a re-audit). Verified with `cargo check --offline --locked --workspace --all-targets`. This adds uuid 1.26.1 and sha1_smol 1.0.1, both reviewed and clean.
 - Copy the audited `Cargo.lock` with the manifests unchanged, and always build/test with `--locked`. Any lock change (cargo update, new dep or feature) needs a re-audit.
+- The conformance run's scratch lock (sha256 `b4695b5c…`, see Server, Clients run and not run) was audited on its own and is not this repo's lock. Never copy it or its crates (futures 0.3.34, wasm-streams 0.5.0) into this workspace.
 - turso_core's build.rs runs `git rev-parse`/`git show` only to embed a commit hash and timestamp. Set `SOURCE_DATE_EPOCH` for reproducible builds, which also skips the git call.
 - Cargo.lock lists cfg-gated crates that normal builds never compile (cfg(antithesis/loom/shuttle): antithesis_sdk 0.3.0, loom, shuttle, generator) plus wasm/windows targets. antithesis_sdk 0.3.0 was not downloaded or reviewed; do not build with `--cfg antithesis`.
 - aegis 0.9.20 ships prebuilt wasm static libs (`wasm-libs/*.a`) that are linked only for wasm32. Re-audit before targeting wasm.

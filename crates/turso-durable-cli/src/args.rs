@@ -94,7 +94,7 @@ pub enum Command {
     },
     /// Delete what an old enough head no longer reaches; no directory.
     Gc,
-    /// Serve the database over Hrana/HTTP until SIGTERM or SIGINT.
+    /// Serve the database over tursodb's SQL over HTTP v3 until SIGTERM or SIGINT.
     Serve {
         dir: PathBuf,
         listen: Option<String>,

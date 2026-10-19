@@ -1,4 +1,4 @@
-//! Hrana JSON types, conversion to and from library values, and error codes.
+//! SQL over HTTP v3 JSON types, conversion to and from library values, and error codes.
 
 use base64::alphabet;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD_NO_PAD};
@@ -217,7 +217,7 @@ impl ProtoError {
     }
 }
 
-/// A Hrana value.
+/// A protocol value (PROTOCOL.md 8.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HValue {
@@ -286,7 +286,7 @@ pub fn to_value(v: &HValue) -> Result<turso_durable::Value, ProtoError> {
     })
 }
 
-/// A library value as a Hrana value: a blob as unpadded base64, a non-finite float kept (it
+/// A library value as a protocol value: a blob as unpadded base64, a non-finite float kept (it
 /// is written as `null`).
 pub fn from_value(v: &turso_durable::Value) -> HValue {
     use turso_durable::Value;
@@ -411,6 +411,8 @@ mod tests {
     use super::*;
     use turso_durable::{Column, Error, StmtOutput, Value};
 
+    // Request shapes copied from libSQL's clients (provenance). SQL over HTTP v3 descends from
+    // libSQL's Hrana, and these shapes remain accepted.
     // @libsql/hrana-client 0.9.0 (v2 JSON): execute with args and named_args.
     const HRANA_CLIENT_EXECUTE: &str = r#"{"type":"execute","stmt":{"sql":"SELECT ?, :a","args":[{"type":"integer","value":"42"},{"type":"text","value":"x"}],"named_args":[{"name":"a","value":{"type":"null"}}],"want_rows":true}}"#;
 

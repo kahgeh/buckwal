@@ -1,5 +1,7 @@
-//! Test-only blocking Hrana-over-HTTP client. Builds request JSON by hand in the shapes the
-//! real libSQL clients send and never uses the server crate's types.
+//! Test-only blocking client of tursodb's SQL over HTTP v3. Builds request JSON by hand and
+//! never uses the server crate's types. Most builders copy the shapes libSQL's clients send,
+//! which the protocol (it descends from libSQL's Hrana) still accepts; `describe` is
+//! tursodb's. The crate's name is historical: renaming it would change the audited Cargo.lock.
 
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
@@ -358,6 +360,8 @@ mod tests {
 
     #[test]
     fn builders_match_client_shapes() {
+        // Shapes copied from libSQL's clients (provenance). SQL over HTTP v3 descends from
+        // libSQL's Hrana, and these shapes remain accepted.
         // @libsql/hrana-client 0.9.0, v2 encoding of an execute request.
         assert_eq!(
             execute("SELECT ?", &[Arg::Int(1)]),

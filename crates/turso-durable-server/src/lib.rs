@@ -1,4 +1,5 @@
-//! Hrana-over-HTTP server for `turso_durable` databases.
+//! A server of tursodb's SQL over HTTP v3 (`serverless/PROTOCOL.md` in the turso repo) for
+//! `turso_durable` databases. Its clients are tursodb's serverless drivers.
 //!
 //! [`bind`] takes the port and loads the TLS files and the token, so a bad setting fails
 //! before the database is opened. [`Bound::serve`] then runs the server on its own tokio

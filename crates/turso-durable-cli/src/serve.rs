@@ -1,4 +1,5 @@
-//! `serve`: the Hrana server of `turso-durable-server` over a database opened as the writer.
+//! `serve`: `turso-durable-server` (tursodb's SQL over HTTP v3) over a database opened as the
+//! writer.
 use crate::{open_writer, say};
 use std::path::{Path, PathBuf};
 use turso_durable::Batching;

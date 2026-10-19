@@ -1,4 +1,6 @@
 # turso_durable durable-server: the full test command run
+# The figures below are from 4621d4e (round 2). The full run is redone at the end of round 3;
+#   round 3's client runs are in the section at the end of this file.
 # date: 2026-10-18T22:03:40 local (test run id turso-durable-20261018220340-53912)
 # git: 4621d4e60a23eb28dd3a8cf14e5e03b9c7741fe2 (durable-server), with this commit's script
 #   changes in the working tree: scripts/otel-check.sh (SPANS gains durable.server.request) and
@@ -70,3 +72,51 @@
 #
 # After the run: RustFS plain and empty (rustfs.sh reset on exit), no turso-durable-* dirs in
 # $TMPDIR.
+#
+# ---------------------------------------------------------------------------------------------
+# Round 3: tursodb conformance and drivers (2026-10-19)
+# ---------------------------------------------------------------------------------------------
+# Protocol: tursodb's "SQL over HTTP v3", serverless/PROTOCOL.md in the turso repo at 0b2bec917.
+# Server: turso-durable serve, debug build, plain HTTP on 127.0.0.1 (port 0), bearer token from
+#   a file, --claim on a fresh RustFS prefix, SIGTERM at the end. No HTTPS run.
+#
+# tursodb's conformance suite (serverless/rust/conformance at 0b2bec917): 24 raw-HTTP protocol
+#   tests (tests/protocol.rs) + 35 driver tests (tests/driver.rs) through turso_serverless 0.1.3.
+#   before, at 2ebcaf5: 46/59 serially (driver 28/35, protocol 18/24);
+#                       34/59 in parallel (driver 23/35, protocol 11/24; most of those from
+#                       SQLITE_BUSY, which a failed describe caused by leaving a write
+#                       transaction open)
+#   after, at eb101d9:  59/59 serially (--test-threads=1) and 59/59 in parallel (the suite's
+#                       default, as upstream CI runs it)
+#   Built in a scratch Cargo workspace outside this repo, lock sha256
+#   b4695b5cd6b77b6a4a8434c3d553d18a113852f94307f4504f681d427e38e9ca, approved by the
+#   rust-supply-chain-auditor. reqwest without default features (no TLS). Two crates not in this
+#   repo's lock: futures 0.3.34, wasm-streams 0.5.0 (wasm-only, never compiled). Conditions:
+#   plain HTTP on loopback, a dummy token, no proxy, --locked, never in this repo's lock.
+#
+# Go driver tursogo-serverless (serverless/go at 0b2bec917, stdlib only, Go 1.24.3,
+#   GOTOOLCHAIN=local GOPROXY=off, no download), go test ./... (35 tests):
+#   before, at 2ebcaf5: 32/35. TestPrepareAndQuery and TestPrepareWrongArgCount
+#     ("turso: describe is not supported"), TestValueRoundtrip/non-finite_result_decodes_as_NaN
+#     ("turso: infinite float cannot be represented in JSON").
+#   after, at eb101d9: 35/35 ("ok turso.tech/database/tursogo-serverless").
+#
+# Round 3 commits on the server and library: a6a93b7 56192f2 (describe), eb6ada5 d770a71 d9fdd77
+#   (cursor terminator, non-finite floats as null and unpadded base64, x-turso-encryption-key
+#   refused), 57a3d77 02aa6b9 7052e17 35b34f5 (protocol errors, mixed args, error condition,
+#   last_insert_rowid and rows_written, describe minors), 80ea65d 508ae89 eb101d9 (stale
+#   snapshot as SQLITE_BUSY, fresh-database initialisation, minors). 9aec32a (exact busy
+#   matching) came after the client runs and changed only error-code matching and tests.
+#
+# Not run: @tursodatabase/serverless (TypeScript), the Python turso_serverless, upstream's
+#   differential suites (they need the embedded drivers and Turso Cloud), any real driver over
+#   HTTPS, and any libSQL client library (@libsql/client, libsql Rust or Python,
+#   libsql-client-go).
+#
+# Logs (scratch, outside the repo, not kept):
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before-serial.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before.log (parallel)
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-serial.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-parallel.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-before.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-t2b.log

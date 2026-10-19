@@ -1,4 +1,4 @@
-//! Registry of Hrana streams. Each stream owns a `turso_durable::Connection` and is
+//! Registry of streams (PROTOCOL.md 4). Each stream owns a `turso_durable::Connection` and is
 //! addressed by a baton `"{id}.{secret}"` that rotates on every use.
 //!
 //! An anchor connection is held from `Streams::new` until `close_all`: the last connection
