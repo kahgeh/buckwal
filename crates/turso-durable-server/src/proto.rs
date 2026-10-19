@@ -194,6 +194,10 @@ pub enum CursorEntry {
     Error {
         error: ProtoError,
     },
+    /// The last line of a completed cursor (PROTOCOL.md 7.2.6); the value is always `null`.
+    ReplicationIndex {
+        replication_index: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

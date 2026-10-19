@@ -619,7 +619,11 @@ fn serve_client_writes_off_window_and_txn_batching() {
     let (status, entries) = st7.cursor(count).expect("cursor");
     assert_eq!(status, 200, "{entries:?}");
     let kinds: Vec<&str> = entries.iter().filter_map(|e| e["type"].as_str()).collect();
-    assert_eq!(kinds, ["step_begin", "row", "step_end"], "{entries:?}");
+    assert_eq!(
+        kinds,
+        ["step_begin", "row", "step_end", "replication_index"],
+        "{entries:?}"
+    );
     assert_eq!(
         entries[1]["row"][0],
         json!({"type": "integer", "value": "270"}),

@@ -150,7 +150,7 @@ fn v3_batch_get_autocommit_and_cursor() {
         .collect();
     assert_eq!(
         kinds,
-        ["step_begin", "row", "row", "step_end"],
+        ["step_begin", "row", "row", "step_end", "replication_index"],
         "{entries:?}"
     );
     let cols: Vec<&str> = entries[0]["cols"]
@@ -167,6 +167,55 @@ fn v3_batch_get_autocommit_and_cursor() {
     s.stop().unwrap();
 }
 
+const TERMINATOR: &str = r#"{"type":"replication_index","replication_index":null}"#;
+
+/// The body of a completed cursor ends with the terminator line (PROTOCOL.md 7.2.6), even
+/// when a step failed or the batch is empty. A refused cursor has no NDJSON body at all.
+#[test]
+fn cursor_body_ends_with_the_terminator() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let raw = |batch: Value| {
+        let body = json!({"baton": null, "batch": batch}).to_string();
+        let r = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/v3/cursor", s.url()))
+            .body(body)
+            .send()
+            .unwrap();
+        (r.status().as_u16(), r.text().unwrap())
+    };
+    for steps in [
+        json!([{"stmt": stmt("SELECT 1", &[])}]),
+        json!([{"stmt": stmt("SELECT * FROM nope", &[])}, {"stmt": stmt("SELECT 2", &[])}]),
+        json!([]),
+    ] {
+        let (status, body) = raw(json!({ "steps": steps }));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.ends_with('\n'), "{body:?}");
+        let last = body.lines().last().unwrap();
+        assert_eq!(last, TERMINATOR, "{steps}: {body}");
+        assert_eq!(
+            body.lines().filter(|l| *l == TERMINATOR).count(),
+            1,
+            "{body}"
+        );
+    }
+    let mut st = c.stream(Proto::V3);
+    st.set_baton(Some("1.bogus".into()));
+    let (status, entries) = st
+        .cursor(batch(vec![(None, stmt("SELECT 1", &[]))])["batch"].clone())
+        .unwrap();
+    assert_eq!(status, 400, "{entries:?}");
+    assert!(
+        !format!("{entries:?}").contains("replication_index"),
+        "{entries:?}"
+    );
+    s.stop().unwrap();
+}
+
 #[test]
 fn cursor_bad_condition_is_a_final_error_entry() {
     let s = start(Opts::default());
@@ -176,6 +225,7 @@ fn cursor_bad_condition_is_a_final_error_entry() {
     let b = batch(vec![(Some(cond_ok(1)), stmt("SELECT 1", &[]))]);
     let (status, entries) = st.cursor(b["batch"].clone()).unwrap();
     assert_eq!(status, 200, "{entries:?}");
+    // A fatal error ends the cursor: no terminator follows it.
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0]["type"], "error");
     assert_eq!(entries[0]["error"]["code"], "PROTO_ERROR");

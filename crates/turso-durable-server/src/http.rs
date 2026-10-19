@@ -539,7 +539,8 @@ fn run_pipeline(app: &App, streams: &Streams, v: Version, req: PipelineReq) -> D
 }
 
 /// The cursor entries of a finished batch: per step that ran, `step_begin`, its rows and
-/// `step_end`, or `step_error`. A whole-batch error is one final `error` entry.
+/// `step_end`, or `step_error`, then the `replication_index` terminator. A whole-batch error
+/// is one final `error` entry, with no terminator.
 fn cursor_entries(result: Result<BatchResult, ProtoError>) -> Vec<CursorEntry> {
     let batch = match result {
         Ok(b) => b,
@@ -561,6 +562,9 @@ fn cursor_entries(result: Result<BatchResult, ProtoError>) -> Vec<CursorEntry> {
             last_insert_rowid: r.last_insert_rowid,
         });
     }
+    entries.push(CursorEntry::ReplicationIndex {
+        replication_index: None,
+    });
     entries
 }
 
@@ -724,12 +728,27 @@ mod tests {
                 "\"row\"",
                 "\"row\"",
                 "\"step_end\"",
-                "\"step_error\""
+                "\"step_error\"",
+                "\"replication_index\""
             ]
         );
+        assert_eq!(
+            serde_json::to_value(entries.last().unwrap()).unwrap(),
+            json!({"type":"replication_index","replication_index":null})
+        );
         assert_eq!(outcome_of([&e].into_iter()), "error");
+        // A fatal error ends the cursor: no terminator after it.
         let entries = cursor_entries(Err(ProtoError::new("PROTO_ERROR", "bad")));
         assert!(matches!(entries.as_slice(), [CursorEntry::Error { .. }]));
+        // An empty batch completes: the terminator alone.
+        let entries = cursor_entries(Ok(BatchResult {
+            step_results: vec![],
+            step_errors: vec![],
+        }));
+        assert_eq!(
+            serde_json::to_value(&entries).unwrap(),
+            json!([{"type":"replication_index","replication_index":null}])
+        );
         let f = ProtoError::new("FENCED", "fenced");
         assert_eq!(outcome_of([&e, &f].into_iter()), "fenced");
         assert_eq!(outcome_of(std::iter::empty()), "ok");
