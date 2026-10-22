@@ -670,7 +670,7 @@ fn wal_mode_open_unchanged() {
 /// One kind-3 record can carry several engine commits (group commit): every commit counts,
 /// in `commits_uploaded` and in `commits_acked`, and `log_puts` counts records.
 #[test]
-fn group_commit_stats_count_every_commit() {
+fn stats_count_one_commit_per_record_in_group_commit() {
     const THREADS: i64 = 8;
     const EACH: i64 = 20;
     let mem = mem();
@@ -709,6 +709,7 @@ fn group_commit_stats_count_every_commit() {
         (commits, commits, records),
         "{s:?}"
     );
+    assert!(s.log_puts < commits, "{s:?}");
     assert_eq!(ids(&conn), (1..=THREADS * EACH).collect::<Vec<_>>());
     assert_eq!(
         bucket_rows(&*mem, None),
@@ -756,5 +757,7 @@ fn set_batching_window_refused_in_an_open_mvcc_database() {
     db.close().unwrap();
 }
 
+mod maintenance;
 mod readonly;
 mod restore;
+mod run;

@@ -101,7 +101,13 @@ impl IO for DurableIo {
             self.inner.clone(),
             self.uploader.clone(),
             self.storage.clone(),
-            self.wal_bytes.clone(),
+            // In MVCC mode the measure is the log's (`LogShippingFile`); the `-wal` only
+            // holds a checkpoint's frames.
+            if self.log.is_some() {
+                Arc::default()
+            } else {
+                self.wal_bytes.clone()
+            },
             self.read_only,
         )?;
         Ok(Arc::new(if self.log.is_some() {

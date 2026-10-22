@@ -165,6 +165,7 @@ pub(crate) fn open_engine(
             uploader.clone(),
             storage.clone(),
             enc,
+            wal_bytes.clone(),
             cfg.read_only,
         )?))
     } else {

@@ -79,6 +79,10 @@ pub(crate) struct LogShippingFile {
     /// A read-only open (`verify`): the engine's recovery writes and truncates go to the
     /// local file only. Nothing is recorded, shipped or sealed.
     read_only: bool,
+    /// The log's high-water mark: the highest offset + length written (the file's size at
+    /// open), 0 after a `truncate(0)`. Shared with `Engine::wal_bytes`, which maintenance
+    /// measures in MVCC mode (the `-wal` is near 0 there).
+    high_water: Arc<AtomicU64>,
 }
 
 impl LogShippingFile {
@@ -88,9 +92,11 @@ impl LogShippingFile {
         inner: Arc<dyn File>,
         io: Arc<dyn IO>,
         uploader: Arc<Uploader>,
+        high_water: Arc<AtomicU64>,
         read_only: bool,
     ) -> turso_core::Result<LogShippingFile> {
         let generation = uploader.generation();
+        high_water.store(inner.size()?, SeqCst);
         Ok(LogShippingFile {
             inner,
             io,
@@ -105,6 +111,7 @@ impl LogShippingFile {
             }),
             poisoned: Mutex::new(None),
             read_only,
+            high_water,
         })
     }
 
@@ -290,11 +297,16 @@ impl File for LogShippingFile {
         }
         // A poisoned commit is refused at its write, so it rolls back (P3 variant C).
         self.refuse_if_poisoned()?;
+        let end = pos + buffer.len() as u64;
         let op = Op::Write {
             off: pos,
             bytes: buffer.as_slice().to_vec(),
         };
-        self.record_write(vec![op], self.inner.pwrite(pos, buffer, c))
+        let r = self.record_write(vec![op], self.inner.pwrite(pos, buffer, c));
+        if r.is_ok() {
+            self.high_water.fetch_max(end, SeqCst);
+        }
+        r
     }
     fn pwritev(
         &self,
@@ -315,7 +327,12 @@ impl File for LogShippingFile {
             });
             off += b.len() as u64;
         }
-        self.record_write(ops, self.inner.pwritev(pos, buffers, c))
+        let end = off;
+        let r = self.record_write(ops, self.inner.pwritev(pos, buffers, c));
+        if r.is_ok() {
+            self.high_water.fetch_max(end, SeqCst);
+        }
+        r
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
         if self.read_only {
@@ -343,14 +360,23 @@ impl File for LogShippingFile {
     /// write, and `reset_to_fresh_header`).
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
         if self.read_only {
-            return self.inner.truncate(len, c);
+            let r = self.inner.truncate(len, c);
+            if r.is_ok() {
+                self.high_water.store(len, SeqCst);
+            }
+            return r;
         }
         if len > 0 {
-            return self.record_write(vec![Op::Truncate { len }], self.inner.truncate(len, c));
+            let r = self.record_write(vec![Op::Truncate { len }], self.inner.truncate(len, c));
+            if r.is_ok() {
+                self.high_water.store(len, SeqCst);
+            }
+            return r;
         }
         let mut s = crate::db::lock(&self.shipped);
         let r = self.inner.truncate(0, c);
         if r.is_ok() {
+            self.high_water.store(0, SeqCst);
             s.unconfirmed.clear();
             s.commits = 0;
             let mut p = crate::db::lock(&self.pending);
@@ -562,7 +588,14 @@ mod tests {
             self.file_over(self.local.clone(), false)
         }
         fn file_over(&self, inner: Arc<dyn File>, read_only: bool) -> LogShippingFile {
-            LogShippingFile::new(inner, self.io.clone(), self.up.clone(), read_only).unwrap()
+            LogShippingFile::new(
+                inner,
+                self.io.clone(),
+                self.up.clone(),
+                Arc::default(),
+                read_only,
+            )
+            .unwrap()
         }
         /// The records of `log/<gen>` in seq order, decoded.
         fn records(&self, gen: u64) -> Vec<LogRecord> {

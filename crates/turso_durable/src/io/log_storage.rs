@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::uploader::Uploader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use turso_core::io::FileSyncType;
 use turso_core::mvcc::database::{LogRecord, RowVersion};
@@ -88,6 +88,7 @@ impl LogDurableStorage {
     /// Open `<dir>/app.db-log` (created empty if missing) with the platform IO,
     /// wrap it, and build the engine's `Storage` over it with `enc` (the database's cipher and
     /// key). The first sync ships the whole local file (`ship_whole_file_next`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         platform: Arc<dyn IO>,
         log_path: &Path,
@@ -95,6 +96,7 @@ impl LogDurableStorage {
         uploader: Arc<Uploader>,
         db: Arc<BucketDbStorage>,
         enc: Option<EncryptionContext>,
+        wal_bytes: Arc<AtomicU64>,
         read_only: bool,
     ) -> Result<LogDurableStorage> {
         let path = log_path
@@ -128,8 +130,14 @@ impl LogDurableStorage {
             enc
         };
         let file = Arc::new(
-            LogShippingFile::new(local, platform.clone(), uploader.clone(), read_only)
-                .map_err(|e| io_err("app.db-log", e))?,
+            LogShippingFile::new(
+                local,
+                platform.clone(),
+                uploader.clone(),
+                wal_bytes,
+                read_only,
+            )
+            .map_err(|e| io_err("app.db-log", e))?,
         );
         file.ship_whole_file_next();
         Ok(LogDurableStorage {
@@ -340,6 +348,7 @@ mod tests {
             e.uploader.clone(),
             e.storage.clone(),
             None,
+            Arc::default(),
             false,
         )
         .unwrap();
