@@ -500,7 +500,7 @@ fn engine_tracing_is_not_ours() {
 #[test]
 fn a_fenced_writer_logs_one_error() {
     use crate::bucket::Bucket;
-    use crate::format::{encode_record, Keys, LogRecord, Op};
+    use crate::format::{encode_record, Keys, LogFile, LogRecord, Op};
     use crate::store::RetryPolicy;
     let cap = Capture::new();
     tracing::subscriber::with_default(cap.subscriber(), || {
@@ -525,8 +525,11 @@ fn a_fenced_writer_logs_one_error() {
                 bytes: vec![1; 4],
             }]]
         };
-        assert!(b.append_log(sync()).is_err());
-        assert!(b.append_log(sync()).is_err(), "fenced for good");
+        assert!(b.append_log(LogFile::Wal, sync()).is_err());
+        assert!(
+            b.append_log(LogFile::Wal, sync()).is_err(),
+            "fenced for good"
+        );
     });
     let errors: Vec<_> = cap
         .spans()

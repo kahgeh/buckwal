@@ -777,3 +777,96 @@ fn a_failed_seal_on_an_idle_bucket_clears_only_after_a_head_get() {
         "a probe writes nothing: {after:?}"
     );
 }
+
+/// A kind-3 submission that was never sent comes back to its caller (`LogFailure::unsent`)
+/// instead of being dropped like an `Off` WAL sync, and is neither owed nor degraded. One
+/// in doubt comes back with `None` (the bucket settles it), and `settle_log` is Ok only
+/// once it has.
+#[test]
+fn log_file_unsent_ops_come_back_to_the_caller() {
+    let store = Arc::new(HeadGetsFail::default());
+    let mut b = bucket_with(store.clone(), short());
+    b.set_lease(Duration::ZERO);
+    let u = Uploader::spawn(b, None, None, Arc::default());
+    store.failing.store(true, SeqCst);
+    let f = u
+        .submit_log_file(LogFile::Log, op(1), 1)
+        .wait()
+        .unwrap_err();
+    assert!(matches!(f.error, Error::Timeout(_)), "{f:?}");
+    assert_eq!(f.unsent, Some(op(1)), "handed back, not dropped");
+    assert!(!u.degraded(), "nothing owed, nothing in doubt");
+    assert!(u.settle_log().is_err(), "the head GET still fails");
+    store.failing.store(false, SeqCst);
+    assert_eq!(u.settle_log(), Ok(1));
+    let p = u.submit_log_file(LogFile::Log, op(1), 1).wait().unwrap();
+    assert_eq!(p, pos(1, 1));
+    let body = store
+        .inner
+        .get(&Keys::new("db").log(1, 1))
+        .unwrap()
+        .unwrap()
+        .body;
+    assert!(matches!(
+        decode_record(&body).unwrap(),
+        LogRecord::Extents { file: LogFile::Log, syncs, .. } if syncs == vec![op(1)]
+    ));
+
+    // In doubt: every PUT fails, so the record may be anywhere; `None`, degraded, and
+    // `settle_log` fails until the bucket settles it.
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let u = Uploader::spawn(
+        bucket_with(fault.clone(), short()),
+        None,
+        None,
+        Arc::default(),
+    );
+    fault.only_keys_containing("/log/");
+    fault.fail_puts_after(0);
+    let f = u
+        .submit_log_file(LogFile::Log, op(2), 1)
+        .wait()
+        .unwrap_err();
+    assert_eq!(
+        f.unsent, None,
+        "in doubt: never sent again in another record"
+    );
+    assert!(u.degraded());
+    assert!(u.settle_log().is_err());
+    fault.fail_puts_after(u64::MAX);
+    assert_eq!(u.settle_log(), Ok(1));
+    assert!(!u.degraded());
+    assert_eq!(stored_ops(&mem, pos(1, 1)), vec![op(2)]);
+}
+
+/// `settle_log` adopts a seal whose head PUT stored but whose reply was lost: the uploader
+/// moves to the new generation, and the next append goes there.
+#[test]
+fn settle_log_adopts_a_published_pending_seal() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let (trim_tx, trim_rx) = mpsc::channel();
+    let u = Uploader::spawn(
+        bucket_with(fault.clone(), short()),
+        Some(trim_tx),
+        None,
+        Arc::default(),
+    );
+    fault.only_keys_containing("/head");
+    fault.store_then_fail_next_puts(1);
+    fault.fail_puts_after(0);
+    assert!(u.seal_generation(vec![(1, vec![1; 8])], 8, 1).is_err());
+    assert!(u.degraded());
+    fault.fail_puts_after(u64::MAX);
+    assert_eq!(u.settle_log(), Ok(2));
+    assert_eq!(u.generation(), 2);
+    assert!(!u.degraded());
+    assert_eq!(
+        trim_rx.try_recv().unwrap().head.generation,
+        2,
+        "the trimmer is told"
+    );
+    let p = u.submit_log_file(LogFile::Log, op(3), 1).wait().unwrap();
+    assert_eq!(p, pos(2, 1));
+}

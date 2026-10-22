@@ -15,7 +15,7 @@ use crate::bucket::{Bucket, LogPos};
 use crate::config::{EngineConfig, JournalMode};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, WAL_FILE};
-use crate::format::{Head, LocalState, Op};
+use crate::format::{Head, LocalState, LogFile, Op};
 use crate::io::db_storage::{truncate_dirty_file, READ_ONLY};
 use crate::io::wal_file::EPOCH;
 use crate::restore::{generation_image, page_one_seed, write_synced};
@@ -103,7 +103,7 @@ pub(crate) fn reconcile(
         return Err(Error::Unsupported(READ_ONLY));
     } else {
         let uploaded = bucket
-            .append_log(vec![catch_up_ops(&image, &local)])
+            .append_log(LogFile::Wal, vec![catch_up_ops(&image, &local)])
             .map_err(|f| f.error)?
             .pos;
         Reconciled::Ahead { uploaded }

@@ -5,12 +5,16 @@
 //! the first of their limits; an `Off` sync flushes at once, carrying the waiting ones. A
 //! record that was never sent hands its syncs back (`AppendFailure::unsent`): the Window
 //! ones stay owed, at the front of every later record, until they land.
+//!
+//! A `.db-log` sync (`submit_log_file`, record kind 3) is never batched, owed or dropped: it
+//! is its own record, and ops that were never sent go back to the caller
+//! (`LogFailure::unsent`), which keeps them for its next sync (the confirmed-sync rule).
 
 use crate::batching::Batching;
 use crate::bucket::{AppendFailure, Bucket, Counters, LogPos};
 use crate::config::{defaults, Event, EventHook};
 use crate::error::{Error, Result};
-use crate::format::{Head, Manifest, Op};
+use crate::format::{Head, LogFile, Manifest, Op};
 use crate::stats::StatsCell;
 pub(crate) use batch::op_bytes;
 use batch::{Batch, Pending};
@@ -68,8 +72,63 @@ impl Ticket {
     }
 }
 
+/// Why a `submit_log_file` record is not confirmed, and whether its ops may be sent again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LogFailure {
+    pub error: Error,
+    /// `Some(ops)`, as submitted, when no PUT of the record was attempted
+    /// (`AppendFailure::unsent`): the caller sends them again. `None` when the record is in
+    /// doubt at its seq (the bucket settles it before anything else is appended, so the
+    /// ops must not go in another record), or when the writer is fenced (never sent again).
+    pub unsent: Option<Vec<Op>>,
+}
+
+/// The reply to one `submit_log_file`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LogTicket {
+    /// Its commit number, from the same sequence as `Ticket::commit`.
+    pub commit: u64,
+    pub submitted: Instant,
+    rx: Receiver<std::result::Result<LogPos, LogFailure>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl LogTicket {
+    /// Block until the record is in the bucket (or its upload failed).
+    pub(crate) fn wait(self) -> std::result::Result<LogPos, LogFailure> {
+        self.rx.recv().unwrap_or_else(|_| {
+            Err(LogFailure {
+                error: stopped(),
+                unsent: None,
+            })
+        })
+    }
+
+    /// [`LogTicket::wait`] inside a `durable.ack_wait` child of `commit`.
+    pub(crate) fn wait_in(self, commit: &Span) -> std::result::Result<LogPos, LogFailure> {
+        info_span!(target: "turso_durable", parent: commit, "durable.ack_wait")
+            .in_scope(|| self.wait())
+    }
+}
+
+/// One `submit_log_file`: `ops` of `file` as one record of one sync, carrying `commits`
+/// commits (for the stats).
+struct FilePending {
+    file: LogFile,
+    ops: Vec<Op>,
+    commits: u64,
+    commit: u64,
+    reply: Sender<std::result::Result<LogPos, LogFailure>>,
+    span: Span,
+}
+
 enum Job {
     Log(Pending),
+    #[cfg_attr(not(test), allow(dead_code))]
+    File(FilePending),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Settle(Sender<Result<u64>>),
     Seal {
         pages: Vec<(u32, Vec<u8>)>,
         page_size: u32,
@@ -182,6 +241,44 @@ impl Uploader {
             submitted,
             rx,
         }
+    }
+
+    /// Queue `ops` of `file` as one record of its own (never batched with WAL syncs) and
+    /// return at once; it carries `commits` commits, as the stats count them. A record that
+    /// was never sent hands its ops back (`LogFailure::unsent`) instead of being dropped or
+    /// owed. The current span is its commit span.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn submit_log_file(&self, file: LogFile, ops: Vec<Op>, commits: u64) -> LogTicket {
+        let (reply, rx) = mpsc::channel();
+        let jobs = self.jobs.lock().unwrap();
+        let commit = self.commits.fetch_add(1, SeqCst) + 1;
+        let submitted = Instant::now();
+        if let Some(tx) = jobs.as_ref() {
+            let _ = tx.send(Job::File(FilePending {
+                file,
+                ops,
+                commits,
+                commit,
+                reply,
+                span: Span::current(),
+            }));
+        }
+        LogTicket {
+            commit,
+            submitted,
+            rx,
+        }
+    }
+
+    /// Settle what the bucket owes, behind every job already queued, and wait
+    /// (`Bucket::settle_all`): a record in doubt is settled at its seq, and a seal whose head
+    /// is published is adopted (the generation moves on). Ok only when nothing is left to
+    /// settle; returns the current generation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn settle_log(&self) -> Result<u64> {
+        let (reply, rx) = mpsc::channel();
+        self.send(Job::Settle(reply));
+        rx.recv().unwrap_or_else(|_| Err(stopped()))
     }
 
     /// Queue a seal behind every log object already submitted and wait for it; returns the
@@ -331,6 +428,13 @@ impl Worker {
             };
             match next {
                 Ok(Job::Log(item)) => self.log(item),
+                Ok(Job::File(item)) => self.log_file(item),
+                Ok(Job::Settle(reply)) => {
+                    let r = self.settle_log();
+                    self.last_failed.store(r.is_err(), SeqCst);
+                    self.publish_degraded();
+                    let _ = reply.send(r);
+                }
                 Ok(Job::Seal {
                     pages,
                     page_size,
@@ -440,7 +544,7 @@ impl Worker {
             waiters.push((p.batching, p.commit, p.reply));
             commit_spans.push(p.span);
         }
-        let r = span.in_scope(|| self.bucket.append_log(syncs));
+        let r = span.in_scope(|| self.bucket.append_log(LogFile::Wal, syncs));
         match &r {
             Ok(a) => {
                 span.record("durable.bytes", a.bytes);
@@ -538,6 +642,13 @@ impl Worker {
         );
         let g = span.in_scope(|| self.bucket.seal_generation(pages, page_size, page_count))?;
         drop(span);
+        self.sealed(g);
+        Ok(g)
+    }
+
+    /// The bucket moved to generation `g` (a seal, or an adopted one): publish it and wake
+    /// the trimmer.
+    fn sealed(&self, g: u64) {
         self.generation.store(g, SeqCst);
         if let Some(tx) = &self.trim_tx {
             // No trimmer listening is not an upload failure.
@@ -546,7 +657,90 @@ impl Worker {
                 manifest: self.bucket.manifest().cloned(),
             });
         }
-        Ok(g)
+    }
+
+    /// `Uploader::settle_log` on the thread. Nothing is batched or owed in MVCC mode
+    /// (Window is refused there), so there is nothing to flush first.
+    fn settle_log(&mut self) -> Result<u64> {
+        if self.bucket.settle_all()? {
+            self.sealed(self.bucket.head().generation);
+        }
+        Ok(self.bucket.head().generation)
+    }
+
+    /// Upload one `submit_log_file` record and reply. WAL syncs waiting or owed go first, so
+    /// records keep the submission order; if owed ones remain, this record is not sent.
+    fn log_file(&mut self, p: FilePending) {
+        let FilePending {
+            file,
+            ops,
+            commits,
+            commit,
+            reply,
+            span: commit_span,
+        } = p;
+        if let Err(error) = self.flush() {
+            if !self.owed.is_empty() {
+                let _ = reply.send(Err(LogFailure {
+                    error,
+                    unsent: Some(ops),
+                }));
+                return;
+            }
+        }
+        let span = info_span!(
+            target: "turso_durable",
+            parent: &commit_span,
+            "durable.upload",
+            durable.commits = commits,
+            durable.bytes = Empty,
+            durable.generation = Empty,
+            durable.seq = Empty,
+            durable.retries = Empty,
+            s3.status = Empty,
+        );
+        let r = span.in_scope(|| self.bucket.append_log(file, vec![ops]));
+        match &r {
+            Ok(a) => {
+                span.record("durable.bytes", a.bytes);
+            }
+            Err(f) => span.in_scope(|| {
+                tracing::warn!(
+                    target: "turso_durable",
+                    error = %f.error,
+                    commits,
+                    "log upload failed"
+                );
+            }),
+        }
+        drop(span);
+        drop(commit_span);
+        match r {
+            Ok(a) => {
+                // Counted, reported and published before the reply, as in `flush`.
+                self.stats.record_put(commits, a.bytes);
+                self.last_failed.store(false, SeqCst);
+                self.emit(Event::LogUploaded {
+                    generation: a.pos.generation,
+                    seq: a.pos.seq,
+                    bytes: a.bytes,
+                    commits: vec![commit],
+                });
+                self.publish_degraded();
+                let _ = reply.send(Ok(a.pos));
+            }
+            Err(AppendFailure { error, unsent }) => {
+                // A fenced writer never sends again; one in doubt is the bucket's to settle.
+                let unsent = match unsent {
+                    _ if matches!(error, Error::Fenced(_)) => None,
+                    Some(syncs) => Some(syncs.into_iter().flatten().collect()),
+                    None => None,
+                };
+                self.last_failed.store(true, SeqCst);
+                self.publish_degraded();
+                let _ = reply.send(Err(LogFailure { error, unsent }));
+            }
+        }
     }
 }
 

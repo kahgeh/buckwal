@@ -118,8 +118,8 @@ fn create_then_attach_round_trip() {
     assert_eq!(b.head(), &want);
     assert_eq!(f.stored_head(), want);
     assert_eq!((b.next_seq(), b.manifest()), (1, None));
-    b.append_log(syncs(1)).unwrap();
-    b.append_log(syncs(2)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(2)).unwrap();
 
     let a = f.attach("w1").unwrap();
     assert_eq!((a.head(), a.next_seq(), a.manifest()), (&want, 3, None));
@@ -145,7 +145,7 @@ fn create_then_attach_round_trip() {
 fn attach_ignores_unparseable_log_keys_and_needs_manifest() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.mem
         .put(&format!("{}junk", keys().log_prefix(1)), b"x")
         .unwrap();
@@ -188,7 +188,9 @@ fn append_log_is_linear_and_conditional() {
     let before = f.fault.events().len();
     for tag in 1..=3u8 {
         assert_eq!(
-            b.append_log(syncs(tag)).map(|a| a.pos).map_err(|f| f.error),
+            b.append_log(LogFile::Wal, syncs(tag))
+                .map(|a| a.pos)
+                .map_err(|f| f.error),
             Ok(LogPos {
                 generation: 1,
                 seq: tag as u64
@@ -213,7 +215,7 @@ fn ambiguous_put_is_accepted_on_retry() {
     let mut b = f.create(fast(), 4);
     f.fault.store_then_fail_next_puts(1);
     assert_eq!(
-        b.append_log(syncs(1))
+        b.append_log(LogFile::Wal, syncs(1))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -223,7 +225,7 @@ fn ambiguous_put_is_accepted_on_retry() {
     assert_eq!(f.record(1, 1), Some(ours(1)));
     assert!(b.counters().retries.load(Relaxed) >= 1);
     assert_eq!(
-        b.append_log(syncs(2))
+        b.append_log(LogFile::Wal, syncs(2))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -241,20 +243,24 @@ fn foreign_object_fences_and_stops() {
     });
     f.mem.put(&keys().log(1, 2), &foreign).unwrap();
     assert_eq!(
-        b.append_log(syncs(1))
+        b.append_log(LogFile::Wal, syncs(1))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
         Ok(1)
     );
     assert!(matches!(
-        b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(2))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
 
     let n = f.fault.events().len();
     assert!(matches!(
-        b.append_log(syncs(3)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(3))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
     assert!(matches!(
@@ -291,7 +297,7 @@ fn no_seal_objects(f: &Fixture, gen: u64) {
 fn seal_start_record_collision_fences_before_any_upload() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let head = f.stored_head();
     let claim = encode_record(&empty("w2"));
     f.mem.put(&keys().log(1, 2), &claim).unwrap();
@@ -311,7 +317,9 @@ fn seal_start_record_collision_fences_before_any_upload() {
     assert_eq!(f.stored_head(), head);
     assert_eq!(f.body(&keys().log(1, 2)), Some(claim));
     assert!(matches!(
-        b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(2))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
 }
@@ -339,7 +347,9 @@ fn seal_start_with_moved_head_fences_before_any_upload() {
     assert_eq!(f.stored_head(), other);
     assert_eq!(f.record(1, 1), Some(empty("w1")));
     assert!(matches!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
 }
@@ -351,7 +361,7 @@ fn seal_start_with_moved_head_fences_before_any_upload() {
 fn seal_start_accepts_our_own_late_head() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let late = Head {
         journal_mode: JournalMode::Wal,
         format: 1,
@@ -379,7 +389,7 @@ fn append_after_the_lease_checks_the_head() {
     let k = keys();
     b.age_lease(Duration::from_millis(150), Duration::ZERO);
     let before = f.fault.events().len();
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
         [
@@ -399,7 +409,7 @@ fn append_within_the_lease_sends_no_get() {
     let k = keys();
 
     let before = f.fault.events().len();
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
         [format!("put_if_absent {}", k.log(1, 1))],
@@ -408,7 +418,7 @@ fn append_within_the_lease_sends_no_get() {
 
     b.age_lease(Duration::from_secs(9), Duration::from_secs(9));
     let before = f.fault.events().len();
-    b.append_log(syncs(2)).unwrap();
+    b.append_log(LogFile::Wal, syncs(2)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
         [format!("put_if_absent {}", k.log(1, 2))],
@@ -417,7 +427,7 @@ fn append_within_the_lease_sends_no_get() {
 
     b.age_lease(Duration::from_secs(11), Duration::ZERO);
     let before = f.fault.events().len();
-    b.append_log(syncs(3)).unwrap();
+    b.append_log(LogFile::Wal, syncs(3)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
         [
@@ -429,7 +439,7 @@ fn append_within_the_lease_sends_no_get() {
 
     // The append just confirmed a write: the next one goes straight to the log again.
     let before = f.fault.events().len();
-    b.append_log(syncs(4)).unwrap();
+    b.append_log(LogFile::Wal, syncs(4)).unwrap();
     assert_eq!(
         f.fault.events()[before..],
         [format!("put_if_absent {}", k.log(1, 4))]
@@ -462,7 +472,10 @@ fn a_record_landing_past_the_lease_checks_the_head() {
     f.fault.only_keys_containing("/log/");
     f.fault.delay_puts(Duration::from_millis(300));
     let before = f.fault.events().len();
-    let r = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    let r = b
+        .append_log(LogFile::Wal, syncs(1))
+        .map(|a| a.pos)
+        .map_err(|f| f.error);
     assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
     assert_eq!(
         f.fault.events()[before..],
@@ -472,7 +485,10 @@ fn a_record_landing_past_the_lease_checks_the_head() {
         ],
         "inside the lease at the check, past it when the record landed: the head after it"
     );
-    let r = b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error);
+    let r = b
+        .append_log(LogFile::Wal, syncs(2))
+        .map(|a| a.pos)
+        .map_err(|f| f.error);
     assert!(r.is_err(), "fenced for good: {r:?}");
 }
 
@@ -490,7 +506,10 @@ fn a_record_landing_past_the_lease_under_our_head_counts() {
     f.fault.only_keys_containing("/log/");
     f.fault.delay_puts(Duration::from_millis(300));
     let before = f.fault.events().len();
-    let pos = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    let pos = b
+        .append_log(LogFile::Wal, syncs(1))
+        .map(|a| a.pos)
+        .map_err(|f| f.error);
     assert_eq!(pos.map(|p| p.seq), Ok(1));
     assert_eq!(
         f.fault.events()[before..],
@@ -501,7 +520,10 @@ fn a_record_landing_past_the_lease_under_our_head_counts() {
     );
     f.fault.delay_puts(Duration::ZERO);
     let before = f.fault.events().len();
-    let pos = b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error);
+    let pos = b
+        .append_log(LogFile::Wal, syncs(2))
+        .map(|a| a.pos)
+        .map_err(|f| f.error);
     assert_eq!(pos.map(|p| p.seq), Ok(2));
     assert_eq!(
         f.fault.events()[before..],
@@ -528,7 +550,10 @@ fn a_writer_that_slept_checks_the_head() {
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     b.age_lease(Duration::ZERO, Duration::from_secs(1));
     let before = f.fault.events().len();
-    let r = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    let r = b
+        .append_log(LogFile::Wal, syncs(1))
+        .map(|a| a.pos)
+        .map_err(|f| f.error);
     assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
     let ev = f.fault.events()[before..].to_vec();
     assert_eq!(ev, [format!("get {}", keys().head())]);
@@ -569,7 +594,7 @@ fn seal_renews_the_lease_between_page_puts() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
     b.set_lease(Duration::from_millis(200));
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/pages/");
     f.fault.delay_puts(Duration::from_millis(150));
     let before = f.fault.events().len();
@@ -604,7 +629,7 @@ fn a_lapsed_lease_before_the_head_put_gets_the_head_first() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
     b.set_lease(Duration::from_millis(200));
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/manifest/");
     f.fault.delay_puts(Duration::from_millis(300));
     let before = f.fault.events().len();
@@ -635,7 +660,7 @@ fn a_zero_lease_seal_checks_the_head_before_each_put() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
     b.set_lease(Duration::ZERO);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let before = f.fault.events().len();
     assert_eq!(b.seal_generation(pages(3), 4096, 3), Ok(2));
     assert_eq!(
@@ -664,7 +689,7 @@ fn a_long_seal_that_keeps_uploading_outlasts_the_deadline() {
         };
         let mut b = f.create(short, 1);
         b.set_lease(lease);
-        b.append_log(syncs(1)).unwrap();
+        b.append_log(LogFile::Wal, syncs(1)).unwrap();
         f.fault.only_keys_containing("/pages/");
         f.fault.delay_puts(Duration::from_millis(150));
         let before = f.fault.events().len();
@@ -696,7 +721,7 @@ fn a_seal_whose_head_checks_outlast_the_lease_times_out() {
     };
     let mut b = f.create(short, 1);
     b.set_lease(Duration::from_millis(50));
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/head");
     f.fault.delay_gets(Duration::from_millis(100));
     let before = f.fault.events().len();
@@ -721,7 +746,7 @@ fn seal_stops_page_puts_when_the_head_moves_mid_seal() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
     b.set_lease(Duration::from_millis(200));
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/pages/");
     f.fault.delay_puts(Duration::from_millis(150));
     let before = f.fault.events().len();
@@ -774,7 +799,7 @@ fn failed_or_ambiguous_append_does_not_renew_the_lease() {
         let f = Fixture::new();
         let mut b = f.create(short.clone(), 4);
         b.set_lease(Duration::from_secs(10));
-        b.append_log(syncs(1)).unwrap();
+        b.append_log(LogFile::Wal, syncs(1)).unwrap();
         // 9 s after the last confirmed write: no check, and this append fails.
         b.age_lease(Duration::from_secs(9), Duration::from_secs(9));
         if ambiguous {
@@ -783,7 +808,9 @@ fn failed_or_ambiguous_append_does_not_renew_the_lease() {
         f.fault.fail_puts_after(0);
         let before = f.fault.events().len();
         assert!(matches!(
-            b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error),
+            b.append_log(LogFile::Wal, syncs(2))
+                .map(|a| a.pos)
+                .map_err(|f| f.error),
             Err(Error::Timeout(_))
         ));
         assert!(
@@ -798,7 +825,7 @@ fn failed_or_ambiguous_append_does_not_renew_the_lease() {
         b.age_lease(Duration::from_secs(2), Duration::from_secs(2));
         let before = f.fault.events().len();
         assert_eq!(
-            b.append_log(syncs(3))
+            b.append_log(LogFile::Wal, syncs(3))
                 .map(|a| a.pos)
                 .map_err(|f| f.error)
                 .map(|p| p.seq),
@@ -823,7 +850,7 @@ fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
     b.set_lease(Duration::ZERO);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let other = Head {
         journal_mode: JournalMode::Wal,
         format: 1,
@@ -836,7 +863,9 @@ fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
     f.mem.delete(&keys().log(1, 1)).unwrap();
     let before = f.fault.events().len();
     assert!(matches!(
-        b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(2))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
     assert_eq!(
@@ -846,7 +875,9 @@ fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
     assert!(f.log_keys(1).is_empty());
     let n = f.fault.events().len();
     assert!(matches!(
-        b.append_log(syncs(3)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(3))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
     assert_eq!(f.fault.events().len(), n, "fenced for good");
@@ -860,7 +891,7 @@ fn lapsed_append_with_our_head_proceeds() {
     let mut b = f.create(fast(), 4);
     b.set_lease(Duration::ZERO);
     assert_eq!(
-        b.append_log(syncs(1))
+        b.append_log(LogFile::Wal, syncs(1))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -868,7 +899,7 @@ fn lapsed_append_with_our_head_proceeds() {
     );
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
     assert_eq!(
-        b.append_log(syncs(2))
+        b.append_log(LogFile::Wal, syncs(2))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| (p.generation, p.seq)),
@@ -884,7 +915,7 @@ fn lapsed_append_with_our_head_proceeds() {
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(
-        b.append_log(syncs(3))
+        b.append_log(LogFile::Wal, syncs(3))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| (p.generation, p.seq)),
@@ -903,7 +934,7 @@ fn ambiguous_seal_start_record_is_settled_then_sealed() {
     };
     let f = Fixture::new();
     let mut b = f.create(short, 4);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/log/");
     f.fault.store_then_fail_next_puts(1);
     f.fault.fail_puts_after(0);
@@ -949,7 +980,7 @@ fn deadline_failure_leaves_record_in_doubt_then_settles() {
     let mut b = f.create(short.clone(), 4);
     f.fault.fail_next_puts(1000);
     assert!(matches!(
-        b.append_log(syncs(b'A'))
+        b.append_log(LogFile::Wal, syncs(b'A'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
@@ -957,7 +988,7 @@ fn deadline_failure_leaves_record_in_doubt_then_settles() {
     assert_eq!(f.record(1, 1), None);
     f.fault.fail_next_puts(0);
     assert_eq!(
-        b.append_log(syncs(b'B'))
+        b.append_log(LogFile::Wal, syncs(b'B'))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -972,7 +1003,7 @@ fn deadline_failure_leaves_record_in_doubt_then_settles() {
     f.fault.store_then_fail_next_puts(1);
     f.fault.fail_puts_after(0);
     assert!(matches!(
-        b.append_log(syncs(b'A'))
+        b.append_log(LogFile::Wal, syncs(b'A'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
@@ -980,7 +1011,7 @@ fn deadline_failure_leaves_record_in_doubt_then_settles() {
     assert_eq!(f.record(1, 1), Some(ours(b'A')));
     f.fault.fail_puts_after(u64::MAX);
     assert_eq!(
-        b.append_log(syncs(b'B'))
+        b.append_log(LogFile::Wal, syncs(b'B'))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -1000,14 +1031,14 @@ fn settle_failure_keeps_record_in_doubt() {
     let mut b = f.create(short, 4);
     f.fault.fail_next_puts(100_000);
     assert!(matches!(
-        b.append_log(syncs(b'A'))
+        b.append_log(LogFile::Wal, syncs(b'A'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
     ));
     // The settle fails too: B is not written anywhere and A is still owed seq 1.
     assert!(matches!(
-        b.append_log(syncs(b'B'))
+        b.append_log(LogFile::Wal, syncs(b'B'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
@@ -1018,7 +1049,7 @@ fn settle_failure_keeps_record_in_doubt() {
     ));
     f.fault.fail_next_puts(0);
     assert_eq!(
-        b.append_log(syncs(b'C'))
+        b.append_log(LogFile::Wal, syncs(b'C'))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -1035,11 +1066,13 @@ fn permanent_error_is_upload_failed() {
     let mut b = f.create(fast(), 4);
     f.fault.fail_next_puts_permanently(1);
     assert!(matches!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::UploadFailed(_))
     ));
     assert_eq!(
-        b.append_log(syncs(2))
+        b.append_log(LogFile::Wal, syncs(2))
             .map(|a| a.pos)
             .map_err(|f| f.error)
             .map(|p| p.seq),
@@ -1059,7 +1092,7 @@ fn permanent_error_is_upload_failed() {
 fn seal_uploads_pages_manifest_head_in_order() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let before = f.fault.events().len();
     assert_eq!(b.seal_generation(pages(8), 4096, 8), Ok(2));
 
@@ -1110,7 +1143,9 @@ fn seal_uploads_pages_manifest_head_in_order() {
     assert_eq!(b.counters().seals.load(Relaxed), 1);
 
     assert_eq!(
-        b.append_log(syncs(2)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(2))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 2,
             seq: 1
@@ -1138,7 +1173,7 @@ fn seal_settles_in_doubt_record_first() {
     let f = Fixture::new();
     let mut b = f.create(short, 4);
     f.fault.fail_next_puts(100_000);
-    assert!(b.append_log(syncs(b'A')).is_err());
+    assert!(b.append_log(LogFile::Wal, syncs(b'A')).is_err());
     f.fault.fail_next_puts(0);
     let before = f.fault.events().len();
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
@@ -1191,7 +1226,9 @@ fn seal_failure_keeps_generation() {
     // The failed seal's seal-start record holds seq 1.
     assert_eq!(f.log_keys(1), [keys().log(1, 1)]);
     assert_eq!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 1,
             seq: 2
@@ -1259,7 +1296,9 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     assert_eq!(f.stored_head().generation, 2);
     assert_eq!(b.head().generation, 1);
     assert!(matches!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::UploadFailed(_))
     ));
     assert_eq!(
@@ -1270,7 +1309,9 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     f.fault.fail_puts_after(u64::MAX);
     assert_eq!(b.seal_generation(pages(1), 4096, 1), Ok(2));
     assert_eq!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 2,
             seq: 1
@@ -1287,7 +1328,9 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     assert!(b.seal_generation(pages(1), 4096, 1).is_err());
     f.fault.fail_next_puts(0);
     assert_eq!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 1,
             seq: 2
@@ -1314,7 +1357,9 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
     assert_eq!(
@@ -1389,7 +1434,9 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
         [Event::SealFinished { generation: 1, .. }]
     ));
     assert_eq!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 2,
             seq: 1
@@ -1461,14 +1508,14 @@ fn append_log_has_one_deadline_per_call() {
     let mut b = f.create(short.clone(), 4);
     f.fault.fail_next_puts(1_000_000);
     assert!(matches!(
-        b.append_log(syncs(b'A'))
+        b.append_log(LogFile::Wal, syncs(b'A'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
     ));
     let t = Instant::now();
     assert!(matches!(
-        b.append_log(syncs(b'B'))
+        b.append_log(LogFile::Wal, syncs(b'B'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
@@ -1486,7 +1533,7 @@ fn append_log_has_one_deadline_per_call() {
     let mut b = f.create(short, 4);
     f.fault.fail_next_puts(1_000_000);
     assert!(matches!(
-        b.append_log(syncs(b'A'))
+        b.append_log(LogFile::Wal, syncs(b'A'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
@@ -1496,7 +1543,7 @@ fn append_log_has_one_deadline_per_call() {
     f.fault.fail_puts_after(1);
     let t = Instant::now();
     assert!(matches!(
-        b.append_log(syncs(b'B'))
+        b.append_log(LogFile::Wal, syncs(b'B'))
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Err(Error::Timeout(_))
@@ -1528,7 +1575,9 @@ fn head_conflict_fences() {
     assert_eq!(f.stored_head(), other);
     assert_eq!(b.head().generation, 1);
     assert!(matches!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Err(Error::Fenced(_))
     ));
 }
@@ -1537,7 +1586,7 @@ fn head_conflict_fences() {
 fn take_over_raises_the_epoch_with_the_new_writer_in_the_same_generation() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let old = f.stored_head();
 
     // An ambiguous first attempt (stored, then an error): the retry finds its own head.
@@ -1699,7 +1748,7 @@ fn fence(writer_id: &str, epoch: u64) -> LogRecord {
 /// w1 at seq 1, then a takeover by w2 (epoch 2) attached at seq 2.
 fn taken_over(f: &Fixture) -> (Bucket, Bucket) {
     let mut a = f.create(fast(), 4);
-    a.append_log(syncs(1)).unwrap();
+    a.append_log(LogFile::Wal, syncs(1)).unwrap();
     take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
     let b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
     assert_eq!(b.next_seq(), 2);
@@ -1712,7 +1761,7 @@ fn append_fence_steps_over_an_old_writer_record() {
     // it, and the old writer's next append collides with the fence.
     let f = Fixture::new();
     let (mut a, mut b) = taken_over(&f);
-    a.append_log(syncs(2)).unwrap();
+    a.append_log(LogFile::Wal, syncs(2)).unwrap();
     let out = b.append_fence().unwrap();
     assert_eq!(
         (out.pos, out.seal_may_be_in_flight),
@@ -1726,7 +1775,7 @@ fn append_fence_steps_over_an_old_writer_record() {
     );
     assert_eq!(f.record(1, 3), Some(fence("w2", 2)));
     assert_eq!(b.next_seq(), 4);
-    let r = a.append_log(syncs(3)).map_err(|f| f.error);
+    let r = a.append_log(LogFile::Wal, syncs(3)).map_err(|f| f.error);
     assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
     // The restore image: w1's two records, then the fence.
     let (_, n) =
@@ -1752,7 +1801,10 @@ fn append_fence_steps_over_an_old_writer_record() {
         let r = b.append_fence();
         assert!(matches!(r, Err(Error::Fenced(_))), "epoch {epoch}: {r:?}");
         assert_eq!(f.record(1, 3), None);
-        assert!(b.append_log(syncs(4)).is_err(), "fenced for good");
+        assert!(
+            b.append_log(LogFile::Wal, syncs(4)).is_err(),
+            "fenced for good"
+        );
     }
 
     // Our own fence already there (an earlier attempt landed): landed, no step.
@@ -1801,7 +1853,7 @@ fn a_chained_fence_reports_a_seal_in_flight_further_back() {
             "w2's fence"
         );
         for t in 0..b_commits {
-            b.append_log(syncs(10 + t)).unwrap();
+            b.append_log(LogFile::Wal, syncs(10 + t)).unwrap();
         }
         take_over(&*f.store(), &keys(), &fast(), 1, "w3").unwrap();
         let mut c = Bucket::attach(f.store(), keys(), fast(), 4, "w3", 3).unwrap();
@@ -1833,7 +1885,7 @@ fn a_chained_fence_reports_a_seal_in_flight_further_back() {
     let f = Fixture::new();
     let (_a, mut b) = taken_over(&f);
     assert!(!b.append_fence().unwrap().seal_may_be_in_flight);
-    b.append_log(syncs(10)).unwrap();
+    b.append_log(LogFile::Wal, syncs(10)).unwrap();
     take_over(&*f.store(), &keys(), &fast(), 1, "w3").unwrap();
     let mut c = Bucket::attach(f.store(), keys(), fast(), 4, "w3", 3).unwrap();
     assert!(!c.append_fence().unwrap().seal_may_be_in_flight);
@@ -1850,7 +1902,7 @@ fn append_fence_gives_up_after_the_step_bound() {
     // An old writer that always wins: before each fence PUT, its record lands at that key.
     let mem = Arc::new(MemStore::new());
     let mut a = Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
-    a.append_log(syncs(1)).unwrap();
+    a.append_log(LogFile::Wal, syncs(1)).unwrap();
     take_over(&*mem, &keys(), &fast(), 1, "w2").unwrap();
     let store = Arc::new(Interpose {
         mem: mem.clone(),
@@ -1890,18 +1942,18 @@ fn append_refused_before_any_put_hands_the_syncs_back() {
     // never sent.
     let (mem, fault, mut b) = fault_bucket_with_short_deadline();
     fault.fail_puts_after(0);
-    let first = b.append_log(vec![op(1)]).unwrap_err();
+    let first = b.append_log(LogFile::Wal, vec![op(1)]).unwrap_err();
     assert!(
         first.unsent.is_none(),
         "an attempted PUT is in doubt, not unsent"
     );
     assert!(b.degraded());
-    let second = b.append_log(vec![op(2)]).unwrap_err();
+    let second = b.append_log(LogFile::Wal, vec![op(2)]).unwrap_err();
     assert_eq!(second.unsent, Some(vec![op(2)]));
     fault.fail_puts_after(u64::MAX);
     b.catch_up().unwrap(); // settles the in-doubt record at its own seq
     assert!(!b.degraded());
-    let a = b.append_log(vec![op(2)]).unwrap();
+    let a = b.append_log(LogFile::Wal, vec![op(2)]).unwrap();
     assert_eq!(a.pos.seq, 2);
     assert_eq!(
         stored_ops(
@@ -1929,7 +1981,7 @@ fn fenced_append_reports_no_unsent_syncs_and_degrades() {
     let (mem, _fault, mut b) = fault_bucket_with_short_deadline();
     mem.put_if_absent(&keys().log(1, 1), b"someone else")
         .unwrap();
-    let f = b.append_log(vec![op(1)]).unwrap_err();
+    let f = b.append_log(LogFile::Wal, vec![op(1)]).unwrap_err();
     assert!(matches!(f.error, Error::Fenced(_)) && f.unsent.is_none());
     assert!(b.degraded());
     assert!(matches!(b.catch_up(), Err(Error::Fenced(_))));
@@ -1939,7 +1991,7 @@ fn fenced_append_reports_no_unsent_syncs_and_degrades() {
 fn appended_reports_bytes_and_retries() {
     let (_mem, fault, mut b) = fault_bucket_with_short_deadline();
     fault.fail_next_puts(2);
-    let a = b.append_log(vec![op(1)]).unwrap();
+    let a = b.append_log(LogFile::Wal, vec![op(1)]).unwrap();
     assert_eq!(a.retries, 2);
     assert!(a.bytes > 0);
 }
@@ -1953,7 +2005,7 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
     fault.store_then_fail_next_puts(1);
     fault.fail_puts_after(0);
     assert!(b.seal_generation(pages(1), 4096, 1).is_err());
-    let f = b.append_log(vec![op(1)]).unwrap_err();
+    let f = b.append_log(LogFile::Wal, vec![op(1)]).unwrap_err();
     assert!(matches!(f.error, Error::UploadFailed(_)), "{f:?}");
     assert_eq!(f.unsent, Some(vec![op(1)]));
     let before = mem.stats();
@@ -1976,13 +2028,13 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
         epoch: 0,
     };
     mem.put(&keys().head(), &other.encode()).unwrap();
-    let f = b.append_log(vec![op(1)]).unwrap_err();
+    let f = b.append_log(LogFile::Wal, vec![op(1)]).unwrap_err();
     assert!(matches!(f.error, Error::Fenced(_)), "{f:?}");
     assert_eq!(f.unsent, Some(vec![op(1)]));
     assert!(b.degraded());
     // Already fenced: nothing is sent at all.
     let before = mem.stats();
-    let f = b.append_log(vec![op(2)]).unwrap_err();
+    let f = b.append_log(LogFile::Wal, vec![op(2)]).unwrap_err();
     assert!(matches!(f.error, Error::Fenced(_)), "{f:?}");
     assert_eq!(f.unsent, Some(vec![op(2)]));
     assert_eq!(mem.stats().since(&before).requests(), 0);
@@ -2015,7 +2067,9 @@ fn ambiguous_head_write_not_landed_raises_the_epoch() {
     assert!(b.seal_generation(pages(1), 4096, 1).is_err());
     f.fault.fail_next_puts(0);
     assert_eq!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 1,
             seq: 2
@@ -2118,7 +2172,10 @@ fn check_head_adopts_its_own_raise_whose_reply_was_lost() {
     f.fault.fail_next_puts(0);
     f.fault.store_then_fail_next_puts(1);
     f.fault.fail_puts_after(0);
-    let r = b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error);
+    let r = b
+        .append_log(LogFile::Wal, syncs(1))
+        .map(|a| a.pos)
+        .map_err(|f| f.error);
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
     let raised = Head {
         epoch: old.epoch + 1,
@@ -2128,7 +2185,9 @@ fn check_head_adopts_its_own_raise_whose_reply_was_lost() {
     assert_eq!(b.head().epoch, raised.epoch - 1, "its reply was lost");
     f.fault.fail_puts_after(u64::MAX);
     assert_eq!(
-        b.append_log(syncs(1)).map(|a| a.pos).map_err(|f| f.error),
+        b.append_log(LogFile::Wal, syncs(1))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
         Ok(LogPos {
             generation: 1,
             seq: 2
@@ -2231,7 +2290,7 @@ fn stale_writers_late_put_is_refused(held: &str) {
     let hold = Arc::new(HoldStore::new(f.mem.clone()));
     let mut a = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
     a.set_lease(Duration::from_millis(200));
-    a.append_log(syncs(1)).unwrap();
+    a.append_log(LogFile::Wal, syncs(1)).unwrap();
     let (held_rx, go) = hold.hold_next_put(held);
     std::thread::scope(|s| {
         let a_seal = s.spawn(move || {
@@ -2250,7 +2309,7 @@ fn stale_writers_late_put_is_refused(held: &str) {
         );
         let quiet = Duration::from_millis(300);
         b.set_seal_not_before(1, Instant::now() + quiet);
-        b.append_log(syncs(2)).unwrap();
+        b.append_log(LogFile::Wal, syncs(2)).unwrap();
         assert_eq!(b.seal_generation(pages_of(3, 0xB), 4096, 3), Ok(2));
         let published = sealed(&f.mem, 1);
         go.send(()).unwrap();
@@ -2298,7 +2357,7 @@ fn a_stale_writers_late_manifest_put_cannot_overwrite_a_published_seal() {
 fn a_retried_seal_overwrites_its_own_pages() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/manifest/");
     f.fault.fail_next_puts_permanently(1);
     let r = b.seal_generation(pages_of(2, 1), 4096, 2);
@@ -2326,7 +2385,7 @@ fn a_retried_seal_overwrites_its_own_pages() {
 fn a_seal_overwrites_a_foreign_leftover_page() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let k = keys();
     f.mem
         .put(&k.page(1, 1), b"another writer's leftover")
@@ -2356,7 +2415,7 @@ fn a_seal_overwrites_a_foreign_leftover_page() {
 fn a_lost_reply_on_a_conditional_page_put_is_rewritten_without_fencing() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 1);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/pages/");
     f.fault.store_then_fail_next_puts(1);
     let before = f.fault.events().len();
@@ -2391,7 +2450,7 @@ fn a_seal_finding_its_own_page_overwritten_checks_the_head_first() {
         let f = Fixture::new();
         let hold = Arc::new(HoldStore::new(f.store()));
         let mut b = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
-        b.append_log(syncs(1)).unwrap();
+        b.append_log(LogFile::Wal, syncs(1)).unwrap();
         f.fault.only_keys_containing("/manifest/");
         f.fault.fail_next_puts_permanently(1);
         let r = b.seal_generation(pages_of(2, 1), 4096, 2);
@@ -2470,7 +2529,7 @@ fn residual_content_equal_etag_lets_a_stale_put_through() {
     let hold = Arc::new(HoldStore::new(f.store()));
     let mut a = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
     a.set_lease(Duration::from_millis(200));
-    a.append_log(syncs(1)).unwrap();
+    a.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/manifest/");
     f.fault.fail_next_puts_permanently(1);
     let r = a.seal_generation(pages_of(1, 0xA), 4096, 1);
@@ -2485,7 +2544,7 @@ fn residual_content_equal_etag_lets_a_stale_put_through() {
         assert!(b.append_fence().unwrap().seal_may_be_in_flight);
         let quiet = Duration::from_millis(300);
         b.set_seal_not_before(1, Instant::now() + quiet);
-        b.append_log(syncs(2)).unwrap();
+        b.append_log(LogFile::Wal, syncs(2)).unwrap();
         let b_pages = vec![(1, vec![0xA; 16]), (2, vec![0xB; 16])];
         assert_eq!(b.seal_generation(b_pages, 4096, 2), Ok(2));
         assert_eq!(f.body(&k.page(1, 1)), Some(vec![0xA; 16]), "B's page 1");
@@ -2577,7 +2636,7 @@ fn a_seal_against_a_store_that_answers_412_forever_times_out() {
     let retry = RetryPolicy { deadline, ..fast() };
     let mut b = Bucket::create(store, keys(), retry, 1, "w1".into()).unwrap();
     b.set_lease(lease);
-    b.append_log(syncs(1)).unwrap();
+    b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let t = Instant::now();
@@ -2599,4 +2658,73 @@ fn a_seal_against_a_store_that_answers_412_forever_times_out() {
     assert!(mem.get(&k.manifest(1)).unwrap().is_none());
     let head = Head::decode(&mem.get(&k.head()).unwrap().unwrap().body).unwrap();
     assert_eq!(head.generation, 1);
+}
+
+/// `append_log` writes the record kind its `LogFile` names: 1 for the `-wal`, 3 for the
+/// `.db-log`, at consecutive seqs of one log.
+#[test]
+fn append_log_writes_the_kind_of_its_file() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    let a = b.append_log(LogFile::Log, syncs(1)).unwrap();
+    let w = b.append_log(LogFile::Wal, syncs(2)).unwrap();
+    assert_eq!((a.pos.seq, w.pos.seq), (1, 2));
+    assert!(matches!(
+        f.record(1, 1),
+        Some(LogRecord::Extents { file: LogFile::Log, syncs: s, .. }) if s == syncs(1)
+    ));
+    assert!(matches!(
+        f.record(1, 2),
+        Some(LogRecord::Extents { file: LogFile::Wal, syncs: s, .. }) if s == syncs(2)
+    ));
+}
+
+/// `settle_all`: Ok only with nothing left to settle. A record in doubt is settled at its
+/// seq (`false`: no generation change); a published pending seal is adopted (`true`), and
+/// the next append goes to the new generation.
+#[test]
+fn settle_all_settles_in_doubt_and_adopts_a_published_seal() {
+    let short = RetryPolicy {
+        deadline: Duration::from_millis(100),
+        ..fast()
+    };
+    let f = Fixture::new();
+    let mut b = f.create(short, 4);
+    f.fault.only_keys_containing("/log/");
+    f.fault.store_then_fail_next_puts(1);
+    f.fault.fail_puts_after(0);
+    assert!(b.append_log(LogFile::Log, syncs(1)).is_err());
+    assert!(b.degraded());
+    assert!(b.settle_all().is_err(), "still failing");
+    f.fault.fail_puts_after(u64::MAX);
+    assert_eq!(b.settle_all(), Ok(false));
+    assert!(!b.degraded());
+    assert_eq!(
+        f.log_keys(1),
+        [keys().log(1, 1)],
+        "settled once, at its seq"
+    );
+
+    f.fault.only_keys_containing("/head");
+    f.fault.store_then_fail_next_puts(1);
+    f.fault.fail_puts_after(0);
+    assert!(b.seal_generation(pages(1), 4096, 1).is_err());
+    assert_eq!(f.stored_head().generation, 2);
+    assert_eq!(
+        b.settle_all(),
+        Ok(true),
+        "a published seal needs no PUT to adopt"
+    );
+    assert_eq!(b.head().generation, 2);
+    assert!(!b.degraded());
+    f.fault.fail_puts_after(u64::MAX);
+    assert_eq!(
+        b.append_log(LogFile::Log, syncs(2))
+            .map(|a| a.pos)
+            .map_err(|f| f.error),
+        Ok(LogPos {
+            generation: 2,
+            seq: 1
+        })
+    );
 }

@@ -799,7 +799,8 @@ impl Bucket {
         }
     }
 
-    /// Write one log record at the next seq of the current generation.
+    /// Write one log record of `file`'s ops (kind 1 for `LogFile::Wal`, kind 3 for
+    /// `LogFile::Log`) at the next seq of the current generation.
     /// Every retry in the call shares one deadline, counted from its start.
     ///
     /// The record is built only once `check_fenced` and `before_record` have passed; a
@@ -813,10 +814,11 @@ impl Bucket {
     /// it was meant for) and `durable.retries` (`Appended::retries`) on the current span.
     pub(crate) fn append_log(
         &mut self,
+        file: LogFile,
         syncs: Vec<Vec<Op>>,
     ) -> std::result::Result<Appended, AppendFailure> {
         let retries = self.counters.retries.load(Relaxed);
-        let r = self.append_log_at(syncs, retries);
+        let r = self.append_log_at(file, syncs, retries);
         let span = Span::current();
         let pos = match &r {
             Ok(a) => a.pos,
@@ -836,6 +838,7 @@ impl Bucket {
 
     fn append_log_at(
         &mut self,
+        file: LogFile,
         syncs: Vec<Vec<Op>>,
         retries: u64,
     ) -> std::result::Result<Appended, AppendFailure> {
@@ -847,7 +850,7 @@ impl Bucket {
             });
         }
         let body = encode_record(&LogRecord::Extents {
-            file: LogFile::Wal,
+            file,
             writer_id: self.head.writer_id.clone(),
             syncs,
         });
@@ -1052,6 +1055,33 @@ impl Bucket {
         let start = Instant::now();
         self.check_fenced()?;
         self.catch_up_at(start).map(|_| ()).map_err(upload_error)
+    }
+
+    /// Settle everything an earlier failure left owed, for a `.db-log` sync (the
+    /// confirmed-sync rule): `catch_up`, and a pending seal whose head is published is adopted
+    /// here, without uploading, as the next seal would (`seal`). Ok only when nothing is left:
+    /// no record in doubt, no seal pending. `true` when it adopted a seal (the generation
+    /// moved on). One deadline, counted from its start.
+    pub(crate) fn settle_all(&mut self) -> Result<bool> {
+        let start = Instant::now();
+        self.check_fenced()?;
+        let adopted = match self.catch_up_at(start).map_err(upload_error)? {
+            HeadCheck::Published(etag) => {
+                let p = self
+                    .pending_seal
+                    .take()
+                    .expect("a published seal is pending");
+                self.finish_seal(start, p.head, etag, p.manifest);
+                true
+            }
+            HeadCheck::Unmoved => false,
+        };
+        if self.degraded() {
+            return Err(Error::UploadFailed(
+                "the bucket still has a record or a seal to settle".into(),
+            ));
+        }
+        Ok(adopted)
     }
 
     /// Is the bucket answering? For the uploader after a failed operation that left nothing
