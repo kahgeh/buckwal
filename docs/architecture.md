@@ -85,7 +85,7 @@ flowchart LR
 |---|---|---|
 | Public API | `open`, `takeover`, `restore`, `gc`, `is_claimed`, `Config`, `JournalMode`, `Database`, `Connection`, `Batching`, `UploadStats`, `Error` | `crates/buckwal/src/lib.rs`, `config.rs`, `error.rs`, `stats.rs` |
 | Connection and Database | One engine connection per `Connection`: the SQL guard, the maintenance gate, the ack wait, `run`, `describe`, `is_autocommit`, `transaction`, `checkpoint` | `crates/buckwal/src/conn.rs`, `guard.rs`, `batching.rs`, `db.rs` |
-| Open and create | The directory cases of `open`, the claim, the mode checks, and the creation of a new MVCC database (built locally, then published as a seal) | `crates/buckwal/src/db.rs`, `create.rs`, `engine.rs` |
+| Open and create | The directory cases of `open`, the claim, the mode checks, page 1 of a fresh database, and the creation of a new MVCC database (built locally, then published as a seal) | `crates/buckwal/src/db.rs`, `create.rs`, `engine.rs` |
 | Restore, reconcile, takeover | Rebuild `app.db-wal` and `app.db-log` from the bucket, level a local directory with the bucket (Level, Behind, Ahead, NewGeneration), take a database over with a head write and a fence record | `crates/buckwal/src/restore.rs`, `reconcile.rs`, `takeover.rs` |
 | Maintenance, GC and trim | The background checkpoint that seals a generation the engine never restarts, and the deletion of what the head no longer reaches | `crates/buckwal/src/maintenance.rs`, `gc.rs`, `trim.rs` |
 | DurableIo | The engine's IO: the platform IO with `app.db-wal` wrapped, and `app.db-log` refused outside its wrapper | `crates/buckwal/src/io/durable_io.rs` |

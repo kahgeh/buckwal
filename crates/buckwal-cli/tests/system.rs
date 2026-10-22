@@ -989,6 +989,15 @@ fn verify_while_writer_runs_loses_nothing() {
 
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
+fn sql_on_a_fresh_prefix_prints_page_count_1() {
+    let ctx = Ctx::new("sql_on_a_fresh_prefix_prints_page_count_1");
+    let dir = ctx.dir("db");
+    let out = ctx.ok(&["sql", "--dir", dir.to_str().unwrap(), "PRAGMA page_count"]);
+    assert_eq!(out.stdout.trim(), "1", "{}\n{}", out.stdout, out.stderr);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
 fn second_process_is_refused() {
     let ctx = Ctx::new("second_process_is_refused");
     let dir = ctx.dir("db");
