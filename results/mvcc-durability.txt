@@ -55,3 +55,5 @@ Task 10 (CLI --journal-mode, soak --concurrent, MVCC system tests)
   stale assert: mvcc_pragma_refused_then_all_acks_restore expected "MVCC is not supported yet"; the library now says "MVCC: switching an existing WAL database" (since Task 2/3). Assertion text updated.
   note: takeover of a saturated MVCC writer (~600 commits/s) times out after 64 fence probes (same rule as WAL, borderline there too); the old writer is fenced anyway, 1999 acks present. mvcc_takeover_cli stops the writer (SIGSTOP) first.
   mvcc tests: plain 16 passed (36.4 s) + server 1; https+encryption 16 passed (39.0 s) + server 1; peak turso-durable-objects 66 / 67 MB; whole-bucket scan: pass 1 finds CREATE TABLE, pass 2 finds nothing.
+
+Task 12 (documentation): ./scripts/test.sh unit exit 0, 697 unit tests (32 cli + 6 hrana client + 81 server + 36 http + 1 span + 489 library + 33 batching + 5 fencing + 8 mvcc_fencing + 5 mvcc_limits + 1 otel_down), up from the baseline 588. Cargo.lock unchanged since 332b45f. Doc comments only in Rust (conn.rs, db.rs, io/log_file.rs). docs/architecture.md and docs/mvcc-recon.md diagrams render with mmdc.
