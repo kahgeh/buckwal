@@ -15,7 +15,7 @@ Every seal moves the head from generation G to G+1 and writes `manifest/G` and t
 
 A new MVCC database is built in a staging directory (`app.db-creating`) with plain local IO and no wrapper: `PRAGMA journal_mode='mvcc'`, then a `TRUNCATE` checkpoint. Only then does the bucket see anything, and it sees a seal of generation 1: `pages/1/*` and `manifest/1` with plain PUTs first, then the head last, with `If-None-Match`, at generation 2 naming manifest 1 (format 2, epoch 1, `"journal_mode":"mvcc"`). After the head landed, the files move into the database directory, local state last. A crash at any step leaves no head without its manifest and pages, and a staging directory is never opened again: the next open removes it.
 
-Code: `crates/turso_durable/src/create.rs`, `bucket.rs` (`create_sealed`), `db.rs` (`create_new_mvcc`). Tests: `create_mvcc_makes_head_manifest_pages_and_local_files` and `create_crash_at_each_step` (`crates/turso_durable/src/db/tests.rs`).
+Code: `crates/buckwal/src/create.rs`, `bucket.rs` (`create_sealed`), `db.rs` (`create_new_mvcc`). Tests: `create_mvcc_makes_head_manifest_pages_and_local_files` and `create_crash_at_each_step` (`crates/buckwal/src/db/tests.rs`).
 
 ## Consequences
 

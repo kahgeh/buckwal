@@ -20,7 +20,7 @@ The seal runs inside the `truncate` of a `DurableStorage` wrapper (`LogDurableSt
 - `should_checkpoint` is false: only maintenance (and an explicit checkpoint, which runs as `TRUNCATE`) checkpoints, because an auto-checkpoint's error is swallowed inside a commit (Q6).
 - A checkpoint that fails after a successful seal poisons the database. The engine may already hold the new salt while the file keeps the old frames, so writes, checkpoints and seals are refused until the database is reopened, and the open repairs and reconciles. This is wider than the design's "a failed local log truncate": it covers the log truncate, its fsync and the WAL truncate.
 
-Code: `crates/turso_durable/src/io/log_storage.rs` (`truncate`, `on_checkpoint_start`, `on_checkpoint_end`, `poison`), `io/wal_file.rs` (`in_mvcc`), `engine.rs`. Tests: `seal_failure_retry_crash_restore` and `local_truncate_failure_after_seal_poisons_until_reopen` (`crates/turso_durable/src/db/tests/mvcc.rs`).
+Code: `crates/buckwal/src/io/log_storage.rs` (`truncate`, `on_checkpoint_start`, `on_checkpoint_end`, `poison`), `io/wal_file.rs` (`in_mvcc`), `engine.rs`. Tests: `seal_failure_retry_crash_restore` and `local_truncate_failure_after_seal_poisons_until_reopen` (`crates/buckwal/src/db/tests/mvcc.rs`).
 
 ## Consequences
 

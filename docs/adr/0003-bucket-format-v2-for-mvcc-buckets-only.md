@@ -18,7 +18,7 @@ An MVCC bucket uses format 2; a WAL bucket stays byte-identical format 1.
 - A kind 3 record in a format 1 bucket is refused (`MVCC: a .db-log record in a WAL bucket` for a writer, `Corrupt` for a restore).
 - A v1 build fails to decode a format 2 head (`head: unsupported format 2`), so it never writes to, seals, restores or trims an MVCC bucket.
 
-Code: `crates/turso_durable/src/format/head.rs`, `format/record.rs`, `bucket.rs` (`append_log_at`). Tests: `v1_head_bytes_are_unchanged` (`crates/turso_durable/src/format/tests.rs`), `restore_wal_bucket_bytes_identical_to_before` (`crates/turso_durable/src/db/tests/mvcc/restore.rs`), `wal_bucket_stays_format_1_under_the_same_operations` (`crates/turso_durable/tests/mvcc_fencing.rs`), `kind3_record_is_refused_in_a_format1_bucket` (`crates/turso_durable/src/bucket/tests.rs`).
+Code: `crates/buckwal/src/format/head.rs`, `format/record.rs`, `bucket.rs` (`append_log_at`). Tests: `v1_head_bytes_are_unchanged` (`crates/buckwal/src/format/tests.rs`), `restore_wal_bucket_bytes_identical_to_before` (`crates/buckwal/src/db/tests/mvcc/restore.rs`), `wal_bucket_stays_format_1_under_the_same_operations` (`crates/buckwal/tests/mvcc_fencing.rs`), `kind3_record_is_refused_in_a_format1_bucket` (`crates/buckwal/src/bucket/tests.rs`).
 
 ## Consequences
 

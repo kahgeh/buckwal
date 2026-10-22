@@ -4,7 +4,7 @@ Rust library `buckwal` (crates/buckwal) plus CLI `buckwal` (crates/buckwal-cli) 
 
 ## Tests
 
-- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (701, the server's HTTP tests and the MVCC fencing and limits tests included). Fast.
+- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (712, the server's HTTP tests and the MVCC fencing and limits tests included). Fast.
 - `./scripts/test.sh`: the above, then starts RustFS and runs `--ignored` tests with `--test-threads=1` in two passes: plain HTTP (`--skip tls_`), then HTTPS with encryption (all). Each pass runs 6 `serve` tests (`mvcc_serve_begin_concurrent` included), 52 system tests (the MVCC ones included) and the S3 tests (8, then 12). 14:34 (874 s) at 9ab3403 on 2026-10-22. Before the MVCC work: 5 `serve` tests, 38 system tests, about 12 min (baseline at 332b45f).
 - The `serve` system tests (crates/buckwal-cli/tests/server.rs, `mvcc_serve_begin_concurrent` included) join both passes: plain HTTP without a token in pass 1, HTTPS with a token in pass 2. `serve` defaults to `127.0.0.1:9295`; tests always use port 0 and read the port from the `serve listening` line.
 - Pass 2's TLS material and key are made in a `mktemp -d` dir (`buckwal-tls.*`) and removed on exit; it exports `BUCKWAL_TLS_DIR` and `BUCKWAL_ENCRYPTION_KEY_FILE`.

@@ -22,7 +22,7 @@ The commit point is the `File::sync` of `app.db-log`, through a `LogShippingFile
 
 Group commit is the engine's own, so one kind 3 record carries a group, and each engine frame is counted and acked.
 
-Code: `crates/turso_durable/src/io/log_file.rs`, `uploader.rs`, `bucket.rs` (`append_log`, `settle_all`). Tests: `sync_ok_only_when_all_ops_confirmed` (`crates/turso_durable/tests/mvcc_fencing.rs`), `stats_count_one_commit_per_record_in_group_commit` and `head_stored_reply_lost_next_commit_adopts_and_is_acked` (`crates/turso_durable/src/db/tests/mvcc.rs`).
+Code: `crates/buckwal/src/io/log_file.rs`, `uploader.rs`, `bucket.rs` (`append_log`, `settle_all`). Tests: `sync_ok_only_when_all_ops_confirmed` (`crates/buckwal/tests/mvcc_fencing.rs`), `stats_count_one_commit_per_record_in_group_commit` and `head_stored_reply_lost_next_commit_adopts_and_is_acked` (`crates/buckwal/src/db/tests/mvcc.rs`).
 
 ## Consequences
 
