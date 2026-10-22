@@ -296,3 +296,120 @@ fn gc_ignores_the_directory() {
         Err(Error::Config(_))
     ));
 }
+
+fn mvcc_config(dir: &Path) -> Config {
+    let mut c = config(dir);
+    c.journal_mode = crate::config::JournalMode::Mvcc;
+    c.retry_deadline = Duration::from_millis(300);
+    c.maintenance_log_objects = 0;
+    c.maintenance_wal_bytes = 0;
+    c
+}
+
+/// The kind byte of a log object (1: kind 1, 2: fence, 3: kind 3).
+fn log_kind(store: &MemStore, key: &str) -> u8 {
+    store.get(key).unwrap().unwrap().body[8]
+}
+
+fn restored_mvcc_rows(store: &Arc<MemStore>) -> Vec<i64> {
+    let v = tempdir();
+    let db = open_read_only_with_store(mvcc_config(v.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    let ok = c.query("PRAGMA integrity_check", &[]).unwrap();
+    assert_eq!(ok[0][0].to_text(), Some("ok"));
+    c.query("SELECT id FROM t ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect()
+}
+
+/// Three MVCC seals, then five unsealed commits (kind 3 in the current generation), the
+/// writer crashed. After the manifest comes of age GC keeps exactly the head's manifest, its
+/// pages and the current generation's log (kind 3 included), deletes every older generation's
+/// kind-1 and kind-3 objects, and a restore still has every row.
+#[test]
+fn gc_and_trim_across_mvcc_generations_keep_only_sealed_manifest_pages_and_log() {
+    let store = mem();
+    let a = tempdir();
+    let k = keys();
+    let db = open_with_store(mvcc_config(a.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    // The first seal writes many pages; the later ones touch few, so the head's manifest
+    // maps some pages to an older generation (kept) next to newer ones.
+    for id in 1..=300 {
+        c.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[Value::from_i64(id), Value::build_text("x".repeat(200))],
+        )
+        .unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    seal_rows(&c, 301, 302);
+    seal_rows(&c, 303, 304);
+    for id in 305..=309 {
+        insert(&c, id);
+    }
+    let h = head(&*store);
+    assert_eq!(h.journal_mode, crate::config::JournalMode::Mvcc);
+    assert!(h.manifest.unwrap() >= 3, "{h:?}");
+    // Old generations hold kind-3 (and kind-1) objects now doomed.
+    let old_logs: Vec<String> = all_keys(&store)
+        .into_iter()
+        .filter(|key| matches!(k.parse_log(key), Some((g, _)) if g < h.generation))
+        .collect();
+    assert!(
+        old_logs.iter().any(|key| log_kind(&store, key) == 3),
+        "an old generation shipped kind-3 records"
+    );
+    let current: Vec<String> = store.list(&k.log_prefix(h.generation)).unwrap();
+    assert!(
+        current.iter().any(|key| log_kind(&store, key) == 3),
+        "the current generation holds kind-3 records: {current:?}"
+    );
+    store.advance_clock(min_age() + Duration::from_secs(1));
+    let doomed = reachable_no_more(&store);
+    assert!(old_logs.iter().all(|l| doomed.contains(l)));
+    let before = all_keys(&store);
+
+    let rep = gc_with_store(&mvcc_config(a.path()), store.clone()).unwrap();
+    assert_eq!(rep.outcome, GcOutcome::Trimmed, "{rep:?}");
+    assert_eq!(rep.trimmed_against, h.manifest);
+    assert_eq!(rep.deleted, doomed.len() as u64);
+    let now = all_keys(&store);
+    assert_eq!(now, before.difference(&doomed).cloned().collect());
+    // The current generation's log, kind 3 included, and the head's manifest and pages stay.
+    for key in &current {
+        assert!(now.contains(key), "{key} was trimmed");
+    }
+    let m = Manifest::decode(
+        &store
+            .get(&k.manifest(h.manifest.unwrap()))
+            .unwrap()
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    for (p, g) in &m.pages {
+        assert!(now.contains(&k.page(*g, *p)), "page {p} of {g}");
+    }
+    assert!(
+        m.pages.values().any(|g| *g < h.manifest.unwrap()),
+        "the head's manifest maps a page to an older generation: {:?}",
+        m.pages
+    );
+    // Only one manifest older than the head's is gone, none newer; no old-generation log.
+    assert!(now
+        .iter()
+        .all(|key| !matches!(k.parse_log(key), Some((g, _)) if g < h.generation)));
+    assert_eq!(
+        now.iter().filter_map(|key| k.parse_manifest(key)).min(),
+        h.manifest
+    );
+    // A restore after the trim has every row.
+    assert_eq!(restored_mvcc_rows(&store), (1..=309).collect::<Vec<_>>());
+    std::mem::forget(c);
+    std::mem::forget(db);
+}

@@ -278,3 +278,58 @@ fn trimmer_retries_a_failed_pass_on_the_next_wake() {
     drop(tx);
     t.join().unwrap();
 }
+
+fn head_v2(generation: u64, manifest: Option<u64>) -> Head {
+    Head {
+        journal_mode: JournalMode::Mvcc,
+        format: 2,
+        ..head(generation, manifest)
+    }
+}
+
+/// A format-2 head (`"format":2`, `"journal_mode":"mvcc"`) decodes in the trimmer's and GC's
+/// paths: `gc_once` reads it from the bucket, and `trim_once` trims exactly as it does for a
+/// format-1 head.
+#[test]
+fn trim_reads_format_2_head() {
+    let k = keys();
+    let (mem, m2) = three_generations();
+    mem.put(&k.head(), &head_v2(3, Some(2)).encode()).unwrap();
+    let body = String::from_utf8(mem.get(&k.head()).unwrap().unwrap().body).unwrap();
+    assert!(body.contains("\"format\":2") && body.contains("\"journal_mode\":\"mvcc\""));
+    let decoded = Head::decode(body.as_bytes()).unwrap();
+    assert_eq!(decoded, head_v2(3, Some(2)));
+    // A kind-3 record of the current generation and of an old one.
+    let kind3 = |tag: u8| {
+        crate::format::encode_record(&crate::format::LogRecord::Extents {
+            file: crate::format::LogFile::Log,
+            writer_id: "w".into(),
+            syncs: vec![vec![crate::format::Op::Write {
+                off: 0,
+                bytes: vec![tag; 8],
+            }]],
+        })
+    };
+    mem.put(&k.log(1, 3), &kind3(1)).unwrap();
+    mem.put(&k.log(3, 2), &kind3(3)).unwrap();
+
+    // GC against an old enough manifest 2, through the head in the bucket.
+    mem.advance_clock(Duration::from_secs(3600));
+    let pass = gc_once(&mem, &k, Duration::from_secs(60), None).unwrap();
+    assert_eq!(pass.outcome, GcOutcome::Trimmed, "{pass:?}");
+    assert_eq!(pass.generation, 3);
+    assert_eq!(pass.trimmed_against, Some(2));
+    // Logs 1/* (kind 1 and kind 3) went; the current generation's records stay.
+    assert!(mem.list(&k.log_prefix(1)).unwrap().is_empty());
+    assert_eq!(
+        mem.list(&k.log_prefix(3)).unwrap(),
+        [k.log(3, 1), k.log(3, 2)]
+    );
+    assert!(mem.get(&k.manifest(2)).unwrap().is_some());
+    assert!(mem.get(&k.manifest(1)).unwrap().is_none());
+    // And trim_once with the v2 head directly: nothing more to delete.
+    assert_eq!(
+        trim_once(&mem, &k, &head_v2(3, Some(2)), Some(&m2)).unwrap(),
+        0
+    );
+}

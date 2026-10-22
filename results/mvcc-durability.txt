@@ -33,3 +33,19 @@ Task 6 fix round 1: a .db-log-only NewGeneration truncated the dirty file (dropp
     assertion `left == right` failed: not truncated   left: []   right: [7, 0, 0, 0]
   after:  test db::tests::mvcc::restore::log_only_new_generation_keeps_the_dirty_file ... ok
   golden: restore_wal_bucket_bytes_identical_to_before fails with kind-1 syncs replayed in reverse; passes on base ecc9f4f
+
+Task 9: proofs of the 'argued' rows (fencing, takeover, GC/trim, sync, verify, restore, v1 bytes)
+  No bug found: every new test passed on first run. Each group shown able to fail by mutation:
+  M1  bucket.rs put_log_at: another writer's record at the seq treated as ours
+      -> FAILED 4 of 8 (mvcc_writer_fenced_by_takeover_fails_commits_forever, kind3_put_on_a_seq_another_writer_holds_is_fenced,
+         takeover_of_mvcc_restores_log_claims_fences_reconciles, takeover_after_in_doubt_kind3_record)
+  M1b bucket.rs check_fenced always Ok -> mvcc_writer_fenced_by_takeover_fails_commits_forever FAILED
+  M2  uploader.rs settle_log without settle_all -> sync_ok_only_when_all_ops_confirmed FAILED (7 passed; 1 failed)
+  M3a trim.rs older-log rule g < generation -> g <= generation: gc_and_trim_across_mvcc_generations..., trim_reads_format_2_head FAILED
+  M3b trim.rs page keep rule dropped: gc_and_trim_across_mvcc_generations... FAILED
+  M4  head.rs ACCEPTED = [FORMAT]: trim_reads_format_2_head and gc_and_trim_across... FAILED
+  M5  restore.rs skips app.db-log: restore_through_library_format_v2 FAILED
+  M6  wal_file.rs read-only refuses MVCC writes again: verify_of_mid_checkpoint_restore (and the rest) FAILED
+  M7  bucket.rs new WAL head format 2: wal_bucket_stays_format_1_under_the_same_operations FAILED
+  all reverted (git checkout). sync_ok property: 549 acked commits, 27 Err across 64 schedules.
+  ./scripts/test.sh unit exit 0.
