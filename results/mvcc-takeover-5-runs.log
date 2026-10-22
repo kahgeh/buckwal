@@ -1,0 +1,50 @@
+==> run1.log <==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/system.rs (target/debug/deps/system-9d0cb261afb2643d)
+
+running 1 test
+test mvcc_takeover_fences_a_running_soak ... mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=240
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.03s
+
+==> run2.log <==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/system.rs (target/debug/deps/system-9d0cb261afb2643d)
+
+running 1 test
+test mvcc_takeover_fences_a_running_soak ... mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=240
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.02s
+
+==> run3.log <==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/system.rs (target/debug/deps/system-9d0cb261afb2643d)
+
+running 1 test
+test mvcc_takeover_fences_a_running_soak ... mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=243
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.03s
+
+==> run4.log <==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/system.rs (target/debug/deps/system-9d0cb261afb2643d)
+
+running 1 test
+test mvcc_takeover_fences_a_running_soak ... mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=243
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 5.97s
+
+==> run5.log <==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/system.rs (target/debug/deps/system-9d0cb261afb2643d)
+
+running 1 test
+test mvcc_takeover_fences_a_running_soak ... mvcc_takeover_fences_a_running_soak: took over; soak acks=349; first fenced error "error fenced by a newer writer: sys/mvcc_takeover_fences_a_running_soak-1792672697029098000/log/0000000002/00000000000000000177 holds another writer's record"; acked=359 restored generation=2 log_objects=187 gets=190 lists=1 bytes=782213 ms=60
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.64s
+

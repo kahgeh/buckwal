@@ -56,7 +56,7 @@ Task 10 (CLI --journal-mode, soak --concurrent, MVCC system tests)
   note: takeover of a saturated MVCC writer (~600 commits/s) times out after 64 fence probes (same rule as WAL, borderline there too); the old writer is fenced anyway, 1999 acks present. mvcc_takeover_cli stops the writer (SIGSTOP) first.
   mvcc tests: plain 16 passed (36.4 s) + server 1; https+encryption 16 passed (39.0 s) + server 1; peak turso-durable-objects 66 / 67 MB; whole-bucket scan: pass 1 finds CREATE TABLE, pass 2 finds nothing.
 
-Task 12 (documentation): ./scripts/test.sh unit exit 0, 697 unit tests (32 cli + 6 hrana client + 81 server + 36 http + 1 span + 489 library + 33 batching + 5 fencing + 8 mvcc_fencing + 5 mvcc_limits + 1 otel_down), up from the baseline 588. Cargo.lock unchanged since 332b45f. Doc comments only in Rust (conn.rs, db.rs, io/log_file.rs). docs/architecture.md and docs/mvcc-recon.md diagrams render with mmdc.
+Task 12 (documentation, recorded in dde2689): ./scripts/test.sh unit exit 0, 697 unit tests (32 cli + 6 hrana client + 81 server + 36 http + 1 span + 489 library + 33 batching + 5 fencing + 8 mvcc_fencing + 5 mvcc_limits + 1 otel_down), up from the baseline 588. Cargo.lock unchanged since 332b45f. Doc comments only in Rust (conn.rs, db.rs, io/log_file.rs). docs/architecture.md and docs/mvcc-recon.md diagrams render with mmdc.
 
 Final fix wave (whole-branch review)
   Task 2 round 1 (earlier, from task-2-report.md): MVCC directory opened as WAL.
@@ -74,10 +74,10 @@ Final fix wave (whole-branch review)
   3. clear_interrupted_create deleted a foreign app.db and app.db-log when app.db-creating was stale.
     before: db::tests::stale_staging_dir_never_deletes_a_foreign_app_db FAILED: panicked "opened over a foreign app.db" (the foreign file had been deleted and a database created)
     after: refused with Config "holds an app.db not created by turso_durable", foreign files untouched
-  turso_durable lib: 492 passed; 0 failed.
+  turso_durable lib: 492 passed; 0 failed (final review fixes, commit 9ab3403).
 
 == Final run, 2026-10-22, HEAD 9ab3403, ./scripts/test.sh, exit 0 ==
-whole run 14:34 (874 s). unit tests: 700 (./scripts/test.sh unit).
+whole run 14:34 (874 s). unit tests: 700 at 9ab3403 (./scripts/test.sh unit).
 each pass: 6 serve tests (mvcc_serve_begin_concurrent included), 52 system tests (the MVCC ones included), S3 tests (8 in pass 1, 12 in pass 2).
 peak turso-durable-objects: 722 MB (plain), 764 MB (https+encryption). Baseline at 332b45f: 747 MB and 699 MB; 588 unit, 5 serve, 38 system, about 12 min.
 scan: pass 1 found CREATE TABLE in 13240 objects; pass 2 found no plaintext (CREATE TABLE, SQLite header, bench payload, marker 1, the encryption key: all not found).
@@ -95,12 +95,12 @@ Before the check_mode call (cargo test --locked -p turso_durable --lib transacti
   test result: FAILED. 0 passed; 1 failed
 After:
   test db::tests::mvcc::transaction_with_window_refused_in_mvcc_and_still_works_in_wal ... ok
-  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 492 filtered out
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 492 filtered out (HEAD 19a3b7d, before bcad767)
 Other Batching entries: Config::validate (config.rs:466), Database::set_batching (db.rs:1007), Connection::set_batching (conn.rs:140) and the guard's PRAGMA check (guard.rs:104) already call check_mode. The server only calls Connection::set_batching. The PRAGMA path is covered by the guard before batching_pragma runs (the new test asserts it inside BEGIN). Only transaction_with was a gap.
 
 -- 2. Commit 389cd5a: CLI writers follow the head's journal mode --
 Command: DURABLE_KEEP_PREFIXES=1 cargo test --locked -p turso-durable-cli --test system -- --ignored --test-threads=1 mvcc_refusals_cli mvcc_takeover_cli
-With writer_config temporarily NOT following the head (if !explicit && NEVER_SET_X set), FAILING:
+Mutation: the CLI's writer_config was temporarily changed so that it never looked at the bucket's head and always used the default (WAL) when no flag or env var was given; main.rs was then restored from a backup and git diff showed it unchanged. With the mutation, FAILING:
   test mvcc_refusals_cli ... FAILED
   test mvcc_takeover_cli ... FAILED
   mvcc_refusals_cli_mvcc: ["sql", "--dir", "$TMP/.tmpoOwIdW/a", "SELECT count(*) FROM t"] failed (exit status: 1)
@@ -108,7 +108,7 @@ With writer_config temporarily NOT following the head (if !explicit && NEVER_SET
   mvcc_takeover_cli: ["takeover", "--dir", "$TMP/.tmpZcEvii/b"] failed (exit status: 1)
   error: MVCC: switching back to WAL is not supported yet by turso_durable
   test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 50 filtered out; finished in 1.65s
-main.rs restored from backup; git diff --stat empty. PASSING:
+With main.rs restored, PASSING:
   test mvcc_refusals_cli ... ok
   test mvcc_takeover_cli ... ok
   test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 4.53s
@@ -120,5 +120,9 @@ run 1: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=
 run 2: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=240; test result: ok. 1 passed
 run 3: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=243; test result: ok. 1 passed
 run 4: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=243; test result: ok. 1 passed
-run 5: mvcc_takeover_fences_a_running_soak: took over; soak acks=349; first fenced error "error fenced by a newer writer: sys/mvcc_takeover_fences_a_running_soak-1792672697029098000/log/0000000002/00000000000000000177 holds another writer's record"; acked=359 restored generation=2 log_object; test result: ok. 1 passed
-Observed: 4 of 5 timed out (64 fence probes), 1 of 5 took over. README and docs/mvcc-recon.md changed from "5 of 5" to "4 of 5".
+run 5: mvcc_takeover_fences_a_running_soak: took over; soak acks=349; first fenced error "error fenced by a newer writer: sys/mvcc_takeover_fences_a_running_soak-1792672697029098000/log/0000000002/00000000000000000177 holds another writer's record"; acked=359 restored generation=2 log_objects=187 gets=190 lists=1 bytes=782213 ms=60; test result: ok. 1 passed
+Observed: 4 of 5 timed out (64 fence probes), 1 of 5 took over. README and docs/mvcc-recon.md say 4 of 5.
+Raw output of the five runs, unedited, one block per run: results/mvcc-takeover-5-runs.log (each block is that run's own captured stdout; the lines above are copied from it).
+Runs 1 and 3, and runs 2 and 4, show the same ack and object counts and differ only in ms.
+
+Unit tests after the rejection fixes: 701 at c9c02b7 (./scripts/test.sh unit).
