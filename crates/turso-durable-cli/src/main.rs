@@ -10,13 +10,13 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use turso_durable::store::fault::FaultStore;
 use turso_durable::store::s3::{S3Config, S3Store};
 use turso_durable::store::ObjectStore;
 use turso_durable::telemetry::{self, TelemetryConfig, TelemetryGuard};
-use turso_durable::{Batching, Config, Database, UploadStats, Value};
+use turso_durable::{Batching, Config, Database, JournalMode, UploadStats, Value};
 
 type CliResult<T> = Result<T, String>;
 
@@ -61,8 +61,44 @@ pub fn stats_lines(s: &UploadStats) -> Vec<String> {
     ]
 }
 
+/// `--journal-mode`, set once by `main` before any database opens; it wins over
+/// `DURABLE_JOURNAL_MODE`.
+static JOURNAL_MODE: OnceLock<JournalMode> = OnceLock::new();
+
 pub fn config(dir: &Path) -> CliResult<Config> {
-    Config::from_env(dir).map_err(err)
+    let mut cfg = Config::from_env(dir).map_err(err)?;
+    if let Some(m) = JOURNAL_MODE.get() {
+        cfg.journal_mode = *m;
+    }
+    Ok(cfg)
+}
+
+/// The journal mode a head's JSON records: v2 heads name `"journal_mode":"mvcc"`, a v1 head
+/// is WAL.
+fn head_journal_mode(head: &[u8]) -> JournalMode {
+    let text = String::from_utf8_lossy(head);
+    if text.contains("\"journal_mode\":\"mvcc\"") {
+        JournalMode::Mvcc
+    } else {
+        JournalMode::Wal
+    }
+}
+
+/// The config for a command that only reads the bucket (`restore`, `verify`): the bucket's
+/// head decides the journal mode, whatever `DURABLE_JOURNAL_MODE` says. Without a head
+/// nothing changes, and the command reports the missing database itself.
+fn reader_config(dir: &Path) -> CliResult<Config> {
+    let mut cfg = config(dir)?;
+    let store = s3_store(&cfg)?;
+    let key = format!("{}/head", cfg.prefix);
+    let policy = turso_durable::store::RetryPolicy::default();
+    let head =
+        turso_durable::store::with_retry(&policy, &format!("get {key}"), |_| store.get(&key))
+            .map_err(err)?;
+    if let Some(head) = head {
+        cfg.journal_mode = head_journal_mode(&head.body);
+    }
+    Ok(cfg)
 }
 
 /// The S3 store `config` names, optionally delaying page PUTs.
@@ -109,7 +145,7 @@ pub fn render(v: &Value) -> String {
 }
 
 fn restore(dir: &Path) -> CliResult<()> {
-    let r = turso_durable::restore(&config(dir)?, dir).map_err(err)?;
+    let r = turso_durable::restore(&reader_config(dir)?, dir).map_err(err)?;
     say(&format!(
         "restored generation={} log_objects={} gets={} lists={} bytes={} ms={}",
         r.generation,
@@ -188,7 +224,7 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
         ),
         None => Vec::new(),
     };
-    let db = turso_durable::open_read_only(config(dir)?).map_err(err)?;
+    let db = turso_durable::open_read_only(reader_config(dir)?).map_err(err)?;
     let conn = db.connect().map_err(err)?;
     let rows = conn.query("PRAGMA integrity_check", &[]).map_err(err)?;
     let verdict = rows
@@ -296,8 +332,13 @@ fn main() -> ExitCode {
     // Kept until main returns: dropping it flushes the export.
     let _telemetry = telemetry_init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = match args::parse(&argv) {
-        Ok(c) => c,
+    let cmd = match args::parse_with_mode(&argv) {
+        Ok((c, mode)) => {
+            if let Some(m) = mode {
+                let _ = JOURNAL_MODE.set(m);
+            }
+            c
+        }
         Err(m) => {
             eprintln!("error: {m}\n{}", args::USAGE);
             return ExitCode::from(2);
@@ -418,6 +459,15 @@ mod tests {
                 "ack_wait_p99_ms=20.123",
             ]
         );
+    }
+
+    #[test]
+    fn head_journal_mode_reads_the_head() {
+        let v2 = br#"{"format":2,"journal_mode":"mvcc","generation":2}"#;
+        let v1 = br#"{"format":1,"generation":2}"#;
+        assert_eq!(head_journal_mode(v2), JournalMode::Mvcc);
+        assert_eq!(head_journal_mode(v1), JournalMode::Wal);
+        assert_eq!(head_journal_mode(b"not json"), JournalMode::Wal);
     }
 
     #[test]

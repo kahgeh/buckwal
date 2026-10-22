@@ -49,3 +49,9 @@ Task 9: proofs of the 'argued' rows (fencing, takeover, GC/trim, sync, verify, r
   M7  bucket.rs new WAL head format 2: wal_bucket_stays_format_1_under_the_same_operations FAILED
   all reverted (git checkout). sync_ok property: 549 acked commits, 27 Err across 64 schedules.
   ./scripts/test.sh unit exit 0.
+
+Task 10 (CLI --journal-mode, soak --concurrent, MVCC system tests)
+  bug: restore/verify of an MVCC bucket without a flag. before: `verify --dir DIR` and `restore --dir DIR` -> "error: MVCC: switching back to WAL is not supported yet by turso_durable" (exit 1). after: reader_config() takes the mode from the bucket head; `verify ok acked=0 present=0 unacked_present=5` and `restored generation=2 log_objects=6`.
+  stale assert: mvcc_pragma_refused_then_all_acks_restore expected "MVCC is not supported yet"; the library now says "MVCC: switching an existing WAL database" (since Task 2/3). Assertion text updated.
+  note: takeover of a saturated MVCC writer (~600 commits/s) times out after 64 fence probes (same rule as WAL, borderline there too); the old writer is fenced anyway, 1999 acks present. mvcc_takeover_cli stops the writer (SIGSTOP) first.
+  mvcc tests: plain 16 passed (36.4 s) + server 1; https+encryption 16 passed (39.0 s) + server 1; peak turso-durable-objects 66 / 67 MB; whole-bucket scan: pass 1 finds CREATE TABLE, pass 2 finds nothing.

@@ -220,7 +220,7 @@ impl fmt::Debug for Config {
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 21] = [
+const ENV_VARS: [&str; 22] = [
     "DURABLE_ENDPOINT",
     "DURABLE_CA_BUNDLE",
     "DURABLE_REGION",
@@ -242,6 +242,7 @@ const ENV_VARS: [&str; 21] = [
     "DURABLE_GC_AFTER_SEAL",
     "DURABLE_ENCRYPTION_KEY_FILE",
     "DURABLE_ENCRYPTION_CIPHER",
+    "DURABLE_JOURNAL_MODE",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -409,7 +410,6 @@ impl Config {
         if let Some(v) = get("DURABLE_ENCRYPTION_CIPHER").filter(|v| !v.is_empty()) {
             c.encryption_cipher = v;
         }
-        // Not in `ENV_VARS`: that list's length is pinned by an existing test.
         if let Some(v) = get("DURABLE_JOURNAL_MODE") {
             c.journal_mode = JournalMode::parse(&v).ok_or_else(|| {
                 Error::Config(format!(
@@ -828,6 +828,7 @@ mod tests {
             ("DURABLE_GC_AFTER_SEAL", "off"),
             ("DURABLE_ENCRYPTION_KEY_FILE", "/etc/db.key"),
             ("DURABLE_ENCRYPTION_CIPHER", "aes256gcm"),
+            ("DURABLE_JOURNAL_MODE", "mvcc"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads DURABLE_* variables.
@@ -840,6 +841,7 @@ mod tests {
         }
         let c = c.unwrap();
         assert_eq!(c.dir, PathBuf::from("/data/db"));
+        assert_eq!(c.journal_mode, JournalMode::Mvcc);
         assert_eq!(c.endpoint, "http://127.0.0.1:9000");
         assert_eq!(c.ca_bundle, Some(PathBuf::from("/etc/ca.pem")));
         assert_eq!(c.region, "eu-west-2");

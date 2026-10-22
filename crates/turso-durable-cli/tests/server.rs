@@ -665,6 +665,94 @@ fn serve_sigkill_mid_load_restores_every_ack() {
     );
 }
 
+/// `serve --journal-mode mvcc`: four client threads, each on its own stream, write rows in
+/// `BEGIN CONCURRENT` ... `COMMIT` pipelines until 300 acks (a row counts only when all three
+/// results of its pipeline are `ok`); the server is SIGKILLed and its disk lost. Every ack
+/// restores, and the restore needs no `--journal-mode`: the head says MVCC.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_serve_begin_concurrent() {
+    const NAME: &str = "mvcc_serve_begin_concurrent";
+    const OR_REPLACE: &str = "INSERT OR REPLACE INTO soak(id, payload) VALUES (?, ?)";
+    let (ctx, access) = serve_ctx(NAME);
+    let dir = ctx.dir("db");
+    let mut server = ServerProc::spawn(&ctx, &access, &dir, &["--claim", "--journal-mode", "mvcc"]);
+    create_table(&server.client());
+    let stop = Arc::new(AtomicBool::new(false));
+    let disrupted = Arc::new(AtomicBool::new(false));
+    let total = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<JoinHandle<(Vec<String>, usize)>> = (0..4)
+        .map(|t| {
+            let client = server.client();
+            let (stop, disrupted, total) = (stop.clone(), disrupted.clone(), total.clone());
+            std::thread::spawn(move || {
+                let proto = if t % 2 == 0 { Proto::V2 } else { Proto::V3 };
+                let mut st = client.stream(proto);
+                let (mut acks, mut conflicts) = (Vec::new(), 0usize);
+                let first = (t as i64 + 1) * 1_000_000;
+                let mut id = first;
+                while !stop.load(SeqCst) {
+                    let r = st.pipeline(vec![
+                        execute("BEGIN CONCURRENT", &[]),
+                        execute(OR_REPLACE, &[Arg::Int(id), Arg::Blob(payload(id))]),
+                        execute("COMMIT", &[]),
+                    ]);
+                    let all_ok = matches!(&r, Ok(r) if r.status == 200
+                    && r.body["results"].as_array().is_some_and(|v| {
+                        v.len() >= 3 && v[..3].iter().all(|x| x["type"] == "ok")
+                    }));
+                    if all_ok {
+                        acks.push(format!("ack {id}"));
+                        total.fetch_add(1, SeqCst);
+                        id += 1;
+                        continue;
+                    }
+                    assert!(
+                        disrupted.load(SeqCst) || matches!(&r, Ok(r) if r.status == 200),
+                        "thread {t}: request failed before the disruption: {r:?}"
+                    );
+                    if disrupted.load(SeqCst) {
+                        break;
+                    }
+                    // A conflict between concurrent writers: roll back and retry the row.
+                    conflicts += 1;
+                    let _ = st.pipeline(vec![execute("ROLLBACK", &[])]);
+                }
+                (acks, conflicts)
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + WAIT;
+    while total.load(SeqCst) < 300 {
+        assert!(
+            Instant::now() < deadline,
+            "no 300 acks: {}",
+            total.load(SeqCst)
+        );
+        assert!(
+            !handles.iter().any(|h| h.is_finished()),
+            "a client thread ended"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    disrupted.store(true, SeqCst);
+    server.kill();
+    stop.store(true, SeqCst);
+    let results: Vec<(Vec<String>, usize)> = handles
+        .into_iter()
+        .map(|h| h.join().expect("client thread"))
+        .collect();
+    let conflicts: usize = results.iter().map(|r| r.1).sum();
+    let acks: Vec<String> = results.into_iter().flat_map(|r| r.0).collect();
+    assert!(acks.len() >= 300, "{} acks", acks.len());
+    lose_disk(&ctx, &dir);
+    let v = restore_verify(&ctx, &acks);
+    println!(
+        "{NAME}: acked={} unacked_present={} conflicts retried={conflicts} {}",
+        v.acked, v.unacked_present, v.restored
+    );
+}
+
 /// Server A acks 20 rows; `takeover --dir B` fences it and server B serves B. A's next
 /// inserts fail with `FENCED` and its health turns 503 `fenced`; B acks 20 more. All 40
 /// restore, and none of A's refused rows.

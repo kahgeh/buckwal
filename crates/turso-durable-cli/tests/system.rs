@@ -1132,7 +1132,8 @@ fn mvcc_pragma_refused_then_all_acks_restore() {
     let out = ctx.run(&["sql", "--dir", d, "PRAGMA journal_mode='mvcc'"]);
     assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
     assert!(
-        out.stderr.contains("MVCC is not supported yet"),
+        out.stderr
+            .contains("MVCC: switching an existing WAL database"),
         "{}",
         out.stderr
     );
@@ -1902,4 +1903,582 @@ fn ctx_deletes_its_prefix_unless_a_failure_is_kept() {
     );
     delete_prefix(&probe.store(), &kept).unwrap();
     eprintln!("ctx cleanup: deleted {passed}/ and {failed}/, kept {kept}/ (then deleted)");
+}
+
+// ---- MVCC (`--journal-mode mvcc`, soak `--concurrent`) ----
+//
+// Every test here runs in both passes of scripts/test.sh: pass 2 serves RustFS over HTTPS and
+// encrypts pages, the log and the head's contents with a key, so these tests also cover the
+// encrypted `.db-log`. Where a kill must land on one exact op boundary (between a seal and the
+// log truncate, between the log truncate and the WAL truncate, mid log PUT) the CLI cannot
+// reach it: those boundaries are the library's fault-schedule tests (crates/turso_durable/
+// tests/mvcc_fencing.rs); the kills here land on the process-level boundaries only.
+
+/// Soak arguments for an MVCC soak writing inside `BEGIN CONCURRENT`, then `extra`.
+fn mvcc_soak<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--journal-mode", "mvcc", "--concurrent"];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// The bucket's head says MVCC (bucket format 2).
+fn assert_mvcc_head(ctx: &Ctx) {
+    let head = ctx
+        .store()
+        .get(&format!("{}/head", ctx.prefix()))
+        .expect("get head")
+        .expect("head exists");
+    let json = String::from_utf8(head.body).unwrap();
+    assert!(
+        json.contains("\"journal_mode\":\"mvcc\""),
+        "{}: head is not MVCC: {json}",
+        ctx.name
+    );
+}
+
+/// `args` run to the end and must fail with exit code 1 and `message` on stderr.
+fn assert_refused(ctx: &Ctx, args: &[&str], message: &str) {
+    let out = ctx.run(args);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}: {args:?}\nstdout:\n{}\nstderr:\n{}",
+        ctx.name,
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains(message),
+        "{}: {args:?}: want {message:?} in\n{}",
+        ctx.name,
+        out.stderr
+    );
+}
+
+/// Killed after `kill_after` acks of an MVCC soak that does no checkpoint of its own (the
+/// engine's auto-checkpoint, the log and the maintenance checkpoint are all there is): the
+/// local disk is deleted, restored, and every ack is there.
+fn mvcc_crash(name: &str, connections: &str, kills: &[usize]) {
+    for &kill_after in kills {
+        let ctx = Ctx::new(&format!("{name}_{kill_after}"));
+        let dir = ctx.dir("db");
+        let mut soak = Soak::spawn(&ctx, &dir, &mvcc_soak(&["--connections", connections]));
+        soak.wait_acks(kill_after);
+        soak.kill();
+        assert!(soak.errors().is_empty(), "{name}: {:?}", soak.errors());
+        assert_mvcc_head(&ctx);
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        eprintln!(
+            "{name}: kill after {kill_after} acks: acked={} {} unacked_present={}",
+            v.acked, v.restored, v.unacked_present
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_crash_commit() {
+    mvcc_crash("mvcc_crash_commit", "1", &[150, 600]);
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_crash_group_commit() {
+    mvcc_crash("mvcc_crash_group_commit", "8", &[200, 800]);
+}
+
+/// The soak's own checkpoint (`truncate`, then `reopen`) every 100 commits, killed after 350
+/// acks: at least two seals finished, the restore keeps every ack.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_crash_checkpoint() {
+    for mode in ["truncate", "reopen"] {
+        let ctx = Ctx::new(&format!("mvcc_crash_checkpoint_{mode}"));
+        let dir = ctx.dir("db");
+        let args = mvcc_soak(&["--checkpoint", mode, "--every", "100"]);
+        let mut soak = Soak::spawn(&ctx, &dir, &args);
+        soak.wait_acks(350);
+        soak.kill();
+        assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
+        let seals = soak.count("event seal-finished");
+        let checkpoints = soak.count(&format!("event checkpoint {mode}"));
+        assert!(
+            checkpoints >= 3,
+            "{mode}: {checkpoints} checkpoints\n{}",
+            soak.tail()
+        );
+        // A reopen closes and opens the database; in MVCC that keeps the log and seals nothing.
+        if mode == "truncate" {
+            assert!(seals >= 2, "{mode}: {seals} seals\n{}", soak.tail());
+        }
+        assert_mvcc_head(&ctx);
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        eprintln!(
+            "mvcc_crash_checkpoint: {mode}: acked={} seals={seals} {} unacked_present={}",
+            v.acked, v.restored, v.unacked_present
+        );
+    }
+}
+
+/// Killed the moment a seal finishes (the 1st and the 3rd), when the log truncate and the WAL
+/// truncate that follow it are next: wherever the kill lands, every ack restores.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_crash_right_after_seal() {
+    for nth in [1, 3] {
+        let ctx = Ctx::new(&format!("mvcc_crash_right_after_seal_{nth}"));
+        let dir = ctx.dir("db");
+        let args = mvcc_soak(&["--checkpoint", "truncate", "--every", "100"]);
+        let mut soak = Soak::spawn(&ctx, &dir, &args);
+        soak.wait_for("a finished seal", |s| s.count("event seal-finished") >= nth);
+        soak.kill();
+        assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        eprintln!(
+            "mvcc_crash_right_after_seal: seal #{nth}: acked={} {}",
+            v.acked, v.restored
+        );
+    }
+}
+
+/// Killed while a seal's page PUTs are in flight (each delayed 200 ms), on the first seal and
+/// the third: the generation is not sealed, the log still holds the commits, every ack restores.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_crash_during_seal_upload() {
+    for nth in [1, 3] {
+        let ctx = Ctx::new(&format!("mvcc_crash_during_seal_upload_{nth}"));
+        let dir = ctx.dir("db");
+        let args = mvcc_soak(&[
+            "--checkpoint",
+            "truncate",
+            "--every",
+            "100",
+            "--page-put-delay-ms",
+            "200",
+        ]);
+        let mut soak = Soak::spawn(&ctx, &dir, &args);
+        soak.wait_for("seal-started", |s| s.count("event seal-started") >= nth);
+        soak.kill();
+        assert_eq!(
+            soak.count("event seal-finished"),
+            nth - 1,
+            "{}",
+            soak.tail()
+        );
+        assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        eprintln!(
+            "mvcc_crash_during_seal_upload: killed on seal-started #{nth}: acked={} {}",
+            v.acked, v.restored
+        );
+    }
+}
+
+/// `connections` writer threads, `count` rows in all, in the given `--concurrent` form.
+fn mvcc_threads(name: &str, concurrent: &[&str], count: &str) {
+    let ctx = Ctx::new(name);
+    let dir = ctx.dir("db");
+    let mut args = vec!["--journal-mode", "mvcc"];
+    args.extend_from_slice(concurrent);
+    args.extend(["--connections", "8", "--count", count]);
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.finish();
+    // A conflict between concurrent writers is retried (`error …` line, then the same row
+    // again), never lost: what counts is that every row was acked exactly once.
+    let want: usize = count.parse().unwrap();
+    assert_eq!(soak.acks(), want, "{name}\n{}", soak.tail());
+    assert_mvcc_head(&ctx);
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    eprintln!(
+        "{name}: acked={} soak error lines={} {}",
+        v.acked,
+        soak.errors().len(),
+        v.restored
+    );
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_8_threads_begin_concurrent() {
+    mvcc_threads("mvcc_8_threads_begin_concurrent", &["--concurrent"], "800");
+}
+
+/// Even-numbered threads write in plain `BEGIN`, odd-numbered ones in `BEGIN CONCURRENT`.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_8_threads_mixed_begin_and_concurrent() {
+    mvcc_threads(
+        "mvcc_8_threads_mixed_begin_and_concurrent",
+        &["--concurrent", "mixed"],
+        "800",
+    );
+}
+
+/// A restore with no WAL frames: the soak never checkpoints and is killed long before the
+/// engine's auto-checkpoint, so the bucket holds the creation generation and log objects only.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn verify_acked_on_plain_mvcc_restore() {
+    let ctx = Ctx::new("verify_acked_on_plain_mvcc_restore");
+    let dir = ctx.dir("db");
+    let mut soak = Soak::spawn(&ctx, &dir, &mvcc_soak(&[]));
+    soak.wait_acks(100);
+    soak.kill();
+    assert_eq!(soak.count("event seal-finished"), 0, "{}", soak.tail());
+    let head = ctx.head();
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    // The restore is of the generation the database was created in.
+    assert_eq!(field(&v.restored, "generation") as u64, head.generation);
+    assert!(field(&v.restored, "log_objects") >= 1, "{}", v.restored);
+    // A second restore of the same bucket gives the same answer.
+    restore_verify(&ctx, &soak.lines);
+    eprintln!(
+        "verify_acked_on_plain_mvcc_restore: acked={} {}",
+        v.acked, v.restored
+    );
+}
+
+/// A restore of a bucket whose writer died during a seal (the page PUTs delayed): the head
+/// still names the previous generation, and `verify --acked` finds every ack.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn verify_acked_on_mid_checkpoint_restore() {
+    let ctx = Ctx::new("verify_acked_on_mid_checkpoint_restore");
+    let dir = ctx.dir("db");
+    let args = mvcc_soak(&[
+        "--checkpoint",
+        "truncate",
+        "--every",
+        "100",
+        "--page-put-delay-ms",
+        "300",
+    ]);
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.wait_for("the 2nd seal-started", |s| {
+        s.count("event seal-started") >= 2
+    });
+    let head_before = ctx.head();
+    soak.kill();
+    assert_eq!(soak.count("event seal-finished"), 1, "{}", soak.tail());
+    // The killed seal published nothing.
+    assert_eq!(ctx.head().generation, head_before.generation);
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    assert!(v.acked >= 200, "acked={}", v.acked);
+    eprintln!(
+        "verify_acked_on_mid_checkpoint_restore: head generation {}; acked={} {}",
+        head_before.generation, v.acked, v.restored
+    );
+}
+
+/// The CLI refusals of an MVCC database: a mode switch in either direction, Window batching,
+/// and `PRAGMA journal_mode=wal`.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_refusals_cli() {
+    // A WAL bucket asked for as MVCC: refused from the same directory and from a fresh one.
+    let ctx = Ctx::new("mvcc_refusals_cli_wal");
+    let a = ctx.dir("a");
+    let (a, b) = (a.to_str().unwrap(), ctx.dir("b"));
+    let b = b.to_str().unwrap();
+    ctx.ok(&[
+        "sql",
+        "--claim",
+        "--dir",
+        a,
+        "CREATE TABLE t(x)",
+        "INSERT INTO t VALUES (1)",
+    ]);
+    let want = "MVCC: switching an existing WAL database";
+    assert_refused(
+        &ctx,
+        &["sql", "--dir", a, "--journal-mode", "mvcc", "SELECT 1"],
+        want,
+    );
+    assert_refused(
+        &ctx,
+        &[
+            "sql",
+            "--claim",
+            "--dir",
+            b,
+            "--journal-mode",
+            "mvcc",
+            "SELECT 1",
+        ],
+        want,
+    );
+    // The refusals left the WAL database as it was.
+    let n = ctx.ok(&["sql", "--dir", a, "SELECT count(*) FROM t"]);
+    assert_eq!(n.stdout.trim(), "1");
+
+    // An MVCC bucket asked for as WAL, by the flag, the environment or nothing.
+    let ctx = Ctx::new("mvcc_refusals_cli_mvcc");
+    let a = ctx.dir("a");
+    let (a, b) = (a.to_str().unwrap(), ctx.dir("b"));
+    let b = b.to_str().unwrap();
+    let mvcc = ["--journal-mode", "mvcc"];
+    let sql_mvcc = |stmts: &[&str]| {
+        let mut args = vec!["sql", "--claim", "--dir", a];
+        args.extend(mvcc);
+        args.extend(stmts);
+        ctx.ok(&args)
+    };
+    sql_mvcc(&["CREATE TABLE t(x)", "INSERT INTO t VALUES (1)"]);
+    assert_mvcc_head(&ctx);
+    let back = "MVCC: switching back to WAL";
+    assert_refused(
+        &ctx,
+        &["sql", "--dir", a, "--journal-mode", "wal", "SELECT 1"],
+        back,
+    );
+    assert_refused(&ctx, &["sql", "--dir", a, "SELECT 1"], back);
+    assert_refused(
+        &ctx,
+        &[
+            "sql",
+            "--claim",
+            "--dir",
+            b,
+            "--journal-mode",
+            "wal",
+            "SELECT 1",
+        ],
+        back,
+    );
+    // DURABLE_JOURNAL_MODE applies without the flag; the flag wins over it.
+    let env_mvcc = ctx.ok_env(
+        &[("DURABLE_JOURNAL_MODE", "mvcc")],
+        &["sql", "--dir", a, "SELECT count(*) FROM t"],
+    );
+    assert_eq!(env_mvcc.stdout.trim(), "1");
+    let flag_wins = ctx.run_env(
+        &[("DURABLE_JOURNAL_MODE", "mvcc")],
+        &["sql", "--dir", a, "--journal-mode", "wal", "SELECT 1"],
+    );
+    assert_eq!(flag_wins.status.code(), Some(1));
+    assert!(flag_wins.stderr.contains(back), "{}", flag_wins.stderr);
+    // Window batching, from the flag and from the environment.
+    let window = "MVCC: Window batching";
+    assert_refused(
+        &ctx,
+        &[
+            "sql",
+            "--dir",
+            a,
+            "--journal-mode",
+            "mvcc",
+            "--batching",
+            WINDOW,
+            "SELECT 1",
+        ],
+        window,
+    );
+    let out = ctx.run_env(
+        &[
+            ("DURABLE_JOURNAL_MODE", "mvcc"),
+            ("DURABLE_BATCHING", WINDOW),
+        ],
+        &["sql", "--dir", a, "SELECT 1"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains(window), "{}", out.stderr);
+    // PRAGMA journal_mode=wal through an MVCC session.
+    assert_refused(
+        &ctx,
+        &[
+            "sql",
+            "--dir",
+            a,
+            "--journal-mode",
+            "mvcc",
+            "PRAGMA journal_mode=wal",
+        ],
+        back,
+    );
+    // None of the refusals touched the data, and `batching off` is accepted.
+    let n = ctx.ok(&[
+        "sql",
+        "--dir",
+        a,
+        "--journal-mode",
+        "mvcc",
+        "--batching",
+        "off",
+        "SELECT count(*) FROM t",
+    ]);
+    assert_eq!(n.stdout.trim(), "1");
+    // verify and restore need no flag: the head decides.
+    let r = ctx.dir("r");
+    ctx.ok(&["restore", "--dir", r.to_str().unwrap()]);
+    let v = ctx.ok(&["verify", "--dir", r.to_str().unwrap()]);
+    assert!(v.stdout.starts_with("verify ok "), "{}", v.stdout);
+}
+
+/// `takeover --journal-mode mvcc` of a bucket whose writer is stopped (SIGSTOP; a writer
+/// committing at full speed can outrun the fence record's 64 probes, which the takeover then
+/// reports as a timeout to resume): the new directory continues with `sql`, and the old
+/// soak, resumed, is fenced and acks nothing. Every row of both writers restores. A takeover
+/// without the flag is refused like any other mode switch.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_takeover_cli() {
+    let ctx = Ctx::new("mvcc_takeover_cli");
+    let a = ctx.dir("a");
+    let mut soak = Soak::spawn(&ctx, &a, &mvcc_soak(&[]));
+    soak.wait_acks(200);
+    soak.signal("STOP");
+    let before = ctx.head();
+    let b = ctx.dir("b");
+    let bs = b.to_str().unwrap();
+    assert_refused(
+        &ctx,
+        &["takeover", "--dir", bs],
+        "MVCC: switching back to WAL",
+    );
+    let took = ctx.ok(&["takeover", "--dir", bs, "--journal-mode", "mvcc"]);
+    let took = took.stdout.trim().to_string();
+    assert!(took.starts_with("took over "), "{took}");
+    assert_eq!(field(&took, "epoch") as u64, before.epoch + 1, "{took}");
+    assert_eq!(ctx.head().epoch, before.epoch + 1);
+    // sql continues in the new directory with every row the old writer acked.
+    let rows = insert_rows(&ctx, &b, 100001..=100010, &["--journal-mode", "mvcc"]);
+    let n = ctx.ok(&[
+        "sql",
+        "--dir",
+        bs,
+        "--journal-mode",
+        "mvcc",
+        "SELECT count(*) FROM soak",
+    ]);
+    let count: usize = n.stdout.trim().parse().unwrap();
+    assert!(
+        count >= soak.acks() + 10,
+        "{count} rows, {} acks",
+        soak.acks()
+    );
+    let cont = Instant::now();
+    soak.signal("CONT");
+    let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
+    soak.kill();
+    // One commit may have returned before the STOP and printed its ack after the CONT; a
+    // second ack would be an append after the fence.
+    let late = soak.acks_around(cont, false);
+    assert!(late <= 1, "{late} acks after the CONT\n{}", soak.tail());
+    let mut lines = soak.lines.clone();
+    lines.extend(rows);
+    let v = restore_verify(&ctx, &lines);
+    assert_mvcc_head(&ctx);
+    eprintln!(
+        "mvcc_takeover_cli: {took}; first fenced error {:?}; soak acks={} ({late} after the \
+         CONT); acked={} {}",
+        soak.lines[fenced],
+        soak.acks(),
+        v.acked,
+        v.restored
+    );
+}
+
+/// GC after several MVCC checkpoints (each ends a generation): it trims every log below the
+/// head's manifest, and the restore afterwards still has every row.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_gc_across_generations() {
+    let ctx = short_lease_ctx("mvcc_gc_across_generations");
+    let dir = ctx.dir("db");
+    let args = mvcc_soak(&[
+        "--checkpoint",
+        "truncate",
+        "--every",
+        "50",
+        "--count",
+        "400",
+    ]);
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.finish();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let head = ctx.head();
+    assert!(head.generation >= 8, "checkpoints sealed: {head:?}");
+    let before = log_generations(&ctx);
+    assert!(
+        before.len() > 1,
+        "log/ holds several generations: {before:?}"
+    );
+    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(40));
+    let logs = ctx.list("log/");
+    let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
+    assert!(
+        logs.iter().all(|k| k.starts_with(&root)),
+        "only generation {} logs remain: {logs:?}",
+        head.generation
+    );
+    let v = restore_verify(&ctx, &soak.lines);
+    assert_eq!(v.acked, 400);
+    eprintln!(
+        "mvcc_gc_across_generations: head {head:?}; log generations before {before:?}; {gc}; \
+         log/ holds {} keys after; {}",
+        logs.len(),
+        v.restored
+    );
+}
+
+/// The MVCC bucket in the harness's mode: with an encryption key (pass 2 of test.sh) no
+/// object of the prefix holds the marker row's text, log objects and sealed pages included;
+/// without one (pass 1) the same scan finds it, so the check is not vacuous.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_encrypted() {
+    let ctx = Ctx::new("mvcc_encrypted");
+    let encrypted = ctx
+        .opt_var("DURABLE_ENCRYPTION_KEY_FILE")
+        .is_some_and(|k| !k.is_empty());
+    let dir = ctx.dir("db");
+    let d = dir.to_str().unwrap();
+    let marker = format!("mvcc-marker-{}", nanos());
+    let insert = format!("INSERT INTO m VALUES ('{marker}')");
+    // Rows in the log, then a checkpoint (sealed pages and the emptied log), then more rows.
+    ctx.ok(&[
+        "sql",
+        "--claim",
+        "--dir",
+        d,
+        "--journal-mode",
+        "mvcc",
+        "CREATE TABLE m(t TEXT)",
+    ]);
+    ctx.ok(&["sql", "--dir", d, "--journal-mode", "mvcc", &insert]);
+    ctx.ok(&[
+        "sql",
+        "--dir",
+        d,
+        "--journal-mode",
+        "mvcc",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        &insert,
+    ]);
+    let scan = if encrypted { "absent" } else { "present" };
+    let out = ctx.run(&["scan", "--expect", scan, "--marker", &marker]);
+    assert!(
+        out.status.success(),
+        "scan --expect {scan}\n{}\n{}",
+        out.stdout,
+        out.stderr
+    );
+    // The data restores and reads back in both modes.
+    fs::remove_dir_all(&dir).unwrap();
+    let r = ctx.dir("r");
+    ctx.ok(&["restore", "--dir", r.to_str().unwrap()]);
+    let n = ctx.ok(&["verify", "--dir", r.to_str().unwrap()]);
+    assert!(n.stdout.starts_with("verify ok "), "{}", n.stdout);
+    eprintln!(
+        "mvcc_encrypted: encrypted={encrypted}: scan --expect {scan}: {}",
+        out.stdout.trim()
+    );
 }

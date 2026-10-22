@@ -16,7 +16,7 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_turso-durable");
 /// environment never leaks into a test (the TLS and encryption ones come back through
 /// `env()`). `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not here: `scripts/test.sh` sets
 /// them so the children export under its run id.
-pub const OPTIONAL: [&str; 24] = [
+pub const OPTIONAL: [&str; 25] = [
     "DURABLE_PREFIX",
     "DURABLE_RETRY_DEADLINE_MS",
     "DURABLE_REQUEST_TIMEOUT_MS",
@@ -32,6 +32,7 @@ pub const OPTIONAL: [&str; 24] = [
     "DURABLE_CA_BUNDLE",
     "DURABLE_ENCRYPTION_KEY_FILE",
     "DURABLE_ENCRYPTION_CIPHER",
+    "DURABLE_JOURNAL_MODE",
     "DURABLE_SERVE_LISTEN",
     "DURABLE_SERVE_TLS_CERT",
     "DURABLE_SERVE_TLS_KEY",
@@ -220,8 +221,14 @@ impl Ctx {
     }
 
     pub fn run(&self, args: &[&str]) -> Run {
+        self.run_env(&[], args)
+    }
+
+    /// Like `run`, with `extra` settings in the child's environment.
+    pub fn run_env(&self, extra: &[(&str, &str)], args: &[&str]) -> Run {
         let o = self
             .command(args)
+            .envs(extra.iter().copied())
             .output()
             .unwrap_or_else(|e| panic!("run {args:?}: {e}"));
         Run {
@@ -233,7 +240,12 @@ impl Ctx {
 
     /// Run `args` and require success.
     pub fn ok(&self, args: &[&str]) -> Run {
-        let r = self.run(args);
+        self.ok_env(&[], args)
+    }
+
+    /// Like `ok`, with `extra` settings in the child's environment.
+    pub fn ok_env(&self, extra: &[(&str, &str)], args: &[&str]) -> Run {
+        let r = self.run_env(extra, args);
         assert!(
             r.status.success(),
             "{}: {args:?} failed ({})\nstdout:\n{}\nstderr:\n{}",

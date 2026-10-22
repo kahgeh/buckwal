@@ -1,6 +1,6 @@
 //! Hand-written command-line parsing.
 use std::path::PathBuf;
-use turso_durable::Batching;
+use turso_durable::{Batching, JournalMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpoint {
@@ -9,6 +9,19 @@ pub enum Checkpoint {
     Restart,
     Truncate,
     Reopen,
+}
+
+/// How `soak` wraps each write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Concurrent {
+    /// Autocommit, as always.
+    #[default]
+    Off,
+    /// Every write in `BEGIN CONCURRENT ... COMMIT`.
+    All,
+    /// Even-numbered threads write in plain `BEGIN ... COMMIT`, odd-numbered ones in
+    /// `BEGIN CONCURRENT ... COMMIT`.
+    Mixed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +40,7 @@ pub struct SoakArgs {
     pub batching_file: Option<PathBuf>,
     /// Print the upload stats every N acks.
     pub stats_every: Option<u64>,
+    pub concurrent: Concurrent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,16 +122,21 @@ pub enum Command {
 
 pub const USAGE: &str = "usage: turso-durable <command> [options]
   restore --dir DIR
-  takeover --dir DIR
   gc
   verify  --dir DIR [--acked FILE]
-  sql     --dir DIR [--claim] [--batching SPEC] SQL...
-  stats   --dir DIR [--claim] [--batching SPEC] SQL...
+  sql     --dir DIR [--claim] [--batching SPEC] [--journal-mode wal|mvcc] SQL...
+  stats   --dir DIR [--claim] [--batching SPEC] [--journal-mode wal|mvcc] SQL...
   soak    --dir DIR [--checkpoint passive|full|restart|truncate|reopen] [--every N]
           [--start ID] [--count N] [--page-put-delay-ms N] [--connections N]
           [--batching SPEC] [--batching-file PATH] [--stats-every N]
-  bench   --dir DIR --commits N [--connections N] [--batching SPEC]
-  serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC]
+          [--journal-mode wal|mvcc] [--concurrent [all|mixed]]
+  bench   --dir DIR --commits N [--connections N] [--batching SPEC] [--journal-mode wal|mvcc]
+  serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal|mvcc]
+  takeover --dir DIR [--journal-mode wal|mvcc]
+--journal-mode is the mode a new database is created in (an existing one keeps its own; asking
+for the other is refused); without it, DURABLE_JOURNAL_MODE applies, default wal.
+--concurrent (alone, or `all`) runs every soak write in BEGIN CONCURRENT ... COMMIT (MVCC);
+`mixed` has even-numbered threads use plain BEGIN and odd-numbered ones BEGIN CONCURRENT.
 SPEC is `off` or `window <max_wait> <max_commits> <max_bytes>` (e.g. 'window 10ms 64 1MiB');
 without --batching, DURABLE_BATCHING applies.
 S3 settings come from the DURABLE_* environment variables; serve also reads DURABLE_SERVE_*.";
@@ -144,7 +163,14 @@ pub fn batching(flag: &str, v: &str) -> Result<Batching, String> {
 }
 
 /// Parse the arguments after the program name.
+#[cfg(test)]
 pub fn parse(args: &[String]) -> Result<Command, String> {
+    parse_with_mode(args).map(|(c, _)| c)
+}
+
+/// [`parse`], and the `--journal-mode` given, if any (only `sql`, `stats`, `soak`, `bench`,
+/// `serve` and `takeover` take it).
+pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>), String> {
     let (cmd, rest) = args.split_first().ok_or("missing command")?;
     let mut dir: Option<PathBuf> = None;
     let mut acked: Option<PathBuf> = None;
@@ -161,11 +187,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut batching_spec = None;
     let mut batching_file = None;
     let mut stats_every = None;
+    let mut journal_mode = None;
+    let mut concurrent = Concurrent::Off;
     let mut expect = None;
     let mut all = false;
     let mut markers = Vec::new();
 
-    let mut it = rest.iter();
+    let mut it = rest.iter().peekable();
     while let Some(a) = it.next() {
         if !a.starts_with("--") {
             positional.push(a.clone());
@@ -187,6 +215,29 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             }
             ("sql" | "stats" | "soak" | "bench" | "serve", "--batching") => {
                 batching_spec = Some(batching(a, &value(a)?)?);
+                true
+            }
+            ("sql" | "stats" | "soak" | "bench" | "serve" | "takeover", "--journal-mode") => {
+                let v = value(a)?;
+                journal_mode = Some(match v.as_str() {
+                    "wal" => JournalMode::Wal,
+                    "mvcc" => JournalMode::Mvcc,
+                    _ => return Err(format!("{a} is wal or mvcc, not {v:?}")),
+                });
+                true
+            }
+            ("soak", "--concurrent") => {
+                concurrent = match it.peek().map(|s| s.as_str()) {
+                    Some("mixed") => {
+                        it.next();
+                        Concurrent::Mixed
+                    }
+                    Some("all") => {
+                        it.next();
+                        Concurrent::All
+                    }
+                    _ => Concurrent::All,
+                };
                 true
             }
             ("soak" | "bench", "--connections") => {
@@ -265,14 +316,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
     }
 
+    let parsed = |c: Command| Ok((c, journal_mode));
     if cmd == "gc" || cmd == "scan" {
         if let Some(a) = positional.first() {
             return Err(format!("unexpected argument {a:?}"));
         }
         if cmd == "gc" {
-            return Ok(Command::Gc);
+            return parsed(Command::Gc);
         }
-        return Ok(Command::Scan(ScanArgs {
+        return parsed(Command::Scan(ScanArgs {
             expect: expect.ok_or("--expect is required")?,
             all,
             markers,
@@ -282,32 +334,32 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     if !matches!(cmd.as_str(), "sql" | "stats") && !positional.is_empty() {
         return Err(format!("unexpected argument {:?}", positional[0]));
     }
-    match cmd.as_str() {
-        "restore" => Ok(Command::Restore { dir }),
-        "takeover" => Ok(Command::Takeover { dir }),
-        "verify" => Ok(Command::Verify { dir, acked }),
+    let command = match cmd.as_str() {
+        "restore" => Command::Restore { dir },
+        "takeover" => Command::Takeover { dir },
+        "verify" => Command::Verify { dir, acked },
         "sql" | "stats" if positional.is_empty() => {
-            Err(format!("{cmd} needs at least one SQL argument"))
+            return Err(format!("{cmd} needs at least one SQL argument"));
         }
-        "sql" => Ok(Command::Sql {
+        "sql" => Command::Sql {
             dir,
             statements: positional,
             claim,
             batching: batching_spec,
-        }),
-        "stats" => Ok(Command::Stats {
+        },
+        "stats" => Command::Stats {
             dir,
             sql: positional,
             claim,
             batching: batching_spec,
-        }),
-        "serve" => Ok(Command::Serve {
+        },
+        "serve" => Command::Serve {
             dir,
             listen,
             claim,
             batching: batching_spec,
-        }),
-        "soak" => Ok(Command::Soak(SoakArgs {
+        },
+        "soak" => Command::Soak(SoakArgs {
             dir,
             checkpoint,
             every,
@@ -318,15 +370,17 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             batching: batching_spec,
             batching_file,
             stats_every,
-        })),
-        "bench" => Ok(Command::Bench(BenchArgs {
+            concurrent,
+        }),
+        "bench" => Command::Bench(BenchArgs {
             dir,
             commits: commits.ok_or("--commits is required")?,
             connections,
             batching: batching_spec,
-        })),
-        _ => Err(format!("unknown command {cmd:?}")),
-    }
+        }),
+        _ => return Err(format!("unknown command {cmd:?}")),
+    };
+    parsed(command)
 }
 
 /// Ids from an acked file: lines `ack <id>` or a bare `<id>`. Any other line (events, errors,
@@ -419,6 +473,7 @@ mod tests {
                 batching: None,
                 batching_file: None,
                 stats_every: None,
+                concurrent: Concurrent::Off,
             }))
         );
         match p(&["soak", "--dir", "d"]).unwrap() {
@@ -700,6 +755,86 @@ mod tests {
         ])
         .is_err());
         assert!(p(&["soak", "--dir", "d", "--claim"]).is_err());
+    }
+
+    fn pm(a: &[&str]) -> Result<(Command, Option<JournalMode>), String> {
+        parse_with_mode(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn journal_mode_flag_on_the_commands_that_open_a_database() {
+        for argv in [
+            &["sql", "--dir", "d", "--journal-mode", "mvcc", "SELECT 1"][..],
+            &["stats", "--dir", "d", "--journal-mode", "mvcc", "SELECT 1"],
+            &["soak", "--dir", "d", "--journal-mode", "mvcc"],
+            &[
+                "bench",
+                "--dir",
+                "d",
+                "--commits",
+                "1",
+                "--journal-mode",
+                "mvcc",
+            ],
+            &["serve", "--dir", "d", "--journal-mode", "mvcc"],
+            &["takeover", "--dir", "d", "--journal-mode", "mvcc"],
+        ] {
+            assert_eq!(pm(argv).unwrap().1, Some(JournalMode::Mvcc), "{argv:?}");
+        }
+        let (_, m) = pm(&["sql", "--dir", "d", "--journal-mode", "wal", "SELECT 1"]).unwrap();
+        assert_eq!(m, Some(JournalMode::Wal));
+        // Without the flag nothing is chosen: DURABLE_JOURNAL_MODE applies.
+        assert_eq!(pm(&["soak", "--dir", "d"]).unwrap().1, None);
+        assert_eq!(pm(&["gc"]).unwrap().1, None);
+        // A bad or missing value, and a command that has no use for it.
+        let e = pm(&["sql", "--dir", "d", "--journal-mode", "delete", "SELECT 1"]).unwrap_err();
+        assert!(
+            e.contains("--journal-mode") && e.contains("wal or mvcc"),
+            "{e}"
+        );
+        assert!(pm(&["soak", "--dir", "d", "--journal-mode"]).is_err());
+        for c in ["restore", "verify", "gc", "scan"] {
+            assert!(
+                pm(&[c, "--dir", "d", "--journal-mode", "mvcc"]).is_err(),
+                "{c}"
+            );
+        }
+        assert!(
+            USAGE.contains("--journal-mode wal|mvcc") && USAGE.contains("DURABLE_JOURNAL_MODE")
+        );
+    }
+
+    #[test]
+    fn soak_concurrent_flag() {
+        let c = |a: &[&str]| match p(a).unwrap() {
+            Command::Soak(s) => s.concurrent,
+            c => panic!("{c:?}"),
+        };
+        assert_eq!(c(&["soak", "--dir", "d"]), Concurrent::Off);
+        assert_eq!(c(&["soak", "--dir", "d", "--concurrent"]), Concurrent::All);
+        assert_eq!(c(&["soak", "--concurrent", "--dir", "d"]), Concurrent::All);
+        assert_eq!(
+            c(&["soak", "--dir", "d", "--concurrent", "all"]),
+            Concurrent::All
+        );
+        assert_eq!(
+            c(&["soak", "--dir", "d", "--concurrent", "mixed"]),
+            Concurrent::Mixed
+        );
+        assert_eq!(
+            c(&["soak", "--dir", "d", "--concurrent", "--connections", "8"]),
+            Concurrent::All
+        );
+        assert!(
+            p(&["soak", "--dir", "d", "--concurrent", "bogus"]).is_err(),
+            "positional"
+        );
+        for cmd in ["sql", "bench", "serve", "restore"] {
+            assert!(
+                p(&[cmd, "--dir", "d", "--concurrent", "SELECT 1"]).is_err(),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]

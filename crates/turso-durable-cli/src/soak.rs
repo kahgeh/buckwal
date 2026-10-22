@@ -1,7 +1,7 @@
 //! `soak`: commit one 1 KB row at a time, printing `ack <id>` after each durable commit.
 //! With `--connections N`, N threads each commit on their own connection; thread `i` commits
 //! ids `start + i + k·N`.
-use crate::args::{self, Checkpoint, SoakArgs};
+use crate::args::{self, Checkpoint, Concurrent, SoakArgs};
 use crate::{config, err, ms, say, say_all, stats_lines, store, CliResult};
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -261,10 +261,7 @@ impl Soak<'_> {
             let r = {
                 let pool = self.read();
                 let conn = lock(&pool.as_ref().expect("open").conns[i]);
-                conn.execute(
-                    "INSERT OR REPLACE INTO soak(id, payload) VALUES (?, ?)",
-                    &[Value::from_i64(id), blob],
-                )
+                write(&conn, begin_for(self.args.concurrent, i), id, blob)
             };
             if let Err(e) = r {
                 say_error(&e);
@@ -289,6 +286,40 @@ impl Soak<'_> {
             }
         }
     }
+}
+
+/// The statement that opens thread `i`'s write transaction; `None` for an autocommit write.
+fn begin_for(concurrent: Concurrent, i: usize) -> Option<&'static str> {
+    match concurrent {
+        Concurrent::Off => None,
+        Concurrent::All => Some("BEGIN CONCURRENT"),
+        Concurrent::Mixed if i.is_multiple_of(2) => Some("BEGIN"),
+        Concurrent::Mixed => Some("BEGIN CONCURRENT"),
+    }
+}
+
+/// Write row `id`: one autocommit statement, or inside `begin` ... `COMMIT`. `Ok` only once
+/// the commit returned `Ok`; any failure rolls the transaction back (a rollback that cannot
+/// run is moot) and is returned, to be retried by the caller.
+fn write(
+    conn: &Connection,
+    begin: Option<&str>,
+    id: i64,
+    blob: Value,
+) -> turso_durable::Result<u64> {
+    const INSERT: &str = "INSERT OR REPLACE INTO soak(id, payload) VALUES (?, ?)";
+    let params = [Value::from_i64(id), blob];
+    let Some(begin) = begin else {
+        return conn.execute(INSERT, &params);
+    };
+    conn.execute(begin, &[])?;
+    let r = conn
+        .execute(INSERT, &params)
+        .and_then(|n| conn.execute("COMMIT", &[]).map(|_| n));
+    if r.is_err() {
+        let _ = conn.execute("ROLLBACK", &[]);
+    }
+    r
 }
 
 fn name(c: Checkpoint) -> &'static str {
@@ -348,6 +379,16 @@ pub fn run(args: &SoakArgs) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn begin_statement_per_thread() {
+        assert_eq!(begin_for(Concurrent::Off, 3), None);
+        assert_eq!(begin_for(Concurrent::All, 0), Some("BEGIN CONCURRENT"));
+        assert_eq!(begin_for(Concurrent::All, 7), Some("BEGIN CONCURRENT"));
+        assert_eq!(begin_for(Concurrent::Mixed, 0), Some("BEGIN"));
+        assert_eq!(begin_for(Concurrent::Mixed, 1), Some("BEGIN CONCURRENT"));
+        assert_eq!(begin_for(Concurrent::Mixed, 2), Some("BEGIN"));
+    }
 
     #[test]
     fn maintenance_events_print_one_line_each() {
