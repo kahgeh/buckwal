@@ -89,7 +89,7 @@
 #                       transaction open)
 #   after, at eb101d9:  59/59 serially (--test-threads=1) and 59/59 in parallel (the suite's
 #                       default, as upstream CI runs it)
-#   again at c5ad4c5 (code of 9aec32a) and at 10e62fb (the final code, named-arg prefixes
+#   again at c5ad4c5 (code of eda0d1d) and at 10e62fb (the final code, named-arg prefixes
 #                       stripped): 59/59 serially and 59/59 in parallel, each run with
 #                       --nocapture and 0 "skipping" lines
 #   Built in a scratch Cargo workspace outside this repo, lock sha256
@@ -114,7 +114,8 @@
 #   snapshot as SQLITE_BUSY, fresh-database initialisation, minors), 9aec32a (exact busy
 #   matching), 10e62fb (named args bind with one leading ':', '@' or '$' stripped, PROTOCOL.md
 #   8.1: before, `SELECT $x` with the name ":x" gave SQL_INPUT_ERROR "the statement has no
-#   parameter named \":x\""; after, it binds). The first client runs were at eb101d9; both
+#   parameter named \":x\""; after, it binds. The cost: `SELECT :x, $x` with the names ":x"
+#   and "$x" bound both before and now fails with SQL_INPUT_ERROR). The first client runs were at eb101d9; both
 #   suites were run again at c5ad4c5 and at 10e62fb.
 #
 # Not run: @tursodatabase/serverless (TypeScript), the Python turso_serverless, upstream's

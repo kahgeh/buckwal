@@ -694,6 +694,12 @@ mod tests {
         let unknown = json!({"type":"execute","stmt":{"sql":"SELECT :x",
             "named_args":[{"name":"$y","value":{"type":"integer","value":"7"}}]}});
         assert_eq!(f.err(Version::V3, unknown), "SQL_INPUT_ERROR");
+        // `?` is not a prefix to strip: `?2` binds the second parameter.
+        let r = f.ok(json!({"type":"execute","stmt":{"sql":"SELECT ?1, ?2",
+            "named_args":[{"name":"?2","value":{"type":"integer","value":"2"}},
+                          {"name":"?1","value":{"type":"integer","value":"1"}}]}}));
+        assert_eq!(r["result"]["rows"][0][0]["value"], "1");
+        assert_eq!(r["result"]["rows"][0][1]["value"], "2");
         // `:x` and `$x` are two parameters, but both names strip to `x`.
         let one = json!({"type":"integer","value":"1"});
         for names in [json!(["x"]), json!([":x", "$x"])] {
