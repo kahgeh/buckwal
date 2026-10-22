@@ -1,0 +1,9 @@
+mvcc-durability: results log (stage 2)
+
+== Baseline, 2026-10-22, base 332b45f, ./scripts/test.sh, exit 0 ==
+unit tests: 588 (28+6+81+36+1+397+33+5+1)
+pass 1 (plain HTTP): 5 serve tests, 38 system tests, 8 S3 tests, all passed (system tests 302 s)
+pass 2 (HTTPS + encryption): all passed; scan found no plaintext; otel check PASSED
+peak turso-durable-objects: pass 2 699 MB (https+encryption); pass 1 see below
+peak turso-durable-objects: 747 MB (plain)
+peak turso-durable-objects: 699 MB (https+encryption)
