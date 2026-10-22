@@ -1,31 +1,31 @@
 #!/usr/bin/env bash
 # Conditional-PUT gate against the local RustFS. Writes results/rustfs-gate.txt, or
-# results/rustfs-gate-tls.txt when the endpoint is https:// (TURSO_DURABLE_TLS_DIR set; locally generated CA).
+# results/rustfs-gate-tls.txt when the endpoint is https:// (BUCKWAL_TLS_DIR set; locally generated CA).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-# Connection settings always come from `rustfs.sh env` (local RustFS; TURSO_DURABLE_TLS_DIR selects
+# Connection settings always come from `rustfs.sh env` (local RustFS; BUCKWAL_TLS_DIR selects
 # HTTPS), never from the ambient environment, so the gate cannot hit another S3 endpoint.
 IMAGE_DIGEST="sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
 
-unset DURABLE_ENDPOINT DURABLE_REGION DURABLE_PATH_STYLE DURABLE_BUCKET DURABLE_ACCESS_KEY DURABLE_SECRET_KEY DURABLE_CA_BUNDLE
+unset BUCKWAL_ENDPOINT BUCKWAL_REGION BUCKWAL_PATH_STYLE BUCKWAL_BUCKET BUCKWAL_ACCESS_KEY BUCKWAL_SECRET_KEY BUCKWAL_CA_BUNDLE
 if [ -x "$HERE/rustfs.sh" ]; then eval "$("$HERE/rustfs.sh" env 2>/dev/null)" 2>/dev/null; fi
 CA=()
-if [ -n "${DURABLE_CA_BUNDLE:-}" ]; then CA=(--cacert "$DURABLE_CA_BUNDLE"); fi
+if [ -n "${BUCKWAL_CA_BUNDLE:-}" ]; then CA=(--cacert "$BUCKWAL_CA_BUNDLE"); fi
 
 OVER_TLS=0
-case "${DURABLE_ENDPOINT:-}" in https://*) OVER_TLS=1 ;; esac
+case "${BUCKWAL_ENDPOINT:-}" in https://*) OVER_TLS=1 ;; esac
 OUT="$ROOT/results/rustfs-gate.txt"
 if [ "$OVER_TLS" = 1 ]; then OUT="$ROOT/results/rustfs-gate-tls.txt"; fi
 
-if [ -z "${DURABLE_ENDPOINT:-}" ] \
-   || ! curl -sS -o /dev/null --max-time 5 ${CA[@]+"${CA[@]}"} "$DURABLE_ENDPOINT/health" 2>/dev/null; then
+if [ -z "${BUCKWAL_ENDPOINT:-}" ] \
+   || ! curl -sS -o /dev/null --max-time 5 ${CA[@]+"${CA[@]}"} "$BUCKWAL_ENDPOINT/health" 2>/dev/null; then
   echo "RustFS is not running (scripts/rustfs.sh up)" >&2
   exit 2
 fi
 
-AK="$DURABLE_ACCESS_KEY"; SK="$DURABLE_SECRET_KEY"
-BASE="$DURABLE_ENDPOINT/$DURABLE_BUCKET"
+AK="$BUCKWAL_ACCESS_KEY"; SK="$BUCKWAL_SECRET_KEY"
+BASE="$BUCKWAL_ENDPOINT/$BUCKWAL_BUCKET"
 PREFIX="gate/$(date +%s)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/s3gate.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -33,7 +33,7 @@ trap 'rm -rf "$TMP"' EXIT
 # s3 METHOD URL OUTFILE [curl args...] -> prints HTTP code; headers in OUTFILE.h, body in OUTFILE
 s3() {
   local method="$1" url="$2" out="$3"; shift 3
-  curl -sS ${CA[@]+"${CA[@]}"} -X "$method" --aws-sigv4 "aws:amz:${DURABLE_REGION}:s3" --user "$AK:$SK" \
+  curl -sS ${CA[@]+"${CA[@]}"} -X "$method" --aws-sigv4 "aws:amz:${BUCKWAL_REGION}:s3" --user "$AK:$SK" \
     -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
     -D "$out.h" -o "$out" -w '%{http_code}' "$@" "$url"
 }
@@ -127,10 +127,10 @@ d=$(s3 DELETE "$BASE/$PREFIX/c1" "$TMP/d")
   || rec FAIL list_delete "list=$l keys=$nkeys delete=$d" 0
 
 # 7 pause (informational)
-if podman pause turso-durable-rustfs >/dev/null 2>&1; then
+if podman pause buckwal-rustfs >/dev/null 2>&1; then
   pu=ok
 else pu=failed; fi
-podman unpause turso-durable-rustfs >/dev/null 2>&1 && un=ok || un=failed
+podman unpause buckwal-rustfs >/dev/null 2>&1 && un=ok || un=failed
 sleep 1
 pg=$(s3 GET "$BASE/$PREFIX/race" "$TMP/pg")
 [ "$pu" = ok ] && [ "$un" = ok ] && [ "$pg" = 200 ] \
@@ -139,7 +139,7 @@ pg=$(s3 GET "$BASE/$PREFIX/race" "$TMP/pg")
 
 {
   echo "# RustFS conditional-PUT gate"
-  if [ "$OVER_TLS" = 1 ]; then echo "# ran over HTTPS ($DURABLE_ENDPOINT) against a locally generated CA"; fi
+  if [ "$OVER_TLS" = 1 ]; then echo "# ran over HTTPS ($BUCKWAL_ENDPOINT) against a locally generated CA"; fi
   echo "# image: docker.io/rustfs/rustfs:1.0.0@$IMAGE_DIGEST"
   echo "# curl: $(curl --version | head -1)"
   echo "# date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

@@ -62,9 +62,9 @@ pub fn env() -> Vec<(String, String)> {
         ("BUCKWAL_ENDPOINT", "http://127.0.0.1:9290"),
         ("BUCKWAL_REGION", "us-east-1"),
         ("BUCKWAL_PATH_STYLE", "true"),
-        ("BUCKWAL_BUCKET", "turso-durable"),
-        ("BUCKWAL_ACCESS_KEY", "turso-durable-admin"),
-        ("BUCKWAL_SECRET_KEY", "turso-durable-local-secret-not-real"),
+        ("BUCKWAL_BUCKET", "buckwal"),
+        ("BUCKWAL_ACCESS_KEY", "buckwal-admin"),
+        ("BUCKWAL_SECRET_KEY", "buckwal-local-secret-not-real"),
     ]
     .iter()
     .map(|(k, d)| {

@@ -26,8 +26,8 @@ make_ca() { # NAME CN
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" -out "$1.pem"
 }
-make_ca ca "turso-durable test CA"
-make_ca other-ca "turso-durable unrelated CA"
+make_ca ca "buckwal test CA"
+make_ca other-ca "buckwal unrelated CA"
 
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server/rustfs_key.pem
 openssl req -new -key server/rustfs_key.pem -subj /CN=localhost -out server.csr

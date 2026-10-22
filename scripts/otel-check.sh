@@ -3,15 +3,15 @@
 #   Prints `otel check SKIPPED: …` and exits 0 when the observability stack is down;
 #   otherwise polls up to 60 s and prints `otel check PASSED: …` (exit 0) or
 #   `otel check FAILED: …` (exit 1).
-# Reads DURABLE_CH_URL (default http://localhost:8123), DURABLE_CH_USER (default hyperdx_ro)
-# and DURABLE_CH_PASSWORD; without it, the password is read from the stack's users SQL file
+# Reads BUCKWAL_CH_URL (default http://localhost:8123), BUCKWAL_CH_USER (default hyperdx_ro)
+# and BUCKWAL_CH_PASSWORD; without it, the password is read from the stack's users SQL file
 # at run time. The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
 
 RUN_ID="${1:-}"
-CH_URL="${DURABLE_CH_URL:-http://localhost:8123}"
-CH_USER="${DURABLE_CH_USER:-hyperdx_ro}"
+CH_URL="${BUCKWAL_CH_URL:-http://localhost:8123}"
+CH_USER="${BUCKWAL_CH_USER:-hyperdx_ro}"
 USERS_SQL="$HOME/Dev/p/sre/stack/clickhouse/00_database_users.sql"
 SPANS="buckwal.commit buckwal.local_write buckwal.local_fsync buckwal.ack_wait buckwal.upload buckwal.checkpoint_upload buckwal.restore buckwal.takeover buckwal.fence buckwal.gc buckwal.server.request"
 DEADLINE=60
@@ -19,7 +19,7 @@ DEADLINE=60
 fail() { echo "otel check FAILED: $*"; exit 1; }
 
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "usage: otel-check.sh RUN_ID (letters, digits, . _ -)"
-[[ "$CH_USER" =~ ^[A-Za-z0-9_]+$ ]] || fail "DURABLE_CH_USER must be letters, digits and _"
+[[ "$CH_USER" =~ ^[A-Za-z0-9_]+$ ]] || fail "BUCKWAL_CH_USER must be letters, digits and _"
 
 command -v nc >/dev/null 2>&1 || fail "nc not found"
 if ! curl -sf --max-time 5 "$CH_URL/ping" >/dev/null 2>&1 \
@@ -30,8 +30,8 @@ fi
 
 # The read-only user's password: the environment's, else the users SQL file's.
 password() {
-  if [[ -n "${DURABLE_CH_PASSWORD:-}" ]]; then
-    printf '%s' "$DURABLE_CH_PASSWORD"
+  if [[ -n "${BUCKWAL_CH_PASSWORD:-}" ]]; then
+    printf '%s' "$BUCKWAL_CH_PASSWORD"
     return
   fi
   [[ -r "$USERS_SQL" ]] || return 1
@@ -39,7 +39,7 @@ password() {
     | head -n 1
 }
 PASSWORD="$(password)" || PASSWORD=""
-[[ -n "$PASSWORD" ]] || fail "no password for $CH_USER (set DURABLE_CH_PASSWORD)"
+[[ -n "$PASSWORD" ]] || fail "no password for $CH_USER (set BUCKWAL_CH_PASSWORD)"
 
 # ch SQL -> the result as TabSeparated, then the HTTP status on its own line; curl's own
 # error text on stderr.

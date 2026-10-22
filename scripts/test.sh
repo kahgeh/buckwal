@@ -8,10 +8,10 @@
 #                  every test, a short workload with a marker row, a whole-bucket scan that
 #                  must find no plaintext, and the ClickHouse check (scripts/otel-check.sh;
 #                  SKIPPED when the observability stack is down).
-#             Tests keep their bucket prefixes (DURABLE_KEEP_PREFIXES=1) so the scans see
+#             Tests keep their bucket prefixes (BUCKWAL_KEEP_PREFIXES=1) so the scans see
 #             everything; RustFS's storage is emptied (scripts/rustfs.sh reset) before each
 #             pass and again on exit, pass or fail. The volume's peak size is printed per pass.
-#             Both passes run the `serve` system tests (crates/turso-durable-cli/tests/server.rs):
+#             Both passes run the `serve` system tests (crates/buckwal-cli/tests/server.rs):
 #             plain HTTP without a token in pass 1, HTTPS with a token in pass 2.
 #   unit      fmt, clippy, unit tests only
 set -euo pipefail
@@ -43,7 +43,7 @@ PEAK_DONE=""
 peak_line() {
   local mb
   mb="$(awk -v p="$1" '$1 == p && $2 > m { m = $2 } END { print m + 0 }' "$WORK0/disk")"
-  echo "peak turso-durable-objects: $mb MB ($1)"
+  echo "peak buckwal-objects: $mb MB ($1)"
 }
 
 peak() {
@@ -55,7 +55,7 @@ peak() {
 # stopped or paused).
 sample() {
   local mb
-  mb="$(podman exec turso-durable-rustfs du -sm /data 2>/dev/null | awk '{ print $1 }')" || true
+  mb="$(podman exec buckwal-rustfs du -sm /data 2>/dev/null | awk '{ print $1 }')" || true
   [[ -n "$mb" ]] && echo "$(cat "$WORK0/pass" 2>/dev/null) $mb" >>"$WORK0/disk"
   return 0
 }
@@ -63,7 +63,7 @@ sample() {
 # Remove a directory this run made with mktemp: never an empty or relative path, nor one
 # outside the temp directory.
 remove_dir() {
-  [[ "$1" == /* && "$1" == "$TMP"/turso-durable-* ]] || { echo "test.sh: not removing $1" >&2; return 0; }
+  [[ "$1" == /* && "$1" == "$TMP"/buckwal-* ]] || { echo "test.sh: not removing $1" >&2; return 0; }
   rm -rf "$1" || echo "test.sh: could not remove $1" >&2
 }
 
@@ -85,7 +85,7 @@ cleanup() {
     pending="$(peak_line "$PASS" 2>/dev/null)"
   fi
   [[ -n "$WORK" ]] && remove_dir "$WORK"
-  unset TURSO_DURABLE_TLS_DIR DURABLE_ENCRYPTION_KEY_FILE
+  unset BUCKWAL_TLS_DIR BUCKWAL_ENCRYPTION_KEY_FILE
   scripts/rustfs.sh reset || echo "test.sh: emptying RustFS storage (rustfs.sh reset) failed" >&2
   [[ -n "$TLS_DIR" ]] && remove_dir "$TLS_DIR"
   [[ -n "$WORK0" ]] && remove_dir "$WORK0"
@@ -94,42 +94,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
-WORK0="$(mktemp -d "$TMP/turso-durable-test.XXXXXX")"
-TLS_DIR="$(mktemp -d "$TMP/turso-durable-tls.XXXXXX")"
+WORK0="$(mktemp -d "$TMP/buckwal-test.XXXXXX")"
+TLS_DIR="$(mktemp -d "$TMP/buckwal-tls.XXXXXX")"
 : >"$WORK0/disk"
 # Every 15 s, the volume's size in MB, tagged with the pass.
 (while sleep 15; do sample; done) &
 SAMPLER=$!
 
-export DURABLE_OTEL=1
-export DURABLE_TEST_RUN_ID="turso-durable-$(date +%Y%m%d%H%M%S)-$$"
-echo "test run id: $DURABLE_TEST_RUN_ID"
-cli() { DURABLE_PREFIX="otel/$DURABLE_TEST_RUN_ID" cargo run -q --locked -p turso-durable-cli -- "$@"; }
+export BUCKWAL_OTEL=1
+export BUCKWAL_TEST_RUN_ID="buckwal-$(date +%Y%m%d%H%M%S)-$$"
+echo "test run id: $BUCKWAL_TEST_RUN_ID"
+cli() { BUCKWAL_PREFIX="otel/$BUCKWAL_TEST_RUN_ID" cargo run -q --locked -p buckwal-cli -- "$@"; }
 
 # Pass 1: plain HTTP, no encryption.
 PASS=plain
 echo "$PASS" >"$WORK0/pass"
 scripts/rustfs.sh reset
 eval "$(scripts/rustfs.sh env)"
-DURABLE_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1 --skip tls_
+BUCKWAL_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1 --skip tls_
 sample
 cli scan --all --expect present
 peak "$PASS"
 
 # Pass 2: HTTPS with encryption. rustfs.sh (also run by the system tests) serves TLS while
-# TURSO_DURABLE_TLS_DIR is set.
+# BUCKWAL_TLS_DIR is set.
 PASS=https+encryption
 echo "$PASS" >"$WORK0/pass"
 scripts/tls-material.sh "$TLS_DIR/m"
-export TURSO_DURABLE_TLS_DIR="$TLS_DIR/m" DURABLE_ENCRYPTION_KEY_FILE="$TLS_DIR/m/encryption.key"
+export BUCKWAL_TLS_DIR="$TLS_DIR/m" BUCKWAL_ENCRYPTION_KEY_FILE="$TLS_DIR/m/encryption.key"
 scripts/rustfs.sh reset
 eval "$(scripts/rustfs.sh env)"
-DURABLE_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1
+BUCKWAL_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1
 
 # A short workload under the run id, so every span kind is exported, with a marker row the
 # scan must not find.
-WORK="$(mktemp -d "$TMP/turso-durable-otel.XXXXXX")"
-MARKER="turso-durable-marker-$DURABLE_TEST_RUN_ID"
+WORK="$(mktemp -d "$TMP/buckwal-otel.XXXXXX")"
+MARKER="buckwal-marker-$BUCKWAL_TEST_RUN_ID"
 cli bench --dir "$WORK/bench" --commits 50 --batching "window 5ms 8 1MiB" --connections 4
 cli sql --dir "$WORK/bench" "CREATE TABLE marker(t TEXT)"
 cli sql --dir "$WORK/bench" "INSERT INTO marker VALUES ('$MARKER')"
@@ -140,4 +140,4 @@ cli gc
 sample
 cli scan --all --expect absent --marker "$MARKER"
 peak "$PASS"
-scripts/otel-check.sh "$DURABLE_TEST_RUN_ID"
+scripts/otel-check.sh "$BUCKWAL_TEST_RUN_ID"
