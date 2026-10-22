@@ -694,6 +694,18 @@ mod tests {
         let unknown = json!({"type":"execute","stmt":{"sql":"SELECT :x",
             "named_args":[{"name":"$y","value":{"type":"integer","value":"7"}}]}});
         assert_eq!(f.err(Version::V3, unknown), "SQL_INPUT_ERROR");
+        // `:x` and `$x` are two parameters, but both names strip to `x`.
+        let one = json!({"type":"integer","value":"1"});
+        for names in [json!(["x"]), json!([":x", "$x"])] {
+            let named: Vec<J> = names
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| json!({"name":n,"value":one}))
+                .collect();
+            let both = json!({"type":"execute","stmt":{"sql":"SELECT :x, $x","named_args":named}});
+            assert_eq!(f.err(Version::V3, both), "SQL_INPUT_ERROR", "{names}");
+        }
     }
 
     #[test]
