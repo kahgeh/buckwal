@@ -1,0 +1,19 @@
+[package]
+name = "buckwal-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "buckwal"
+path = "src/main.rs"
+
+[dependencies]
+buckwal = { path = "../buckwal" }
+buckwal-server = { path = "../buckwal-server" }
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+buckwal-hrana-client = { path = "../buckwal-hrana-client" }

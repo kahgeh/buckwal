@@ -259,6 +259,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "buckwal"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rustls",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_parser",
+]
+
+[[package]]
+name = "buckwal-cli"
+version = "0.1.0"
+dependencies = [
+ "buckwal",
+ "buckwal-hrana-client",
+ "buckwal-server",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "buckwal-hrana-client"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest",
+ "rustls",
+ "serde_json",
+]
+
+[[package]]
+name = "buckwal-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "buckwal",
+ "buckwal-hrana-client",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "turso_parser",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2587,53 +2656,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "turso-durable-cli"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "rustls",
- "serde_json",
- "tempfile",
- "turso-durable-hrana-client",
- "turso-durable-server",
- "turso_durable",
-]
-
-[[package]]
-name = "turso-durable-hrana-client"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "reqwest",
- "rustls",
- "serde_json",
-]
-
-[[package]]
-name = "turso-durable-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "hyper",
- "hyper-util",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "turso-durable-hrana-client",
- "turso_durable",
- "turso_parser",
-]
-
-[[package]]
 name = "turso_core"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2702,28 +2724,6 @@ dependencies = [
  "uncased",
  "uuid",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "turso_durable"
-version = "0.1.0"
-dependencies = [
- "hex",
- "hmac",
- "opentelemetry",
- "opentelemetry-appender-tracing",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "reqwest",
- "rustls",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "turso_core",
- "turso_parser",
 ]
 
 [[package]]

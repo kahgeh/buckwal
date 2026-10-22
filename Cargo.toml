@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/turso_durable",
-    "crates/turso-durable-cli",
-    "crates/turso-durable-server",
-    "crates/turso-durable-hrana-client",
+    "crates/buckwal",
+    "crates/buckwal-cli",
+    "crates/buckwal-server",
+    "crates/buckwal-hrana-client",
 ]
 
 [workspace.package]
