@@ -4,9 +4,9 @@ mvcc-durability: results log (stage 2)
 unit tests: 588 (28+6+81+36+1+397+33+5+1)
 pass 1 (plain HTTP): 5 serve tests, 38 system tests, 8 S3 tests, all passed (system tests 302 s)
 pass 2 (HTTPS + encryption): all passed; scan found no plaintext; otel check PASSED
-peak turso-durable-objects: pass 2 699 MB (https+encryption); pass 1 see below
-peak turso-durable-objects: 747 MB (plain)
-peak turso-durable-objects: 699 MB (https+encryption)
+peak buckwal-objects: pass 2 699 MB (https+encryption); pass 1 see below
+peak buckwal-objects: 747 MB (plain)
+peak buckwal-objects: 699 MB (https+encryption)
 
 Task 3 fix round 1 (review): move_created fsynced the db dir once after all renames
   before: move_created_fsyncs_the_dir_after_each_rename FAILED
@@ -51,10 +51,10 @@ Task 9: proofs of the 'argued' rows (fencing, takeover, GC/trim, sync, verify, r
   ./scripts/test.sh unit exit 0.
 
 Task 10 (CLI --journal-mode, soak --concurrent, MVCC system tests)
-  bug: restore/verify of an MVCC bucket without a flag. before: `verify --dir DIR` and `restore --dir DIR` -> "error: MVCC: switching back to WAL is not supported yet by turso_durable" (exit 1). after: reader_config() takes the mode from the bucket head; `verify ok acked=0 present=0 unacked_present=5` and `restored generation=2 log_objects=6`.
+  bug: restore/verify of an MVCC bucket without a flag. before: `verify --dir DIR` and `restore --dir DIR` -> "error: MVCC: switching back to WAL is not supported yet by buckwal" (exit 1). after: reader_config() takes the mode from the bucket head; `verify ok acked=0 present=0 unacked_present=5` and `restored generation=2 log_objects=6`.
   stale assert: mvcc_pragma_refused_then_all_acks_restore expected "MVCC is not supported yet"; the library now says "MVCC: switching an existing WAL database" (since Task 2/3). Assertion text updated.
   note: takeover of a saturated MVCC writer (~600 commits/s) times out after 64 fence probes (same rule as WAL, borderline there too); the old writer is fenced anyway, 1999 acks present. mvcc_takeover_cli stops the writer (SIGSTOP) first.
-  mvcc tests: plain 16 passed (36.4 s) + server 1; https+encryption 16 passed (39.0 s) + server 1; peak turso-durable-objects 66 / 67 MB; whole-bucket scan: pass 1 finds CREATE TABLE, pass 2 finds nothing.
+  mvcc tests: plain 16 passed (36.4 s) + server 1; https+encryption 16 passed (39.0 s) + server 1; peak buckwal-objects 66 / 67 MB; whole-bucket scan: pass 1 finds CREATE TABLE, pass 2 finds nothing.
 
 Task 12 (documentation, recorded in dde2689): ./scripts/test.sh unit exit 0, 697 unit tests (32 cli + 6 hrana client + 81 server + 36 http + 1 span + 489 library + 33 batching + 5 fencing + 8 mvcc_fencing + 5 mvcc_limits + 1 otel_down), up from the baseline 588. Cargo.lock unchanged since 332b45f. Doc comments only in Rust (conn.rs, db.rs, io/log_file.rs). docs/architecture.md and docs/mvcc-recon.md diagrams render with mmdc.
 
@@ -73,25 +73,25 @@ Final fix wave (whole-branch review)
     after: Corrupt "head: format 2 with journal_mode \"wal\"" (also format 1 with a journal_mode key)
   3. clear_interrupted_create deleted a foreign app.db and app.db-log when app.db-creating was stale.
     before: db::tests::stale_staging_dir_never_deletes_a_foreign_app_db FAILED: panicked "opened over a foreign app.db" (the foreign file had been deleted and a database created)
-    after: refused with Config "holds an app.db not created by turso_durable", foreign files untouched
-  turso_durable lib: 492 passed; 0 failed (final review fixes, commit 9ab3403).
+    after: refused with Config "holds an app.db not created by buckwal", foreign files untouched
+  buckwal lib: 492 passed; 0 failed (final review fixes, commit 9ab3403).
 
 == Final run, 2026-10-22, HEAD 9ab3403, ./scripts/test.sh, exit 0 ==
 whole run 14:34 (874 s). unit tests: 700 at 9ab3403 (./scripts/test.sh unit).
 each pass: 6 serve tests (mvcc_serve_begin_concurrent included), 52 system tests (the MVCC ones included), S3 tests (8 in pass 1, 12 in pass 2).
-peak turso-durable-objects: 722 MB (plain), 764 MB (https+encryption). Baseline at 332b45f: 747 MB and 699 MB; 588 unit, 5 serve, 38 system, about 12 min.
+peak buckwal-objects: 722 MB (plain), 764 MB (https+encryption). Baseline at 332b45f: 747 MB and 699 MB; 588 unit, 5 serve, 38 system, about 12 min.
 scan: pass 1 found CREATE TABLE in 13240 objects; pass 2 found no plaintext (CREATE TABLE, SQLite header, bench payload, marker 1, the encryption key: all not found).
 otel check PASSED.
 raw log: .superpowers/sdd/mvcc-durability/final.log (git-ignored, not committed).
 
 == Coordinator rejection fixes ==
-Date: 2026-10-22. HEAD before: 19a3b7d. RustFS: existing turso-durable-rustfs container, plain HTTP; env from: eval "$(./scripts/rustfs.sh env)".
+Date: 2026-10-22. HEAD before: 19a3b7d. RustFS: existing buckwal-rustfs container, plain HTTP; env from: eval "$(./scripts/rustfs.sh env)".
 
 -- 1. transaction_with refuses Window in MVCC (commit bcad767) --
-Test: crates/turso_durable/src/db/tests/mvcc.rs transaction_with_window_refused_in_mvcc_and_still_works_in_wal
-Before the check_mode call (cargo test --locked -p turso_durable --lib transaction_with_window):
+Test: crates/buckwal/src/db/tests/mvcc.rs transaction_with_window_refused_in_mvcc_and_still_works_in_wal
+Before the check_mode call (cargo test --locked -p buckwal --lib transaction_with_window):
   test db::tests::mvcc::transaction_with_window_refused_in_mvcc_and_still_works_in_wal ... FAILED
-  panicked at crates/turso_durable/src/db/tests.rs:78:14: expected Unsupported, got Ok(())
+  panicked at crates/buckwal/src/db/tests.rs:78:14: expected Unsupported, got Ok(())
   test result: FAILED. 0 passed; 1 failed
 After:
   test db::tests::mvcc::transaction_with_window_refused_in_mvcc_and_still_works_in_wal ... ok
@@ -99,14 +99,14 @@ After:
 Other Batching entries: Config::validate (config.rs:466), Database::set_batching (db.rs:1007), Connection::set_batching (conn.rs:140) and the guard's PRAGMA check (guard.rs:104) already call check_mode. The server only calls Connection::set_batching. The PRAGMA path is covered by the guard before batching_pragma runs (the new test asserts it inside BEGIN). Only transaction_with was a gap.
 
 -- 2. Commit 389cd5a: CLI writers follow the head's journal mode --
-Command: DURABLE_KEEP_PREFIXES=1 cargo test --locked -p turso-durable-cli --test system -- --ignored --test-threads=1 mvcc_refusals_cli mvcc_takeover_cli
+Command: DURABLE_KEEP_PREFIXES=1 cargo test --locked -p buckwal-cli --test system -- --ignored --test-threads=1 mvcc_refusals_cli mvcc_takeover_cli
 Mutation: the CLI's writer_config was temporarily changed so that it never looked at the bucket's head and always used the default (WAL) when no flag or env var was given; main.rs was then restored from a backup and git diff showed it unchanged. With the mutation, FAILING:
   test mvcc_refusals_cli ... FAILED
   test mvcc_takeover_cli ... FAILED
   mvcc_refusals_cli_mvcc: ["sql", "--dir", "$TMP/.tmpoOwIdW/a", "SELECT count(*) FROM t"] failed (exit status: 1)
-  error: MVCC: switching back to WAL is not supported yet by turso_durable
+  error: MVCC: switching back to WAL is not supported yet by buckwal
   mvcc_takeover_cli: ["takeover", "--dir", "$TMP/.tmpZcEvii/b"] failed (exit status: 1)
-  error: MVCC: switching back to WAL is not supported yet by turso_durable
+  error: MVCC: switching back to WAL is not supported yet by buckwal
   test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 50 filtered out; finished in 1.65s
 With main.rs restored, PASSING:
   test mvcc_refusals_cli ... ok
@@ -114,7 +114,7 @@ With main.rs restored, PASSING:
   test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 4.53s
 
 -- 3. mvcc_takeover_fences_a_running_soak, five runs --
-Command (each run): DURABLE_KEEP_PREFIXES=1 cargo test --locked -p turso-durable-cli --test system -- --ignored --test-threads=1 --nocapture mvcc_takeover_fences_a_running_soak
+Command (each run): DURABLE_KEEP_PREFIXES=1 cargo test --locked -p buckwal-cli --test system -- --ignored --test-threads=1 --nocapture mvcc_takeover_fences_a_running_soak
 The test asserts epoch == before+1, the old writer fenced and silent, and restore --verify of every ack; all five passed those assertions.
 run 1: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=240; test result: ok. 1 passed
 run 2: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=240; test result: ok. 1 passed

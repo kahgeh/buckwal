@@ -1,11 +1,11 @@
-# turso_durable stage 3 (writer-lease) measurements
+# buckwal stage 3 (writer-lease) measurements
 # date: 2026-10-17T15:27:50Z (run 2; run 1 a few minutes earlier)
 # git: 2c152895f57dfc642561a5af1247a01b174c8157 (writer-lease) plus
-#   crates/turso-durable-cli/examples/stage3_costs.rs, committed with this file
+#   crates/buckwal-cli/examples/stage3_costs.rs, committed with this file
 # engine: turso_core 0.8.3 (features fs, json, uuid)
 # RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
-# build: cargo build --release --locked -p turso-durable-cli --bins --examples (rustc 1.97.1):
-#   target/release/turso-durable and target/release/examples/stage3_costs
+# build: cargo build --release --locked -p buckwal-cli --bins --examples (rustc 1.97.1):
+#   target/release/buckwal and target/release/examples/stage3_costs
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop figures (Apple M4 Max, RustFS in podman on the same Mac), not production numbers
 # telemetry: DURABLE_OTEL unset (off). DURABLE_BATCHING unset (off). One run per measure.
@@ -14,7 +14,7 @@
 # - bench: stage 1's workload (one connection, CREATE TABLE bench, 5000 INSERT OR REPLACE of
 #   a 1 KB blob, then close), default settings. It builds the database the rest work on.
 # - restore: a plain read-only restore of that database, for the restore's GET count.
-# - stage3_costs takeover DIR: turso_durable::takeover_with_store into an empty DIR, with the
+# - stage3_costs takeover DIR: buckwal::takeover_with_store into an empty DIR, with the
 #   S3 store wrapped in a FaultStore that records every request. restore_* are the
 #   TakeoverReport's RestoreReport; total_* count every request of the takeover, restore
 #   included; each request follows as "request <op> <key>" (stat = HEAD, counted as a GET).
@@ -33,19 +33,19 @@
 #
 # Commands (DURABLE_* from scripts/rustfs.sh env; <P> = stage3/<run id>, <T> from mktemp -d;
 # the prefix and <T> were deleted afterwards):
-#   DURABLE_PREFIX=<P> turso-durable bench --dir <T>/bench --commits 5000
-#   DURABLE_PREFIX=<P> turso-durable restore --dir <T>/restored
+#   DURABLE_PREFIX=<P> buckwal bench --dir <T>/bench --commits 5000
+#   DURABLE_PREFIX=<P> buckwal restore --dir <T>/restored
 #   DURABLE_PREFIX=<P> stage3_costs takeover <T>/took-ex           (run 2; run 1: second)
-#   DURABLE_PREFIX=<P> turso-durable takeover --dir <T>/took       (run 2; run 1: first)
+#   DURABLE_PREFIX=<P> buckwal takeover --dir <T>/took       (run 2; run 1: first)
 #   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <T>/took    (twice)
 #   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs lease <T>/took 31000
-#   DURABLE_PREFIX=<P> turso-durable gc
+#   DURABLE_PREFIX=<P> buckwal gc
 #   sleep 10
 #   DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 \
-#     DURABLE_REQUEST_TIMEOUT_MS=1000 DURABLE_PREFIX=<P> turso-durable gc     (twice)
-#   DURABLE_PREFIX=<P> turso-durable restore --dir <T>/after-gc
-#   DURABLE_PREFIX=<P> turso-durable verify --dir <T>/after-gc
-#   DURABLE_PREFIX=<P> turso-durable sql --dir <T>/took \
+#     DURABLE_REQUEST_TIMEOUT_MS=1000 DURABLE_PREFIX=<P> buckwal gc     (twice)
+#   DURABLE_PREFIX=<P> buckwal restore --dir <T>/after-gc
+#   DURABLE_PREFIX=<P> buckwal verify --dir <T>/after-gc
+#   DURABLE_PREFIX=<P> buckwal sql --dir <T>/took \
 #     "SELECT count(*), min(id), max(id) FROM bench" "SELECT count(*) FROM lease_cost"
 #
 # Summary (run 2):

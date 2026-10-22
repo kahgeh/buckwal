@@ -1,10 +1,10 @@
-# turso_durable stage 4 (durable-transport) measurements
+# buckwal stage 4 (durable-transport) measurements
 # date: 2026-10-18
 # git: 5215309 (durable-transport; the measured code, before this file was committed)
 # engine: turso_core 0.8.3 (features fs, json, uuid, encryption)
 # RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
-# build: cargo build --release --locked -p turso-durable-cli --bins --examples (rustc 1.97.1),
-#   target/release/turso-durable and target/release/examples/stage3_costs
+# build: cargo build --release --locked -p buckwal-cli --bins --examples (rustc 1.97.1),
+#   target/release/buckwal and target/release/examples/stage3_costs
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop figures (Apple M4 Max, RustFS in podman on the same Mac, loopback), not production
 # numbers and not S3. TLS here is rustls/ring to a RustFS on 127.0.0.1 with a test CA.
@@ -16,26 +16,26 @@
 #   (b) HTTPS (DURABLE_CA_BUNDLE = the test CA), no encryption
 #   (c) HTTPS + encryption (DURABLE_ENCRYPTION_KEY_FILE, default cipher aegis256)
 # Between setups RustFS was reset (scripts/rustfs.sh reset), so each setup ran on an empty
-# bucket. HTTPS setups: TURSO_DURABLE_TLS_DIR = <T>/m made by scripts/tls-material.sh, <T> from
+# bucket. HTTPS setups: BUCKWAL_TLS_DIR = <T>/m made by scripts/tls-material.sh, <T> from
 # mktemp -d. Key material is not recorded here.
 #
 # Commands (DURABLE_* from `eval "$(scripts/rustfs.sh env)"`; <P> a distinct DURABLE_PREFIX per
 # run, t7/<setup>-<off|win>-<pid>; <W> a scratch directory, deleted afterwards):
 #   T=$(mktemp -d <scratchpad>/tls.XXXXXX); scripts/tls-material.sh $T/m          (b, c)
-#   unset TURSO_DURABLE_TLS_DIR DURABLE_ENCRYPTION_KEY_FILE DURABLE_CA_BUNDLE
-#   export TURSO_DURABLE_TLS_DIR=$T/m                                              (b, c)
+#   unset BUCKWAL_TLS_DIR DURABLE_ENCRYPTION_KEY_FILE DURABLE_CA_BUNDLE
+#   export BUCKWAL_TLS_DIR=$T/m                                              (b, c)
 #   export DURABLE_ENCRYPTION_KEY_FILE=<the key file tls-material.sh made>   (c)
 #   scripts/rustfs.sh reset; eval "$(scripts/rustfs.sh env)"
-#   DURABLE_PREFIX=<P> turso-durable bench --dir <W>/bench-off --commits 1000 --batching off
-#   DURABLE_PREFIX=<P> turso-durable bench --dir <W>/bench-win --commits 1000 \
+#   DURABLE_PREFIX=<P> buckwal bench --dir <W>/bench-off --commits 1000 --batching off
+#   DURABLE_PREFIX=<P> buckwal bench --dir <W>/bench-win --commits 1000 \
 #     --batching 'window 10ms 64 1MiB'
-#   DURABLE_PREFIX=<P> turso-durable restore --dir <W>/restored-<off|win>          (a, c)
+#   DURABLE_PREFIX=<P> buckwal restore --dir <W>/restored-<off|win>          (a, c)
 #   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/restored-<off|win>  (a, c)
 # Stage 3's costs, re-measured on plain RustFS (setup a):
-#   DURABLE_PREFIX=<P> turso-durable bench --dir <W>/bench --commits 5000
+#   DURABLE_PREFIX=<P> buckwal bench --dir <W>/bench --commits 5000
 #   DURABLE_PREFIX=<P> stage3_costs takeover <W>/took-ex
 #   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/took-ex     (twice)
-#   DURABLE_PREFIX=<P> turso-durable restore --dir <W>/restored
+#   DURABLE_PREFIX=<P> buckwal restore --dir <W>/restored
 #   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/restored
 #
 # Workload (bench): CREATE TABLE bench(id INTEGER PRIMARY KEY, payload BLOB), then 1000
@@ -92,12 +92,12 @@
 #   pass 1 (plain HTTP, no encryption; the tls_* tests skipped): 38 system tests + 8 S3 tests, all ok
 #     scan: 41942 objects, 514365239 bytes
 #     CREATE TABLE: found in 12864 objects; SQLite header: found in 12864; bench payload: found in 1998
-#     peak turso-durable-objects: 673 MB (plain)
+#     peak buckwal-objects: 673 MB (plain)
 #   pass 2 (HTTPS + encryption, every test): 38 system tests + 11 S3 tests, all ok
 #     scan: 44604 objects, 543608616 bytes
 #     CREATE TABLE: not found; SQLite header: not found; bench payload: not found;
 #     marker 1: not found; the encryption key: not found
-#     peak turso-durable-objects: 711 MB (https+encryption)
+#     peak buckwal-objects: 711 MB (https+encryption)
 #   otel check PASSED: durable.ack_wait=83096 durable.checkpoint_upload=516 durable.commit=83090
 #     durable.fence=21 durable.gc=794 durable.local_fsync=83251 durable.local_write=83297
 #     durable.maintenance=111 durable.restore=144 durable.takeover=21 durable.upload=50331 logs=1010
@@ -106,7 +106,7 @@
 #
 # Final test-command run (after the merge fixes): the canonical figures (laptop, RustFS)
 # (./scripts/test.sh at commit b4afb8f, the controller's run; `real 703.27` s (11:43); rc=0;
-#   test run id turso-durable-20261018103945-87483)
+#   test run id buckwal-20261018103945-87483)
 #   unit: test result ok: 24 passed (cli); 379 passed (lib); 31; 5; 1
 #   pass 1 (plain HTTP, no encryption): system "test result: ok. 38 passed; 0 failed";
 #     S3 "test result: ok. 8 passed; 0 failed; … 4 filtered out" (the 4 tls_* tests)
@@ -114,17 +114,17 @@
 #     CREATE TABLE: found in 13071 objects
 #     SQLite header: found in 13071 objects
 #     bench payload: found in 2006 objects
-#     peak turso-durable-objects: 684 MB (plain)
+#     peak buckwal-objects: 684 MB (plain)
 #   pass 2 (HTTPS + encryption): system "test result: ok. 38 passed; 0 failed";
 #     S3 "test result: ok. 12 passed; 0 failed" (incl. tls_redirect_to_plain_http_is_not_followed)
 #     scan: 44022 objects, 543159646 bytes
 #     CREATE TABLE: not found / SQLite header: not found / bench payload: not found /
 #     marker 1: not found / the encryption key: not found
-#     peak turso-durable-objects: 708 MB (https+encryption)
+#     peak buckwal-objects: 708 MB (https+encryption)
 #   otel check PASSED: durable.ack_wait=83318 durable.checkpoint_upload=517 durable.commit=83315
 #     durable.fence=21 durable.gc=797 durable.local_fsync=83494 durable.local_write=83528
 #     durable.maintenance=111 durable.restore=144 durable.takeover=21 durable.upload=50283 logs=994
-#   After the run: RustFS plain and empty, no turso-durable-* dirs in $TMPDIR, tree clean.
+#   After the run: RustFS plain and empty, no buckwal-* dirs in $TMPDIR, tree clean.
 #
 # Raw bench output of the six runs (setup a, b, c; off then window) follows.
 

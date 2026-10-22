@@ -1,9 +1,9 @@
-# turso_durable stage 1 measurements
+# buckwal stage 1 measurements
 # date: 2026-10-16T11:02:00Z
 # git: fab6bebb9cc6044e68359cc51b2cd7266438d9e1 (durable-core; the measured code, before this file was committed)
 # engine: turso_core 0.8.3 (features fs, json, uuid)
 # RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
-# build: cargo build --release --locked -p turso-durable-cli (rustc 1.97.1), target/release/turso-durable
+# build: cargo build --release --locked -p buckwal-cli (rustc 1.97.1), target/release/buckwal
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop figures: macOS, RustFS in podman on the same Mac; not production numbers
 #
@@ -16,14 +16,14 @@
 # setup (the first head, the CREATE TABLE's record); page_puts = PUTs to pages/ counted at the store.
 #
 # Commands (DURABLE_* from scripts/rustfs.sh env; run id 1792148480):
-#   DURABLE_PREFIX=bench13/1792148480/c500  turso-durable bench --dir <tmp>/c500  --commits 500
-#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable bench --dir <tmp>/c5000 --commits 5000
-#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable restore --dir <tmp>/r5000
-#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable verify  --dir <tmp>/r5000
-#   DURABLE_PREFIX=bench13/1792148480/c5000 turso-durable sql --dir <tmp>/r5000 "SELECT count(*), min(id), max(id) FROM bench"
+#   DURABLE_PREFIX=bench13/1792148480/c500  buckwal bench --dir <tmp>/c500  --commits 500
+#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal bench --dir <tmp>/c5000 --commits 5000
+#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal restore --dir <tmp>/r5000
+#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal verify  --dir <tmp>/r5000
+#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal sql --dir <tmp>/r5000 "SELECT count(*), min(id), max(id) FROM bench"
 #   (then, for a timed verify of a fresh copy:)
-#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p turso-durable restore --dir <tmp>/r5000b
-#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p turso-durable verify  --dir <tmp>/r5000b
+#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p buckwal restore --dir <tmp>/r5000b
+#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p buckwal verify  --dir <tmp>/r5000b
 
 ## bench --commits 500 (raw)
 commits=500

@@ -1,9 +1,9 @@
-# turso_durable stage 2 (batching-knob) measurements
+# buckwal stage 2 (batching-knob) measurements
 # date: 2026-10-16T19:40:00Z
 # git: 8a20b8419fe2dd884cd118dd711d3ea965ba6eb3 (batching-knob; the measured code, before this file was committed)
 # engine: turso_core 0.8.3 (features fs, json, uuid)
 # RustFS: docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
-# build: cargo build --release --locked -p turso-durable-cli (rustc 1.97.1), target/release/turso-durable
+# build: cargo build --release --locked -p buckwal-cli (rustc 1.97.1), target/release/buckwal
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
 # telemetry: DURABLE_OTEL unset (off), so no span or log record was exported during these runs.
@@ -39,9 +39,9 @@
 # run id 1792179518; <tmp> from mktemp -d, removed afterwards):
 #   for C in 1 8; for B in off 'window 1ms 64 1MiB' 'window 10ms 64 1MiB' 'window 50ms 64 1MiB':
 #     DURABLE_PREFIX=bench/stage2/c<C>-<off|window-Nms>-1792179518 \
-#       turso-durable bench --dir <tmp>/<tag> --commits 2000 --connections C --batching B
-#   DURABLE_PREFIX=bench/stage2/c1-off-1792179518 /usr/bin/time -p turso-durable restore --dir <tmp>/r-c1-off
-#   DURABLE_PREFIX=bench/stage2/c1-off-1792179518 /usr/bin/time -p turso-durable verify  --dir <tmp>/r-c1-off
+#       buckwal bench --dir <tmp>/<tag> --commits 2000 --connections C --batching B
+#   DURABLE_PREFIX=bench/stage2/c1-off-1792179518 /usr/bin/time -p buckwal restore --dir <tmp>/r-c1-off
+#   DURABLE_PREFIX=bench/stage2/c1-off-1792179518 /usr/bin/time -p buckwal verify  --dir <tmp>/r-c1-off
 
 ## c1-off: --connections 1 --batching 'off' (raw)
 commits=2000
@@ -321,7 +321,7 @@ Restore (the c1-off prefix: generation 6):
 # Maintenance checkpoint (Task 13)
 # date: 2026-10-17T08:52:04Z
 # git: c29e11c (batching-knob; the measured code, before this section was committed)
-# engine, RustFS, build, machine: as above (rustc 1.97.1, release build, target/release/turso-durable)
+# engine, RustFS, build, machine: as above (rustc 1.97.1, release build, target/release/buckwal)
 # laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
 # telemetry: DURABLE_OTEL unset (off).
 #
@@ -348,7 +348,7 @@ Restore (the c1-off prefix: generation 6):
 #   close-time TRUNCATE seals, so the final generation holds 1 log object.
 
 ## off-on-a: batching=off maintenance=on prefix=bench/maint-20261017195204-off-on-a
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.shqvYe/db --commits 6000 --connections 8
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.shqvYe/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.339
 commit_p95_ms=1.729
@@ -385,14 +385,14 @@ seal_7_ms=82.178 seal_7_pages=344
 seal_8_ms=90.738 seal_8_pages=371
 seal_9_ms=41.749 seal_9_pages=172
 seal_10_ms=50.132 seal_10_pages=191
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=11 log_objects=1 gets=4 lists=1 bytes=5243 ms=19
 real 0.03
 user 0.00
 sys 0.00
 
 ## off-off-a: batching=off maintenance=off prefix=bench/maint-20261017195204-off-off-a
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.VXyFVm/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.VXyFVm/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.353
 commit_p95_ms=1.764
@@ -429,14 +429,14 @@ seal_7_ms=43.723 seal_7_pages=172
 seal_8_ms=51.350 seal_8_pages=171
 seal_9_ms=95.940 seal_9_pages=341
 seal_10_ms=21.448 seal_10_pages=46
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=11 log_objects=1 gets=4 lists=1 bytes=5179 ms=23
 real 0.04
 user 0.00
 sys 0.00
 
 ## w1-on-a: batching=window 1ms 64 1MiB maintenance=on prefix=bench/maint-20261017195204-w1-on-a
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.uTC9z8/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.uTC9z8/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.174
 commit_p95_ms=22.155
@@ -466,14 +466,14 @@ generation_log_objects_max=1005
 seal_1_ms=5.785 seal_1_pages=2
 seal_2_ms=267.125 seal_2_pages=1147
 seal_3_ms=227.584 seal_3_pages=1048
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=21
 real 0.03
 user 0.00
 sys 0.00
 
 ## w1-off-a: batching=window 1ms 64 1MiB maintenance=off prefix=bench/maint-20261017195204-w1-off-a
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.6I61Su/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.6I61Su/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.015
 commit_p95_ms=22.470
@@ -502,14 +502,14 @@ maintenance_gate_wait_max_ms=0.000
 generation_log_objects_max=1945
 seal_1_ms=5.376 seal_1_pages=2
 seal_2_ms=512.145 seal_2_pages=2183
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=25
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-on-a: batching=window 10ms 64 1MiB maintenance=on prefix=bench/maint-20261017195204-w10-on-a
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.N5VQTe/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.N5VQTe/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=14.822
 commit_p95_ms=34.015
@@ -539,14 +539,14 @@ generation_log_objects_max=956
 seal_1_ms=8.349 seal_1_pages=2
 seal_2_ms=467.144 seal_2_pages=2057
 seal_3_ms=28.529 seal_3_pages=72
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=21
 real 0.03
 user 0.00
 sys 0.00
 
 ## w10-off-a: batching=window 10ms 64 1MiB maintenance=off prefix=bench/maint-20261017195204-w10-off-a
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hOtkrp/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hOtkrp/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=15.043
 commit_p95_ms=34.123
@@ -576,14 +576,14 @@ generation_log_objects_max=699
 seal_1_ms=11.419 seal_1_pages=2
 seal_2_ms=402.083 seal_2_pages=1512
 seal_3_ms=148.582 seal_3_pages=623
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=18
 real 0.03
 user 0.00
 sys 0.00
 
 ## w50-on-a: batching=window 50ms 64 1MiB maintenance=on prefix=bench/maint-20261017195204-w50-on-a
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hDPJ8H/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hDPJ8H/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=62.878
 commit_p95_ms=70.510
@@ -614,14 +614,14 @@ seal_1_ms=7.996 seal_1_pages=2
 seal_2_ms=243.095 seal_2_pages=842
 seal_3_ms=320.065 seal_3_pages=1225
 seal_4_ms=25.982 seal_4_pages=9
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=5 log_objects=1 gets=4 lists=1 bytes=4490 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## w50-off-a: batching=window 50ms 64 1MiB maintenance=off prefix=bench/maint-20261017195204-w50-off-a
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.bHQLOr/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.bHQLOr/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=63.441
 commit_p95_ms=69.935
@@ -652,14 +652,14 @@ seal_1_ms=19.080 seal_1_pages=2
 seal_2_ms=215.679 seal_2_pages=976
 seal_3_ms=144.842 seal_3_pages=496
 seal_4_ms=176.223 seal_4_pages=609
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=5 log_objects=1 gets=4 lists=1 bytes=4474 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-lo200-a: batching=off maintenance=lo200 prefix=bench/maint-20261017195204-off-lo200-a
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.QrBFvh/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.QrBFvh/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.257
 commit_p95_ms=2.083
@@ -714,14 +714,14 @@ seal_25_ms=23.206 seal_25_pages=76
 seal_26_ms=27.033 seal_26_pages=76
 seal_27_ms=52.545 seal_27_pages=78
 seal_28_ms=13.838 seal_28_pages=26
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=29 log_objects=1 gets=4 lists=1 bytes=5867 ms=19
 real 0.04
 user 0.00
 sys 0.00
 
 ## w50-lo200-a: batching=window 50ms 64 1MiB maintenance=lo200 prefix=bench/maint-20261017195204-w50-lo200-a
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kll3qb/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kll3qb/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=63.278
 commit_p95_ms=70.548
@@ -755,14 +755,14 @@ seal_4_ms=147.690 seal_4_pages=558
 seal_5_ms=129.946 seal_5_pages=486
 seal_6_ms=113.871 seal_6_pages=483
 seal_7_ms=24.979 seal_7_pages=76
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=8 log_objects=1 gets=4 lists=1 bytes=4538 ms=23
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-on-b: batching=off maintenance=on prefix=bench/maint-20261017195546-off-on-b
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.rGIR8c/db --commits 6000 --connections 8
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.rGIR8c/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.310
 commit_p95_ms=1.668
@@ -800,14 +800,14 @@ seal_8_ms=82.571 seal_8_pages=341
 seal_9_ms=50.217 seal_9_pages=177
 seal_10_ms=44.707 seal_10_pages=173
 seal_11_ms=54.459 seal_11_pages=205
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=12 log_objects=1 gets=4 lists=1 bytes=4939 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-off-b: batching=off maintenance=off prefix=bench/maint-20261017195546-off-off-b
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.wOapYA/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.wOapYA/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.378
 commit_p95_ms=1.786
@@ -841,14 +841,14 @@ seal_4_ms=79.588 seal_4_pages=340
 seal_5_ms=86.881 seal_5_pages=345
 seal_6_ms=135.329 seal_6_pages=511
 seal_7_ms=19.765 seal_7_pages=49
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=8 log_objects=1 gets=4 lists=1 bytes=5322 ms=20
 real 0.04
 user 0.00
 sys 0.00
 
 ## w1-on-b: batching=window 1ms 64 1MiB maintenance=on prefix=bench/maint-20261017195546-w1-on-b
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kwXnkG/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kwXnkG/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.159
 commit_p95_ms=15.144
@@ -878,14 +878,14 @@ generation_log_objects_max=1005
 seal_1_ms=9.439 seal_1_pages=2
 seal_2_ms=243.084 seal_2_pages=1138
 seal_3_ms=249.907 seal_3_pages=1069
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4522 ms=23
 real 0.04
 user 0.00
 sys 0.00
 
 ## w1-off-b: batching=window 1ms 64 1MiB maintenance=off prefix=bench/maint-20261017195546-w1-off-b
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.1OY2Ov/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.1OY2Ov/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.414
 commit_p95_ms=15.009
@@ -914,14 +914,14 @@ maintenance_gate_wait_max_ms=0.000
 generation_log_objects_max=1889
 seal_1_ms=5.410 seal_1_pages=2
 seal_2_ms=547.080 seal_2_pages=2174
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=26
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-on-b: batching=window 10ms 64 1MiB maintenance=on prefix=bench/maint-20261017195546-w10-on-b
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.lb0Q4B/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.lb0Q4B/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=14.964
 commit_p95_ms=35.222
@@ -953,14 +953,14 @@ seal_2_ms=208.873 seal_2_pages=768
 seal_3_ms=129.395 seal_3_pages=503
 seal_4_ms=108.611 seal_4_pages=388
 seal_5_ms=136.377 seal_5_pages=483
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=6 log_objects=1 gets=4 lists=1 bytes=4570 ms=23
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-off-b: batching=window 10ms 64 1MiB maintenance=off prefix=bench/maint-20261017195546-w10-off-b
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.FGwZKa/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.FGwZKa/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=14.886
 commit_p95_ms=35.155
@@ -992,14 +992,14 @@ seal_2_ms=176.963 seal_2_pages=757
 seal_3_ms=32.818 seal_3_pages=132
 seal_4_ms=133.269 seal_4_pages=503
 seal_5_ms=187.734 seal_5_pages=759
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=6 log_objects=1 gets=4 lists=1 bytes=4586 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## w50-on-b: batching=window 50ms 64 1MiB maintenance=on prefix=bench/maint-20261017195546-w50-on-b
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.jSj7vz/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.jSj7vz/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=62.900
 commit_p95_ms=70.738
@@ -1031,14 +1031,14 @@ seal_2_ms=278.455 seal_2_pages=1096
 seal_3_ms=183.107 seal_3_pages=729
 seal_4_ms=53.696 seal_4_pages=128
 seal_5_ms=52.346 seal_5_pages=138
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=6 log_objects=1 gets=4 lists=1 bytes=4538 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## w50-off-b: batching=window 50ms 64 1MiB maintenance=off prefix=bench/maint-20261017195546-w50-off-b
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.T0Vqv8/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.T0Vqv8/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=63.026
 commit_p95_ms=70.838
@@ -1070,14 +1070,14 @@ seal_2_ms=204.521 seal_2_pages=722
 seal_3_ms=182.530 seal_3_pages=604
 seal_4_ms=120.390 seal_4_pages=488
 seal_5_ms=84.653 seal_5_pages=277
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=6 log_objects=1 gets=4 lists=1 bytes=4538 ms=21
 real 0.03
 user 0.00
 sys 0.00
 
 ## off-lo200-b: batching=off maintenance=lo200 prefix=bench/maint-20261017195546-off-lo200-b
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.GrYPJ8/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.GrYPJ8/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.251
 commit_p95_ms=2.398
@@ -1135,14 +1135,14 @@ seal_28_ms=25.978 seal_28_pages=77
 seal_29_ms=36.089 seal_29_pages=76
 seal_30_ms=26.874 seal_30_pages=79
 seal_31_ms=7.517 seal_31_pages=13
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=32 log_objects=1 gets=4 lists=1 bytes=5931 ms=23
 real 0.05
 user 0.00
 sys 0.00
 
 ## w50-lo200-b: batching=window 50ms 64 1MiB maintenance=lo200 prefix=bench/maint-20261017195546-w50-lo200-b
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.ENhDEZ/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.ENhDEZ/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=62.819
 commit_p95_ms=70.630
@@ -1176,7 +1176,7 @@ seal_4_ms=165.849 seal_4_pages=555
 seal_5_ms=82.481 seal_5_pages=244
 seal_6_ms=64.560 seal_6_pages=129
 seal_7_ms=80.058 seal_7_pages=248
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=8 log_objects=1 gets=4 lists=1 bytes=4570 ms=34
 real 0.05
 user 0.00
@@ -1191,25 +1191,25 @@ sys 0.00
 # and machine as above; the restore line follows each run.
 
 ## off-on: batching=off maintenance=on prefix=bench/maint-20261017194520-off-on
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hysb8j/db --commits 6000 --connections 8
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hysb8j/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=7 log_objects=1 gets=4 lists=1 bytes=5002 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-off: batching=off maintenance=off prefix=bench/maint-20261017194520-off-off
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.v52BbK/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.v52BbK/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=7 log_objects=1 gets=4 lists=1 bytes=4874 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## w1-on: batching=window 1ms 64 1MiB maintenance=on prefix=bench/maint-20261017194520-w1-on
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.1CC9fP/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.1CC9fP/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.169
 commit_p95_ms=14.362
@@ -1238,14 +1238,14 @@ generation_log_objects_max=1005
 seal_1_ms=5.587 seal_1_pages=2
 seal_2_ms=280.348 seal_2_pages=1153
 seal_3_ms=230.938 seal_3_pages=1030
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4490 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## w1-off: batching=window 1ms 64 1MiB maintenance=off prefix=bench/maint-20261017194520-w1-off
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.8PKWtM/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.8PKWtM/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.229
 commit_p95_ms=14.844
@@ -1273,14 +1273,14 @@ maintenance_gate_wait_max_ms=0.000
 generation_log_objects_max=1901
 seal_1_ms=5.550 seal_1_pages=2
 seal_2_ms=507.578 seal_2_pages=2180
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=27
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-on: batching=window 10ms 64 1MiB maintenance=on prefix=bench/maint-20261017194520-w10-on
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.aLWUCS/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.aLWUCS/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=14.944
 commit_p95_ms=32.893
@@ -1309,14 +1309,14 @@ generation_log_objects_max=939
 seal_1_ms=7.655 seal_1_pages=2
 seal_2_ms=474.970 seal_2_pages=2048
 seal_3_ms=20.978 seal_3_pages=69
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4426 ms=24
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-off: batching=window 10ms 64 1MiB maintenance=off prefix=bench/maint-20261017194520-w10-off
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.XxqhCh/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.XxqhCh/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=14.985
 commit_p95_ms=34.342
@@ -1344,14 +1344,14 @@ maintenance_gate_wait_max_ms=0.000
 generation_log_objects_max=988
 seal_1_ms=9.652 seal_1_pages=2
 seal_2_ms=520.363 seal_2_pages=2122
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=24
 real 0.04
 user 0.00
 sys 0.00
 
 ## w50-on: batching=window 50ms 64 1MiB maintenance=on prefix=bench/maint-20261017194520-w50-on
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.HtD4nP/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.HtD4nP/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=62.751
 commit_p95_ms=70.411
@@ -1383,14 +1383,14 @@ seal_3_ms=168.530 seal_3_pages=607
 seal_4_ms=112.603 seal_4_pages=369
 seal_5_ms=102.302 seal_5_pages=368
 seal_6_ms=137.152 seal_6_pages=490
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=7 log_objects=1 gets=4 lists=1 bytes=4554 ms=26
 real 0.05
 user 0.00
 sys 0.00
 
 ## w50-off: batching=window 50ms 64 1MiB maintenance=off prefix=bench/maint-20261017194520-w50-off
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.Etzglc/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.Etzglc/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=62.711
 commit_p95_ms=70.530
@@ -1421,14 +1421,14 @@ seal_2_ms=119.001 seal_2_pages=367
 seal_3_ms=151.403 seal_3_pages=496
 seal_4_ms=162.805 seal_4_pages=603
 seal_5_ms=181.665 seal_5_pages=621
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=6 log_objects=1 gets=4 lists=1 bytes=4490 ms=23
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-on-r2: batching=off maintenance=on prefix=bench/maint-20261017194830-off-on-r2
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.F9BWt9/db --commits 6000 --connections 8
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.F9BWt9/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.232
 commit_p95_ms=1.598
@@ -1465,23 +1465,23 @@ seal_8_ms=86.774 seal_8_pages=337
 seal_9_ms=44.697 seal_9_pages=173
 seal_10_ms=41.969 seal_10_pages=173
 seal_11_ms=18.088 seal_11_pages=30
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=12 log_objects=1 gets=4 lists=1 bytes=5291 ms=19
 real 0.03
 user 0.00
 sys 0.00
 
 ## off-off-r2: batching=off maintenance=off prefix=bench/maint-20261017194830-off-off-r2
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.FBSywj/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.FBSywj/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=7 log_objects=1 gets=4 lists=1 bytes=5018 ms=23
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-lo200: batching=off maintenance=lo200 prefix=bench/maint-20261017194830-off-lo200
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kxf0AC/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.kxf0AC/db --commits 6000 --connections 8
 commits=6000
 commit_p50_ms=1.262
 commit_p95_ms=2.302
@@ -1538,14 +1538,14 @@ seal_28_ms=33.278 seal_28_pages=77
 seal_29_ms=44.007 seal_29_pages=76
 seal_30_ms=22.661 seal_30_pages=77
 seal_31_ms=9.349 seal_31_pages=13
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=32 log_objects=1 gets=4 lists=1 bytes=5931 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## w50-lo200: batching=window 50ms 64 1MiB maintenance=lo200 prefix=bench/maint-20261017194830-w50-lo200
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.KKMaxP/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=200 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.KKMaxP/db --commits 6000 --connections 8 --batching window 50ms 64 1MiB
 commits=6000
 commit_p50_ms=62.702
 commit_p95_ms=70.738
@@ -1579,14 +1579,14 @@ seal_5_ms=90.821 seal_5_pages=249
 seal_6_ms=146.398 seal_6_pages=478
 seal_7_ms=120.350 seal_7_pages=371
 seal_8_ms=34.968 seal_8_pages=73
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=9 log_objects=1 gets=4 lists=1 bytes=4634 ms=22
 real 0.04
 user 0.00
 sys 0.00
 
 ## w1-on-r2: batching=window 1ms 64 1MiB maintenance=on prefix=bench/maint-20261017194830-w1-on-r2
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.HL7eJh/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.HL7eJh/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.088
 commit_p95_ms=15.617
@@ -1615,14 +1615,14 @@ generation_log_objects_max=1005
 seal_1_ms=14.306 seal_1_pages=2
 seal_2_ms=286.209 seal_2_pages=1148
 seal_3_ms=261.207 seal_3_pages=1058
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4490 ms=21
 real 0.03
 user 0.00
 sys 0.00
 
 ## w1-off-r2: batching=window 1ms 64 1MiB maintenance=off prefix=bench/maint-20261017194830-w1-off-r2
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.2zXjgJ/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.2zXjgJ/db --commits 6000 --connections 8 --batching window 1ms 64 1MiB
 commits=6000
 commit_p50_ms=5.409
 commit_p95_ms=15.033
@@ -1650,14 +1650,14 @@ maintenance_gate_wait_max_ms=0.000
 generation_log_objects_max=1888
 seal_1_ms=5.600 seal_1_pages=2
 seal_2_ms=515.845 seal_2_pages=2169
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=28
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-on-r2: batching=window 10ms 64 1MiB maintenance=on prefix=bench/maint-20261017194830-w10-on-r2
-$  turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.IEXURI/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$  buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.IEXURI/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=15.069
 commit_p95_ms=33.874
@@ -1686,14 +1686,14 @@ generation_log_objects_max=963
 seal_1_ms=5.717 seal_1_pages=2
 seal_2_ms=475.009 seal_2_pages=2067
 seal_3_ms=28.572 seal_3_pages=63
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=4 log_objects=1 gets=4 lists=1 bytes=4458 ms=22
 real 0.04
 user 0.00
 sys 0.00
 
 ## w10-off-r2: batching=window 10ms 64 1MiB maintenance=off prefix=bench/maint-20261017194830-w10-off-r2
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.PIWL9T/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.PIWL9T/db --commits 6000 --connections 8 --batching window 10ms 64 1MiB
 commits=6000
 commit_p50_ms=14.828
 commit_p95_ms=33.534
@@ -1721,52 +1721,52 @@ maintenance_gate_wait_max_ms=0.000
 generation_log_objects_max=971
 seal_1_ms=12.897 seal_1_pages=2
 seal_2_ms=503.033 seal_2_pages=2115
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=3 log_objects=1 gets=4 lists=1 bytes=4362 ms=24
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-off-r3: batching=off maintenance=off prefix=bench/maint-20261017195049-off-off-r3
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.QvsoFr/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.QvsoFr/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=5 log_objects=1 gets=4 lists=1 bytes=4810 ms=21
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-off-r4: batching=off maintenance=off prefix=bench/maint-20261017195056-off-off-r4
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.VYU6GB/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.VYU6GB/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=5 log_objects=1 gets=4 lists=1 bytes=4858 ms=22
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-off-r5: batching=off maintenance=off prefix=bench/maint-20261017195101-off-off-r5
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.4uqSVa/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.4uqSVa/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=8 log_objects=1 gets=4 lists=1 bytes=4682 ms=21
 real 0.03
 user 0.00
 sys 0.00
 
 ## off-off-r6: batching=off maintenance=off prefix=bench/maint-20261017195107-off-off-r6
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.PCOOTx/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.PCOOTx/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=7 log_objects=1 gets=4 lists=1 bytes=4938 ms=24
 real 0.04
 user 0.00
 sys 0.00
 
 ## off-off-r7: batching=off maintenance=off prefix=bench/maint-20261017195112-off-off-r7
-$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 turso-durable bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hl9OzM/db --commits 6000 --connections 8
+$ DURABLE_MAINTENANCE_LOG_OBJECTS=0 DURABLE_MAINTENANCE_WAL_MIB=0 buckwal bench --dir /var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T//td-measure.hl9OzM/db --commits 6000 --connections 8
 error: engine error: database is busy (locked)
-$ turso-durable restore --dir <fresh>
+$ buckwal restore --dir <fresh>
 restored generation=7 log_objects=1 gets=4 lists=1 bytes=4826 ms=21
 real 0.05
 user 0.00

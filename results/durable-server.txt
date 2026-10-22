@@ -1,8 +1,8 @@
-# turso_durable durable-server: the full test command run
+# buckwal durable-server: the full test command run
 # SUPERSEDED: the figures directly below are round 2's run at 4621d4e. The canonical full run
 #   is now round 3's at eda0d1d (the "Round 3: full test command run" block at the end of this
 #   file). Round 3's client runs are in the section before it.
-# date: 2026-10-18T22:03:40 local (test run id turso-durable-20261018220340-53912)
+# date: 2026-10-18T22:03:40 local (test run id buckwal-20261018220340-53912)
 # git: 4621d4e60a23eb28dd3a8cf14e5e03b9c7741fe2 (durable-server), with this commit's script
 #   changes in the working tree: scripts/otel-check.sh (SPANS gains durable.server.request) and
 #   a comment in scripts/test.sh; the rest of the working-tree diff was README.md only.
@@ -20,10 +20,10 @@
 # rc=0; wall time 12:01.50 (`208.52s user 82.92s system 40% cpu 12:01.50 total`, 721.5 s).
 #
 # unit (fmt, clippy -D warnings, cargo test --workspace --locked):
-#   turso-durable (cli bin): 28 passed
-#   turso-durable-hrana-client: 6 passed
-#   turso-durable-server: lib 62 passed; tests/http.rs 21 passed (3.96 s); tests/span.rs 1 passed
-#   turso_durable: lib 389 passed (51.19 s); batching 33 (14.31 s); fencing 5 (3.06 s); otel_down 1
+#   buckwal (cli bin): 28 passed
+#   buckwal-hrana-client: 6 passed
+#   buckwal-server: lib 62 passed; tests/http.rs 21 passed (3.96 s); tests/span.rs 1 passed
+#   buckwal: lib 389 passed (51.19 s); batching 33 (14.31 s); fencing 5 (3.06 s); otel_down 1
 #   (ignored there: server 5, system 38, s3_rustfs 12)
 #
 # pass 1 (plain HTTP, no encryption; --skip tls_):
@@ -34,7 +34,7 @@
 #   CREATE TABLE: found in 13612 objects
 #   SQLite header: found in 13612 objects
 #   bench payload: found in 1996 objects
-#   peak turso-durable-objects: 721 MB (plain)
+#   peak buckwal-objects: 721 MB (plain)
 #
 # pass 2 (HTTPS + encryption, every test; serve over HTTPS with a bearer token):
 #   server: "test result: ok. 5 passed; 0 failed" (6.79 s)
@@ -46,7 +46,7 @@
 #   bench payload: not found
 #   marker 1: not found
 #   the encryption key: not found
-#   peak turso-durable-objects: 735 MB (https+encryption)
+#   peak buckwal-objects: 735 MB (https+encryption)
 #
 # otel check PASSED: durable.ack_wait=86088 durable.checkpoint_upload=530 durable.commit=86086
 #   durable.fence=23 durable.gc=818 durable.local_fsync=86243 durable.local_write=86291
@@ -71,14 +71,14 @@
 # race (a parallel test bound the freed ephemeral port), fixed in 4621d4e together with the
 # reset race of oversized_body_is_413.
 #
-# After the run: RustFS plain and empty (rustfs.sh reset on exit), no turso-durable-* dirs in
+# After the run: RustFS plain and empty (rustfs.sh reset on exit), no buckwal-* dirs in
 # $TMPDIR.
 #
 # ---------------------------------------------------------------------------------------------
 # Round 3: tursodb conformance and drivers (2026-10-19)
 # ---------------------------------------------------------------------------------------------
 # Protocol: tursodb's "SQL over HTTP v3", serverless/PROTOCOL.md in the turso repo at 0b2bec917.
-# Server: turso-durable serve, debug build, plain HTTP on 127.0.0.1 (port 0), bearer token from
+# Server: buckwal serve, debug build, plain HTTP on 127.0.0.1 (port 0), bearer token from
 #   a file, --claim on a fresh RustFS prefix, SIGTERM at the end. No HTTPS run.
 #
 # tursodb's conformance suite (serverless/rust/conformance at 0b2bec917): 24 raw-HTTP protocol
@@ -124,34 +124,34 @@
 #   libsql-client-go).
 #
 # Logs (scratch, outside the repo, not kept):
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before-serial.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before.log (parallel)
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-serial.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-parallel.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-before.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-t2b.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-final.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-final-serial.log (c5ad4c5)
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-final-parallel.log (c5ad4c5)
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-10e62fb-serial.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-10e62fb-parallel.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-10e62fb.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/named-probe-before.log, named-probe-after.log (c5ad4c5 and 10e62fb, over HTTP)
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before-serial.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before.log (parallel)
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-serial.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-parallel.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-before.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-t2b.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-final.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-final-serial.log (c5ad4c5)
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-final-parallel.log (c5ad4c5)
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-10e62fb-serial.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-10e62fb-parallel.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-10e62fb.log
+#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/named-probe-before.log, named-probe-after.log (c5ad4c5 and 10e62fb, over HTTP)
 #
 # ---------------------------------------------------------------------------------------------
 # Round 3: full test command run (canonical; supersedes the 4621d4e figures at the top)
 # ---------------------------------------------------------------------------------------------
-# date: 2026-10-19 (test run id turso-durable-20261019230210-97811)
+# date: 2026-10-19 (test run id buckwal-20261019230210-97811)
 # git: eda0d1d (durable-server); the code is unchanged since 9aec32a (eda0d1d changed docs,
 #   comments, two error message strings ("… needs /v3") and the serve help text). 10e62fb came
 #   after this run: its unit run (fmt, clippy -D warnings, cargo test --workspace --locked) gave
-#   588 passed (turso-durable-server lib 81); the full command has not been run at 10e62fb.
+#   588 passed (buckwal-server lib 81); the full command has not been run at 10e62fb.
 # Command: ./scripts/test.sh, run by the controller. exit 0; wall time 12:15.
 # Log (scratch, outside the repo): /private/tmp/claude-502/round3/full-run.log
 #
 # unit (fmt, clippy -D warnings, cargo test --workspace --locked): 587 passed
-#   turso-durable (cli bin) 28; turso-durable-hrana-client 6; turso-durable-server lib 80,
-#   tests/http.rs 36, tests/span.rs 1; turso_durable lib 397, batching 33, fencing 5, otel_down 1
+#   buckwal (cli bin) 28; buckwal-hrana-client 6; buckwal-server lib 80,
+#   tests/http.rs 36, tests/span.rs 1; buckwal lib 397, batching 33, fencing 5, otel_down 1
 #
 # pass 1 (plain HTTP, no encryption; --skip tls_):
 #   server: "test result: ok. 5 passed; 0 failed" (7.21 s)
@@ -161,7 +161,7 @@
 #   CREATE TABLE: found in 13140 objects (the control: present)
 #   SQLite header: found in 13140 objects
 #   bench payload: found in 1908 objects
-#   peak turso-durable-objects: 703 MB (plain)
+#   peak buckwal-objects: 703 MB (plain)
 #
 # pass 2 (HTTPS + encryption, every test; serve over HTTPS with a bearer token):
 #   server: "test result: ok. 5 passed; 0 failed" (9.35 s)
@@ -173,7 +173,7 @@
 #   bench payload: not found
 #   marker 1: not found
 #   the encryption key: not found
-#   peak turso-durable-objects: 751 MB (https+encryption)
+#   peak buckwal-objects: 751 MB (https+encryption)
 #
 # otel check PASSED: durable.ack_wait=84860 durable.checkpoint_upload=530 durable.commit=84860
 #   durable.fence=23 durable.gc=818 durable.local_fsync=85034 durable.local_write=85070
