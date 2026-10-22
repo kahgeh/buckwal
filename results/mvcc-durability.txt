@@ -27,3 +27,9 @@ Task 6: WAL frames next to an empty app.db-log (engine: "logical log header is m
   before: wal_frames_with_empty_log_is_repaired_and_opens asserts the engine refuses the
     directory; repair_wal_without_log (the engine's reset_to_fresh_header) then opens it, rows 1..=10
   mutation (repair call removed from restore): restore_with_wal_frames_and_empty_log_image_writes_a_header FAILED
+
+Task 6 fix round 1: a .db-log-only NewGeneration truncated the dirty file (dropping an unsealed dirty record)
+  before: log_only_new_generation_keeps_the_dirty_file FAILED
+    assertion `left == right` failed: not truncated   left: []   right: [7, 0, 0, 0]
+  after:  test db::tests::mvcc::restore::log_only_new_generation_keeps_the_dirty_file ... ok
+  golden: restore_wal_bucket_bytes_identical_to_before fails with kind-1 syncs replayed in reverse; passes on base ecc9f4f

@@ -129,7 +129,9 @@ pub(crate) fn reconcile_files(
     if wal_new || log_new {
         // The seal of the local generation published `manifest/(head.generation - 1)`,
         // which covers every page that WAL and the dirty file name.
-        if head.manifest.is_some() {
+        // Only a change of generation (or a stale WAL of the generation before) is covered by
+        // the manifest; a `.db-log` replaced alone leaves the dirty record of this generation.
+        if head.manifest.is_some() && (behind || wal_new) {
             truncate_dirty_file(&dir.join(DIRTY_FILE))?;
         }
         // An unclaimed directory (restored, or only ever opened read-only) never checkpointed

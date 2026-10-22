@@ -407,8 +407,15 @@ fn restore_of_created_mvcc_bucket_opens() {
     }
     assert_eq!(ids(&c), vec![1, 2, 3]);
     assert_eq!(integrity_of(&c), "ok");
+    // A seal on the restored (empty-log) directory, then a commit after it, then another
+    // restore: every row, and the sealed generation's log image starts with the commit's header.
+    truncate_checkpoint(&c).unwrap();
+    assert_eq!(db.generation(), 3);
+    insert_c(&c, 4).unwrap();
+    assert_eq!(ids(&c), vec![1, 2, 3, 4]);
+    assert_eq!(integrity_of(&c), "ok");
     crash(db, vec![c]);
-    restored_rows(&store, &[1, 2, 3]);
+    restored_rows(&store, &[1, 2, 3, 4]);
 }
 
 /// Level, Behind, Ahead and NewGeneration, each for the `.db-log`.
@@ -539,10 +546,11 @@ fn restore_of_mvcc_bucket_by_wal_config_is_refused() {
     );
 }
 
-/// A WAL bucket restores to exactly the bytes it did before: the kind-1 replay in `app.db-wal`,
-/// the seed (or nothing) in `app.db`, the local state, and no `app.db-log`.
+/// A WAL bucket restores to the kind-1 replay in `app.db-wal`, the seed (or nothing) in
+/// `app.db`, the local state, and no `app.db-log` (a live database; the golden bytes are
+/// `restore_wal_bucket_bytes_identical_to_before`).
 #[test]
-fn restore_wal_bucket_bytes_identical_to_before() {
+fn restore_wal_bucket_files_match_kind1_replay() {
     for sealed in [false, true] {
         let store = mem();
         let t = tempdir();
@@ -630,4 +638,136 @@ fn restore_after_adopt_and_failed_checkpoint_opens() {
     let want: Vec<i64> = (1..=12).collect();
     check_open(&mem, copy.path(), &want);
     restored_rows(&mem, &want);
+}
+
+/// Golden bytes: a hand-built WAL bucket (two page-512 frames; records whose replay depends on
+/// the order of records, of syncs inside a record, and on a truncate) restores to bytes written
+/// out by hand here, not by `apply_ops`. The same test was run against the base commit
+/// (ecc9f4f) and passed there.
+#[test]
+fn restore_wal_bucket_bytes_identical_to_before() {
+    const PS: usize = 512;
+    let mut header = vec![0u8; 32];
+    header[0..4].copy_from_slice(&0x377f_0682u32.to_be_bytes());
+    header[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+    header[8..12].copy_from_slice(&(PS as u32).to_be_bytes());
+    let frame = |pgno: u32, fill: u8| {
+        let mut f = vec![0u8; 24 + PS];
+        f[0..4].copy_from_slice(&pgno.to_be_bytes());
+        f[4..8].copy_from_slice(&pgno.to_be_bytes());
+        for (i, b) in f[24..].iter_mut().enumerate() {
+            *b = fill.wrapping_add((i % 251) as u8);
+        }
+        // Bytes 18/19 of page 1: legacy (2), not MVCC.
+        f[24 + 18] = 2;
+        f[24 + 19] = 2;
+        f
+    };
+    let (f1, f2) = (frame(1, 0x10), frame(2, 0x40));
+    let at = 32 + 24 + 100;
+    let ext = |syncs: Vec<Vec<Op>>| LogRecord::Extents {
+        file: LogFile::Wal,
+        writer_id: "w".into(),
+        syncs,
+    };
+    let w = |off: usize, bytes: Vec<u8>| Op::Write {
+        off: off as u64,
+        bytes,
+    };
+    let records = [
+        ext(vec![vec![w(0, header.clone()), w(32, f1.clone())]]),
+        ext(vec![
+            vec![w(at, vec![0xAA; 8])],
+            vec![w(at, vec![0xBB; 4]), w(32 + 24 + PS, f2.clone())],
+        ]),
+        ext(vec![vec![
+            w(32 + 2 * (24 + PS), vec![9; 10]),
+            Op::Truncate {
+                len: (32 + 2 * (24 + PS)) as u64,
+            },
+        ]]),
+    ];
+    let store = mem();
+    for (i, r) in records.iter().enumerate() {
+        store
+            .put(&keys().log(1, i as u64 + 1), &encode_record(r))
+            .unwrap();
+    }
+    let h = Head {
+        journal_mode: JournalMode::Wal,
+        format: 1,
+        generation: 1,
+        manifest: None,
+        writer_id: "w".into(),
+        epoch: 0,
+    };
+    store.put(&keys().head(), &h.encode()).unwrap();
+
+    // The expected bytes, by hand.
+    let mut expect = header.clone();
+    expect.extend_from_slice(&f1);
+    expect.extend_from_slice(&f2);
+    expect[at..at + 4].copy_from_slice(&[0xBB; 4]);
+    expect[at + 4..at + 8].copy_from_slice(&[0xAA; 4]);
+    let mut page1 = f1[24..].to_vec();
+    page1[100..104].copy_from_slice(&[0xBB; 4]);
+    page1[104..108].copy_from_slice(&[0xAA; 4]);
+
+    let t = tempdir();
+    let d = fresh(&t);
+    restore_with_store(&config(&d), store.clone(), &d).unwrap();
+    assert_eq!(read(&d, "app.db-wal"), expect);
+    assert_eq!(read(&d, "app.db"), page1, "the page-1 seed");
+    assert!(!d.join("app.db-log").exists());
+}
+
+/// A dirty record (a page checkpointed since the last seal) is not dropped by a reconcile
+/// that only replaces the `.db-log`: the generation did not change, no seal covers it.
+#[test]
+fn log_only_new_generation_keeps_the_dirty_file() {
+    let store = mem();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let db = open_mvcc(store.clone(), mvcc(&dir));
+    // A created database: generation 2, its log image empty, its local log the header.
+    let copy = copy_dir(&dir);
+    crash(db, vec![]);
+    assert_eq!(read(copy.path(), "app.db-log").len(), 56);
+    let dirty = [7u8, 0, 0, 0];
+    std::fs::write(copy.path().join("app.db-dirty"), dirty).unwrap();
+    let o = outcomes(&store, copy.path());
+    assert_eq!(o.log, Some(Reconciled::NewGeneration));
+    assert_eq!(o.wal, Reconciled::Level);
+    assert_eq!(read(copy.path(), "app.db-dirty"), dirty, "not truncated");
+}
+
+/// `wal_frames_with_empty_log_is_repaired_and_opens`, encrypted: the repair needs no key, and
+/// the engine opens the result with it.
+#[test]
+fn wal_frames_with_empty_log_is_repaired_and_opens_encrypted() {
+    let mem = mem();
+    let store = Arc::new(FaultStore::new(mem.clone()));
+    let k = tempdir();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let c = mvcc_enc(&dir, &k, &key_hex());
+    let enc = encryption::load(&c).unwrap().unwrap();
+    let (db, conn) = mvcc_with_rows(store.clone(), c, 4);
+    store.only_keys_containing("/manifest/");
+    store.fail_puts_after(0);
+    assert!(truncate_checkpoint(&conn).is_err());
+    store.fail_puts_after(u64::MAX);
+    store.only_keys_containing("");
+    let b = bucket_image(&*mem);
+    assert!(!b.wal.is_empty());
+    crash(db, vec![conn]);
+    let d = tempdir();
+    std::fs::write(d.path().join("app.db-wal"), &b.wal).unwrap();
+    assert!(repair_wal_without_log(d.path()).unwrap());
+    let log = std::fs::read(d.path().join("app.db-log")).unwrap();
+    assert_eq!(log.len(), 56);
+    assert_eq!(
+        plain_rows(&b.db, &b.wal, &log, Some(&enc)),
+        vec![1, 2, 3, 4]
+    );
 }
