@@ -9,7 +9,7 @@
 //! directory is never opened again: the next open removes it (`clear_interrupted_create`).
 use crate::encryption::Encryption;
 use crate::error::{Error, Result};
-use crate::files::{io_err, DB_FILE, LOG_FILE, STATE_FILE};
+use crate::files::{io_err, DB_FILE, LOG_FILE, STATE_FILE, WAL_FILE};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +93,13 @@ pub(crate) fn build_mvcc_image(staging: &Path, enc: Option<&Encryption>) -> Resu
         conn.close().map_err(engine)?;
         (ps, header)
     };
+    // The checkpoint backfilled every frame and truncated the `-wal`: the image is `app.db`.
+    let wal = fs::metadata(staging.join(WAL_FILE)).map_or(0, |m| m.len());
+    if wal != 0 {
+        return Err(Error::Engine(format!(
+            "the TRUNCATE checkpoint left a {wal}-byte app.db-wal"
+        )));
+    }
     if header.len() != LOG_HEADER_LEN {
         return Err(Error::Engine(format!(
             "the switch left a {}-byte app.db-log, not the {LOG_HEADER_LEN}-byte header",
@@ -145,6 +152,7 @@ fn sync_dir_files(staging: &Path) -> Result<()> {
 }
 
 fn fsync_dir(dir: &Path) -> Result<()> {
+    trace(|| format!("fsync {}", name(dir)));
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))
@@ -159,19 +167,37 @@ fn remove_dir_if_exists(d: &Path) -> Result<()> {
 }
 
 /// Move the staged `app.db-log`, `app.db` and local state (written into `staging` by the
-/// caller) into `dir`, the state last, then remove `staging`. Runs only after the bucket's
+/// caller) into `dir`, the state last, fsyncing `dir` after each rename, then remove
+/// `staging`. Runs only after the bucket's
 /// head landed. A crash during it leaves `staging`, and `clear_interrupted_create` takes the
 /// directory back to empty unless the state file already made it in.
 pub(crate) fn move_created(staging: &Path, dir: &Path) -> Result<()> {
     for (moved, f) in CREATED.iter().enumerate() {
         crash_point(moved)?;
+        trace(|| format!("rename {f}"));
         fs::rename(staging.join(f), dir.join(f))
             .map_err(|e| io_err(&format!("move created {f}"), e))?;
+        // Durable before the next rename: the state file must never reach the disk ahead of
+        // the files it vouches for.
+        fsync_dir(dir)?;
     }
     crash_point(CREATED.len())?;
-    fsync_dir(dir)?;
     remove_dir_if_exists(staging)?;
     fsync_dir(dir)
+}
+
+/// Tests: record `event` in `TRACE`.
+fn trace(event: impl FnOnce() -> String) {
+    #[cfg(test)]
+    TRACE.with(|t| t.borrow_mut().push(event()));
+    let _ = event;
+}
+
+/// A path's last component, for `trace`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn name(p: &Path) -> String {
+    p.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 /// Tests: the crash `CRASH_AFTER_MOVING` injects once `moved` files are in place.
@@ -215,4 +241,43 @@ thread_local! {
     /// all moved, before the staging directory is removed), as a crash there would. Per
     /// thread.
     pub(crate) static CRASH_AFTER_MOVING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests: every rename and directory fsync of a creation's move, in order. Per thread.
+    pub(crate) static TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each rename into the database directory is made durable before the next one: the
+    /// state file never reaches the disk ahead of `app.db` or `app.db-log`.
+    #[test]
+    fn move_created_fsyncs_the_dir_after_each_rename() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("db");
+        let staging = staging_dir(&dir);
+        fs::create_dir_all(&staging).unwrap();
+        for f in CREATED {
+            fs::write(staging.join(f), f).unwrap();
+        }
+        TRACE.with(|t| t.borrow_mut().clear());
+        move_created(&staging, &dir).unwrap();
+        let trace = TRACE.with(|t| t.take());
+        assert_eq!(
+            trace,
+            [
+                "rename app.db-log",
+                "fsync db",
+                "rename app.db",
+                "fsync db",
+                "rename app.db-durable",
+                "fsync db",
+                "fsync db",
+            ]
+        );
+        assert!(!staging.exists());
+        for f in CREATED {
+            assert_eq!(fs::read(dir.join(f)).unwrap(), f.as_bytes());
+        }
+    }
 }
