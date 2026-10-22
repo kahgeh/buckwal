@@ -2,12 +2,12 @@
 //! Restore onto an empty directory: rebuild the current generation's `-wal` from its log and
 //! leave every database page in the bucket, to be fetched on first read.
 
-use crate::config::{Config, EngineConfig};
-use crate::db::DirGuard;
+use crate::config::{Config, EngineConfig, JournalMode};
+use crate::db::{refuse_mode_mismatch, DirGuard};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
-    apply_ops, decode_record, Head, Keys, LocalState, LogFile, LogRecord, Manifest, FORMAT,
+    apply_ops, decode_record, Head, Keys, LocalState, LogFile, LogRecord, Manifest,
 };
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
@@ -120,15 +120,13 @@ pub(crate) fn fetch_generation(
         .collect())
 }
 
-/// MVCC lives in header bytes 18/19 of page 1 (D5).
-fn refuse_mvcc(page1: &[u8]) -> Result<()> {
+/// Page 1 (header bytes 18/19, D5) against the head's journal mode and the one this
+/// restore asks for (`refuse_mode_mismatch`).
+fn refuse_mvcc(page1: &[u8], head: &Head, mode: JournalMode) -> Result<()> {
     if page1.len() < 20 {
         return Err(Error::Corrupt("page 1 is shorter than its header".into()));
     }
-    if page1[18] == 255 || page1[19] == 255 {
-        return Err(Error::Unsupported("MVCC"));
-    }
-    Ok(())
+    refuse_mode_mismatch(head, Some([page1[18], page1[19]]), mode)
 }
 
 /// The first whole page-1 frame of a `-wal` image (layout as in `wal_frame_pages`).
@@ -294,10 +292,10 @@ fn generation_image_counted(
 /// WAL holding frames next to it as an orphan (database.rs:738-760, 2223-2246). Any page-1
 /// frame bootstraps it (page size, reserved space); page 1 itself is read from the WAL, which
 /// holds the current version. Empty when `wal` has no page-1 frame.
-pub(crate) fn page_one_seed(wal: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn page_one_seed(wal: &[u8], head: &Head, mode: JournalMode) -> Result<Vec<u8>> {
     match wal_page_one(wal) {
         Some(p) => {
-            refuse_mvcc(p)?;
+            refuse_mvcc(p, head, mode)?;
             Ok(p.to_vec())
         }
         None => Ok(Vec::new()),
@@ -392,10 +390,12 @@ fn restore_files(
     let head_obj = counted(retries, retry, &head_key, || store.get(&head_key))?
         .ok_or_else(|| Error::NotFound(head_key.clone()))?;
     let head = Head::decode(&head_obj.body)?;
+    // The mode is checked on the head alone first: nothing is fetched for a mismatch.
+    refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
     let sealed_page1 = match head.manifest {
         Some(g) => {
             let p = manifest_page_one(&*store, keys, g, retry, retries)?;
-            refuse_mvcc(&p)?;
+            refuse_mvcc(&p, &head, cfg.journal_mode)?;
             Some(p)
         }
         None => None,
@@ -404,7 +404,7 @@ fn restore_files(
     // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).
     let db = match head.manifest {
         Some(_) => Vec::new(),
-        None => page_one_seed(&wal)?,
+        None => page_one_seed(&wal, &head, cfg.journal_mode)?,
     };
     fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
     write_synced(&dir.join(WAL_FILE), &wal)?;
@@ -413,7 +413,7 @@ fn restore_files(
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))?;
     LocalState {
-        format: FORMAT,
+        format: head.format,
         writer_id: head.writer_id.clone(),
         generation: head.generation,
         complete: false,

@@ -35,6 +35,7 @@ pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
         events: None,
         read_only: false,
         encryption: None,
+        journal_mode: crate::config::JournalMode::Wal,
     }
 }
 
@@ -986,4 +987,17 @@ fn wal_high_water_follows_the_generation() {
     commit_row(&conn, 41).unwrap();
     let restarted = e.wal_bytes.load(SeqCst);
     assert!(restarted < high / 4, "{restarted} vs {high}");
+}
+
+#[test]
+fn passive_checkpoint_flag_never_set() {
+    // The library builds `DatabaseOpts`; no call that turns the experimental flag on.
+    let src = include_str!("../engine.rs");
+    for line in src.lines() {
+        let code = line.split("//").next().unwrap();
+        assert!(!code.contains("passive_checkpoint"), "{line}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let (e, _conn) = writer(Arc::new(MemStore::new()), d.path());
+    assert!(!e.db.db.experimental_mvcc_passive_checkpoint_enabled());
 }

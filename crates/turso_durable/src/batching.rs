@@ -134,6 +134,17 @@ impl fmt::Display for Batching {
 }
 
 impl Batching {
+    /// Window batching acks followers before their upload is confirmed, which an MVCC
+    /// database never does (`MVCC: Window batching`).
+    pub(crate) fn check_mode(&self, mode: crate::config::JournalMode) -> Result<()> {
+        match (self, mode) {
+            (Batching::Window { .. }, crate::config::JournalMode::Mvcc) => {
+                Err(Error::Unsupported("MVCC: Window batching"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// A window needs room for at least one commit and one byte, and may wait at most
     /// [`defaults::MAX_BATCH_WAIT`] (60 s).
     pub fn validate(&self) -> Result<()> {

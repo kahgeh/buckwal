@@ -12,10 +12,10 @@
 //! has not opened the files yet and `durable.lock` keeps every other process out.
 
 use crate::bucket::{Bucket, LogPos};
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, JournalMode};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, WAL_FILE};
-use crate::format::{LocalState, Op};
+use crate::format::{Head, LocalState, Op};
 use crate::io::db_storage::{truncate_dirty_file, READ_ONLY};
 use crate::io::wal_file::EPOCH;
 use crate::restore::{generation_image, page_one_seed, write_synced};
@@ -43,6 +43,7 @@ pub(crate) fn reconcile(
     cfg: &EngineConfig,
 ) -> Result<Reconciled> {
     let head = bucket.head().clone();
+    crate::db::refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
     if head.writer_id != state.writer_id {
         return Err(Error::Fenced(format!(
             "head names writer {:?}, not this directory's {:?}",
@@ -112,7 +113,7 @@ pub(crate) fn reconcile(
             Reconciled::Level | Reconciled::Ahead { .. } => &local,
             Reconciled::Behind | Reconciled::NewGeneration => &image,
         };
-        seed_database_file(dir, wal)?;
+        seed_database_file(dir, wal, &head, cfg.journal_mode)?;
     }
     Ok(outcome)
 }
@@ -186,7 +187,7 @@ fn replace_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
 
 /// Never sealed: an empty or missing database file next to a WAL with frames would be read
 /// as a new database and the WAL deleted, so seed it as a restore does (`page_one_seed`).
-fn seed_database_file(dir: &Path, wal: &[u8]) -> Result<()> {
+fn seed_database_file(dir: &Path, wal: &[u8], head: &Head, mode: JournalMode) -> Result<()> {
     let len = match fs::metadata(dir.join(DB_FILE)) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -195,7 +196,7 @@ fn seed_database_file(dir: &Path, wal: &[u8]) -> Result<()> {
     if len > 0 {
         return Ok(());
     }
-    let seed = page_one_seed(wal)?;
+    let seed = page_one_seed(wal, head, mode)?;
     if seed.is_empty() {
         return Ok(());
     }

@@ -83,6 +83,9 @@ fn read_only_err<T: std::fmt::Debug>(r: Result<T>) {
     assert_eq!(unsupported(r), "writes on a read-only open");
 }
 
+const SWITCH_TO_MVCC: &str = "MVCC: switching an existing WAL database";
+const SWITCH_BACK: &str = "MVCC: switching back to WAL";
+
 fn header_bytes(dir: &Path) -> (u8, u8) {
     let b = std::fs::read(dir.join("app.db")).unwrap();
     (b[18], b[19])
@@ -265,8 +268,8 @@ fn mvcc_pragma_is_refused_and_header_unchanged() {
         "PRAGMA journal_mode='EXPERIMENTAL_MVCC'",
         "PRAGMA main.journal_mode = 'mvcc'",
     ] {
-        assert_eq!(unsupported(c.execute(sql, &[])), "MVCC", "{sql}");
-        assert_eq!(unsupported(c.query(sql, &[])), "MVCC", "{sql}");
+        assert_eq!(unsupported(c.execute(sql, &[])), SWITCH_TO_MVCC, "{sql}");
+        assert_eq!(unsupported(c.query(sql, &[])), SWITCH_TO_MVCC, "{sql}");
     }
     insert(&c, 2).unwrap();
     c.close().unwrap();
@@ -325,7 +328,7 @@ fn mvcc_pragma_inside_batch_is_refused() {
     let c = db.connect().unwrap();
     create(&c);
     let r = c.execute_batch("INSERT INTO t(id, v) VALUES (1, 'a'); PRAGMA journal_mode=mvcc;");
-    assert_eq!(unsupported(r), "MVCC");
+    assert_eq!(unsupported(r), SWITCH_TO_MVCC);
     assert!(ids(&c).is_empty(), "the INSERT ran");
     c.execute_batch("INSERT INTO t(id, v) VALUES (1, 'a'); INSERT INTO t(id, v) VALUES (2, 'b');")
         .unwrap();
@@ -3077,8 +3080,8 @@ fn encrypted_mvcc_pragma_is_refused_and_header_unchanged() {
         "PRAGMA journal_mode='EXPERIMENTAL_MVCC'",
         "PRAGMA main.journal_mode = 'mvcc'",
     ] {
-        assert_eq!(unsupported(c.execute(sql, &[])), "MVCC", "{sql}");
-        assert_eq!(unsupported(c.query(sql, &[])), "MVCC", "{sql}");
+        assert_eq!(unsupported(c.execute(sql, &[])), SWITCH_TO_MVCC, "{sql}");
+        assert_eq!(unsupported(c.query(sql, &[])), SWITCH_TO_MVCC, "{sql}");
     }
     insert(&c, 2).unwrap();
     c.close().unwrap();
@@ -3357,4 +3360,167 @@ fn takeover_without_a_key_on_a_plaintext_database_goes_ahead() {
     std::mem::forget(db);
     let db = open_mem(&store, &fresh(&t));
     assert_eq!(ids(&db.connect().unwrap()), (1..=11).collect::<Vec<_>>());
+}
+
+fn mvcc_config(dir: &Path) -> Config {
+    let mut c = config(dir);
+    c.journal_mode = JournalMode::Mvcc;
+    c
+}
+
+/// A WAL database with one row, sealed, closed. Returns the store and the directory.
+fn closed_wal_database() -> (Arc<MemStore>, TempDir) {
+    let store = mem();
+    let t = tempdir();
+    let db = open_mem(&store, t.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    insert(&c, 1).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    (store, t)
+}
+
+/// The bucket's head rewritten as an MVCC bucket's (format 2), and a local state to match.
+fn make_bucket_mvcc(store: &MemStore, dir: Option<&Path>) {
+    let mut h = head(store);
+    h.format = crate::format::FORMAT_V2;
+    h.journal_mode = JournalMode::Mvcc;
+    store.put(&keys().head(), &h.encode()).unwrap();
+    if let Some(dir) = dir {
+        let mut s = state(dir);
+        s.format = crate::format::FORMAT_V2;
+        s.write_atomic(dir).unwrap();
+    }
+}
+
+#[test]
+fn wal_bucket_opened_as_mvcc_is_refused() {
+    let (store, t) = closed_wal_database();
+    // The directory that created it (local state, claimed bucket).
+    let before = store.stats().puts;
+    let r = open_with_store(mvcc_config(t.path()), store.clone());
+    assert_eq!(unsupported(r), SWITCH_TO_MVCC);
+    // A fresh disk (restore path).
+    let t2 = tempdir();
+    let r = open_with_store(mvcc_config(&fresh(&t2)), store.clone());
+    assert_eq!(unsupported(r), SWITCH_TO_MVCC);
+    assert_eq!(store.stats().puts, before, "the bucket was written");
+    // Read-only too.
+    let t3 = tempdir();
+    let r = open_read_only_with_store(mvcc_config(&fresh(&t3)), store.clone());
+    assert_eq!(unsupported(r), SWITCH_TO_MVCC);
+    // Nothing changed for WAL: it opens and keeps its row.
+    let db = open_mem(&store, t.path());
+    assert_eq!(ids(&db.connect().unwrap()), vec![1]);
+}
+
+#[test]
+fn mvcc_bucket_opened_as_wal_is_refused() {
+    let (store, t) = closed_wal_database();
+    make_bucket_mvcc(&store, Some(t.path()));
+    let before = store.stats().puts;
+    // Local state of an MVCC database (claim, raise and fence are bucket writes).
+    let r = open_with_store(config(t.path()), store.clone());
+    assert_eq!(unsupported(r), SWITCH_BACK);
+    // A fresh disk (restore path).
+    let t2 = tempdir();
+    let r = open_with_store(config(&fresh(&t2)), store.clone());
+    assert_eq!(unsupported(r), SWITCH_BACK);
+    assert!(
+        !fresh(&t2).join("app.db").exists(),
+        "the refusal left files"
+    );
+    let r = open_read_only_with_store(config(&fresh(&tempdir())), store.clone());
+    assert_eq!(unsupported(r), SWITCH_BACK);
+    assert_eq!(store.stats().puts, before, "the bucket was written");
+    // restore() has the same check.
+    let t4 = tempdir();
+    let r = restore_with_store(&config(&fresh(&t4)), store.clone(), &fresh(&t4));
+    assert_eq!(unsupported(r), SWITCH_BACK);
+}
+
+#[test]
+fn new_mvcc_database_is_not_created_yet() {
+    // Until the MVCC engine is wired in, a new MVCC database must not become a WAL bucket.
+    let store = mem();
+    let t = tempdir();
+    let r = open_with_store(mvcc_config(&fresh(&t)), store.clone());
+    assert_eq!(unsupported(r), "MVCC");
+    assert_eq!(store.stats().puts, 0, "the bucket was touched");
+}
+
+#[test]
+fn window_batching_is_refused_in_mvcc_before_anything_is_touched() {
+    let store = mem();
+    let t = tempdir();
+    let mut c = mvcc_config(&fresh(&t));
+    c.batching = Batching::Window {
+        max_wait: Duration::from_millis(10),
+        max_commits: 4,
+        max_bytes: 1024,
+    };
+    let r = open_with_store(c, store.clone());
+    assert_eq!(unsupported(r), "MVCC: Window batching");
+    assert_eq!(store.stats().puts, 0);
+}
+
+#[test]
+fn set_batching_window_still_works_in_wal_mode() {
+    let store = mem();
+    let t = tempdir();
+    let db = open_mem(&store, t.path());
+    let w = Batching::Window {
+        max_wait: Duration::from_millis(10),
+        max_commits: 4,
+        max_bytes: 1024,
+    };
+    db.set_batching(w).unwrap();
+    let c = db.connect().unwrap();
+    c.set_batching(Some(w)).unwrap();
+}
+
+#[test]
+fn refuse_mode_mismatch_table() {
+    use JournalMode::{Mvcc, Wal};
+    let head = |mode| Head {
+        format: if mode == Mvcc {
+            crate::format::FORMAT_V2
+        } else {
+            1
+        },
+        generation: 1,
+        manifest: None,
+        writer_id: "w".into(),
+        epoch: 1,
+        journal_mode: mode,
+    };
+    let wal_page = Some([2, 2]);
+    let mvcc_page = Some([255, 255]);
+    assert_eq!(refuse_mode_mismatch(&head(Wal), wal_page, Wal), Ok(()));
+    assert_eq!(refuse_mode_mismatch(&head(Wal), None, Wal), Ok(()));
+    assert_eq!(refuse_mode_mismatch(&head(Mvcc), mvcc_page, Mvcc), Ok(()));
+    assert_eq!(refuse_mode_mismatch(&head(Mvcc), None, Mvcc), Ok(()));
+    assert_eq!(
+        refuse_mode_mismatch(&head(Wal), wal_page, Mvcc),
+        Err(Error::Unsupported(SWITCH_TO_MVCC))
+    );
+    assert_eq!(
+        refuse_mode_mismatch(&head(Mvcc), mvcc_page, Wal),
+        Err(Error::Unsupported(SWITCH_BACK))
+    );
+    // The head's mode is checked before the page.
+    assert_eq!(
+        refuse_mode_mismatch(&head(Mvcc), None, Wal),
+        Err(Error::Unsupported(SWITCH_BACK))
+    );
+    // A WAL bucket whose page 1 says MVCC is not something this build opens.
+    assert_eq!(
+        refuse_mode_mismatch(&head(Wal), mvcc_page, Wal),
+        Err(Error::Unsupported("MVCC"))
+    );
+    assert_eq!(
+        refuse_mode_mismatch(&head(Wal), Some([255, 2]), Wal),
+        Err(Error::Unsupported("MVCC"))
+    );
 }

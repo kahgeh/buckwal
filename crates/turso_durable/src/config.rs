@@ -463,6 +463,7 @@ impl Config {
             )));
         }
         self.batching.validate()?;
+        self.batching.check_mode(self.journal_mode)?;
         let cipher = parse_cipher(&self.encryption_cipher)?;
         if self.encryption_key_file.is_none()
             && cipher != parse_cipher(defaults::ENCRYPTION_CIPHER)?
@@ -502,6 +503,7 @@ impl Config {
             events: self.on_event.clone(),
             read_only,
             encryption: None,
+            journal_mode: self.journal_mode,
         }
     }
 
@@ -618,6 +620,9 @@ pub(crate) struct EngineConfig {
     /// The cipher and key the engine opens and connects with (D16); `None` is unencrypted.
     /// [`Config::engine`] leaves it `None`: `open` loads the key file (`encryption::load`).
     pub encryption: Option<Arc<Encryption>>,
+    /// The mode the caller opens the database in: a head or local state of the other mode is
+    /// refused (`db::refuse_mode_mismatch`).
+    pub journal_mode: JournalMode,
 }
 
 impl EngineConfig {
@@ -1149,5 +1154,33 @@ mod tests {
                 r => panic!("{bad:?}: {r:?}"),
             }
         }
+    }
+
+    #[test]
+    fn window_refused_in_mvcc() {
+        let window = Batching::Window {
+            max_wait: Duration::from_millis(10),
+            max_commits: 4,
+            max_bytes: 1024,
+        };
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.batching = window;
+        assert_eq!(c.validate(), Ok(()), "Window stays valid in WAL mode");
+        c.journal_mode = JournalMode::Mvcc;
+        assert_eq!(
+            c.validate(),
+            Err(Error::Unsupported("MVCC: Window batching"))
+        );
+        c.batching = Batching::Off;
+        assert_eq!(c.validate(), Ok(()));
+        // From the environment.
+        let mut env = required();
+        env.insert("DURABLE_JOURNAL_MODE", "mvcc");
+        env.insert("DURABLE_BATCHING", "window 10ms 4 1KiB");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(
+            c.validate(),
+            Err(Error::Unsupported("MVCC: Window batching"))
+        );
     }
 }

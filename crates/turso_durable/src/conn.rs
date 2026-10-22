@@ -137,6 +137,7 @@ impl Connection {
     pub fn set_batching(&self, b: Option<Batching>) -> Result<()> {
         if let Some(b) = &b {
             b.validate()?;
+            b.check_mode(self.shared.journal_mode)?;
         }
         *lock(&self.batching) = b;
         Ok(())
@@ -289,7 +290,7 @@ impl Connection {
     ) -> Result<Prepared> {
         stash::clear();
         let pragma = if single {
-            guard::check_sql(sql)?;
+            guard::check_sql(sql, self.shared.journal_mode)?;
             guard::batching_pragma(sql).map(|p| (p, sql.len()))
         } else {
             // execute_batch guard-checked the whole string before its first statement.
@@ -390,10 +391,10 @@ impl Connection {
                 || guard::mentions_batching(sql)
                 || lock(&self.txn_batching).is_some();
             if split {
-                guard::check_sql_split(sql)?;
+                guard::check_sql_split(sql, self.shared.journal_mode)?;
                 return self.execute_batch_split(sql);
             }
-            guard::check_sql(sql)?;
+            guard::check_sql(sql, self.shared.journal_mode)?;
             let r = self.core().prepare_execute_batch(sql).map_err(engine_error);
             // Defence in depth: the guard above refuses every spelling of a lower
             // `synchronous`, but the batch prepares and runs its statements in one engine
@@ -475,7 +476,7 @@ impl Connection {
     pub fn describe(&self, sql: &str) -> Result<Description> {
         self.call(self.effective_batching(), || {
             stash::clear();
-            guard::check_sql(sql)?;
+            guard::check_sql(sql, self.shared.journal_mode)?;
             if guard::batching_pragma(sql).is_some() {
                 return Ok(Description {
                     params: Vec::new(),

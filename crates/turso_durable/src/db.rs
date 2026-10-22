@@ -1,13 +1,13 @@
 //! [`open`] and [`Database`]: the directory locks (D4), the order of an open, and shutdown.
 use crate::batching::Batching;
 use crate::bucket::{self, Bucket, FenceOutcome};
-use crate::config::{Config, EngineConfig, Event, EventHook};
+use crate::config::{Config, EngineConfig, Event, EventHook, JournalMode};
 use crate::conn::Connection;
 use crate::encryption::{self, check_page_one};
 use crate::engine::{engine_error, open_engine, Engine, EngineDb};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
-use crate::format::{decode_record, Keys, LocalState, LogRecord, FORMAT};
+use crate::format::{decode_record, Head, Keys, LocalState, LogRecord, FORMAT, FORMAT_V2};
 use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, restore_staged, sealed_page_one};
@@ -118,6 +118,8 @@ pub(crate) struct Shared {
     connections: AtomicUsize,
     /// The setting a connection without its own commits with ([`Database::set_batching`]).
     batching: Mutex<Batching>,
+    /// The database's journal mode (its head's, which `open` made equal to the config's).
+    pub(crate) journal_mode: JournalMode,
     /// The uploader's counters; connections record their acks in them.
     pub(crate) stats: Arc<StatsCell>,
     events: Option<EventHook>,
@@ -276,10 +278,12 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     cfg.encryption = encryption;
     let keys = config.keys();
     clear_interrupted_restore(&dir)?;
-    refuse_mvcc_file(&dir.join(DB_FILE))?;
+    refuse_mvcc_file(&dir.join(DB_FILE), cfg.journal_mode)?;
 
     let (bucket, state, reconciled) = match LocalState::read(&dir)? {
         Some(state) => {
+            // Before the claim, the epoch raise or any other write to the bucket.
+            refuse_journal_mode_mismatch(state_mode(&state), cfg.journal_mode)?;
             refuse_encryption_mismatch(&dir, &store, &keys, &cfg, None)?;
             attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
         }
@@ -301,6 +305,11 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
                 "no database in the bucket at prefix {:?}",
                 config.prefix
             )))
+        }
+        None if cfg.journal_mode == JournalMode::Mvcc => {
+            // A new MVCC database is created once the MVCC engine is wired in; until then it
+            // must not become a WAL bucket.
+            return Err(Error::Unsupported("MVCC"));
         }
         None => {
             let (bucket, state) = create_new(&dir, &store, &keys, &cfg)?;
@@ -355,6 +364,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             })),
             connections: AtomicUsize::new(0),
             batching: Mutex::new(config.batching),
+            journal_mode: config.journal_mode,
             events: cfg.events.clone(),
             reconciled,
         }),
@@ -367,7 +377,9 @@ fn attached(a: Attached) -> (Bucket, LocalState, Option<Reconciled>) {
 }
 
 /// Bytes 18/19 of an existing `app.db`, read before the engine opens it: 255 is MVCC (D5).
-fn refuse_mvcc_file(path: &Path) -> Result<()> {
+/// With no head to compare to, an MVCC file is refused when this open is a WAL one. An MVCC
+/// open of one is left to the engine open.
+fn refuse_mvcc_file(path: &Path, config_mode: JournalMode) -> Result<()> {
     let mut f = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -378,10 +390,58 @@ fn refuse_mvcc_file(path: &Path) -> Result<()> {
         .take(20)
         .read_to_end(&mut header)
         .map_err(|e| io_err("read app.db header", e))?;
-    if header.len() == 20 && (header[18] == 255 || header[19] == 255) {
+    if header.len() == 20
+        && is_mvcc_header([header[18], header[19]])
+        && config_mode == JournalMode::Wal
+    {
         return Err(Error::Unsupported("MVCC"));
     }
     Ok(())
+}
+
+/// Bytes 18/19 of page 1: 255 in either is the MVCC header (D5).
+pub(crate) fn is_mvcc_header(bytes: [u8; 2]) -> bool {
+    bytes[0] == 255 || bytes[1] == 255
+}
+
+/// The journal mode a local state records: format 2 is an MVCC database.
+fn state_mode(state: &LocalState) -> JournalMode {
+    if state.format == FORMAT_V2 {
+        JournalMode::Mvcc
+    } else {
+        JournalMode::Wal
+    }
+}
+
+/// An existing database is never switched between modes in either direction.
+fn refuse_journal_mode_mismatch(stored: JournalMode, config: JournalMode) -> Result<()> {
+    match (stored, config) {
+        (JournalMode::Wal, JournalMode::Mvcc) => Err(Error::Unsupported(
+            "MVCC: switching an existing WAL database",
+        )),
+        (JournalMode::Mvcc, JournalMode::Wal) => {
+            Err(Error::Unsupported("MVCC: switching back to WAL"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The bucket's head (and page 1 bytes 18/19, when the caller holds page 1) against the mode
+/// this open asks for. The head's mode decides: a WAL bucket opened as MVCC and an MVCC bucket
+/// opened as WAL are both refused. A WAL bucket whose page 1 carries the MVCC header is
+/// refused too (`Unsupported("MVCC")`). Nothing is written before this runs.
+pub(crate) fn refuse_mode_mismatch(
+    head: &Head,
+    header_bytes_18_19: Option<[u8; 2]>,
+    config_mode: JournalMode,
+) -> Result<()> {
+    refuse_journal_mode_mismatch(head.journal_mode, config_mode)?;
+    match header_bytes_18_19 {
+        Some(h) if is_mvcc_header(h) && head.journal_mode == JournalMode::Wal => {
+            Err(Error::Unsupported("MVCC"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Page 1 against the encryption setting (`encryption::check_page_one`) before a writer open
@@ -886,6 +946,7 @@ impl Database {
     /// made with. Starts as [`Config::batching`]. `Config` when `b` is invalid.
     pub fn set_batching(&self, b: Batching) -> Result<()> {
         b.validate()?;
+        b.check_mode(self.shared.journal_mode)?;
         *lock(&self.shared.batching) = b;
         Ok(())
     }

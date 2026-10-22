@@ -169,3 +169,20 @@ fn ctx_is_per_thread() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn window_is_refused_in_mvcc_only() {
+    use crate::config::JournalMode::{Mvcc, Wal};
+    let w = Batching::Window {
+        max_wait: Duration::from_millis(5),
+        max_commits: 2,
+        max_bytes: 10,
+    };
+    assert_eq!(w.check_mode(Wal), Ok(()));
+    assert_eq!(Batching::Off.check_mode(Wal), Ok(()));
+    assert_eq!(Batching::Off.check_mode(Mvcc), Ok(()));
+    assert_eq!(
+        w.check_mode(Mvcc),
+        Err(Error::Unsupported("MVCC: Window batching"))
+    );
+}

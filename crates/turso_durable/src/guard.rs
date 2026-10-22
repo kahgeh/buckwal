@@ -1,8 +1,10 @@
 //! The SQL guard (D5, D7): statements the engine must never see, refused before `prepare`.
-//! - `PRAGMA journal_mode` set to `mvcc`/`experimental_mvcc`: the engine writes the MVCC
-//!   header to page 1 before it opens the MVCC log, so refusing the log afterwards would leave
-//!   the header changed.
-//! - `PRAGMA journal_mode` set to anything but `wal`: only the WAL is shipped.
+//! - `PRAGMA journal_mode` set to `mvcc`/`experimental_mvcc` in a WAL database: the engine
+//!   writes the MVCC header to page 1 before it opens the MVCC log, so refusing the log
+//!   afterwards would leave the header changed (`MVCC: switching an existing WAL database`).
+//! - `PRAGMA journal_mode` set to `wal` in an MVCC database (`MVCC: switching back to WAL`).
+//! - `PRAGMA durable_batching` set to a Window in an MVCC database (`MVCC: Window batching`).
+//! - `PRAGMA journal_mode` set to anything else: only the WAL and the MVCC log are shipped.
 //! - `PRAGMA synchronous` below FULL: a commit that does not fsync is not uploaded either.
 //! - `ATTACH`: writes to an attached database are not shipped.
 //! - `PRAGMA hexkey` or `PRAGMA cipher` set to a value: the engine would swap the
@@ -18,23 +20,24 @@
 //! Reading a pragma (no value) is fine. A statement that does not parse is left to the
 //! engine, which reports it (and never runs it or anything after it).
 use crate::batching::Batching;
+use crate::config::JournalMode;
 use crate::error::{Error, Result};
 use turso_parser::ast::{Cmd, Expr, Literal, PragmaBody, QualifiedName, Stmt, UnaryOperator};
 use turso_parser::parser::Parser;
 
 /// Refuse a statement that would leave WAL mode, lower `synchronous` or attach a database,
 /// and a `PRAGMA durable_batching` that is not the only statement in `sql`.
-pub(crate) fn check_sql(sql: &str) -> Result<()> {
-    check(sql, false)
+pub(crate) fn check_sql(sql: &str, mode: JournalMode) -> Result<()> {
+    check(sql, false, mode)
 }
 
 /// [`check_sql`] for a caller that runs `sql` one statement at a time, catching each
 /// `PRAGMA durable_batching` in place ([`first_batching_pragma`]): it may be one of several.
-pub(crate) fn check_sql_split(sql: &str) -> Result<()> {
-    check(sql, true)
+pub(crate) fn check_sql_split(sql: &str, mode: JournalMode) -> Result<()> {
+    check(sql, true, mode)
 }
 
-fn check(sql: &str, split: bool) -> Result<()> {
+fn check(sql: &str, split: bool, mode: JournalMode) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
     if !lower.contains("pragma") && !lower.contains("attach") {
         return Ok(());
@@ -55,7 +58,7 @@ fn check(sql: &str, split: bool) -> Result<()> {
         };
         if let Stmt::Pragma { name, body } = &stmt {
             if name.name.as_str().eq_ignore_ascii_case("durable_batching") {
-                check_batching(name, body.as_ref(), explain)?;
+                check_batching(name, body.as_ref(), explain, mode)?;
                 batching = true;
                 continue;
             }
@@ -65,7 +68,7 @@ fn check(sql: &str, split: bool) -> Result<()> {
             Stmt::Pragma {
                 name,
                 body: Some(PragmaBody::Equals(value) | PragmaBody::Call(value)),
-            } => check_pragma(name.name.as_str(), &value)?,
+            } => check_pragma(name.name.as_str(), &value, mode)?,
             _ => {}
         }
     }
@@ -79,7 +82,12 @@ fn check(sql: &str, split: bool) -> Result<()> {
 
 /// A `PRAGMA durable_batching` the connection can run: on `main`, not explained, and with a
 /// valid value if it has one. (Outside a transaction is only known when it runs.)
-fn check_batching(name: &QualifiedName, body: Option<&PragmaBody>, explain: bool) -> Result<()> {
+fn check_batching(
+    name: &QualifiedName,
+    body: Option<&PragmaBody>,
+    explain: bool,
+    mode: JournalMode,
+) -> Result<()> {
     if !is_batching(name) {
         return Err(Error::Config(
             "PRAGMA durable_batching applies to main only".into(),
@@ -91,12 +99,14 @@ fn check_batching(name: &QualifiedName, body: Option<&PragmaBody>, explain: bool
         ));
     }
     if let BatchingPragma::Set(b) = setting(body) {
-        b?.validate()?;
+        let b = b?;
+        b.validate()?;
+        b.check_mode(mode)?;
     }
     Ok(())
 }
 
-fn check_pragma(name: &str, value: &Expr) -> Result<()> {
+fn check_pragma(name: &str, value: &Expr, mode: JournalMode) -> Result<()> {
     if name.eq_ignore_ascii_case("hexkey") || name.eq_ignore_ascii_case("cipher") {
         return Err(Error::Unsupported(
             "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)",
@@ -104,9 +114,15 @@ fn check_pragma(name: &str, value: &Expr) -> Result<()> {
     }
     let value = pragma_value(value).map(|v| v.to_ascii_lowercase());
     if name.eq_ignore_ascii_case("journal_mode") {
-        return match value.as_deref() {
-            Some("wal") => Ok(()),
-            Some("mvcc" | "experimental_mvcc") => Err(Error::Unsupported("MVCC")),
+        return match (value.as_deref(), mode) {
+            (Some("wal"), JournalMode::Wal) => Ok(()),
+            (Some("wal"), JournalMode::Mvcc) => {
+                Err(Error::Unsupported("MVCC: switching back to WAL"))
+            }
+            (Some("mvcc" | "experimental_mvcc"), JournalMode::Mvcc) => Ok(()),
+            (Some("mvcc" | "experimental_mvcc"), JournalMode::Wal) => Err(Error::Unsupported(
+                "MVCC: switching an existing WAL database",
+            )),
             _ => Err(Error::Unsupported("journal_mode other than WAL")),
         };
     }
@@ -222,12 +238,95 @@ fn unquote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::JournalMode;
     use crate::error::Error;
+
+    // The WAL-mode checks below keep their call shape.
+    fn check_sql(sql: &str) -> Result<()> {
+        super::check_sql(sql, JournalMode::Wal)
+    }
+
+    fn check_sql_split(sql: &str) -> Result<()> {
+        super::check_sql_split(sql, JournalMode::Wal)
+    }
 
     fn refused(sql: &str) -> &'static str {
         match check_sql(sql) {
             Err(Error::Unsupported(what)) => what,
             r => panic!("{sql}: {r:?}"),
+        }
+    }
+
+    fn refused_in_mvcc(sql: &str) -> &'static str {
+        match super::check_sql(sql, JournalMode::Mvcc) {
+            Err(Error::Unsupported(what)) => what,
+            r => panic!("{sql}: {r:?}"),
+        }
+    }
+
+    const SWITCH_TO_MVCC: &str = "MVCC: switching an existing WAL database";
+    const SWITCH_BACK: &str = "MVCC: switching back to WAL";
+
+    #[test]
+    fn guard_refuses_journal_mode_wal_in_mvcc() {
+        for sql in [
+            "PRAGMA journal_mode=wal",
+            "PRAGMA journal_mode='WAL'",
+            "pragma JOURNAL_MODE = wal",
+            "PRAGMA main.journal_mode = 'wal'",
+            "PRAGMA journal_mode(\"wal\")",
+            "SELECT 1; PRAGMA journal_mode=wal;",
+        ] {
+            assert_eq!(refused_in_mvcc(sql), SWITCH_BACK, "{sql}");
+            let r = super::check_sql_split(sql, JournalMode::Mvcc);
+            assert_eq!(r, Err(Error::Unsupported(SWITCH_BACK)), "split: {sql}");
+        }
+        // Reading the mode, setting it to what it is, and other modes' own refusal.
+        for sql in [
+            "PRAGMA journal_mode",
+            "PRAGMA journal_mode=mvcc",
+            "PRAGMA journal_mode='experimental_mvcc'",
+            "SELECT 'pragma journal_mode=wal'",
+        ] {
+            assert_eq!(super::check_sql(sql, JournalMode::Mvcc), Ok(()), "{sql}");
+        }
+        assert_eq!(
+            refused_in_mvcc("PRAGMA journal_mode=delete"),
+            "journal_mode other than WAL"
+        );
+    }
+
+    #[test]
+    fn guard_still_refuses_mvcc_pragma_in_wal_mode() {
+        for sql in [
+            "PRAGMA journal_mode='mvcc'",
+            "pragma JOURNAL_MODE = mvcc",
+            "PRAGMA journal_mode = 'EXPERIMENTAL_MVCC'",
+            "PRAGMA main.journal_mode = 'mvcc'",
+            "PRAGMA journal_mode(\"mvcc\")",
+            "SELECT 1; PRAGMA journal_mode=mvcc;",
+        ] {
+            assert_eq!(refused(sql), SWITCH_TO_MVCC, "{sql}");
+        }
+    }
+
+    #[test]
+    fn durable_batching_window_is_refused_in_mvcc() {
+        for sql in [
+            "PRAGMA durable_batching = 'window 50ms 64 1MiB'",
+            "PRAGMA main.durable_batching('window 1s 2 3')",
+        ] {
+            assert_eq!(refused_in_mvcc(sql), "MVCC: Window batching", "{sql}");
+            assert_eq!(super::check_sql(sql, JournalMode::Wal), Ok(()), "{sql}");
+            let r = super::check_sql_split(sql, JournalMode::Mvcc);
+            assert_eq!(r, Err(Error::Unsupported("MVCC: Window batching")), "{sql}");
+        }
+        for sql in [
+            "PRAGMA durable_batching = off",
+            "PRAGMA durable_batching",
+            "PRAGMA durable_batching = 'off'",
+        ] {
+            assert_eq!(super::check_sql(sql, JournalMode::Mvcc), Ok(()), "{sql}");
         }
     }
 
@@ -241,7 +340,7 @@ mod tests {
             "PRAGMA journal_mode(\"mvcc\")",
             "SELECT 1; PRAGMA journal_mode=mvcc;",
         ] {
-            assert_eq!(refused(sql), "MVCC", "{sql}");
+            assert_eq!(refused(sql), SWITCH_TO_MVCC, "{sql}");
         }
         for sql in [
             "PRAGMA journal_mode=delete",
