@@ -2,7 +2,7 @@
 //! With `--connections N`, N threads each commit on their own connection; thread `i` commits
 //! ids `start + i + k·N`.
 use crate::args::{self, Checkpoint, Concurrent, SoakArgs};
-use crate::{config, err, ms, say, say_all, stats_lines, store, CliResult};
+use crate::{err, ms, say, say_all, stats_lines, store, CliResult};
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
@@ -101,7 +101,7 @@ impl Soak<'_> {
     }
 
     fn open_db(&self) -> CliResult<Database> {
-        let mut cfg: Config = config(&self.args.dir)?;
+        let mut cfg: Config = crate::writer_config(&self.args.dir)?;
         let events = self.args.batching.is_some() || self.args.batching_file.is_some();
         cfg.on_event = Some(Arc::new(move |e: &Event| match e {
             Event::SealStarted { .. } => say("event seal-started"),

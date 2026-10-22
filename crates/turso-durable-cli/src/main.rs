@@ -73,8 +73,9 @@ pub fn config(dir: &Path) -> CliResult<Config> {
     Ok(cfg)
 }
 
-/// The journal mode a head's JSON records: v2 heads name `"journal_mode":"mvcc"`, a v1 head
-/// is WAL.
+/// The journal mode a head's JSON records: a v2 head names `"journal_mode":"mvcc"`, a v1
+/// head is WAL. The library's `Head::encode` pins this exact compact form (golden test in
+/// crates/turso_durable/src/format/tests.rs); its decoder is crate-internal.
 fn head_journal_mode(head: &[u8]) -> JournalMode {
     let text = String::from_utf8_lossy(head);
     if text.contains("\"journal_mode\":\"mvcc\"") {
@@ -84,12 +85,10 @@ fn head_journal_mode(head: &[u8]) -> JournalMode {
     }
 }
 
-/// The config for a command that only reads the bucket (`restore`, `verify`): the bucket's
-/// head decides the journal mode, whatever `DURABLE_JOURNAL_MODE` says. Without a head
-/// nothing changes, and the command reports the missing database itself.
-fn reader_config(dir: &Path) -> CliResult<Config> {
-    let mut cfg = config(dir)?;
-    let store = s3_store(&cfg)?;
+/// Set `cfg.journal_mode` from the bucket's head. Without a head nothing changes (a new
+/// database: the configured mode, wal by default).
+fn follow_head(cfg: &mut Config) -> CliResult<()> {
+    let store = s3_store(cfg)?;
     let key = format!("{}/head", cfg.prefix);
     let policy = turso_durable::store::RetryPolicy::default();
     let head =
@@ -97,6 +96,28 @@ fn reader_config(dir: &Path) -> CliResult<Config> {
             .map_err(err)?;
     if let Some(head) = head {
         cfg.journal_mode = head_journal_mode(&head.body);
+    }
+    Ok(())
+}
+
+/// The config for a command that only reads the bucket (`restore`, `verify`): the bucket's
+/// head decides the journal mode, whatever `DURABLE_JOURNAL_MODE` says.
+fn reader_config(dir: &Path) -> CliResult<Config> {
+    let mut cfg = config(dir)?;
+    follow_head(&mut cfg)?;
+    Ok(cfg)
+}
+
+/// The config for a command that opens the database as the writer (`sql`, `stats`, `serve`,
+/// `takeover`, `soak`, `bench`): an explicit `--journal-mode` or `DURABLE_JOURNAL_MODE` is
+/// kept (and the library refuses a mismatch with the bucket); with neither, an existing
+/// bucket's head decides and a missing one means a new WAL database.
+pub fn writer_config(dir: &Path) -> CliResult<Config> {
+    let mut cfg = config(dir)?;
+    let explicit =
+        JOURNAL_MODE.get().is_some() || std::env::var_os("DURABLE_JOURNAL_MODE").is_some();
+    if !explicit {
+        follow_head(&mut cfg)?;
     }
     Ok(cfg)
 }
@@ -161,7 +182,7 @@ fn restore(dir: &Path) -> CliResult<()> {
 /// Restore into the empty directory `dir` and take the database over there; a writer still
 /// running elsewhere is fenced for good. `sql --dir` then continues it.
 fn takeover(dir: &Path) -> CliResult<()> {
-    let r = turso_durable::takeover(config(dir)?).map_err(err)?;
+    let r = turso_durable::takeover(writer_config(dir)?).map_err(err)?;
     say(&format!(
         "took over generation={} epoch={} fence_seq={} writer_id={} quiet_ms={} ms={}",
         r.generation,
@@ -274,7 +295,7 @@ pub(crate) fn open_writer(
     if !claim {
         claim_check(dir)?;
     }
-    let db = turso_durable::open(config(dir)?).map_err(err)?;
+    let db = turso_durable::open(writer_config(dir)?).map_err(err)?;
     if let Some(b) = batching {
         db.set_batching(b).map_err(err)?;
     }

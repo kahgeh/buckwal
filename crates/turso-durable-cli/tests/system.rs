@@ -2239,7 +2239,9 @@ fn mvcc_refusals_cli() {
         &["sql", "--dir", a, "--journal-mode", "wal", "SELECT 1"],
         back,
     );
-    assert_refused(&ctx, &["sql", "--dir", a, "SELECT 1"], back);
+    // Neither flag nor environment: the existing head's mode is used.
+    let n = ctx.ok(&["sql", "--dir", a, "SELECT count(*) FROM t"]);
+    assert_eq!(n.stdout.trim(), "1");
     assert_refused(
         &ctx,
         &[
@@ -2315,6 +2317,17 @@ fn mvcc_refusals_cli() {
         "SELECT count(*) FROM t",
     ]);
     assert_eq!(n.stdout.trim(), "1");
+    // A fresh directory claiming the bucket with no flag follows the head (it fences `a`,
+    // so it comes last among the writers).
+    let b2 = ctx.dir("b2");
+    let n = ctx.ok(&[
+        "sql",
+        "--claim",
+        "--dir",
+        b2.to_str().unwrap(),
+        "SELECT count(*) FROM t",
+    ]);
+    assert_eq!(n.stdout.trim(), "1");
     // verify and restore need no flag: the head decides.
     let r = ctx.dir("r");
     ctx.ok(&["restore", "--dir", r.to_str().unwrap()]);
@@ -2325,8 +2338,8 @@ fn mvcc_refusals_cli() {
 /// `takeover --journal-mode mvcc` of a bucket whose writer is stopped (SIGSTOP; a writer
 /// committing at full speed can outrun the fence record's 64 probes, which the takeover then
 /// reports as a timeout to resume): the new directory continues with `sql`, and the old
-/// soak, resumed, is fenced and acks nothing. Every row of both writers restores. A takeover
-/// without the flag is refused like any other mode switch.
+/// soak, resumed, is fenced and acks nothing. Every row of both writers restores. Without
+/// `--journal-mode` the head's mode is used; an explicit `wal` is refused.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn mvcc_takeover_cli() {
@@ -2338,26 +2351,20 @@ fn mvcc_takeover_cli() {
     let before = ctx.head();
     let b = ctx.dir("b");
     let bs = b.to_str().unwrap();
+    // An explicit wal is refused; no flag follows the head.
     assert_refused(
         &ctx,
-        &["takeover", "--dir", bs],
+        &["takeover", "--dir", bs, "--journal-mode", "wal"],
         "MVCC: switching back to WAL",
     );
-    let took = ctx.ok(&["takeover", "--dir", bs, "--journal-mode", "mvcc"]);
+    let took = ctx.ok(&["takeover", "--dir", bs]);
     let took = took.stdout.trim().to_string();
     assert!(took.starts_with("took over "), "{took}");
     assert_eq!(field(&took, "epoch") as u64, before.epoch + 1, "{took}");
     assert_eq!(ctx.head().epoch, before.epoch + 1);
     // sql continues in the new directory with every row the old writer acked.
-    let rows = insert_rows(&ctx, &b, 100001..=100010, &["--journal-mode", "mvcc"]);
-    let n = ctx.ok(&[
-        "sql",
-        "--dir",
-        bs,
-        "--journal-mode",
-        "mvcc",
-        "SELECT count(*) FROM soak",
-    ]);
+    let rows = insert_rows(&ctx, &b, 100001..=100010, &[]);
+    let n = ctx.ok(&["sql", "--dir", bs, "SELECT count(*) FROM soak"]);
     let count: usize = n.stdout.trim().parse().unwrap();
     assert!(
         count >= soak.acks() + 10,
@@ -2381,6 +2388,56 @@ fn mvcc_takeover_cli() {
          CONT); acked={} {}",
         soak.lines[fenced],
         soak.acks(),
+        v.acked,
+        v.restored
+    );
+}
+
+/// The MVCC twin of `takeover_fences_a_running_soak`: `takeover` of a live MVCC writer
+/// committing flat out (4 connections, no SIGSTOP). It either succeeds or times out after its
+/// 64 fence probes (the head's epoch is raised by then; `sql --claim` resumes). Either way the
+/// old writer is fenced and acks nothing more, the epoch rose, and every ack it printed
+/// restores.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_takeover_fences_a_running_soak() {
+    let ctx = Ctx::new("mvcc_takeover_fences_a_running_soak");
+    let a = ctx.dir("a");
+    let mut soak = Soak::spawn(&ctx, &a, &mvcc_soak(&["--connections", "4"]));
+    soak.wait_acks(200);
+    let before = ctx.head();
+    let b = ctx.dir("b");
+    let bs = b.to_str().unwrap();
+    let out = ctx.run(&["takeover", "--dir", bs]);
+    let outcome = if out.status.success() {
+        "took over"
+    } else {
+        assert!(
+            out.stderr.contains("kept appending past 64 log positions"),
+            "takeover failed otherwise:\n{}\n{}",
+            out.stdout,
+            out.stderr
+        );
+        "timed out (fence probes)"
+    };
+    assert_eq!(ctx.head().epoch, before.epoch + 1, "epoch after {outcome}");
+    let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
+    soak.kill();
+    // A takeover that timed out resumes by opening the directory: it must then continue.
+    let rows = if out.status.success() {
+        insert_rows(&ctx, &b, 100001..=100010, &[])
+    } else {
+        insert_rows(&ctx, &b, 100001..=100010, &["--claim"])
+    };
+    let mut lines = soak.lines.clone();
+    lines.extend(rows);
+    let v = restore_verify(&ctx, &lines);
+    assert_mvcc_head(&ctx);
+    eprintln!(
+        "mvcc_takeover_fences_a_running_soak: {outcome}; soak acks={}; first fenced error {:?}; \
+         acked={} {}",
+        soak.acks(),
+        soak.lines[fenced],
         v.acked,
         v.restored
     );

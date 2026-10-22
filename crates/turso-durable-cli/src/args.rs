@@ -134,7 +134,8 @@ pub const USAGE: &str = "usage: turso-durable <command> [options]
   serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal|mvcc]
   takeover --dir DIR [--journal-mode wal|mvcc]
 --journal-mode is the mode a new database is created in (an existing one keeps its own; asking
-for the other is refused); without it, DURABLE_JOURNAL_MODE applies, default wal.
+for the other is refused); without it, DURABLE_JOURNAL_MODE applies; with neither, an existing
+database's own mode is used and a new one is wal. restore and verify follow the bucket head's mode.
 --concurrent (alone, or `all`) runs every soak write in BEGIN CONCURRENT ... COMMIT (MVCC);
 `mixed` has even-numbered threads use plain BEGIN and odd-numbered ones BEGIN CONCURRENT.
 SPEC is `off` or `window <max_wait> <max_commits> <max_bytes>` (e.g. 'window 10ms 64 1MiB');

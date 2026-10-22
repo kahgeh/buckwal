@@ -1,7 +1,7 @@
 //! `bench`: per-commit latency and bucket traffic, one `key=value` line per metric. With
 //! `--connections N`, N threads (one connection each) share the commits.
 use crate::args::BenchArgs;
-use crate::{config, err, ms, s3_store, say, say_all, stats_lines, CliResult};
+use crate::{err, ms, s3_store, say, say_all, stats_lines, CliResult};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -175,7 +175,7 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
         return Err("--commits must be at least 1".into());
     }
     let counters = Arc::new(Counters::default());
-    let mut cfg = config(&a.dir)?;
+    let mut cfg = crate::writer_config(&a.dir)?;
     let c = counters.clone();
     cfg.on_event = Some(Arc::new(move |e: &Event| match e {
         Event::SealStarted { pages, .. } => c.seals.lock().unwrap().push((*pages, None)),
