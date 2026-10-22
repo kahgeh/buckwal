@@ -278,12 +278,16 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     cfg.encryption = encryption;
     let keys = config.keys();
     clear_interrupted_restore(&dir)?;
+    let local = LocalState::read(&dir)?;
+    // The recorded mode first: an MVCC directory opened as WAL is "switching back", not just
+    // an MVCC file. Before the claim, the epoch raise or any other write to the bucket.
+    if let Some(state) = &local {
+        refuse_journal_mode_mismatch(state_mode(state), cfg.journal_mode)?;
+    }
     refuse_mvcc_file(&dir.join(DB_FILE), cfg.journal_mode)?;
 
-    let (bucket, state, reconciled) = match LocalState::read(&dir)? {
+    let (bucket, state, reconciled) = match local {
         Some(state) => {
-            // Before the claim, the epoch raise or any other write to the bucket.
-            refuse_journal_mode_mismatch(state_mode(&state), cfg.journal_mode)?;
             refuse_encryption_mismatch(&dir, &store, &keys, &cfg, None)?;
             attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
         }

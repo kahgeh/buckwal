@@ -3524,3 +3524,46 @@ fn refuse_mode_mismatch_table() {
         Err(Error::Unsupported("MVCC"))
     );
 }
+
+#[test]
+fn mvcc_directory_opened_as_wal_says_switching_back() {
+    let (store, t) = closed_wal_database();
+    // Local state of an MVCC database and an app.db carrying the MVCC header.
+    make_bucket_mvcc(&store, Some(t.path()));
+    let path = t.path().join("app.db");
+    let mut b = std::fs::read(&path).unwrap();
+    b[18] = 255;
+    b[19] = 255;
+    std::fs::write(&path, &b).unwrap();
+    let before = store.stats().puts;
+    let r = open_with_store(config(t.path()), store.clone());
+    assert_eq!(unsupported(r), SWITCH_BACK);
+    assert_eq!(store.stats().puts, before, "the bucket was written");
+}
+
+#[test]
+fn takeover_refuses_a_mode_mismatch_without_writing() {
+    let (store, t) = closed_wal_database();
+    let h0 = store.get(&keys().head()).unwrap().unwrap().body;
+    let puts = store.stats().puts;
+    let log0 = log_seqs(&*store, head(&*store).generation);
+    // A WAL bucket with an MVCC config.
+    let d = tempdir();
+    let r = crate::takeover_with_store(mvcc_config(&fresh(&d)), store.clone());
+    assert_eq!(unsupported(r), SWITCH_TO_MVCC);
+    // An MVCC bucket with a WAL config.
+    make_bucket_mvcc(&store, Some(t.path()));
+    let h1 = store.get(&keys().head()).unwrap().unwrap().body;
+    assert_ne!(h0, h1);
+    let puts = puts + 1; // make_bucket_mvcc's own head PUT
+    let d = tempdir();
+    let r = crate::takeover_with_store(config(&fresh(&d)), store.clone());
+    assert_eq!(unsupported(r), SWITCH_BACK);
+    assert_eq!(store.stats().puts, puts, "a takeover wrote to the bucket");
+    assert_eq!(store.get(&keys().head()).unwrap().unwrap().body, h1);
+    assert_eq!(
+        log_seqs(&*store, head(&*store).generation),
+        log0,
+        "a fence was appended"
+    );
+}
