@@ -1,0 +1,19 @@
+REVIEW reader inside BEGIN: SELECT id=2 before release -> Done value=1 (169µs)
+REVIEW reader inside BEGIN CONCURRENT: SELECT id=2 before release -> Done value=1 (3.521208ms)
+held completions: 1, A's step() calls so far: 12537496
+reader id=2 (the held row): blocked>2000ms
+reader id=1 (committed earlier): Done value=1 (IO steps 0, Yield steps 0, 361.958µs)
+reader table u (untouched): Done value=0 (IO steps 0, Yield steps 0, 119.958µs)
+streaming reader `SELECT id FROM t ORDER BY id` (started before the 2 s waits): rows_seen_before_release=["Row id=1", "Row id=2"] select_done_before_release=false
+before-release: done=false visible=false(reader blocked)
+blocked readers after release: id=2 -> Done value=1 (IO steps 0, Yield steps 3202209, 2.005340834s), id=1 -> (had returned before release), u -> (had returned before release)
+streaming reader after release: ["Done"]
+new reader id=2 after release: Done value=1 (IO steps 0, Yield steps 0, 349.042µs)
+after-release: done=true visible=true
+thread A result: Some(Ok(())) (released after 54.88ms)
+ops:
+      -- delay_log_sync on; thread A: INSERT id=2
+     0 Pwrite { file: "app.db-log", off: 492, len: 47 }
+     1 Sync("app.db-log")
+      -- fault: .db-log sync held
+      -- release

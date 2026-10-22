@@ -26,14 +26,14 @@ engine change. **Window batching stays refused**, and group commit gives one PUT
 | The log is encrypted | probed (P6, P8e) |
 | The WAL to MVCC switch is not crash safe | probed (P7) |
 | A slow upload stalls other writers | probed (P8g), parked in `on_log_write_complete` |
-| A sync returns Ok only when every op is confirmed | argued (`crates/turso_durable/src/bucket.rs:57-61`) |
-| Fencing and takeover | argued (`crates/turso_durable/src/bucket.rs:1224-1242`) |
-| GC and trim unchanged | argued (`crates/turso_durable/src/trim.rs:27-54`) |
-| Verify of a mid-checkpoint restore, after a read-only change | argued (`crates/turso_durable/src/engine.rs:152`) |
-| Restore through the library, format v2 | argued (`crates/turso_durable/src/restore.rs:258-260`) |
+| A sync returns Ok only when every op is confirmed | proved: `sync_ok_only_when_all_ops_confirmed` (`crates/turso_durable/tests/mvcc_fencing.rs`: 64 fault schedules, 549 acked, 27 `Err`), and the `io/log_file.rs` tests (argued from `crates/turso_durable/src/bucket.rs:57-61`) |
+| Fencing and takeover | proved: `mvcc_writer_fenced_by_takeover_fails_commits_forever`, `kind3_put_on_a_seq_another_writer_holds_is_fenced`, `takeover_of_mvcc_restores_log_claims_fences_reconciles`, `takeover_after_in_doubt_kind3_record` (`tests/mvcc_fencing.rs`), system tests `mvcc_takeover_cli`, `mvcc_takeover_fences_a_running_soak` |
+| GC and trim unchanged | proved: `gc_and_trim_across_mvcc_generations_keep_only_sealed_manifest_pages_and_log` (`src/gc/tests.rs`), `trim_reads_format_2_head` (`src/trim/tests.rs`), system test `mvcc_gc_across_generations` |
+| Verify of a mid-checkpoint restore, after a read-only change | proved: `verify_of_mid_checkpoint_restore` (`tests/mvcc_fencing.rs`), `read_only_mvcc_open_of_mid_checkpoint_restore_succeeds_and_ships_nothing` (`src/db/tests/mvcc/readonly.rs`), system tests `verify_acked_on_mid_checkpoint_restore`, `verify_acked_on_plain_mvcc_restore` |
+| Restore through the library, format v2 | proved: `restore_through_library_format_v2` (`tests/mvcc_fencing.rs`), `restore_v2_bucket_writes_wal_and_log_images` (`src/db/tests/mvcc/restore.rs`) |
 
 Probes used plain IO and the engine's own `app.db` storage, and modelled a process crash, not
-power loss. Stage 2 proves the argued rows.
+power loss. Stage 2 proved the argued rows (the table above names the tests) and corrected a few details (see Stage 2 outcome at the end).
 
 Limits (details in the next section):
 
@@ -58,8 +58,10 @@ Your choice: approve stage 2 for new MVCC databases with these limits, or keep t
     busy timeout does not cap (P2: `Yield steps 3544728, 2.003091417s`).
   - A read inside an explicit `BEGIN` or `BEGIN CONCURRENT` returns at once. The coordinator's
     review probe p2b_review
-    (`/private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-main/8dc4d662-160f-4307-a3e1-746a9db9e0a0/scratchpad/p2b_review_output.txt`,
-    source `/private/tmp/claude-502/-Users-kahgeh-Dev-p-turso-durable-main/8dc4d662-160f-4307-a3e1-746a9db9e0a0/scratchpad/probe/src/bin/p2b_review.rs`): `REVIEW reader inside BEGIN: SELECT id=2 before release -> Done value=1 (169µs)`.
+    (output `docs/mvcc-recon-probes/p2b_review_output.txt`, source
+    `docs/mvcc-recon-probes/p2b_review.rs`): `REVIEW reader inside BEGIN: SELECT id=2 before release -> Done value=1 (169µs)`.
+    Pinned in a test since: `speculative_read_inside_begin_sees_unacked_commit`
+    (`crates/turso_durable/tests/mvcc_limits.rs`).
   - No transaction that read it can commit first: it waits on the dependency
     (`turso_core-0.8.3/mvcc/database/mod.rs:3316-3331`).
 - **A failed upload keeps the commit.** Every connection sees it at once. P3: `failed commit: Err(Internal error: probe: log sync refused (sync Err))`,
@@ -68,7 +70,7 @@ Your choice: approve stage 2 for new MVCC databases with these limits, or keep t
   or this writer is fenced, before its next sync confirms it, or if the process stops before any record of its
   generation is confirmed, including while a seal's head is not yet adopted (reconcile then treats it as an older generation's bytes, as
   for the WAL today, `crates/turso_durable/src/reconcile.rs:120-128`). It is never a lost ack.
-- **README promises that break in MVCC mode:**
+- **README promises that break in MVCC mode** (line numbers are those of the README before stage 2, which has rewritten all four):
   - line 182: an Off commit that fails with `Timeout` "is rolled back locally";
   - line 231: Window's read-before-durable gap, "Off has no such gap";
   - line 241: "A failed Off commit is rolled back locally";
@@ -179,7 +181,8 @@ The checkpoint, in blocking TRUNCATE mode (P1 ops 36-46, and
   and the only MVCC field of `DatabaseOpts` is the passive-checkpoint flag (`turso_core-0.8.3/database.rs:71-85`).
 - So the library builds the empty MVCC database itself in a local staging directory (the pragma,
   then a TRUNCATE checkpoint) and only then creates the bucket, with generation 1 as a seal of
-  that image (Stage-2 design, Creation).
+  that image (Stage-2 design, Creation). Built: the head is generation 2 naming manifest 1,
+  which is what a seal of generation 1 publishes (see Stage 2 outcome).
 - A crash mid-switch can make the open panic. P7 run 0: `-> PANIC: Attempted to insert different page with same key: {key:?}`.
   So a staging directory is never opened again: the next open removes it.
 
@@ -375,7 +378,10 @@ the database is whole:
 - The library builds the empty MVCC database in a local staging directory with plain local IO:
   the switch, then a TRUNCATE checkpoint.
 - It then creates the bucket with generation 1 as a seal of that image: pages and manifest first,
-  the head last (the head is the commit point, as for every seal).
+  the head last (the head is the commit point, as for every seal). As built, "generation 1 as a
+  seal" means the head says generation 2 and names manifest 1, as every seal does (head G+1,
+  manifest G). A head at generation 1 naming manifest 1 would let the first real seal overwrite
+  `pages/1/*` and `manifest/1` under a live head.
 - A crash before the head leaves a staging directory, which the next open removes, and maybe
   objects of the never-headed creation. Trim cannot remove those (it needs a head,
   `crates/turso_durable/src/trim.rs:27-54`). They stay until the retry overwrites them: a retried
@@ -412,8 +418,8 @@ the read-only `ShippingFile` (`crates/turso_durable/src/io/wal_file.rs:243-249`)
 (`crates/turso_durable/src/io/db_storage.rs:376-379`) and the new `LogShippingFile`. Verify then
 reads the acked rows back (Q7).
 - Verify now changes the local directory (the bootstrap's writes), so stage 2 updates the README's
-  "Verify never claims, never seals and never writes to the bucket" (README line 316, still true
-  for the bucket, add the local writes), the `open_read_only` doc comment
+  "Verify never claims, never seals and never writes to the bucket" (README, CLI, `verify`: still
+  true for the bucket, now with the local writes, done), the `open_read_only` doc comment
   (`crates/turso_durable/src/db.rs:256-258`) and the reconcile comment
   (`crates/turso_durable/src/reconcile.rs:81-86`, which says a read-only directory never checkpointed).
 - The early WAL truncate probably runs on every MVCC open with no WAL frames (`DriveEarlyTruncate`,
@@ -624,3 +630,29 @@ sequenceDiagram
 | P8a-e | A `DurableStorage` wrapper compiles and delegates to `Storage::new`. `on_log_write_complete` failure rolls back on one connection, diverges under group commit. Encryption needs the wrapper's context. |
 | P8f | `truncate` refused before delegating: checkpoint `Err`, `rows=12` kept, plain and encrypted. |
 | P8g | A parked commit stalls every writer. `BEGIN CONCURRENT` fails at once behind a plain commit (`Write-write conflict`), and waits and succeeds behind `BEGIN CONCURRENT`. |
+
+## Stage 2 outcome
+
+What the build found and changed against the design above. The tests are in
+`crates/turso_durable/` unless a path says otherwise, and the logs are in
+`results/mvcc-durability.txt`. Where the engine matched this document (tasks 9 and 11 found no
+difference), nothing is listed.
+
+| Design said | Built | Evidence |
+|---|---|---|
+| A new database's bucket is "generation 1 as a seal" | The head is generation 2 naming manifest 1: head G+1, manifest G, as every seal. Generation 1 with manifest 1 would let the first seal overwrite `pages/1/*` and `manifest/1` under a live head. | `create_mvcc_makes_head_manifest_pages_and_local_files` (4 PUTs for the empty image, `trim_once` deletes 0) |
+| The staging build leaves `app.db-log` as the engine writes it | The engine's TRUNCATE checkpoint cuts the log to 0 bytes. The build writes the switch's 56-byte header back after it, locally. The bucket's image has an empty log. | the same test (`app.db-log` is exactly 56 bytes, magic `LML2`), `create_crash_at_each_step` |
+| Restore writes `app.db-log` (header repair "if not, the library writes the header itself") | A restore of a creation-made bucket writes an empty `app.db-log` and opens fine. `reset_to_fresh_header` works standalone, so the library writes no header of its own. The repair runs when `-wal` frames sit next to a log shorter than 56 bytes, on restore and on a local directory. | `restore_of_created_mvcc_bucket_opens`, `reset_to_fresh_header_works_standalone`, `wal_frames_with_empty_log_is_repaired_and_opens` (`src/db/tests/mvcc/restore.rs`) |
+| The first reopen of a created database is Level | It reports NewGeneration (header-only local log against an empty image) and sets `complete=false` on an unclaimed directory. Harmless but noisy. | `log_only_new_generation_keeps_the_dirty_file` |
+| A failed local log truncate after the seal poisons the database | Any checkpoint failure after a successful seal poisons it until reopen: the log truncate, its fsync, or the WAL truncate (the engine's `on_checkpoint_end` runs on every checkpoint error path). Broader than the design's diagram. | `local_truncate_failure_after_seal_poisons_until_reopen` (`src/db/tests/mvcc.rs`) |
+| Stats under group commit are not mentioned | Commits were counted per sync and only the lead acked. Now counted and acked per engine frame: `commits_acked == commits_uploaded`, fewer log PUTs than commits. | `stats_count_one_commit_per_record_in_group_commit` (8 threads, 161 commits) |
+| "Verify now changes the local directory", and the early WAL truncate "probably runs on every MVCC open" | On a plain restore the early WAL truncate is a no-op (the WAL is already empty). The only local change is `app.db` (0 to 8192 bytes, the bootstrap's backfill). On a mid-checkpoint restore the bootstrap empties a non-empty `-wal`. A read-only open never creates `app.db-log`, and a directory with no log and an empty log image fails with `<path> is missing: restore the database again`. WAL read-only still refuses writes. | `read_only_plain_restore_runs_early_wal_truncate_locally`, `read_only_mvcc_open_of_mid_checkpoint_restore_succeeds_and_ships_nothing`, `read_only_mvcc_does_not_create_the_log_when_absent`, `read_only_wal_database_still_refuses_writes` (`src/db/tests/mvcc/readonly.rs`) |
+| Reconcile makes the first sync's whole-file ship unnecessary (implied) | `ship_whole_file_next` stays: the "WAL frames + empty log" repair and a NewGeneration that empties the log write local bytes the image lacks. Cost: one extra PUT per open, and a peak memory of about 2 to 3 times the log's size (the log is read into one buffer). | `crates/turso_durable/src/io/log_file.rs` tests, Task 6 and 8 reports |
+| The CLI needs `--journal-mode` (not specified) | `--journal-mode wal\|mvcc` on `sql`, `stats`, `soak`, `bench`, `serve`, `takeover`. Without a flag or `DURABLE_JOURNAL_MODE` the CLI follows an existing head (one GET), and `restore` and `verify` always follow the head. The library does not: `Config.journal_mode` must name the mode of an existing MVCC database. `soak --concurrent [all\|mixed]`. | `mvcc_refusals_cli`, `mvcc_takeover_cli`, `head_journal_mode_reads_the_head` |
+| Takeover and fencing "no change of their own" | Correct for the library, but a takeover of an MVCC writer committing flat out (4 connections, no pause) hits the 64 fence-probe limit in 5 of 5 runs. The head's epoch is raised, the old writer is fenced at its next head check, and every ack it printed restores. Retry the takeover or pause the writer. | `mvcc_takeover_fences_a_running_soak`, `takeover_of_mvcc_restores_log_claims_fences_reconciles` |
+| Maintenance "measures" the log (Q6) | The `LogShippingFile` shares the engine's `wal_bytes` counter (high-water mark: the file's size at open, the highest offset + length written, 0 after `truncate(0)`). The MVCC `-wal` gets a private counter. A pending seal does not starve maintenance. | `maintenance_checkpoints_mvcc_when_log_bytes_exceed_threshold`, `log_high_water_is_the_file_size_at_open`, `pending_seal_does_not_starve_maintenance` |
+| Test plan: failed PUT under group commit, a put that stores then fails before a takeover, a seal failure then retry then crash, as system tests | The CLI cannot inject faults, so these are library tests (fault stores): `seal_failure_retry_crash_restore` (`src/db/tests/mvcc.rs`), `takeover_after_in_doubt_kind3_record`, `sync_ok_only_when_all_ops_confirmed` (`tests/mvcc_fencing.rs`). The system tests kill at `seal-started` and `seal-finished`, which is near the seal boundaries, not on them. | the files named |
+| The four limits stand | Pinned in `tests/mvcc_limits.rs`: P2, P3, P8g and the stop-the-world checkpoint all behaved as quoted above (a reader got `database is busy (locked)` after 5.39 s behind a parked seal PUT). The fifth limit (four README promises) is rewritten in the README. | `speculative_read_inside_begin_sees_unacked_commit`, `autocommit_read_waits_out_the_upload`, `failed_upload_keeps_the_commit_locally_outcome_unknown`, `slow_upload_stalls_writers_and_begin_concurrent_waits`, `checkpoint_stops_readers_with_busy_after_timeout_on_slow_seal` |
+
+The design's other statements held when tested. No `turso_core` change was needed, and
+`Cargo.lock` is unchanged from the stage-1 base.
