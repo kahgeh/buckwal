@@ -757,6 +757,51 @@ fn set_batching_window_refused_in_an_open_mvcc_database() {
     db.close().unwrap();
 }
 
+#[test]
+fn transaction_with_window_refused_in_mvcc_and_still_works_in_wal() {
+    let w = Batching::Window {
+        max_wait: Duration::from_millis(10),
+        max_commits: 4,
+        max_bytes: 1024,
+    };
+    let store = mem();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let (db, c) = mvcc_with_rows(store.clone(), mvcc(&dir), 1);
+    let mut ran = false;
+    let r = c.transaction_with(w, |_| {
+        ran = true;
+        Ok(())
+    });
+    assert_eq!(unsupported(r), "MVCC: Window batching");
+    assert!(!ran, "the closure ran");
+    assert!(c.is_autocommit(), "BEGIN ran");
+    // PRAGMA durable_batching inside a transaction is refused too.
+    c.execute("BEGIN", &[]).unwrap();
+    let r = c.execute("PRAGMA durable_batching = 'window 10ms 4 1KiB'", &[]);
+    assert_eq!(unsupported(r), "MVCC: Window batching");
+    c.execute("ROLLBACK", &[]).unwrap();
+    c.transaction_with(Batching::Off, |_| Ok(())).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+
+    // WAL: unchanged.
+    let store = mem();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let db = open_mem(&store, &dir);
+    let c = db.connect().unwrap();
+    create(&c);
+    c.transaction_with(w, |tx| {
+        tx.execute("INSERT INTO t(id, v) VALUES (1, 'x')", &[])
+            .map(|_| ())
+    })
+    .unwrap();
+    assert!(c.is_autocommit());
+    c.close().unwrap();
+    db.close().unwrap();
+}
+
 mod maintenance;
 mod readonly;
 mod restore;

@@ -354,7 +354,7 @@ The error text is the `Display` of `Error::Unsupported`: the feature, then ` is 
 |---|---|
 | `PRAGMA journal_mode = mvcc` or `experimental_mvcc` on a WAL database. Opening, restoring or taking over a WAL bucket with `journal_mode = Mvcc`. | `MVCC: switching an existing WAL database is not supported yet by turso_durable` |
 | `PRAGMA journal_mode = wal` on an MVCC database. Opening, restoring, taking over or verifying an MVCC bucket or directory with `journal_mode = Wal`. | `MVCC: switching back to WAL is not supported yet by turso_durable` |
-| Window batching in MVCC mode: `Config::batching`, `DURABLE_BATCHING`, `set_batching`, `PRAGMA durable_batching`. | `MVCC: Window batching is not supported yet by turso_durable` |
+| Window batching in MVCC mode: `Config::batching`, `DURABLE_BATCHING`, `set_batching` (database and connection), `transaction_with`, `PRAGMA durable_batching`. | `MVCC: Window batching is not supported yet by turso_durable` |
 | A WAL bucket or directory whose page 1 carries the MVCC header (bytes 18/19 are 255), opened as WAL. | `MVCC is not supported yet by turso_durable` |
 | `PRAGMA wal_checkpoint(PASSIVE)` in MVCC mode. | The engine's: `PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint`. The library never sets that flag (`passive_checkpoint_flag_never_set`). |
 

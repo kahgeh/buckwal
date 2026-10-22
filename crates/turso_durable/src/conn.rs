@@ -523,13 +523,15 @@ impl Connection {
 
     /// [`Connection::transaction`] committing with `b`, whatever this connection's and the
     /// database's settings are; the next transaction or statement is back to them. `Config`
-    /// when `b` is invalid, before anything runs.
+    /// when `b` is invalid, `Unsupported` for a Window in an MVCC database, both before
+    /// anything runs.
     pub fn transaction_with<T>(
         &self,
         b: Batching,
         f: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         b.validate()?;
+        b.check_mode(self.shared.journal_mode)?;
         self.run_transaction(Some(b), f)
     }
 
