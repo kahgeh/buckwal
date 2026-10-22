@@ -99,6 +99,16 @@ impl LogShippingFile {
     /// wait for it. Ok only when every op recorded so far is confirmed; returns the commit
     /// span of the record it shipped (`None`: nothing to ship).
     fn ship(&self) -> Result<Option<Span>> {
+        // `shipped` is held from here to the end of the sync, including the wait for the
+        // upload. It closes two gaps, and must not be narrowed:
+        // - between taking the ops and submitting them, a second sync (a group commit's
+        //   follower) would see them in neither `pending` nor `unconfirmed`, nor in any
+        //   queued record, and could return Ok at once;
+        // - after a record that was never sent, the ops go back to `unconfirmed` only when
+        //   the reply comes. A follower let in while this sync waits would queue its settle
+        //   behind that record, pass it once the store answers, find nothing pending or
+        //   unconfirmed, and be acked with its frame in no PUT
+        //   (`follower_waits_for_the_leads_requeue`).
         let mut s = crate::db::lock(&self.shipped);
         if let Some(e) = &s.fenced {
             return Err(e.clone());
@@ -302,13 +312,28 @@ mod tests {
     }
 
     /// Fails every GET of a key containing "/head" once `pass` more have passed, while armed.
+    /// An armed `GetGate::block_one_head_get`.
+    type Block = (u64, mpsc::Sender<()>, mpsc::Receiver<()>);
+
     struct GetGate {
         inner: Arc<dyn ObjectStore>,
         armed: AtomicBool,
         pass: AtomicU64,
+        /// `block_one_head_get`: (head GETs still to pass, where to say it is blocked, what
+        /// releases it).
+        block: Mutex<Option<Block>>,
     }
 
     impl GetGate {
+        /// Let `pass` head GETs through, then block the next one until the returned sender
+        /// is used (the first receiver hears when it blocks) and fail it once; later head
+        /// GETs pass.
+        fn block_one_head_get(&self, pass: u64) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (held_tx, held_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel();
+            *self.block.lock().unwrap() = Some((pass, held_tx, go_rx));
+            (held_rx, go_tx)
+        }
         fn fail_head_gets_after(&self, pass: u64) {
             self.pass.store(pass, SeqCst);
             self.armed.store(true, SeqCst);
@@ -338,6 +363,24 @@ mod tests {
             self.inner.put_if_match(key, body, etag)
         }
         fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError> {
+            if key.contains("/head") {
+                let blocked = {
+                    let mut b = self.block.lock().unwrap();
+                    match b.as_mut() {
+                        Some((0, _, _)) => b.take(),
+                        Some((n, _, _)) => {
+                            *n -= 1;
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                if let Some((_, held_tx, go_rx)) = blocked {
+                    let _ = held_tx.send(());
+                    let _ = go_rx.recv();
+                    return Err(StoreError::Transient(format!("injected get failure {key}")));
+                }
+            }
             if key.contains("/head")
                 && self.armed.load(SeqCst)
                 && self
@@ -383,6 +426,7 @@ mod tests {
             inner: mem.clone(),
             armed: AtomicBool::new(false),
             pass: AtomicU64::new(0),
+            block: Mutex::new(None),
         });
         let fault = Arc::new(FaultStore::new(gate.clone()));
         let hold = Arc::new(HoldStore::new(fault.clone()));
@@ -749,6 +793,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The lock a sync holds from its settle to its requeue. The lead's record is never sent
+    /// (with a zero lease the append's head GET fails, so no PUT), and the follower's sync
+    /// starts while the lead waits for it. If the follower could run its sync then, its
+    /// settle (queued behind the lead's record) would pass once the store answers, find
+    /// `pending` taken by the lead and `unconfirmed` not yet refilled, and return Ok with its
+    /// frame in no PUT. A follower's Ok must mean its frame is in the bucket.
+    #[test]
+    fn follower_waits_for_the_leads_requeue() {
+        let r = rig_with(100, Some(Duration::ZERO));
+        let f = Arc::new(r.file());
+        write(&*f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        write(&*f, &*r.io, HEADER as u64, frame(1, 55)).unwrap(); // the lead's
+        write(&*f, &*r.io, (HEADER + 55) as u64, frame(2, 49)).unwrap(); // the follower's
+                                                                         // The lead's settle GETs the head (passes); its append's GET blocks, then fails once.
+        let (held, go) = r.gate.block_one_head_get(1);
+        let lead = {
+            let (f, io) = (f.clone(), r.io.clone());
+            std::thread::spawn(move || sync(&*f, &*io))
+        };
+        held.recv().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let follower = {
+            let (f, io) = (f.clone(), r.io.clone());
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                sync(&*f, &*io)
+            })
+        };
+        started_rx.recv().unwrap();
+        // Time for the follower to queue its settle, were it let in.
+        std::thread::sleep(Duration::from_millis(150));
+        go.send(()).unwrap();
+        assert!(
+            matches!(lead.join().unwrap(), Err(Error::Timeout(_))),
+            "the lead's record was never sent"
+        );
+        let followed = follower.join().unwrap();
+        if followed.is_ok() {
+            assert_eq!(
+                kinds(&r.records(2)),
+                [3],
+                "the follower was acked with no PUT"
+            );
+            assert_eq!(
+                r.image(2),
+                r.local_bytes(),
+                "the follower was acked without its frame in the bucket"
+            );
+        }
+        assert_eq!(sync(&*f, &*r.io), Ok(()));
+        assert_eq!(r.image(2), r.local_bytes());
     }
 
     /// A sync with nothing new while earlier ops are unconfirmed (never sent) is no early Ok:
