@@ -1048,7 +1048,7 @@ A is fenced at its next request, but the object it overwrote stays. A possible f
 - Memory use grows with the WAL. A seal reads the whole local `-wal` into memory and holds every dirty page of the generation while it uploads them. A WAL that grows large makes the seal large too. The maintenance checkpoint seals once the `-wal` reaches `maintenance_wal_bytes` (64 MiB by default), but a transaction held open past `maintenance_gate_wait` keeps it from running (it retries with backoff). `CheckpointMode::Truncate` at quiet moments keeps generations small.
 - A writer's `open` allocates page 1 of a fresh database (`PRAGMA page_count` is 0) with `BEGIN IMMEDIATE; ROLLBACK` on a connection of its own, before it returns (see Server, Startup). Three side effects:
   - `PRAGMA page_size = N` on a fresh database is silently ignored, because the page size is fixed when page 1 is created.
-  - A fresh database that is closed without a write may upload page 1 when it closes.
+  - A fresh database that is closed without a write may upload page 1 when it closes. The library test `read_only_open_of_a_fresh_directory_writes_nothing` closes one and finds no page 1 in the bucket, so this is not guaranteed to happen.
   - On a database that is not fresh the check is one `PRAGMA page_count` read on a connection whose automatic WAL actions are disabled. The tests show that a fresh open commits nothing and a reopen adds no commit; they do not show a seal that is already due running during open, and this connection starts none of its own.
 - Never copy a live database directory (`cp -r`, a VM or disk clone). The copy has the same writer id, so fencing cannot tell the two processes apart. Restore into a new directory instead.
 

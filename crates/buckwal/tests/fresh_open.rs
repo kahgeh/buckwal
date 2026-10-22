@@ -167,8 +167,9 @@ fn open_of_a_fresh_database_allocates_page_one_without_a_commit() {
 }
 
 /// Opening a database that is not fresh adds no commit, no ack and no bucket write: the
-/// stats of the new open are the zero they were before it, and the bucket's keys, puts,
-/// deletes and bytes are those taken just before the open.
+/// stats of the new open are the zero they were before it, and the bucket's keys and deletes
+/// are those taken just before the open. Puts rise by exactly one, the `head` rewrite of the
+/// epoch raise that an open of an existing database makes; bytes up are not compared.
 #[test]
 fn open_of_a_database_that_is_not_fresh_adds_no_commit() {
     for key in [false, true] {
