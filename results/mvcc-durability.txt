@@ -7,3 +7,9 @@ pass 2 (HTTPS + encryption): all passed; scan found no plaintext; otel check PAS
 peak turso-durable-objects: pass 2 699 MB (https+encryption); pass 1 see below
 peak turso-durable-objects: 747 MB (plain)
 peak turso-durable-objects: 699 MB (https+encryption)
+
+Task 3 fix round 1 (review): move_created fsynced the db dir once after all renames
+  before: move_created_fsyncs_the_dir_after_each_rename FAILED
+    left:  ["rename app.db-log", "rename app.db", "rename app.db-durable", "fsync db", "fsync db"]
+    right: ["rename app.db-log", "fsync db", "rename app.db", "fsync db", "rename app.db-durable", "fsync db", "fsync db"]
+  after:  test create::tests::move_created_fsyncs_the_dir_after_each_rename ... ok (902821b)
