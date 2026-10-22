@@ -4,7 +4,7 @@
 //!   B. decrypt each frame's page with the key (EncryptionContext), insert the plaintext frame
 use probe::*;
 use turso_core::{CipherMode, EncryptionContext, EncryptionKey};
-use turso_durable::{Batching, Value};
+use buckwal::{Batching, Value};
 
 const KEY: [u8; 32] = [0x5a; 32];
 

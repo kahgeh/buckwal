@@ -2,7 +2,7 @@
 //! hold non-commit frames, and does a later write land below the end of the rebuilt image (a rewrite
 //! of frames already shipped)?
 use probe::*;
-use turso_durable::{open_with_store, Batching, Value};
+use buckwal::{open_with_store, Batching, Value};
 
 fn main() {
     let store = mem();
@@ -12,11 +12,11 @@ fn main() {
     c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
     c.execute("INSERT INTO t(id, v) VALUES (1, zeroblob(100))", &[]).unwrap();
     // ~20 MB of dirty pages in one transaction, then roll it back
-    let r: Result<(), turso_durable::Error> = c.transaction(|t| {
+    let r: Result<(), buckwal::Error> = c.transaction(|t| {
         for i in 1000..7000 {
             t.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(3500))", &[Value::from_i64(i)])?;
         }
-        Err(turso_durable::Error::Config("rollback on purpose".into()))
+        Err(buckwal::Error::Config("rollback on purpose".into()))
     });
     println!("big transaction: {r:?}");
     for i in 2..5 {

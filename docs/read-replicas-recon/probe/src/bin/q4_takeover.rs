@@ -6,7 +6,7 @@ use probe::*;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
-use turso_durable::{open_with_store, takeover_with_store, Batching, Value};
+use buckwal::{open_with_store, takeover_with_store, Batching, Value};
 
 fn main() {
     for b in [

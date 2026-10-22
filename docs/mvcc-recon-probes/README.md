@@ -13,5 +13,5 @@ They ran in a scratchpad crate (`mvcc-probe`, `turso_core =0.8.3` with the featu
 `uuid`, `encryption`, its own `[workspace]`) outside this repository. They are not part of the
 workspace and are not built here: `p2b_review.rs` is kept for reading and for copying into a
 scratch crate. The behaviour is pinned in a test that does build:
-`speculative_read_inside_begin_sees_unacked_commit` in `crates/turso_durable/tests/mvcc_limits.rs`.
+`speculative_read_inside_begin_sees_unacked_commit` in `crates/buckwal/tests/mvcc_limits.rs`.
 Both files are unchanged from the originals (checked for secrets and home paths: none).

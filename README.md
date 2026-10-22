@@ -1,8 +1,6 @@
 # buckwal
 
-Formerly turso-durable. Stored data is unchanged, settings are now `BUCKWAL_*`.
-
-Moving from turso-durable takes two steps: rename each `DURABLE_*` setting to `BUCKWAL_*`, and call `buckwal` where you called `turso-durable`.
+An old `DURABLE_*` setting is refused; set `BUCKWAL_*` instead.
 
 Make a tursodb database durable in an S3 bucket. A Rust library (`buckwal`) and a CLI (`buckwal`).
 
@@ -74,7 +72,7 @@ fn main() -> buckwal::Result<()> {
     })?;
     // The same with the PRAGMA, which works only inside a transaction.
     conn.transaction(|tx| {
-        tx.execute("PRAGMA durable_batching = 'window 50ms 64 1MiB'", &[])?;
+        tx.execute("PRAGMA buckwal_batching = 'window 50ms 64 1MiB'", &[])?;
         tx.execute("INSERT INTO notes(body) VALUES (?)", &[Value::from_text("d")])?;
         Ok(())
     })?;
@@ -133,7 +131,7 @@ The API:
 | `Connection::transaction(\|tx\| …)` | `BEGIN`, your closure (`tx.execute`, `tx.query`), then `COMMIT`. It runs `ROLLBACK` if the closure or the commit fails. It begins with a plain `BEGIN`: for `BEGIN CONCURRENT` (MVCC) use `execute`. In MVCC mode a failed commit is not rolled back (see MVCC mode). |
 | `Connection::transaction_with(Batching, \|tx\| …)` | `transaction`, committing with this setting whatever the connection's and the database's are. The next statement or transaction is back to them. `Config` when the setting is invalid, before anything runs. |
 | `Connection::set_batching(Option<Batching>) -> Result<()>` | This connection's own setting, from its next commit. `None` falls back to the database's. `Config` when the setting is invalid. |
-| `Connection::batching() -> Option<Batching>` | This connection's own setting (`PRAGMA durable_batching` reads the effective one). |
+| `Connection::batching() -> Option<Batching>` | This connection's own setting (`PRAGMA buckwal_batching` reads the effective one). |
 | `Connection::checkpoint(CheckpointMode)` | `Passive`, `Full`, `Restart` or `Truncate`. `Truncate` ends the generation inside the call: its pages upload (a seal), and an upload failure is returned as an error. `Restart` only resets the WAL in memory, so the seal happens in the next commit, which also gets any upload error. |
 | `Connection::close()` | Closes the connection. The writer's last connection runs a TRUNCATE checkpoint, which seals. Dropping a connection also closes it. |
 | `restore(&Config, dir) -> Result<RestoreReport>` | Restores the bucket's current state into `dir`, which must hold no database. It writes nothing to the bucket. `config.dir` is ignored; `dir` is used. An MVCC bucket needs `config.journal_mode = Mvcc`: a `Wal` config is refused and nothing is written. |
@@ -199,7 +197,7 @@ Errors are `buckwal::Error`:
 | `Bucket` | A permanent S3 error outside an upload, such as 403 on a GET. |
 | `Engine` | An error from turso_core, such as an SQL error. |
 | `Io` | A local file error. |
-| `Config` | Bad settings (an invalid batching setting or `PRAGMA durable_batching` misused included), a closed database, or connections still open at `close`. |
+| `Config` | Bad settings (an invalid batching setting or `PRAGMA buckwal_batching` misused included), a closed database, or connections still open at `close`. |
 | `Encryption` | The encryption setting does not fit the database: a key on a plaintext database, no key on an encrypted one, another cipher, or a key that does not decrypt page 1 (a wrong key, or a damaged page 1). Checked on page 1 by a writer open before its claim and by `takeover` before its head write, so nothing is written to the bucket, and again by every engine open (`verify` included). The message names the file or the cipher, never the key (see Guarantees, Encryption). |
 
 ## Batching
@@ -220,15 +218,16 @@ pub enum Batching {
 - `Config::batching` (`BUCKWAL_BATCHING`): the database's setting at open.
 - `Database::set_batching(b)`: the setting of every connection that has none of its own.
 - `Connection::set_batching(Some(b))`: this connection's own setting. `None` falls back to the database's.
-- For one transaction: `Connection::transaction_with(b, |tx| …)`, or `PRAGMA durable_batching` run inside the transaction.
+- For one transaction: `Connection::transaction_with(b, |tx| …)`, or `PRAGMA buckwal_batching` run inside the transaction.
 
 **Which setting a commit uses:** the transaction's, else the connection's, else the database's. A change takes effect from the next commit. It never changes a commit already waiting.
 
-**`PRAGMA durable_batching`.** The wrapper runs it itself; the engine never sees it.
-- `PRAGMA durable_batching = off`, `PRAGMA durable_batching = 'window 50ms 64 1MiB'`, or the call form `PRAGMA durable_batching('…')`.
+**`PRAGMA buckwal_batching`.** The wrapper runs it itself; the engine never sees it.
+- `PRAGMA durable_batching` (the old name) in any form is refused with `Config`, which names `PRAGMA buckwal_batching` instead.
+- `PRAGMA buckwal_batching = off`, `PRAGMA buckwal_batching = 'window 50ms 64 1MiB'`, or the call form `PRAGMA buckwal_batching('…')`.
 - Setting it works only inside a transaction (`BEGIN` … `COMMIT`), and lasts until that transaction ends. Outside a transaction it fails with `Config`; use `Connection::set_batching` there.
-- Reading it (`PRAGMA durable_batching`, anywhere) returns one row: the effective setting as text, for example `off` or `window 50ms 64 1MiB`.
-- `main.` only: `temp.durable_batching` or any other schema is refused with `Config`. `EXPLAIN` of it is refused too.
+- Reading it (`PRAGMA buckwal_batching`, anywhere) returns one row: the effective setting as text, for example `off` or `window 50ms 64 1MiB`.
+- `main.` only: `temp.buckwal_batching` or any other schema is refused with `Config`. `EXPLAIN` of it is refused too.
 - In `execute` and `query` it must be the only statement, with no parameters. `execute_batch` runs it in place among other statements.
 - The text, also used by `BUCKWAL_BATCHING` and the CLI's `--batching`: `off` or `window <max_wait> <max_commits> <max_bytes>`.
   - The keywords `off` and `window` are case-insensitive.
@@ -358,7 +357,7 @@ The error text is the `Display` of `Error::Unsupported`: the feature, then ` is 
 |---|---|
 | `PRAGMA journal_mode = mvcc` or `experimental_mvcc` on a WAL database. Opening, restoring or taking over a WAL bucket with `journal_mode = Mvcc`. | `MVCC: switching an existing WAL database is not supported yet by buckwal` |
 | `PRAGMA journal_mode = wal` on an MVCC database. Opening, restoring, taking over or verifying an MVCC bucket or directory with `journal_mode = Wal`. | `MVCC: switching back to WAL is not supported yet by buckwal` |
-| Window batching in MVCC mode: `Config::batching`, `BUCKWAL_BATCHING`, `set_batching` (database and connection), `transaction_with`, `PRAGMA durable_batching`. | `MVCC: Window batching is not supported yet by buckwal` |
+| Window batching in MVCC mode: `Config::batching`, `BUCKWAL_BATCHING`, `set_batching` (database and connection), `transaction_with`, `PRAGMA buckwal_batching`. | `MVCC: Window batching is not supported yet by buckwal` |
 | A WAL bucket or directory whose page 1 carries the MVCC header (bytes 18/19 are 255), opened as WAL. | `MVCC is not supported yet by buckwal` |
 | `PRAGMA wal_checkpoint(PASSIVE)` in MVCC mode. | The engine's: `PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint`. The library never sets that flag (`passive_checkpoint_flag_never_set`). |
 
@@ -516,7 +515,7 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. (li
 **Protocol coverage.**
 - Served: the endpoints above, and the requests `execute`, `batch` (all six conditions: `ok`, `error`, `not`, `and`, `or`, `is_autocommit`), `sequence`, `describe`, `store_sql`, `close_sql`, `close`, and on `/v3` `get_autocommit`. A statement takes `sql` or `sql_id`, `args`, `named_args` and `want_rows`; unknown fields are ignored (libSQL's Rust crate sends `replication_index`).
 - Named arguments (section 8.1) match with one leading `:`, `@` or `$` stripped, so `"x"`, `":x"`, `"@x"` and `"$x"` each bind whichever of `:x`, `@x` and `$x` the statement has. The Python driver sends a bare dict key `k` as `":k"`, which therefore binds `$k` too. Until 10e62fb a prefixed name had to match exactly, and `SELECT $x` with the name `":x"` failed with `SQL_INPUT_ERROR` ("the statement has no parameter named \":x\""). A statement holding two of `:x`, `@x` and `$x` (two parameters) cannot be bound by name: the names strip to the same `x`, so one parameter is bound twice or the other is left unbound, and the statement fails with `SQL_INPUT_ERROR`. Before 10e62fb, when names matched exactly, the names `":x"` and `"$x"` bound both. A `?N` name is not stripped and binds that numbered parameter.
-- `describe` (section 6.4), by `sql` or `sql_id`, on both pipelines, answers `params` (a name without its `:`, `@` or `$`, and `null` for a positional one), `cols`, `is_explain` and `is_readonly`. It runs the library's `Connection::describe`: the SQL guard first, the sync-mode check after the engine's prepare, and it never steps, so nothing commits. Setter PRAGMAs that turso_core applies at prepare (for example `query_only`, `foreign_keys`) take effect on describe, as on execute; the durability ones are refused by the guard. An `EXPLAIN` describes as read-only. A describe of `PRAGMA durable_batching` gives a fixed description and changes no setting.
+- `describe` (section 6.4), by `sql` or `sql_id`, on both pipelines, answers `params` (a name without its `:`, `@` or `$`, and `null` for a positional one), `cols`, `is_explain` and `is_readonly`. It runs the library's `Connection::describe`: the SQL guard first, the sync-mode check after the engine's prepare, and it never steps, so nothing commits. Setter PRAGMAs that turso_core applies at prepare (for example `query_only`, `foreign_keys`) take effect on describe, as on execute; the durability ones are refused by the guard. An `EXPLAIN` describes as read-only. A describe of `PRAGMA buckwal_batching` gives a fixed description and changes no setting.
 - The `error` condition is the negation of `ok`: it is true when the step failed or was skipped (section 6.2.1). This differs from libSQL's Hrana, where `error` is true only for a step that failed.
 - Values (section 8.2): a non-finite float result is sent as `{"type":"float","value":null}`. Blobs go out as standard base64 without padding; padded and unpadded are both accepted. A client must not send a non-finite float: `{"type":"float","value":null}` as an argument fails its request with `PROTO_ERROR`.
 - Statement results (section 8.4):
@@ -563,7 +562,7 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. (li
 | a new stream whose connection cannot be opened | the library error's code (HTTP 503) |
 
 **Streams.**
-- Each stream (section 4) owns one `buckwal::Connection`, opened on the stream's first request with `PRAGMA busy_timeout` set. So transactions, the SQL guard and `PRAGMA durable_batching` work as in the library.
+- Each stream (section 4) owns one `buckwal::Connection`, opened on the stream's first request with `PRAGMA busy_timeout` set. So transactions, the SQL guard and `PRAGMA buckwal_batching` work as in the library.
 - The baton is `<id>.<secret>`, random, and it changes on every response. A null baton means the stream is closed. A baton used twice, or one for a stream another request holds, gets 400 `STREAM_EXPIRED`.
 - A stale snapshot is `SQLITE_BUSY`: a transaction that read, then tries to write after another stream committed, gets turso_core's stale-snapshot error. The client must roll back and retry the whole transaction.
 - A stream is checked out of the registry for the whole pipeline, and the blocking task gives it back, so a client that drops its connection mid-request never leaks the stream.
@@ -572,9 +571,9 @@ Any other path or method, `GET /v3-protobuf` included, gets 404 `NOT_FOUND`. (li
 - **The anchor connection.** The server holds one extra connection from open until shutdown. The last connection to close runs a TRUNCATE checkpoint, which seals; with the anchor, a stream's close is never the last, so closing a stream never seals. Generations still end at the engine's own checkpoints and the maintenance checkpoint, and the anchor's close at shutdown seals the last one.
 
 **Batching.** The levels of Batching, through the protocol:
-- Per transaction: `BEGIN`, then `PRAGMA durable_batching = '<spec>'` on the stream, as in the library. It lasts until the transaction ends.
+- Per transaction: `BEGIN`, then `PRAGMA buckwal_batching = '<spec>'` on the stream, as in the library. It lasts until the transaction ends.
 - Per stream: the same PRAGMA as its own statement while the stream is in autocommit. The library refuses that; the server catches it in an `execute` or a batch step, without arguments, and calls `Connection::set_batching(Some(b))`, so the setting lasts for the stream's life. It does not catch it in a `sequence`, where the library's refusal comes back as `SQL_INPUT_ERROR`.
-- Reading: `PRAGMA durable_batching` with no value returns the stream's effective setting.
+- Reading: `PRAGMA buckwal_batching` with no value returns the stream's effective setting.
 - Database-wide: `BUCKWAL_BATCHING`, or `serve --batching`.
 
 ```mermaid
@@ -922,7 +921,7 @@ Stores known to support both conditional PUTs (`If-None-Match: *` and `If-Match`
 | `PRAGMA journal_mode` set to `mvcc` or `experimental_mvcc`, on a WAL database | `Unsupported("MVCC: switching an existing WAL database")` |
 | `PRAGMA journal_mode` set to `wal`, on an MVCC database | `Unsupported("MVCC: switching back to WAL")` |
 | `PRAGMA journal_mode` set to anything else | `Unsupported("journal_mode other than WAL")` |
-| `PRAGMA durable_batching` set to a Window, on an MVCC database | `Unsupported("MVCC: Window batching")` |
+| `PRAGMA buckwal_batching` set to a Window, on an MVCC database | `Unsupported("MVCC: Window batching")` |
 | `PRAGMA synchronous` below FULL | `Unsupported("synchronous below FULL")` |
 | `ATTACH` | `Unsupported("ATTACH")`. Writes to an attached database would not be uploaded. |
 | `PRAGMA hexkey` or `PRAGMA cipher` set to a value | `Unsupported("encryption PRAGMAs (use BUCKWAL_ENCRYPTION_KEY_FILE)")`. The engine would swap the connection's key or cipher (translate/pragma.rs:644-655). Reading them is allowed. |
@@ -1051,7 +1050,7 @@ A is fenced at its next request, but the object it overwrote stays. A possible f
 
 **Server limits.** `serve` adds these (and see Server, Memory and Remaining differences from PROTOCOL.md):
 - A client that dies inside a transaction holds the write lock until its stream is reaped: `BUCKWAL_SERVE_STREAM_TIMEOUT_MS` (10 s) plus up to 1 s. Writers on other streams wait only `BUCKWAL_SERVE_BUSY_TIMEOUT_MS` (5 s), then get `SQLITE_BUSY`. Follow-up: an idle timeout below the busy timeout for streams in a transaction.
-- A BUSY wait in a `sequence` spins one core for the whole wait when `Connection::execute_batch` runs the SQL as one engine call (turso_core's `run_ignore_rows` ignores the sleep time). It steps statement by statement instead, and sleeps, in three cases: the SQL mentions `durable_batching`, the open is read-only, or a transaction with its own batching setting is open. `execute` sleeps. Follow-up in the library or upstream.
+- A BUSY wait in a `sequence` spins one core for the whole wait when `Connection::execute_batch` runs the SQL as one engine call (turso_core's `run_ignore_rows` ignores the sleep time). It steps statement by statement instead, and sleeps, in three cases: the SQL mentions `buckwal_batching`, the open is read-only, or a transaction with its own batching setting is open. `execute` sleeps. Follow-up in the library or upstream.
 - There is no time limit on a running statement.
 - After a fence, every request in a pipeline and every statement that runs in a cursor batch gets `FENCED` (a step whose condition is then false is skipped), but an empty pipeline or empty cursor batch, which holds none, still gets 200.
 - The per-stream batching PRAGMA is caught through `execute` (and batch steps) but not through `sequence`.

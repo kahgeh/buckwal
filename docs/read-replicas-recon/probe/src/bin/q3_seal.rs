@@ -12,7 +12,7 @@
 use probe::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use turso_durable::{Batching, CheckpointMode, Value};
+use buckwal::{Batching, CheckpointMode, Value};
 
 const FS: usize = FRAME_HDR + 4096;
 

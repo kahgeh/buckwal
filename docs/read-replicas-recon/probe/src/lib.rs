@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use turso_durable::store::{MemStore, ObjectStore};
-use turso_durable::{Batching, Config};
+use buckwal::store::{MemStore, ObjectStore};
+use buckwal::{Batching, Config};
 
 pub const PREFIX: &str = "db";
 
@@ -220,8 +220,8 @@ impl Rebuild {
 /// empty) and handed a copy of that `app.db` to a replica directory.
 pub struct Baseline {
     pub store: Arc<MemStore>,
-    pub wdb: turso_durable::Database,
-    pub w: turso_durable::Connection,
+    pub wdb: buckwal::Database,
+    pub w: buckwal::Connection,
     pub replica_db_path: PathBuf,
     pub gen: u64,
 }
@@ -239,13 +239,13 @@ pub fn baseline_with(name: &str, batching: Batching, key_file: Option<PathBuf>) 
     std::fs::create_dir_all(&rdir).unwrap();
     let mut cfg = config(&wdir, batching);
     cfg.encryption_key_file = key_file;
-    let wdb = turso_durable::open_with_store(cfg, store.clone()).unwrap();
+    let wdb = buckwal::open_with_store(cfg, store.clone()).unwrap();
     let w = wdb.connect().unwrap();
     w.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
     for i in 1..=10 {
-        w.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(100))", &[turso_durable::Value::from_i64(i)]).unwrap();
+        w.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(100))", &[buckwal::Value::from_i64(i)]).unwrap();
     }
-    w.checkpoint(turso_durable::CheckpointMode::Truncate).unwrap();
+    w.checkpoint(buckwal::CheckpointMode::Truncate).unwrap();
     let gen = wdb.generation();
     std::fs::copy(wdir.join("app.db"), rdir.join("app.db")).unwrap();
     Baseline { store, wdb, w, replica_db_path: rdir.join("app.db"), gen }

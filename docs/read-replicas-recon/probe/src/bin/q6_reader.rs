@@ -6,9 +6,9 @@
 use probe::*;
 use std::time::Instant;
 use turso_core::CheckpointMode as M;
-use turso_durable::{Batching, CheckpointMode, Value};
+use buckwal::{Batching, CheckpointMode, Value};
 
-fn frames_of(store: &dyn turso_durable::store::ObjectStore, gen: u64) -> Vec<Vec<u8>> {
+fn frames_of(store: &dyn buckwal::store::ObjectStore, gen: u64) -> Vec<Vec<u8>> {
     let mut rb = Rebuild::default();
     let mut out = vec![];
     for (_s, ops) in gen_syncs(store, gen) {

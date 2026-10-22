@@ -3,15 +3,15 @@
 //! the uncommitted tail is held back, and a later write that rewinds below the tail discards it.
 //! Also counts what a naive "apply every whole frame" would have done.
 use probe::*;
-use turso_durable::{Batching, Value};
+use buckwal::{Batching, Value};
 
 fn main() {
     let b = baseline("q1c", Batching::Off);
-    let r: Result<(), turso_durable::Error> = b.w.transaction(|t| {
+    let r: Result<(), buckwal::Error> = b.w.transaction(|t| {
         for i in 1000..7000 {
             t.execute("INSERT INTO t(id, v) VALUES (?, zeroblob(3500))", &[Value::from_i64(i)])?;
         }
-        Err(turso_durable::Error::Config("rollback on purpose".into()))
+        Err(buckwal::Error::Config("rollback on purpose".into()))
     });
     println!("big transaction: {r:?}");
     for i in 11..15 {

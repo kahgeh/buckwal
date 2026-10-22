@@ -2,7 +2,7 @@
 //! copy of the writer's database, do readers on other connections in the same process see a commit
 //! only after its last frame, and what does the API do with a repeated frame and with a gap?
 use probe::*;
-use turso_durable::{Batching, Value};
+use buckwal::{Batching, Value};
 
 fn main() {
     let b = baseline("q2", Batching::Off);

@@ -2,7 +2,7 @@
 
 One line per term, as the code on this branch uses it: the meaning, then "Not:", the words not to use for it. Specs, code, logs, settings and docs use these terms and no others for the same thing. The README has the full rules. Words that older text still uses are listed at the end, under "Not yet consistent".
 
-- **buckwal**: the product: the library `buckwal`, the CLI `buckwal` and the server `buckwal serve`. Not: turso-durable (the old name).
+- **buckwal**: the product: the library `buckwal`, the CLI `buckwal` and the server `buckwal serve`.
 - **durable**: a commit is durable when a log record holding it is in the bucket (and in the local fsynced file). `execute` and `COMMIT` return `Ok` only then. Not: saved, persisted, flushed, synced (a local fsync alone is not durable).
 - **ack (acked)**: the `Ok` a commit returns once it is durable; a commit that returned an error is not acked. Not: committed (for a commit still waiting), confirmed (that word is for ops and records in the bucket).
 - **head**: the bucket object `head`, flat JSON: `format`, `generation`, `manifest`, `writer_id`, `epoch` (and `journal_mode` in format 2). It says where the database is now (`format/head.rs`). Not: manifest (a different object), pointer, root, state file (that is the local state).

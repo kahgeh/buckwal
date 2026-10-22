@@ -2,8 +2,8 @@
 //! and which frames carry a commit? Drives a real writer on a MemStore, then replays the log
 //! sync by sync into a WAL image and inspects the image after every sync.
 use probe::*;
-use turso_durable::store::ObjectStore;
-use turso_durable::{open_with_store, Batching, CheckpointMode, Value};
+use buckwal::store::ObjectStore;
+use buckwal::{open_with_store, Batching, CheckpointMode, Value};
 
 fn main() {
     for b in [

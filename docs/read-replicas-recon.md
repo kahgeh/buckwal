@@ -24,7 +24,7 @@ and all in the stage-2 design below:
    not restarting** its WAL.
 4. Encrypted frames must be **decrypted before insert** (stored ciphertext panics a debug build and
    is argued to corrupt a release build).
-5. The follower can only reach the frame API from **inside `turso_durable`** (the library's engine
+5. The follower can only reach the frame API from **inside `buckwal`** (the library's engine
    type is crate-private), and its page reads go through the library's lazy page storage.
 6. `conn_raw_api` is **not a public or documented API**. It is pinned by the `=0.8.3` version.
 7. The library's IO layer has two modes, writer and read-only, and the follower needs a **third,
@@ -110,7 +110,7 @@ and all in the stage-2 design below:
 
 ### 1. Extents to frames: works, here is how
 
-The log record format is in `crates/turso_durable/src/format/record.rs`: a kind byte (1 extents,
+The log record format is in `crates/buckwal/src/format/record.rs`: a kind byte (1 extents,
 2 fence), a writer id, then for extents a list of syncs, each a list of ops: `Write{off,bytes}` of
 the `-wal` file or `Truncate{len}`. A record holds whole syncs, and a sync is what the writer ships
 at one WAL `fsync` (`io/wal_file.rs:324-350`, `uploader/batch.rs:64-84`). The record has no
@@ -335,9 +335,9 @@ fresh directory.
 
 Corrections and additions:
 
-1. **Apply path, in-crate.** `turso_durable::Database` hides its `turso_core::Database` in a
+1. **Apply path, in-crate.** `buckwal::Database` hides its `turso_core::Database` in a
    crate-private engine type, so the follower and the replica's read-only connections are new code
-   inside `crates/turso_durable`. The follower owns one internal apply connection, never handed
+   inside `crates/buckwal`. The follower owns one internal apply connection, never handed
    out. `Cargo.toml` gains `conn_raw_api` on `turso_core` (own audit row, already done for the
    feature in stage 1).
 2. **Replica IO mode** (limits above): a third mode in the library's IO layer
@@ -387,14 +387,14 @@ Corrections and additions:
 flowchart LR
   subgraph writer["Writer machine (unchanged)"]
     wapp["App"]:::existing
-    wlib["turso_durable writer<br/>commits, seals, takeover, GC"]:::existing
+    wlib["buckwal writer<br/>commits, seals, takeover, GC"]:::existing
   end
   subgraph store["Object store"]
     bucket[("Bucket, format v1<br/>head, log/G/seq, pages, manifest")]:::existing
   end
   subgraph replica["Replica machine"]
     rapp["App (reads only)"]:::existing
-    subgraph rlib["turso_durable in replica mode"]
+    subgraph rlib["buckwal in replica mode"]
       ropen["open_replica<br/>read-only connections"]:::new
       follow["Follower thread<br/>poll LIST and head"]:::new
       rebuild["Frame rebuild<br/>WAL image per generation, committed prefix"]:::new
@@ -508,7 +508,7 @@ sequenceDiagram
 ## Probe files
 
 All in `docs/read-replicas-recon/`. The probe crate (`probe/`) depends on `turso_core =0.8.3`
-(features `fs, json, uuid, encryption, conn_raw_api`) and this workspace's `turso_durable` by path.
+(features `fs, json, uuid, encryption, conn_raw_api`) and this workspace's `buckwal` by path.
 It was built offline against the audited `Cargo.lock`, outside this repo.
 
 **Audit record.** The `rust-supply-chain-auditor` approved enabling `conn_raw_api` on
@@ -516,15 +516,15 @@ It was built offline against the audited `Cargo.lock`, outside this repo.
 adds no crate and no feature beyond itself, changes no version against `Cargo.lock`, and breaks
 none of the repo's rules (no aws-lc, openssl or native-tls, no `--cfg antithesis`). Its
 conditions: the probe uses the repo's `Cargo.lock`, `--offline`, only `turso_core` and
-`turso_durable` as dependencies, stays out of the repo's workspace, and is never built with
+`buckwal` as dependencies, stays out of the repo's workspace, and is never built with
 `--cfg antithesis`.
 
 **To re-run a probe safely.** Copy `probe/` to a directory outside this repo, change the
-`turso_durable` path in its `Cargo.toml` to the absolute path of `crates/turso_durable`, copy this
+`buckwal` path in its `Cargo.toml` to the absolute path of `crates/buckwal`, copy this
 repo's `Cargo.lock` into it, set `CARGO_TARGET_DIR` to a directory of your own, and run `cargo run
 --offline --bin q3_seal` (and so on). Do not pass `--locked` the first time: the probe is its own
 root package, so cargo has to rewrite the copied lock. Then diff that lock against the repo's. Only
-three entries may differ: `probe 0.0.0` added, and `turso-durable-cli 0.1.0` and `tokio-macros
+three entries may differ: `probe 0.0.0` added, and `buckwal-cli 0.1.0` and `tokio-macros
 2.7.2` dropped, with no version changes (what an offline build without `--locked` changes, measured
 in review, not an auditor finding). Any other difference voids the audit. After that, `--locked`
 works. Do not add a dependency either. The probes write scratch files under `<probe dir>/work/`
