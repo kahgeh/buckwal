@@ -75,3 +75,11 @@ Final fix wave (whole-branch review)
     before: db::tests::stale_staging_dir_never_deletes_a_foreign_app_db FAILED: panicked "opened over a foreign app.db" (the foreign file had been deleted and a database created)
     after: refused with Config "holds an app.db not created by turso_durable", foreign files untouched
   turso_durable lib: 492 passed; 0 failed.
+
+== Final run, 2026-10-22, HEAD 9ab3403, ./scripts/test.sh, exit 0 ==
+whole run 14:34 (874 s). unit tests: 700 (./scripts/test.sh unit).
+each pass: 6 serve tests (mvcc_serve_begin_concurrent included), 52 system tests (the MVCC ones included), S3 tests (8 in pass 1, 12 in pass 2).
+peak turso-durable-objects: 722 MB (plain), 764 MB (https+encryption). Baseline at 332b45f: 747 MB and 699 MB; 588 unit, 5 serve, 38 system, about 12 min.
+scan: pass 1 found CREATE TABLE in 13240 objects; pass 2 found no plaintext (CREATE TABLE, SQLite header, bench payload, marker 1, the encryption key: all not found).
+otel check PASSED.
+raw log: .superpowers/sdd/mvcc-durability/final.log (git-ignored, not committed).
