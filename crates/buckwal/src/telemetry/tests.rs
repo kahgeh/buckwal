@@ -966,10 +966,10 @@ fn from_env_parses_and_refuses_bad_values() {
         TelemetryConfig::from_lookup(|k| env.get(k).map(|v| v.to_string()))
     };
     let c = lookup(&[
-        ("DURABLE_OTEL", "1"),
-        ("DURABLE_OTEL_ENDPOINT", "http://h:1"),
-        ("DURABLE_OTEL_LEVEL", "warn"),
-        ("DURABLE_TEST_RUN_ID", "r"),
+        ("BUCKWAL_OTEL", "1"),
+        ("BUCKWAL_OTEL_ENDPOINT", "http://h:1"),
+        ("BUCKWAL_OTEL_LEVEL", "warn"),
+        ("BUCKWAL_TEST_RUN_ID", "r"),
     ])
     .unwrap();
     assert_eq!(
@@ -987,9 +987,9 @@ fn from_env_parses_and_refuses_bad_values() {
     assert_eq!(d.endpoint, "http://localhost:4317");
     assert_eq!(d.level, Level::INFO);
     assert_eq!(d.test_run_id, None);
-    assert!(!lookup(&[("DURABLE_OTEL", "false")]).unwrap().enabled);
-    assert!(lookup(&[("DURABLE_OTEL", "TRUE")]).unwrap().enabled);
-    for (var, bad) in [("DURABLE_OTEL", "yes"), ("DURABLE_OTEL_LEVEL", "loud")] {
+    assert!(!lookup(&[("BUCKWAL_OTEL", "false")]).unwrap().enabled);
+    assert!(lookup(&[("BUCKWAL_OTEL", "TRUE")]).unwrap().enabled);
+    for (var, bad) in [("BUCKWAL_OTEL", "yes"), ("BUCKWAL_OTEL_LEVEL", "loud")] {
         match lookup(&[(var, bad)]) {
             Err(Error::Config(m)) => assert!(m.contains(var) && m.contains(bad), "{m}"),
             r => panic!("{var}={bad}: {r:?}"),
@@ -1000,7 +1000,7 @@ fn from_env_parses_and_refuses_bad_values() {
 #[test]
 fn otel_accepts_on_and_off() {
     let lookup = |v: &'static str| {
-        TelemetryConfig::from_lookup(|k| (k == "DURABLE_OTEL").then(|| v.to_string()))
+        TelemetryConfig::from_lookup(|k| (k == "BUCKWAL_OTEL").then(|| v.to_string()))
     };
     for v in ["on", "On", "ON", "1", "true"] {
         assert!(lookup(v).unwrap().enabled, "{v}");
@@ -1285,4 +1285,15 @@ fn failed_gc_exports_error_outcome() {
     let gcs = spans.named("durable.gc");
     assert_eq!(gcs.len(), 1, "{gcs:?}");
     assert_eq!(gcs[0].field("durable.outcome"), Some("error"));
+}
+
+#[test]
+fn telemetry_from_lookup_refuses_old_otel() {
+    let e = TelemetryConfig::from_lookup(|k| (k == "DURABLE_OTEL").then(|| "1".to_string()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("DURABLE_OTEL is no longer read, set BUCKWAL_OTEL instead"),
+        "{e}"
+    );
 }

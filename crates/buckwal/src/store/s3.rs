@@ -438,7 +438,7 @@ impl S3Store {
         let net = |e: reqwest::Error| {
             match tls_failure(&e) {
             Some(why) => StoreError::Permanent(format!(
-                "{method} {key}: TLS certificate not trusted: {why}; set DURABLE_CA_BUNDLE to the CA that signed the endpoint's certificate"
+                "{method} {key}: TLS certificate not trusted: {why}; set BUCKWAL_CA_BUNDLE to the CA that signed the endpoint's certificate"
             )),
             None => StoreError::Transient(format!("{method} {key}: {e}")),
         }

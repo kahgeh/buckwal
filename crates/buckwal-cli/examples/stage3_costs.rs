@@ -1,6 +1,6 @@
 //! Stage-3 cost measurements (`results/writer-lease.txt`): the bucket requests of a takeover,
 //! of a writer open, and of the lease's head check after an idle pause. Settings come from the
-//! `DURABLE_*` variables, as for the CLI. Each command prints `key=value` lines, then every
+//! `BUCKWAL_*` variables, as for the CLI. Each command prints `key=value` lines, then every
 //! request it made as `request <op> <key>` (a `stat` is a HEAD, counted as a GET).
 //!
 //! ```text

@@ -1170,11 +1170,11 @@ fn bind_fails_fast() {
     let mut missing = cfg.clone();
     missing.token_file = Some(dir.path().join("no-token"));
     let e = bind(missing).unwrap_err();
-    assert!(e.contains("DURABLE_SERVE_TOKEN_FILE"), "{e}");
+    assert!(e.contains("BUCKWAL_SERVE_TOKEN_FILE"), "{e}");
     let mut open = cfg;
     open.listen = "0.0.0.0:0".parse().unwrap();
     let e = bind(open).unwrap_err();
-    assert!(e.contains("DURABLE_SERVE_TLS_CERT"), "{e}");
+    assert!(e.contains("BUCKWAL_SERVE_TLS_CERT"), "{e}");
 }
 
 /// Once the port is free, another test running in parallel (or another process) can bind

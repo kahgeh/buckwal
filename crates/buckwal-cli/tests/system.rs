@@ -368,7 +368,7 @@ fn crash_matrix(mode: &str, batching: Option<&str>) {
         // Under 4 Window connections the engine never restarts the WAL after PASSIVE/FULL, so
         // the maintenance checkpoint ends the generation (README "Maintenance checkpoint").
         if batching.is_some() && matches!(mode, "passive" | "full") {
-            ctx = ctx.set("DURABLE_MAINTENANCE_LOG_OBJECTS", WINDOW_SEAL_LOG_OBJECTS);
+            ctx = ctx.set("BUCKWAL_MAINTENANCE_LOG_OBJECTS", WINDOW_SEAL_LOG_OBJECTS);
         }
         let dir = ctx.dir("db");
         let mut args = Vec::new();
@@ -627,7 +627,7 @@ fn crash_during_seal_upload() {
 /// connections, under which the engine never restarts the WAL by itself.
 const MAINTENANCE_ARGS: [&str; 4] = ["--connections", "8", "--batching", "window 1ms 64 1MiB"];
 
-/// The maintenance threshold of the maintenance tests (`DURABLE_MAINTENANCE_LOG_OBJECTS`).
+/// The maintenance threshold of the maintenance tests (`BUCKWAL_MAINTENANCE_LOG_OBJECTS`).
 const MAINTENANCE_LOG_OBJECTS: usize = 200;
 
 fn is_maintenance_end(l: &str) -> bool {
@@ -676,14 +676,14 @@ fn maintenance_bounds_generations_under_window_load() {
             // Only the log-object threshold can trigger a run.
             Ctx::new(&name)
                 .set(
-                    "DURABLE_MAINTENANCE_LOG_OBJECTS",
+                    "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
                     &MAINTENANCE_LOG_OBJECTS.to_string(),
                 )
-                .set("DURABLE_MAINTENANCE_WAL_MIB", "0")
+                .set("BUCKWAL_MAINTENANCE_WAL_MIB", "0")
         } else {
             Ctx::new(&name)
-                .set("DURABLE_MAINTENANCE_LOG_OBJECTS", "0")
-                .set("DURABLE_MAINTENANCE_WAL_MIB", "0")
+                .set("BUCKWAL_MAINTENANCE_LOG_OBJECTS", "0")
+                .set("BUCKWAL_MAINTENANCE_WAL_MIB", "0")
         };
         let dir = ctx.dir("db");
         let mut soak = Soak::spawn(&ctx, &dir, &MAINTENANCE_ARGS);
@@ -752,7 +752,7 @@ fn maintenance_bounds_generations_under_window_load() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_during_maintenance_checkpoint_restores_every_ack() {
     let ctx = Ctx::new("crash_during_maintenance_checkpoint").set(
-        "DURABLE_MAINTENANCE_LOG_OBJECTS",
+        "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
         &MAINTENANCE_LOG_OBJECTS.to_string(),
     );
     let dir = ctx.dir("db");
@@ -806,7 +806,7 @@ const WINDOW_ARGS: [&str; 4] = ["--batching", WINDOW, "--connections", "4"];
 /// RustFS stopped mid-run: error lines while it is down, acks again after `start`; every
 /// acked id restores and `log/<G>/` has no gap. `extra` goes to soak.
 fn rustfs_stopped_mid_commit(name: &str, extra: &[&str]) {
-    let ctx = Ctx::new(name).set("DURABLE_RETRY_DEADLINE_MS", "2000");
+    let ctx = Ctx::new(name).set("BUCKWAL_RETRY_DEADLINE_MS", "2000");
     let dir = ctx.dir("db");
     let mut soak = Soak::spawn(&ctx, &dir, extra);
     soak.wait_acks(200);
@@ -845,8 +845,8 @@ fn fault_window_rustfs_stopped_mid_commit() {
 /// gap of at least 1 s), then carries on; every acked id restores and `log/<G>/` has no gap.
 fn rustfs_paused_ambiguous_put(name: &str, extra: &[&str]) {
     let ctx = Ctx::new(name)
-        .set("DURABLE_REQUEST_TIMEOUT_MS", "500")
-        .set("DURABLE_RETRY_DEADLINE_MS", "5000");
+        .set("BUCKWAL_REQUEST_TIMEOUT_MS", "500")
+        .set("BUCKWAL_RETRY_DEADLINE_MS", "5000");
     let dir = ctx.dir("db");
     let mut soak = Soak::spawn(&ctx, &dir, extra);
     soak.wait_acks(200);
@@ -1181,10 +1181,10 @@ fn gc_until_trimmed_against_head(ctx: &Ctx, head: &Head, limit: Duration) -> Str
 fn trimming_bounds_restore_gets() {
     // The smallest valid grace: 2 s > lease 0 + 400 ms + 500 ms.
     let ctx = Ctx::new("trimming_bounds_restore_gets")
-        .set("DURABLE_TRIM_GRACE_SECS", "2")
-        .set("DURABLE_LEASE_MS", "0")
-        .set("DURABLE_RETRY_DEADLINE_MS", "400")
-        .set("DURABLE_REQUEST_TIMEOUT_MS", "500");
+        .set("BUCKWAL_TRIM_GRACE_SECS", "2")
+        .set("BUCKWAL_LEASE_MS", "0")
+        .set("BUCKWAL_RETRY_DEADLINE_MS", "400")
+        .set("BUCKWAL_REQUEST_TIMEOUT_MS", "500");
     let dir = ctx.dir("db");
     let args = [
         "--checkpoint",
@@ -1481,10 +1481,10 @@ fn takeover_window_fences_a_running_soak() {
 /// against a manifest the bucket says is 11 s old (6 s + 2 s + 2 s + 1 s).
 fn short_lease_ctx(name: &str) -> Ctx {
     Ctx::new(name)
-        .set("DURABLE_LEASE_MS", "1000")
-        .set("DURABLE_RETRY_DEADLINE_MS", "2000")
-        .set("DURABLE_REQUEST_TIMEOUT_MS", "2000")
-        .set("DURABLE_TRIM_GRACE_SECS", "6")
+        .set("BUCKWAL_LEASE_MS", "1000")
+        .set("BUCKWAL_RETRY_DEADLINE_MS", "2000")
+        .set("BUCKWAL_REQUEST_TIMEOUT_MS", "2000")
+        .set("BUCKWAL_TRIM_GRACE_SECS", "6")
 }
 
 /// The generations `log/` holds keys of.
@@ -1788,7 +1788,7 @@ fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration) {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn telemetry_collector_down_and_blackhole() {
-    let (base_p50, base_wall) = bench_run("telemetry_off", &[("DURABLE_OTEL", "0")]);
+    let (base_p50, base_wall) = bench_run("telemetry_off", &[("BUCKWAL_OTEL", "0")]);
 
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
@@ -1822,7 +1822,7 @@ fn telemetry_collector_down_and_blackhole() {
     ] {
         let (p50, wall) = bench_run(
             name,
-            &[("DURABLE_OTEL", "1"), ("DURABLE_OTEL_ENDPOINT", endpoint)],
+            &[("BUCKWAL_OTEL", "1"), ("BUCKWAL_OTEL_ENDPOINT", endpoint)],
         );
         assert!(
             p50 <= 2.0 * base_p50 + 1.0,
@@ -1874,8 +1874,8 @@ fn failed_test_prefix(name: &'static str, keep_failed: bool) -> (String, bool) {
 }
 
 /// A test's `Ctx` deletes every key under its prefix when it is dropped: after a pass, and
-/// after a failure unless `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps the prefix.
-/// `keep_all` (`DURABLE_KEEP_PREFIXES=1`) is off here, whatever the caller set.
+/// after a failure unless `BUCKWAL_KEEP_FAILED=1` (`keep_failed`), which keeps the prefix.
+/// `keep_all` (`BUCKWAL_KEEP_PREFIXES=1`) is off here, whatever the caller set.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn ctx_deletes_its_prefix_unless_a_failure_is_kept() {
@@ -1899,7 +1899,7 @@ fn ctx_deletes_its_prefix_unless_a_failure_is_kept() {
     assert_eq!(
         left.len(),
         20,
-        "failed with DURABLE_KEEP_FAILED=1: {left:?}"
+        "failed with BUCKWAL_KEEP_FAILED=1: {left:?}"
     );
     delete_prefix(&probe.store(), &kept).unwrap();
     eprintln!("ctx cleanup: deleted {passed}/ and {failed}/, kept {kept}/ (then deleted)");
@@ -2255,14 +2255,14 @@ fn mvcc_refusals_cli() {
         ],
         back,
     );
-    // DURABLE_JOURNAL_MODE applies without the flag; the flag wins over it.
+    // BUCKWAL_JOURNAL_MODE applies without the flag; the flag wins over it.
     let env_mvcc = ctx.ok_env(
-        &[("DURABLE_JOURNAL_MODE", "mvcc")],
+        &[("BUCKWAL_JOURNAL_MODE", "mvcc")],
         &["sql", "--dir", a, "SELECT count(*) FROM t"],
     );
     assert_eq!(env_mvcc.stdout.trim(), "1");
     let flag_wins = ctx.run_env(
-        &[("DURABLE_JOURNAL_MODE", "mvcc")],
+        &[("BUCKWAL_JOURNAL_MODE", "mvcc")],
         &["sql", "--dir", a, "--journal-mode", "wal", "SELECT 1"],
     );
     assert_eq!(flag_wins.status.code(), Some(1));
@@ -2285,8 +2285,8 @@ fn mvcc_refusals_cli() {
     );
     let out = ctx.run_env(
         &[
-            ("DURABLE_JOURNAL_MODE", "mvcc"),
-            ("DURABLE_BATCHING", WINDOW),
+            ("BUCKWAL_JOURNAL_MODE", "mvcc"),
+            ("BUCKWAL_BATCHING", WINDOW),
         ],
         &["sql", "--dir", a, "SELECT 1"],
     );
@@ -2494,7 +2494,7 @@ fn mvcc_gc_across_generations() {
 fn mvcc_encrypted() {
     let ctx = Ctx::new("mvcc_encrypted");
     let encrypted = ctx
-        .opt_var("DURABLE_ENCRYPTION_KEY_FILE")
+        .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
         .is_some_and(|k| !k.is_empty());
     let dir = ctx.dir("db");
     let d = dir.to_str().unwrap();

@@ -134,13 +134,13 @@ pub const USAGE: &str = "usage: buckwal <command> [options]
   serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal|mvcc]
   takeover --dir DIR [--journal-mode wal|mvcc]
 --journal-mode is the mode a new database is created in (an existing one keeps its own; asking
-for the other is refused); without it, DURABLE_JOURNAL_MODE applies; with neither, an existing
+for the other is refused); without it, BUCKWAL_JOURNAL_MODE applies; with neither, an existing
 database's own mode is used and a new one is wal. restore and verify follow the bucket head's mode.
 --concurrent (alone, or `all`) runs every soak write in BEGIN CONCURRENT ... COMMIT (MVCC);
 `mixed` has even-numbered threads use plain BEGIN and odd-numbered ones BEGIN CONCURRENT.
 SPEC is `off` or `window <max_wait> <max_commits> <max_bytes>` (e.g. 'window 10ms 64 1MiB');
-without --batching, DURABLE_BATCHING applies.
-S3 settings come from the DURABLE_* environment variables; serve also reads DURABLE_SERVE_*.";
+without --batching, BUCKWAL_BATCHING applies.
+S3 settings come from the BUCKWAL_* environment variables; serve also reads BUCKWAL_SERVE_*.";
 
 fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
     v.parse()
@@ -784,7 +784,7 @@ mod tests {
         }
         let (_, m) = pm(&["sql", "--dir", "d", "--journal-mode", "wal", "SELECT 1"]).unwrap();
         assert_eq!(m, Some(JournalMode::Wal));
-        // Without the flag nothing is chosen: DURABLE_JOURNAL_MODE applies.
+        // Without the flag nothing is chosen: BUCKWAL_JOURNAL_MODE applies.
         assert_eq!(pm(&["soak", "--dir", "d"]).unwrap().1, None);
         assert_eq!(pm(&["gc"]).unwrap().1, None);
         // A bad or missing value, and a command that has no use for it.
@@ -801,7 +801,7 @@ mod tests {
             );
         }
         assert!(
-            USAGE.contains("--journal-mode wal|mvcc") && USAGE.contains("DURABLE_JOURNAL_MODE")
+            USAGE.contains("--journal-mode wal|mvcc") && USAGE.contains("BUCKWAL_JOURNAL_MODE")
         );
     }
 

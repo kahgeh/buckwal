@@ -9,7 +9,7 @@
 //! - `ATTACH`: writes to an attached database are not shipped.
 //! - `PRAGMA hexkey` or `PRAGMA cipher` set to a value: the engine would swap the
 //!   connection's key or cipher (translate/pragma.rs:644-655); the key comes from
-//!   `DURABLE_ENCRYPTION_KEY_FILE` only (D16).
+//!   `BUCKWAL_ENCRYPTION_KEY_FILE` only (D16).
 //! - `PRAGMA durable_batching` the engine would be handed: [`crate::Connection`] runs it
 //!   itself ([`batching_pragma`]), and the engine would take it for an unknown pragma and
 //!   silently do nothing. So it is refused among other statements (not even the first of
@@ -109,7 +109,7 @@ fn check_batching(
 fn check_pragma(name: &str, value: &Expr, mode: JournalMode) -> Result<()> {
     if name.eq_ignore_ascii_case("hexkey") || name.eq_ignore_ascii_case("cipher") {
         return Err(Error::Unsupported(
-            "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)",
+            "encryption PRAGMAs (use BUCKWAL_ENCRYPTION_KEY_FILE)",
         ));
     }
     let value = pragma_value(value).map(|v| v.to_ascii_lowercase());
@@ -476,10 +476,10 @@ mod tests {
     }
 
     /// Setting the key or the cipher would swap the connection's (translate/pragma.rs:644-655);
-    /// the key comes from DURABLE_ENCRYPTION_KEY_FILE only. Reading them is fine.
+    /// the key comes from BUCKWAL_ENCRYPTION_KEY_FILE only. Reading them is fine.
     #[test]
     fn encryption_pragmas_are_refused() {
-        let what = "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)";
+        let what = "encryption PRAGMAs (use BUCKWAL_ENCRYPTION_KEY_FILE)";
         for sql in [
             &format!("PRAGMA hexkey='{}'", "00".repeat(32)) as &str,
             "PRAGMA HEXKEY = \"0011\"",

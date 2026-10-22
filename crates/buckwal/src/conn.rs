@@ -1025,7 +1025,7 @@ mod tests {
             conn.execute("INSERT INTO t VALUES (1), (2)", &[]).unwrap();
             let cipher = |c: &Connection| c.query("PRAGMA cipher", &[]).unwrap();
             let before = cipher(&conn);
-            let what = "encryption PRAGMAs (use DURABLE_ENCRYPTION_KEY_FILE)";
+            let what = "encryption PRAGMAs (use BUCKWAL_ENCRYPTION_KEY_FILE)";
             for sql in [
                 "PRAGMA cipher = 'aes256gcm'".to_string(),
                 format!("PRAGMA hexkey = '{}'", "22".repeat(32)),

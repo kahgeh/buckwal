@@ -62,7 +62,7 @@ pub fn stats_lines(s: &UploadStats) -> Vec<String> {
 }
 
 /// `--journal-mode`, set once by `main` before any database opens; it wins over
-/// `DURABLE_JOURNAL_MODE`.
+/// `BUCKWAL_JOURNAL_MODE`.
 static JOURNAL_MODE: OnceLock<JournalMode> = OnceLock::new();
 
 pub fn config(dir: &Path) -> CliResult<Config> {
@@ -100,21 +100,26 @@ fn follow_head(cfg: &mut Config) -> CliResult<()> {
 }
 
 /// The config for a command that only reads the bucket (`restore`, `verify`): the bucket's
-/// head decides the journal mode, whatever `DURABLE_JOURNAL_MODE` says.
+/// head decides the journal mode, whatever `BUCKWAL_JOURNAL_MODE` says.
 fn reader_config(dir: &Path) -> CliResult<Config> {
     let mut cfg = config(dir)?;
     follow_head(&mut cfg)?;
     Ok(cfg)
 }
 
+/// Whether the environment (through `is_set`) names a journal mode.
+fn journal_mode_in_env(is_set: impl Fn(&str) -> bool) -> bool {
+    is_set("BUCKWAL_JOURNAL_MODE")
+}
+
 /// The config for a command that opens the database as the writer (`sql`, `stats`, `serve`,
-/// `takeover`, `soak`, `bench`): an explicit `--journal-mode` or `DURABLE_JOURNAL_MODE` is
+/// `takeover`, `soak`, `bench`): an explicit `--journal-mode` or `BUCKWAL_JOURNAL_MODE` is
 /// kept (and the library refuses a mismatch with the bucket); with neither, an existing
 /// bucket's head decides and a missing one means a new WAL database.
 pub fn writer_config(dir: &Path) -> CliResult<Config> {
     let mut cfg = config(dir)?;
     let explicit =
-        JOURNAL_MODE.get().is_some() || std::env::var_os("DURABLE_JOURNAL_MODE").is_some();
+        JOURNAL_MODE.get().is_some() || journal_mode_in_env(|k| std::env::var_os(k).is_some());
     if !explicit {
         follow_head(&mut cfg)?;
     }
@@ -337,7 +342,7 @@ fn stats(
     db.close().map_err(err)
 }
 
-/// Export spans and logs as `DURABLE_OTEL*` say; on any failure, warn and run without.
+/// Export spans and logs as `BUCKWAL_OTEL*` say; on any failure, warn and run without.
 fn telemetry_init() -> Option<TelemetryGuard> {
     match TelemetryConfig::from_env().and_then(telemetry::init) {
         Ok(g) => Some(g),
@@ -479,6 +484,13 @@ mod tests {
                 "ack_wait_p99_ms=20.123",
             ]
         );
+    }
+
+    #[test]
+    fn writer_config_reads_buckwal_journal_mode() {
+        assert!(journal_mode_in_env(|k| k == "BUCKWAL_JOURNAL_MODE"));
+        assert!(!journal_mode_in_env(|k| k == "DURABLE_JOURNAL_MODE"));
+        assert!(!journal_mode_in_env(|_| false));
     }
 
     #[test]

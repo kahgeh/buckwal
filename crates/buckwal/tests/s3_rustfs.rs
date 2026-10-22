@@ -9,24 +9,24 @@ fn env(k: &str) -> String {
     })
 }
 
-/// `DURABLE_CA_BUNDLE` (None when unset or empty): the CA of the TLS pass.
+/// `BUCKWAL_CA_BUNDLE` (None when unset or empty): the CA of the TLS pass.
 fn ca_bundle() -> Option<std::path::PathBuf> {
-    std::env::var("DURABLE_CA_BUNDLE")
+    std::env::var("BUCKWAL_CA_BUNDLE")
         .ok()
         .filter(|v| !v.is_empty())
         .map(Into::into)
 }
 
-/// The store from the `DURABLE_*` variables, without creating the bucket; never panics.
+/// The store from the `BUCKWAL_*` variables, without creating the bucket; never panics.
 fn try_s3() -> Result<S3Store, String> {
     let v = |k: &str| std::env::var(k).map_err(|_| format!("{k} is not set"));
     S3Store::new(S3Config {
-        endpoint: v("DURABLE_ENDPOINT")?,
-        region: v("DURABLE_REGION")?,
-        bucket: v("DURABLE_BUCKET")?,
-        access_key: v("DURABLE_ACCESS_KEY")?,
-        secret_key: v("DURABLE_SECRET_KEY")?,
-        path_style: v("DURABLE_PATH_STYLE")? == "true",
+        endpoint: v("BUCKWAL_ENDPOINT")?,
+        region: v("BUCKWAL_REGION")?,
+        bucket: v("BUCKWAL_BUCKET")?,
+        access_key: v("BUCKWAL_ACCESS_KEY")?,
+        secret_key: v("BUCKWAL_SECRET_KEY")?,
+        path_style: v("BUCKWAL_PATH_STYLE")? == "true",
         request_timeout: Duration::from_secs(30),
         ca_bundle: ca_bundle(),
     })
@@ -34,7 +34,7 @@ fn try_s3() -> Result<S3Store, String> {
 }
 
 fn store() -> S3Store {
-    env("DURABLE_ENDPOINT"); // the hint when the variables are missing
+    env("BUCKWAL_ENDPOINT"); // the hint when the variables are missing
     let s = try_s3().expect("store");
     s.create_bucket().expect("bucket");
     s
@@ -60,9 +60,9 @@ fn delete_prefix(s: &S3Store, prefix: &str) -> Result<usize, String> {
 /// A test's prefix, `t/<test>-<nanos>/`.
 struct Prefix {
     p: String,
-    /// Keep the prefix when the test fails (`DURABLE_KEEP_FAILED=1`).
+    /// Keep the prefix when the test fails (`BUCKWAL_KEEP_FAILED=1`).
     keep_failed: bool,
-    /// Keep the prefix, pass or fail (`DURABLE_KEEP_PREFIXES=1`): `scripts/test.sh` scans
+    /// Keep the prefix, pass or fail (`BUCKWAL_KEEP_PREFIXES=1`): `scripts/test.sh` scans
     /// every object each pass leaves.
     keep_all: bool,
 }
@@ -89,7 +89,7 @@ impl Drop for Prefix {
         }
         if std::thread::panicking() && self.keep_failed {
             eprintln!(
-                "failed; bucket prefix {} kept (DURABLE_KEEP_FAILED=1)",
+                "failed; bucket prefix {} kept (BUCKWAL_KEEP_FAILED=1)",
                 self.p
             );
             return;
@@ -107,8 +107,8 @@ fn prefix(test: &str) -> Prefix {
         .as_nanos();
     Prefix {
         p: format!("t/{test}-{n}/"),
-        keep_failed: std::env::var("DURABLE_KEEP_FAILED").as_deref() == Ok("1"),
-        keep_all: std::env::var("DURABLE_KEEP_PREFIXES").as_deref() == Ok("1"),
+        keep_failed: std::env::var("BUCKWAL_KEEP_FAILED").as_deref() == Ok("1"),
+        keep_all: std::env::var("BUCKWAL_KEEP_PREFIXES").as_deref() == Ok("1"),
     }
 }
 
@@ -183,12 +183,12 @@ fn rustfs_if_match_on_missing_bucket_is_permanent() {
             .as_nanos()
     );
     let s = S3Store::new(S3Config {
-        endpoint: env("DURABLE_ENDPOINT"),
-        region: env("DURABLE_REGION"),
+        endpoint: env("BUCKWAL_ENDPOINT"),
+        region: env("BUCKWAL_REGION"),
         bucket: bucket.clone(),
-        access_key: env("DURABLE_ACCESS_KEY"),
-        secret_key: env("DURABLE_SECRET_KEY"),
-        path_style: env("DURABLE_PATH_STYLE") == "true",
+        access_key: env("BUCKWAL_ACCESS_KEY"),
+        secret_key: env("BUCKWAL_SECRET_KEY"),
+        path_style: env("BUCKWAL_PATH_STYLE") == "true",
         request_timeout: Duration::from_secs(30),
         ca_bundle: ca_bundle(),
     })
@@ -278,8 +278,8 @@ fn failed_test_prefix(test: &'static str, keep_failed: bool) -> (String, bool) {
 }
 
 /// Dropping a `Prefix` deletes every key under it: after a pass, and after a failure unless
-/// `DURABLE_KEEP_FAILED=1` (`keep_failed`), which keeps it. `keep_all`
-/// (`DURABLE_KEEP_PREFIXES=1`) is off here, whatever the caller set.
+/// `BUCKWAL_KEEP_FAILED=1` (`keep_failed`), which keeps it. `keep_all`
+/// (`BUCKWAL_KEEP_PREFIXES=1`) is off here, whatever the caller set.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn rustfs_prefix_is_deleted_unless_a_failure_is_kept() {
@@ -302,7 +302,7 @@ fn rustfs_prefix_is_deleted_unless_a_failure_is_kept() {
     assert_eq!(
         s.list(&kept).unwrap().len(),
         1,
-        "failed, DURABLE_KEEP_FAILED=1"
+        "failed, BUCKWAL_KEEP_FAILED=1"
     );
     assert_eq!(delete_prefix(&s, &kept), Ok(1));
 }
@@ -325,7 +325,7 @@ fn stat_reports_etag_and_age() {
 
 fn require_tls() {
     assert!(
-        env("DURABLE_ENDPOINT").starts_with("https://"),
+        env("BUCKWAL_ENDPOINT").starts_with("https://"),
         "tls_* tests run in the TLS pass of ./scripts/test.sh"
     );
 }
@@ -334,7 +334,7 @@ fn require_tls() {
 #[ignore = "needs RustFS in TLS mode: ./scripts/test.sh"]
 fn tls_round_trip_with_ca_bundle() {
     require_tls();
-    assert!(ca_bundle().is_some(), "DURABLE_CA_BUNDLE is not set");
+    assert!(ca_bundle().is_some(), "BUCKWAL_CA_BUNDLE is not set");
     conditional_create_and_match("tls-cond");
 }
 
@@ -353,7 +353,7 @@ fn open_fails_on_certificate(ca_bundle: Option<std::path::PathBuf>) {
     match r {
         Err(Error::Bucket(m)) => {
             assert!(
-                m.contains("certificate") && m.contains("DURABLE_CA_BUNDLE"),
+                m.contains("certificate") && m.contains("BUCKWAL_CA_BUNDLE"),
                 "{m}"
             )
         }
@@ -373,7 +373,7 @@ fn tls_without_ca_bundle_fails_fast_as_certificate_error() {
 #[test]
 #[ignore = "needs RustFS in TLS mode: ./scripts/test.sh"]
 fn tls_wrong_ca_bundle_fails_fast() {
-    let ca = ca_bundle().expect("DURABLE_CA_BUNDLE is not set");
+    let ca = ca_bundle().expect("BUCKWAL_CA_BUNDLE is not set");
     open_fails_on_certificate(Some(ca.with_file_name("other-ca.pem")));
 }
 
@@ -456,7 +456,7 @@ fn serve_redirects(
 fn tls_redirect_to_plain_http_is_not_followed() {
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
     require_tls();
-    let ca = ca_bundle().expect("DURABLE_CA_BUNDLE is not set");
+    let ca = ca_bundle().expect("BUCKWAL_CA_BUNDLE is not set");
     let server = ca.with_file_name("server");
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs: Vec<_> = CertificateDer::pem_file_iter(server.join("rustfs_cert.pem"))

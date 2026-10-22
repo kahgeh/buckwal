@@ -46,15 +46,15 @@ pub(crate) fn export_filter() -> fn(&str) -> bool {
 /// What [`init`] installs. [`Default`] is every [`defaults`] value: disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryConfig {
-    /// Export at all (`DURABLE_OTEL`).
+    /// Export at all (`BUCKWAL_OTEL`).
     pub enabled: bool,
-    /// The OTLP/gRPC collector, `http://host:port` (`DURABLE_OTEL_ENDPOINT`). Set in code,
+    /// The OTLP/gRPC collector, `http://host:port` (`BUCKWAL_OTEL_ENDPOINT`). Set in code,
     /// so `OTEL_EXPORTER_OTLP_*ENDPOINT` cannot redirect it; `OTEL_EXPORTER_OTLP_*HEADERS`
     /// are still sent.
     pub endpoint: String,
-    /// The least severe log record exported (`DURABLE_OTEL_LEVEL`).
+    /// The least severe log record exported (`BUCKWAL_OTEL_LEVEL`).
     pub level: Level,
-    /// Added as `test_run_id` to every span and log record when set (`DURABLE_TEST_RUN_ID`).
+    /// Added as `test_run_id` to every span and log record when set (`BUCKWAL_TEST_RUN_ID`).
     pub test_run_id: Option<String>,
 }
 
@@ -83,25 +83,26 @@ fn parse_level(var: &str, v: &str) -> Result<Level> {
 }
 
 impl TelemetryConfig {
-    /// Read `DURABLE_OTEL` (0/1, true/false or on/off), `DURABLE_OTEL_ENDPOINT`, `DURABLE_OTEL_LEVEL`
-    /// (trace|debug|info|warn|error) and `DURABLE_TEST_RUN_ID`; an unset one keeps its
+    /// Read `BUCKWAL_OTEL` (0/1, true/false or on/off), `BUCKWAL_OTEL_ENDPOINT`, `BUCKWAL_OTEL_LEVEL`
+    /// (trace|debug|info|warn|error) and `BUCKWAL_TEST_RUN_ID`; an unset one keeps its
     /// [`defaults`] value. A bad value is a `Config` error.
     pub fn from_env() -> Result<TelemetryConfig> {
         TelemetryConfig::from_lookup(|k| std::env::var(k).ok())
     }
 
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<TelemetryConfig> {
+        crate::config::refuse_legacy_env(&get)?;
         let mut c = TelemetryConfig::default();
-        if let Some(v) = get("DURABLE_OTEL") {
-            c.enabled = parse_bool("DURABLE_OTEL", &v)?;
+        if let Some(v) = get("BUCKWAL_OTEL") {
+            c.enabled = parse_bool("BUCKWAL_OTEL", &v)?;
         }
-        if let Some(v) = get("DURABLE_OTEL_ENDPOINT") {
+        if let Some(v) = get("BUCKWAL_OTEL_ENDPOINT") {
             c.endpoint = v;
         }
-        if let Some(v) = get("DURABLE_OTEL_LEVEL") {
-            c.level = parse_level("DURABLE_OTEL_LEVEL", &v)?;
+        if let Some(v) = get("BUCKWAL_OTEL_LEVEL") {
+            c.level = parse_level("BUCKWAL_OTEL_LEVEL", &v)?;
         }
-        c.test_run_id = get("DURABLE_TEST_RUN_ID").filter(|v| !v.is_empty());
+        c.test_run_id = get("BUCKWAL_TEST_RUN_ID").filter(|v| !v.is_empty());
         Ok(c)
     }
 }
@@ -112,7 +113,7 @@ fn endpoint(cfg: &TelemetryConfig) -> Result<&str> {
     let endpoint = cfg.endpoint.trim();
     if !endpoint.to_ascii_lowercase().starts_with("http://") {
         return Err(Error::Config(format!(
-            "DURABLE_OTEL_ENDPOINT must be http://host:port (no TLS), not {:?}",
+            "BUCKWAL_OTEL_ENDPOINT must be http://host:port (no TLS), not {:?}",
             cfg.endpoint
         )));
     }

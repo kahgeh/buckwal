@@ -26,7 +26,7 @@ pub mod defaults {
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
     /// Parallel uploads in a seal, and parallel log fetches in a restore.
     pub const UPLOAD_CONCURRENCY: usize = 16;
-    /// How long a writer trusts its last look at the head (`DURABLE_LEASE_MS`): past it, the
+    /// How long a writer trusts its last look at the head (`BUCKWAL_LEASE_MS`): past it, the
     /// next append, page PUT or manifest PUT re-reads the head first.
     pub const LEASE: Duration = Duration::from_secs(30);
     /// How many log positions a takeover's fence record may step over (positions an old
@@ -41,7 +41,7 @@ pub mod defaults {
     pub const MAX_ANSWER_ONLY_ROUNDS: u32 = 3;
     /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
-    /// A writer runs GC itself (`DURABLE_GC_AFTER_SEAL`): at open, after each seal and when
+    /// A writer runs GC itself (`BUCKWAL_GC_AFTER_SEAL`): at open, after each seal and when
     /// the next manifest comes of age.
     pub const GC_AFTER_SEAL: bool = true;
     /// Fetch every sealed page in the background after open.
@@ -53,15 +53,15 @@ pub mod defaults {
     /// so a huge one would hang the caller.
     pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(60);
     /// The maintenance checkpoint runs once the current generation's log holds this many
-    /// objects (`DURABLE_MAINTENANCE_LOG_OBJECTS`; 0 = this measure is off). A restore reads
+    /// objects (`BUCKWAL_MAINTENANCE_LOG_OBJECTS`; 0 = this measure is off). A restore reads
     /// about this many log objects at most.
     pub const MAINTENANCE_LOG_OBJECTS: u64 = 1000;
     /// ... or once the local `-wal` has grown to this many bytes since the generation began
-    /// (`DURABLE_MAINTENANCE_WAL_MIB`, in MiB; 0 = this measure is off).
+    /// (`BUCKWAL_MAINTENANCE_WAL_MIB`, in MiB; 0 = this measure is off).
     pub const MAINTENANCE_WAL_BYTES: u64 = 64 << 20;
     /// How long maintenance waits for in-flight calls (and open transactions) to end, with
     /// new ones held back, before it gives up and retries later
-    /// (`DURABLE_MAINTENANCE_GATE_WAIT_MS`). It bounds the stall a maintenance run adds to
+    /// (`BUCKWAL_MAINTENANCE_GATE_WAIT_MS`). It bounds the stall a maintenance run adds to
     /// a commit.
     pub const MAINTENANCE_GATE_WAIT: Duration = Duration::from_millis(500);
     /// After a skipped or failed maintenance run, the next one waits at least this long.
@@ -75,15 +75,15 @@ pub mod defaults {
     pub const PATH_STYLE: bool = true;
     /// Keys go at the root of the bucket.
     pub const PREFIX: &str = "";
-    /// The cipher of an encrypted database (`DURABLE_ENCRYPTION_CIPHER`): any name turso's
+    /// The cipher of an encrypted database (`BUCKWAL_ENCRYPTION_CIPHER`): any name turso's
     /// `CipherMode::try_from` accepts.
     pub const ENCRYPTION_CIPHER: &str = "aegis256";
 
-    /// Export traces and logs over OTLP (`DURABLE_OTEL`): off in the library.
+    /// Export traces and logs over OTLP (`BUCKWAL_OTEL`): off in the library.
     pub const OTEL: bool = false;
-    /// Where OTLP/gRPC goes (`DURABLE_OTEL_ENDPOINT`); plain `http://` only, no TLS.
+    /// Where OTLP/gRPC goes (`BUCKWAL_OTEL_ENDPOINT`); plain `http://` only, no TLS.
     pub const OTEL_ENDPOINT: &str = "http://localhost:4317";
-    /// The least severe log record exported (`DURABLE_OTEL_LEVEL`); spans are always INFO.
+    /// The least severe log record exported (`BUCKWAL_OTEL_LEVEL`); spans are always INFO.
     pub const OTEL_LEVEL: tracing::Level = tracing::Level::INFO;
     /// How long one OTLP export may take. Fixed.
     pub const OTEL_EXPORT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -104,7 +104,7 @@ pub enum JournalMode {
 }
 
 impl JournalMode {
-    /// The name in `DURABLE_JOURNAL_MODE` and in a v2 head's `journal_mode`.
+    /// The name in `BUCKWAL_JOURNAL_MODE` and in a v2 head's `journal_mode`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             JournalMode::Wal => "wal",
@@ -150,7 +150,7 @@ pub struct Config {
     /// request_timeout` (`Config` otherwise).
     pub trim_grace: Duration,
     /// A writer open runs GC itself, on a thread of its own: at open, after each seal and
-    /// when the next manifest comes of age (`DURABLE_GC_AFTER_SEAL`). Off, only
+    /// when the next manifest comes of age (`BUCKWAL_GC_AFTER_SEAL`). Off, only
     /// [`crate::gc`] deletes anything.
     pub gc_after_seal: bool,
     /// How long the writer trusts its last confirmation that the head is still its own: a
@@ -160,7 +160,7 @@ pub struct Config {
     /// 0 checks before every append and page PUT (tests).
     pub lease: Duration,
     pub prefetch: bool,
-    /// How commits are gathered into one upload (`DURABLE_BATCHING`).
+    /// How commits are gathered into one upload (`BUCKWAL_BATCHING`).
     pub batching: Batching,
     /// The library checkpoints (TRUNCATE) a writer's generation itself once its log holds
     /// this many objects, so a generation the engine never restarts (sustained concurrent
@@ -181,7 +181,7 @@ pub struct Config {
     /// The cipher (any name turso's `CipherMode::try_from` accepts; `Config` otherwise). A
     /// value other than the default needs `encryption_key_file`.
     pub encryption_cipher: String,
-    /// The journal mode a new database is created in (`DURABLE_JOURNAL_MODE` = `wal` | `mvcc`).
+    /// The journal mode a new database is created in (`BUCKWAL_JOURNAL_MODE` = `wal` | `mvcc`).
     pub journal_mode: JournalMode,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
@@ -219,30 +219,86 @@ impl fmt::Debug for Config {
     }
 }
 
-/// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 22] = [
-    "DURABLE_ENDPOINT",
-    "DURABLE_CA_BUNDLE",
-    "DURABLE_REGION",
-    "DURABLE_PATH_STYLE",
-    "DURABLE_BUCKET",
-    "DURABLE_PREFIX",
+/// The names the programs read before the rename to `BUCKWAL_*`. They are no longer read:
+/// [`refuse_legacy_env`] turns one that is set into an error that names its replacement, so a
+/// deployment that still sets an old name fails at start instead of running on defaults.
+pub const LEGACY_ENV: &[&str] = &[
     "DURABLE_ACCESS_KEY",
-    "DURABLE_SECRET_KEY",
-    "DURABLE_RETRY_DEADLINE_MS",
-    "DURABLE_REQUEST_TIMEOUT_MS",
-    "DURABLE_UPLOAD_CONCURRENCY",
-    "DURABLE_TRIM_GRACE_SECS",
-    "DURABLE_PREFETCH",
     "DURABLE_BATCHING",
+    "DURABLE_BUCKET",
+    "DURABLE_CA_BUNDLE",
+    "DURABLE_ENCRYPTION_CIPHER",
+    "DURABLE_ENCRYPTION_KEY_FILE",
+    "DURABLE_ENDPOINT",
+    "DURABLE_GC_AFTER_SEAL",
+    "DURABLE_JOURNAL_MODE",
+    "DURABLE_LEASE_MS",
+    "DURABLE_MAINTENANCE_GATE_WAIT_MS",
     "DURABLE_MAINTENANCE_LOG_OBJECTS",
     "DURABLE_MAINTENANCE_WAL_MIB",
-    "DURABLE_MAINTENANCE_GATE_WAIT_MS",
-    "DURABLE_LEASE_MS",
-    "DURABLE_GC_AFTER_SEAL",
-    "DURABLE_ENCRYPTION_KEY_FILE",
-    "DURABLE_ENCRYPTION_CIPHER",
-    "DURABLE_JOURNAL_MODE",
+    "DURABLE_OTEL",
+    "DURABLE_OTEL_ENDPOINT",
+    "DURABLE_OTEL_LEVEL",
+    "DURABLE_PATH_STYLE",
+    "DURABLE_PREFETCH",
+    "DURABLE_PREFIX",
+    "DURABLE_REGION",
+    "DURABLE_REQUEST_TIMEOUT_MS",
+    "DURABLE_RETRY_DEADLINE_MS",
+    "DURABLE_SECRET_KEY",
+    "DURABLE_SERVE_BUSY_TIMEOUT_MS",
+    "DURABLE_SERVE_LISTEN",
+    "DURABLE_SERVE_MAX_STREAMS",
+    "DURABLE_SERVE_SHUTDOWN_MS",
+    "DURABLE_SERVE_STREAM_TIMEOUT_MS",
+    "DURABLE_SERVE_TLS_CERT",
+    "DURABLE_SERVE_TLS_KEY",
+    "DURABLE_SERVE_TOKEN_FILE",
+    "DURABLE_SERVE_WORKERS",
+    "DURABLE_TRIM_GRACE_SECS",
+    "DURABLE_UPLOAD_CONCURRENCY",
+];
+
+/// The message for the first name in [`LEGACY_ENV`] that `get` finds set (an empty value
+/// counts as set), or `None`. The value is never read into the message.
+pub fn legacy_env_refusal(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let old = LEGACY_ENV.iter().find(|k| get(k).is_some())?;
+    let new = old.replacen("DURABLE_", "BUCKWAL_", 1);
+    Some(format!("{old} is no longer read, set {new} instead"))
+}
+
+/// [`legacy_env_refusal`] as a `Config` error.
+pub fn refuse_legacy_env(get: impl Fn(&str) -> Option<String>) -> Result<()> {
+    match legacy_env_refusal(get) {
+        Some(m) => Err(Error::Config(m)),
+        None => Ok(()),
+    }
+}
+
+/// Every environment variable [`Config::from_env`] reads.
+const ENV_VARS: [&str; 22] = [
+    "BUCKWAL_ENDPOINT",
+    "BUCKWAL_CA_BUNDLE",
+    "BUCKWAL_REGION",
+    "BUCKWAL_PATH_STYLE",
+    "BUCKWAL_BUCKET",
+    "BUCKWAL_PREFIX",
+    "BUCKWAL_ACCESS_KEY",
+    "BUCKWAL_SECRET_KEY",
+    "BUCKWAL_RETRY_DEADLINE_MS",
+    "BUCKWAL_REQUEST_TIMEOUT_MS",
+    "BUCKWAL_UPLOAD_CONCURRENCY",
+    "BUCKWAL_TRIM_GRACE_SECS",
+    "BUCKWAL_PREFETCH",
+    "BUCKWAL_BATCHING",
+    "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
+    "BUCKWAL_MAINTENANCE_WAL_MIB",
+    "BUCKWAL_MAINTENANCE_GATE_WAIT_MS",
+    "BUCKWAL_LEASE_MS",
+    "BUCKWAL_GC_AFTER_SEAL",
+    "BUCKWAL_ENCRYPTION_KEY_FILE",
+    "BUCKWAL_ENCRYPTION_CIPHER",
+    "BUCKWAL_JOURNAL_MODE",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -327,8 +383,8 @@ impl Config {
         }
     }
 
-    /// Read the configuration from `DURABLE_*` environment variables. `DURABLE_ENDPOINT`,
-    /// `DURABLE_BUCKET`, `DURABLE_ACCESS_KEY` and `DURABLE_SECRET_KEY` are required; every
+    /// Read the configuration from `BUCKWAL_*` environment variables. `BUCKWAL_ENDPOINT`,
+    /// `BUCKWAL_BUCKET`, `BUCKWAL_ACCESS_KEY` and `BUCKWAL_SECRET_KEY` are required; every
     /// other one falls back to its [`defaults`] value.
     pub fn from_env(dir: impl Into<PathBuf>) -> Result<Config> {
         Config::from_lookup(dir, |k| std::env::var(k).ok())
@@ -338,7 +394,8 @@ impl Config {
         dir: impl Into<PathBuf>,
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<Config> {
-        debug_assert!(ENV_VARS.iter().all(|v| v.starts_with("DURABLE_")));
+        refuse_legacy_env(&get)?;
+        debug_assert!(ENV_VARS.iter().all(|v| v.starts_with("BUCKWAL_")));
         let required = |k: &str| {
             get(k)
                 .filter(|v| !v.is_empty())
@@ -346,74 +403,74 @@ impl Config {
         };
         let mut c = Config::new(
             dir,
-            &required("DURABLE_ENDPOINT")?,
-            &required("DURABLE_BUCKET")?,
-            &required("DURABLE_ACCESS_KEY")?,
-            &required("DURABLE_SECRET_KEY")?,
+            &required("BUCKWAL_ENDPOINT")?,
+            &required("BUCKWAL_BUCKET")?,
+            &required("BUCKWAL_ACCESS_KEY")?,
+            &required("BUCKWAL_SECRET_KEY")?,
         );
-        if let Some(v) = get("DURABLE_CA_BUNDLE").filter(|v| !v.is_empty()) {
+        if let Some(v) = get("BUCKWAL_CA_BUNDLE").filter(|v| !v.is_empty()) {
             c.ca_bundle = Some(PathBuf::from(v));
         }
-        if let Some(v) = get("DURABLE_REGION") {
+        if let Some(v) = get("BUCKWAL_REGION") {
             c.region = v;
         }
-        if let Some(v) = get("DURABLE_PATH_STYLE") {
-            c.path_style = parse_bool("DURABLE_PATH_STYLE", &v)?;
+        if let Some(v) = get("BUCKWAL_PATH_STYLE") {
+            c.path_style = parse_bool("BUCKWAL_PATH_STYLE", &v)?;
         }
-        if let Some(v) = get("DURABLE_PREFIX") {
+        if let Some(v) = get("BUCKWAL_PREFIX") {
             c.prefix = v;
         }
-        if let Some(v) = get("DURABLE_RETRY_DEADLINE_MS") {
-            c.retry_deadline = Duration::from_millis(parse_num("DURABLE_RETRY_DEADLINE_MS", &v)?);
+        if let Some(v) = get("BUCKWAL_RETRY_DEADLINE_MS") {
+            c.retry_deadline = Duration::from_millis(parse_num("BUCKWAL_RETRY_DEADLINE_MS", &v)?);
         }
-        if let Some(v) = get("DURABLE_REQUEST_TIMEOUT_MS") {
-            c.request_timeout = Duration::from_millis(parse_num("DURABLE_REQUEST_TIMEOUT_MS", &v)?);
+        if let Some(v) = get("BUCKWAL_REQUEST_TIMEOUT_MS") {
+            c.request_timeout = Duration::from_millis(parse_num("BUCKWAL_REQUEST_TIMEOUT_MS", &v)?);
         }
-        if let Some(v) = get("DURABLE_UPLOAD_CONCURRENCY") {
-            c.upload_concurrency = parse_num("DURABLE_UPLOAD_CONCURRENCY", &v)?;
+        if let Some(v) = get("BUCKWAL_UPLOAD_CONCURRENCY") {
+            c.upload_concurrency = parse_num("BUCKWAL_UPLOAD_CONCURRENCY", &v)?;
         }
-        if let Some(v) = get("DURABLE_TRIM_GRACE_SECS") {
-            c.trim_grace = Duration::from_secs(parse_num("DURABLE_TRIM_GRACE_SECS", &v)?);
+        if let Some(v) = get("BUCKWAL_TRIM_GRACE_SECS") {
+            c.trim_grace = Duration::from_secs(parse_num("BUCKWAL_TRIM_GRACE_SECS", &v)?);
         }
-        if let Some(v) = get("DURABLE_GC_AFTER_SEAL") {
-            c.gc_after_seal = parse_bool("DURABLE_GC_AFTER_SEAL", &v)?;
+        if let Some(v) = get("BUCKWAL_GC_AFTER_SEAL") {
+            c.gc_after_seal = parse_bool("BUCKWAL_GC_AFTER_SEAL", &v)?;
         }
-        if let Some(v) = get("DURABLE_LEASE_MS") {
-            c.lease = Duration::from_millis(parse_num("DURABLE_LEASE_MS", &v)?);
+        if let Some(v) = get("BUCKWAL_LEASE_MS") {
+            c.lease = Duration::from_millis(parse_num("BUCKWAL_LEASE_MS", &v)?);
         }
-        if let Some(v) = get("DURABLE_PREFETCH") {
-            c.prefetch = parse_bool("DURABLE_PREFETCH", &v)?;
+        if let Some(v) = get("BUCKWAL_PREFETCH") {
+            c.prefetch = parse_bool("BUCKWAL_PREFETCH", &v)?;
         }
-        if let Some(v) = get("DURABLE_BATCHING") {
+        if let Some(v) = get("BUCKWAL_BATCHING") {
             c.batching = v.parse().map_err(|e| match e {
-                Error::Config(m) => Error::Config(format!("DURABLE_BATCHING: {m}")),
+                Error::Config(m) => Error::Config(format!("BUCKWAL_BATCHING: {m}")),
                 e => e,
             })?;
         }
-        if let Some(v) = get("DURABLE_MAINTENANCE_LOG_OBJECTS") {
-            c.maintenance_log_objects = parse_num("DURABLE_MAINTENANCE_LOG_OBJECTS", &v)?;
+        if let Some(v) = get("BUCKWAL_MAINTENANCE_LOG_OBJECTS") {
+            c.maintenance_log_objects = parse_num("BUCKWAL_MAINTENANCE_LOG_OBJECTS", &v)?;
         }
-        if let Some(v) = get("DURABLE_MAINTENANCE_WAL_MIB") {
-            let var = "DURABLE_MAINTENANCE_WAL_MIB";
+        if let Some(v) = get("BUCKWAL_MAINTENANCE_WAL_MIB") {
+            let var = "BUCKWAL_MAINTENANCE_WAL_MIB";
             let mib: u64 = parse_num(var, &v)?;
             c.maintenance_wal_bytes = mib
                 .checked_mul(1 << 20)
                 .ok_or_else(|| Error::Config(format!("{var} is too large: {v:?}")))?;
         }
-        if let Some(v) = get("DURABLE_MAINTENANCE_GATE_WAIT_MS") {
+        if let Some(v) = get("BUCKWAL_MAINTENANCE_GATE_WAIT_MS") {
             c.maintenance_gate_wait =
-                Duration::from_millis(parse_num("DURABLE_MAINTENANCE_GATE_WAIT_MS", &v)?);
+                Duration::from_millis(parse_num("BUCKWAL_MAINTENANCE_GATE_WAIT_MS", &v)?);
         }
-        if let Some(v) = get("DURABLE_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
+        if let Some(v) = get("BUCKWAL_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
             c.encryption_key_file = Some(PathBuf::from(v));
         }
-        if let Some(v) = get("DURABLE_ENCRYPTION_CIPHER").filter(|v| !v.is_empty()) {
+        if let Some(v) = get("BUCKWAL_ENCRYPTION_CIPHER").filter(|v| !v.is_empty()) {
             c.encryption_cipher = v;
         }
-        if let Some(v) = get("DURABLE_JOURNAL_MODE") {
+        if let Some(v) = get("BUCKWAL_JOURNAL_MODE") {
             c.journal_mode = JournalMode::parse(&v).ok_or_else(|| {
                 Error::Config(format!(
-                    "DURABLE_JOURNAL_MODE {v:?} is not one of wal, mvcc"
+                    "BUCKWAL_JOURNAL_MODE {v:?} is not one of wal, mvcc"
                 ))
             })?;
         }
@@ -430,7 +487,7 @@ impl Config {
                 .starts_with("http://")
         {
             return Err(Error::Config(
-                "DURABLE_CA_BUNDLE is set but the endpoint is http://".into(),
+                "BUCKWAL_CA_BUNDLE is set but the endpoint is http://".into(),
             ));
         }
         if self.bucket.is_empty() {
@@ -445,7 +502,7 @@ impl Config {
         // `MAX_SEAL_QUIET` is refused at open.
         if self.lease.saturating_add(self.request_timeout) > defaults::MAX_SEAL_QUIET {
             return Err(Error::Config(format!(
-                "DURABLE_LEASE_MS ({:?}) + request_timeout ({:?}) must be at most 24h (the \
+                "BUCKWAL_LEASE_MS ({:?}) + request_timeout ({:?}) must be at most 24h (the \
                  longest takeover quiet, MAX_SEAL_QUIET)",
                 self.lease, self.request_timeout
             )));
@@ -469,7 +526,7 @@ impl Config {
             && cipher != parse_cipher(defaults::ENCRYPTION_CIPHER)?
         {
             return Err(Error::Config(format!(
-                "DURABLE_ENCRYPTION_CIPHER is {} but DURABLE_ENCRYPTION_KEY_FILE is not set",
+                "BUCKWAL_ENCRYPTION_CIPHER is {} but BUCKWAL_ENCRYPTION_KEY_FILE is not set",
                 self.encryption_cipher
             )));
         }
@@ -642,6 +699,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refuses_every_legacy_name() {
+        for old in LEGACY_ENV {
+            let e = refuse_legacy_env(|k| (k == *old).then(|| "SECRETVALUE".to_string()))
+                .unwrap_err()
+                .to_string();
+            let new = old.replacen("DURABLE_", "BUCKWAL_", 1);
+            assert!(e.contains(old) && e.contains(&new), "{e}");
+            assert!(
+                e.contains(&format!("{old} is no longer read, set {new} instead")),
+                "{e}"
+            );
+            assert!(!e.contains("SECRETVALUE"), "{e}");
+        }
+        assert!(refuse_legacy_env(|_| None).is_ok());
+    }
+
+    #[test]
+    fn refuses_legacy_name_with_empty_value() {
+        let e = refuse_legacy_env(|k| (k == "DURABLE_BUCKET").then(String::new));
+        assert!(e.is_err());
+    }
+
+    #[test]
+    fn legacy_env_matches_current_names() {
+        // Every old name has a BUCKWAL_ twin that Config, TelemetryConfig or ServeConfig reads
+        // (the serve ones are checked in buckwal-server), and the twin alone is no refusal.
+        let mut read: Vec<&str> = ENV_VARS.to_vec();
+        read.extend([
+            "BUCKWAL_OTEL",
+            "BUCKWAL_OTEL_ENDPOINT",
+            "BUCKWAL_OTEL_LEVEL",
+        ]);
+        for old in LEGACY_ENV {
+            let new = old.replacen("DURABLE_", "BUCKWAL_", 1);
+            if new.starts_with("BUCKWAL_SERVE_") {
+                continue;
+            }
+            assert!(read.contains(&new.as_str()), "{new} is not read");
+            assert!(refuse_legacy_env(|k| (k == new).then(|| "x".to_string())).is_ok());
+        }
+        for v in ENV_VARS {
+            let old = v.replacen("BUCKWAL_", "DURABLE_", 1);
+            assert!(
+                LEGACY_ENV.contains(&old.as_str()),
+                "{old} missing from LEGACY_ENV"
+            );
+        }
+    }
+
+    #[test]
+    fn config_from_lookup_refuses_old_encryption_key_file() {
+        let mut env = required();
+        env.insert("DURABLE_ENCRYPTION_KEY_FILE", "/k");
+        let e = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("DURABLE_ENCRYPTION_KEY_FILE is no longer read, set BUCKWAL_ENCRYPTION_KEY_FILE instead"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn gc_after_seal_from_env() {
         assert!(Config::new("/d", "http://e", "b", "ak", "sk").gc_after_seal);
         let env = required();
@@ -649,14 +769,14 @@ mod tests {
         assert!(c.gc_after_seal, "on by default");
         for (v, want) in [("off", false), ("0", false), ("true", true)] {
             let mut env = required();
-            env.insert("DURABLE_GC_AFTER_SEAL", v);
+            env.insert("BUCKWAL_GC_AFTER_SEAL", v);
             let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
             assert_eq!(c.gc_after_seal, want, "{v}");
         }
         let mut env = required();
-        env.insert("DURABLE_GC_AFTER_SEAL", "sometimes");
+        env.insert("BUCKWAL_GC_AFTER_SEAL", "sometimes");
         match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
-            Err(Error::Config(m)) => assert!(m.contains("DURABLE_GC_AFTER_SEAL"), "{m}"),
+            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_GC_AFTER_SEAL"), "{m}"),
             r => panic!("{r:?}"),
         }
     }
@@ -724,7 +844,7 @@ mod tests {
         c.lease += Duration::from_millis(1);
         match c.validate() {
             Err(Error::Config(m)) => assert!(
-                m.contains("DURABLE_LEASE_MS")
+                m.contains("BUCKWAL_LEASE_MS")
                     && m.contains("request_timeout")
                     && m.contains("24h"),
                 "{m}"
@@ -736,7 +856,7 @@ mod tests {
     #[test]
     fn lease_from_env() {
         let mut env = required();
-        env.insert("DURABLE_LEASE_MS", "1500");
+        env.insert("BUCKWAL_LEASE_MS", "1500");
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(c.lease, Duration::from_millis(1500));
         assert_eq!(c.engine(false).lease, Duration::from_millis(1500));
@@ -745,9 +865,9 @@ mod tests {
         assert_eq!(c.lease, Duration::from_secs(30));
         assert_eq!(defaults::LEASE, Duration::from_secs(30));
         let mut env = required();
-        env.insert("DURABLE_LEASE_MS", "soon");
+        env.insert("BUCKWAL_LEASE_MS", "soon");
         match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
-            Err(Error::Config(m)) => assert!(m.contains("DURABLE_LEASE_MS"), "{m}"),
+            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_LEASE_MS"), "{m}"),
             r => panic!("{r:?}"),
         }
     }
@@ -756,10 +876,10 @@ mod tests {
 
     fn required() -> HashMap<&'static str, &'static str> {
         HashMap::from([
-            ("DURABLE_ENDPOINT", "http://127.0.0.1:9000"),
-            ("DURABLE_BUCKET", "b"),
-            ("DURABLE_ACCESS_KEY", "ak"),
-            ("DURABLE_SECRET_KEY", "sk"),
+            ("BUCKWAL_ENDPOINT", "http://127.0.0.1:9000"),
+            ("BUCKWAL_BUCKET", "b"),
+            ("BUCKWAL_ACCESS_KEY", "ak"),
+            ("BUCKWAL_SECRET_KEY", "sk"),
         ])
     }
 
@@ -807,31 +927,31 @@ mod tests {
     #[test]
     fn config_from_env_reads_every_setting() {
         let all = [
-            ("DURABLE_ENDPOINT", "http://127.0.0.1:9000"),
-            ("DURABLE_CA_BUNDLE", "/etc/ca.pem"),
-            ("DURABLE_REGION", "eu-west-2"),
-            ("DURABLE_PATH_STYLE", "false"),
-            ("DURABLE_BUCKET", "bkt"),
-            ("DURABLE_PREFIX", "dbs/one"),
-            ("DURABLE_ACCESS_KEY", "ak"),
-            ("DURABLE_SECRET_KEY", "sk"),
-            ("DURABLE_RETRY_DEADLINE_MS", "1500"),
-            ("DURABLE_REQUEST_TIMEOUT_MS", "250"),
-            ("DURABLE_UPLOAD_CONCURRENCY", "3"),
-            ("DURABLE_TRIM_GRACE_SECS", "7"),
-            ("DURABLE_PREFETCH", "1"),
-            ("DURABLE_BATCHING", "window 10ms 8 64KiB"),
-            ("DURABLE_MAINTENANCE_LOG_OBJECTS", "250"),
-            ("DURABLE_MAINTENANCE_WAL_MIB", "3"),
-            ("DURABLE_MAINTENANCE_GATE_WAIT_MS", "75"),
-            ("DURABLE_LEASE_MS", "2500"),
-            ("DURABLE_GC_AFTER_SEAL", "off"),
-            ("DURABLE_ENCRYPTION_KEY_FILE", "/etc/db.key"),
-            ("DURABLE_ENCRYPTION_CIPHER", "aes256gcm"),
-            ("DURABLE_JOURNAL_MODE", "mvcc"),
+            ("BUCKWAL_ENDPOINT", "http://127.0.0.1:9000"),
+            ("BUCKWAL_CA_BUNDLE", "/etc/ca.pem"),
+            ("BUCKWAL_REGION", "eu-west-2"),
+            ("BUCKWAL_PATH_STYLE", "false"),
+            ("BUCKWAL_BUCKET", "bkt"),
+            ("BUCKWAL_PREFIX", "dbs/one"),
+            ("BUCKWAL_ACCESS_KEY", "ak"),
+            ("BUCKWAL_SECRET_KEY", "sk"),
+            ("BUCKWAL_RETRY_DEADLINE_MS", "1500"),
+            ("BUCKWAL_REQUEST_TIMEOUT_MS", "250"),
+            ("BUCKWAL_UPLOAD_CONCURRENCY", "3"),
+            ("BUCKWAL_TRIM_GRACE_SECS", "7"),
+            ("BUCKWAL_PREFETCH", "1"),
+            ("BUCKWAL_BATCHING", "window 10ms 8 64KiB"),
+            ("BUCKWAL_MAINTENANCE_LOG_OBJECTS", "250"),
+            ("BUCKWAL_MAINTENANCE_WAL_MIB", "3"),
+            ("BUCKWAL_MAINTENANCE_GATE_WAIT_MS", "75"),
+            ("BUCKWAL_LEASE_MS", "2500"),
+            ("BUCKWAL_GC_AFTER_SEAL", "off"),
+            ("BUCKWAL_ENCRYPTION_KEY_FILE", "/etc/db.key"),
+            ("BUCKWAL_ENCRYPTION_CIPHER", "aes256gcm"),
+            ("BUCKWAL_JOURNAL_MODE", "mvcc"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
-        // No other unit test reads DURABLE_* variables.
+        // No other unit test reads BUCKWAL_* variables.
         for (k, v) in all {
             std::env::set_var(k, v);
         }
@@ -879,10 +999,10 @@ mod tests {
         assert_eq!(c.batching, Batching::Off);
 
         for missing in [
-            "DURABLE_ENDPOINT",
-            "DURABLE_BUCKET",
-            "DURABLE_ACCESS_KEY",
-            "DURABLE_SECRET_KEY",
+            "BUCKWAL_ENDPOINT",
+            "BUCKWAL_BUCKET",
+            "BUCKWAL_ACCESS_KEY",
+            "BUCKWAL_SECRET_KEY",
         ] {
             let mut env = required();
             env.remove(missing);
@@ -892,9 +1012,9 @@ mod tests {
             }
         }
         let mut env = required();
-        env.insert("DURABLE_PREFETCH", "maybe");
+        env.insert("BUCKWAL_PREFETCH", "maybe");
         match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
-            Err(Error::Config(m)) => assert!(m.contains("DURABLE_PREFETCH"), "{m}"),
+            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_PREFETCH"), "{m}"),
             r => panic!("{r:?}"),
         }
     }
@@ -902,11 +1022,11 @@ mod tests {
     #[test]
     fn batching_from_env_and_validate() {
         let mut env = required();
-        env.insert("DURABLE_BATCHING", "nope");
+        env.insert("BUCKWAL_BATCHING", "nope");
         match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
             Err(Error::Config(m)) => {
                 assert!(
-                    m.contains("nope") && m.starts_with("DURABLE_BATCHING: "),
+                    m.contains("nope") && m.starts_with("BUCKWAL_BATCHING: "),
                     "{m}"
                 )
             }
@@ -946,14 +1066,14 @@ mod tests {
         assert_eq!(c.validate(), Ok(()), "maintenance off: the wait is unused");
 
         let mut env = required();
-        env.insert("DURABLE_MAINTENANCE_LOG_OBJECTS", "0");
-        env.insert("DURABLE_MAINTENANCE_WAL_MIB", "0");
+        env.insert("BUCKWAL_MAINTENANCE_LOG_OBJECTS", "0");
+        env.insert("BUCKWAL_MAINTENANCE_WAL_MIB", "0");
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!((c.maintenance_log_objects, c.maintenance_wal_bytes), (0, 0));
         for var in [
-            "DURABLE_MAINTENANCE_LOG_OBJECTS",
-            "DURABLE_MAINTENANCE_WAL_MIB",
-            "DURABLE_MAINTENANCE_GATE_WAIT_MS",
+            "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
+            "BUCKWAL_MAINTENANCE_WAL_MIB",
+            "BUCKWAL_MAINTENANCE_GATE_WAIT_MS",
         ] {
             let mut env = required();
             env.insert(var, "-1");
@@ -964,10 +1084,10 @@ mod tests {
         }
         // MiB that overflow u64 bytes are refused, not wrapped.
         let mut env = required();
-        env.insert("DURABLE_MAINTENANCE_WAL_MIB", "18446744073709551615");
+        env.insert("BUCKWAL_MAINTENANCE_WAL_MIB", "18446744073709551615");
         assert!(matches!(
             Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())),
-            Err(Error::Config(m)) if m.contains("DURABLE_MAINTENANCE_WAL_MIB")
+            Err(Error::Config(m)) if m.contains("BUCKWAL_MAINTENANCE_WAL_MIB")
         ));
     }
 
@@ -991,7 +1111,7 @@ mod tests {
         assert_eq!(
             c.validate(),
             Err(Error::Config(
-                "DURABLE_CA_BUNDLE is set but the endpoint is http://".into()
+                "BUCKWAL_CA_BUNDLE is set but the endpoint is http://".into()
             ))
         );
         c.endpoint = "https://e".into();
@@ -1005,9 +1125,9 @@ mod tests {
             Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap()
         };
         assert_eq!(read(&env).ca_bundle, None);
-        env.insert("DURABLE_CA_BUNDLE", "");
+        env.insert("BUCKWAL_CA_BUNDLE", "");
         assert_eq!(read(&env).ca_bundle, None);
-        env.insert("DURABLE_CA_BUNDLE", "/etc/ca.pem");
+        env.insert("BUCKWAL_CA_BUNDLE", "/etc/ca.pem");
         let c = read(&env);
         assert_eq!(c.ca_bundle, Some(PathBuf::from("/etc/ca.pem")));
         assert!(format!("{c:?}").contains("/etc/ca.pem"));
@@ -1021,7 +1141,7 @@ mod tests {
         assert_eq!(
             c.validate(),
             Err(Error::Config(
-                "DURABLE_ENCRYPTION_CIPHER rot13 is not a cipher turso supports".into()
+                "BUCKWAL_ENCRYPTION_CIPHER rot13 is not a cipher turso supports".into()
             ))
         );
         // Every spelling turso accepts.
@@ -1040,8 +1160,8 @@ mod tests {
         c.encryption_cipher = "aes256gcm".into();
         match c.validate() {
             Err(Error::Config(m)) => assert!(
-                m.contains("DURABLE_ENCRYPTION_CIPHER")
-                    && m.contains("DURABLE_ENCRYPTION_KEY_FILE"),
+                m.contains("BUCKWAL_ENCRYPTION_CIPHER")
+                    && m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"),
                 "{m}"
             ),
             r => panic!("{r:?}"),
@@ -1059,13 +1179,13 @@ mod tests {
         let c = read(&env);
         assert_eq!(c.encryption_key_file, None);
         assert_eq!(c.encryption_cipher, "aegis256");
-        env.insert("DURABLE_ENCRYPTION_KEY_FILE", "");
-        env.insert("DURABLE_ENCRYPTION_CIPHER", "");
+        env.insert("BUCKWAL_ENCRYPTION_KEY_FILE", "");
+        env.insert("BUCKWAL_ENCRYPTION_CIPHER", "");
         let c = read(&env);
         assert_eq!(c.encryption_key_file, None, "empty = off");
         assert_eq!(c.encryption_cipher, "aegis256", "empty = the default");
-        env.insert("DURABLE_ENCRYPTION_KEY_FILE", "/keys/db.key");
-        env.insert("DURABLE_ENCRYPTION_CIPHER", "aegis128l");
+        env.insert("BUCKWAL_ENCRYPTION_KEY_FILE", "/keys/db.key");
+        env.insert("BUCKWAL_ENCRYPTION_CIPHER", "aegis128l");
         let c = read(&env);
         assert_eq!(c.encryption_key_file, Some(PathBuf::from("/keys/db.key")));
         assert_eq!(c.encryption_cipher, "aegis128l");
@@ -1140,9 +1260,9 @@ mod tests {
             Config::new("/d", "http://e", "b", "ak", "sk").journal_mode,
             JournalMode::Wal
         );
-        env.insert("DURABLE_JOURNAL_MODE", "mvcc");
+        env.insert("BUCKWAL_JOURNAL_MODE", "mvcc");
         assert_eq!(read(&env).unwrap().journal_mode, JournalMode::Mvcc);
-        env.insert("DURABLE_JOURNAL_MODE", "wal");
+        env.insert("BUCKWAL_JOURNAL_MODE", "wal");
         assert_eq!(read(&env).unwrap().journal_mode, JournalMode::Wal);
     }
 
@@ -1150,9 +1270,9 @@ mod tests {
     fn unknown_journal_mode_is_config_error() {
         let mut env = required();
         for bad in ["MVCC", "delete", "", "wal2"] {
-            env.insert("DURABLE_JOURNAL_MODE", bad);
+            env.insert("BUCKWAL_JOURNAL_MODE", bad);
             match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
-                Err(Error::Config(m)) => assert!(m.contains("DURABLE_JOURNAL_MODE"), "{m}"),
+                Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_JOURNAL_MODE"), "{m}"),
                 r => panic!("{bad:?}: {r:?}"),
             }
         }
@@ -1177,8 +1297,8 @@ mod tests {
         assert_eq!(c.validate(), Ok(()));
         // From the environment.
         let mut env = required();
-        env.insert("DURABLE_JOURNAL_MODE", "mvcc");
-        env.insert("DURABLE_BATCHING", "window 10ms 4 1KiB");
+        env.insert("BUCKWAL_JOURNAL_MODE", "mvcc");
+        env.insert("BUCKWAL_BATCHING", "window 10ms 4 1KiB");
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(
             c.validate(),

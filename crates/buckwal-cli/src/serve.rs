@@ -35,7 +35,19 @@ pub fn run(
     claim: bool,
     batching: Option<Batching>,
 ) -> Result<(), Failure> {
-    let cfg = ServeConfig::from_env(listen).map_err(Failure::Usage)?;
+    run_lookup(dir, listen, claim, batching, |k| std::env::var(k).ok())
+}
+
+/// [`run`] reading settings through `get`. The settings are read, and an old `DURABLE_*` name
+/// refused, before the directory, the bucket or the port is touched.
+fn run_lookup(
+    dir: &Path,
+    listen: Option<&str>,
+    claim: bool,
+    batching: Option<Batching>,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(), Failure> {
+    let cfg = ServeConfig::from_lookup(listen, get).map_err(Failure::Usage)?;
     run_with(cfg, dir, claim, batching)
 }
 
@@ -100,14 +112,33 @@ mod tests {
     }
 
     #[test]
+    fn serve_refuses_old_name_before_binding() {
+        let t = tempfile::tempdir().unwrap();
+        // An unclaimed directory would give exit 1 from the claim check; the old name is
+        // refused first (exit 2), before the directory, the bucket or the port is touched.
+        let e = run_lookup(t.path(), Some("127.0.0.1:0"), false, None, |k| {
+            (k == "DURABLE_SERVE_TOKEN_FILE").then(|| "/t".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{e:?}");
+        assert!(
+            e.message().contains(
+                "DURABLE_SERVE_TOKEN_FILE is no longer read, set BUCKWAL_SERVE_TOKEN_FILE instead"
+            ),
+            "{}",
+            e.message()
+        );
+    }
+
+    #[test]
     fn serve_refuses_non_loopback_without_tls_and_token() {
         let t = tempfile::tempdir().unwrap();
         let e = run_with(cfg("0.0.0.0:0"), t.path(), false, None).unwrap_err();
         assert_eq!(e.exit_code(), 2, "{e:?}");
         for var in [
-            "DURABLE_SERVE_TLS_CERT",
-            "DURABLE_SERVE_TLS_KEY",
-            "DURABLE_SERVE_TOKEN_FILE",
+            "BUCKWAL_SERVE_TLS_CERT",
+            "BUCKWAL_SERVE_TLS_KEY",
+            "BUCKWAL_SERVE_TOKEN_FILE",
         ] {
             assert!(e.message().contains(var), "{}", e.message());
         }

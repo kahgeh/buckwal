@@ -2958,11 +2958,11 @@ fn open_without_key_on_encrypted_database_is_refused() {
     let etag = head_etag(&store);
     // Its own directory.
     let m = encryption_err(open_with_store(config(a.path()), store.clone()));
-    assert!(m.contains("DURABLE_ENCRYPTION_KEY_FILE"), "{m}");
+    assert!(m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"), "{m}");
     // A fresh directory that auto-restores: refused before the takeover.
     let r = tempdir();
     let m = encryption_err(open_with_store(config(&fresh(&r)), store.clone()));
-    assert!(m.contains("DURABLE_ENCRYPTION_KEY_FILE"), "{m}");
+    assert!(m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"), "{m}");
     assert_eq!(head_etag(&store), etag, "the refused opens wrote the head");
     // The writer still owns it.
     let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
@@ -3040,7 +3040,7 @@ fn encrypted_verify_needs_the_key() {
     let puts = store.stats().puts;
     let v = tempdir();
     let m = encryption_err(open_read_only_with_store(config(v.path()), store.clone()));
-    assert!(m.contains("DURABLE_ENCRYPTION_KEY_FILE"), "{m}");
+    assert!(m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"), "{m}");
     let db =
         open_read_only_with_store(enc_config(v.path(), &k, &key_hex()), store.clone()).unwrap();
     let c = db.connect().unwrap();
@@ -3334,7 +3334,7 @@ fn takeover_without_a_key_on_an_encrypted_database_is_refused() {
     let c = db.connect().unwrap();
     let m = refused_takeover(&store, config);
     assert!(
-        m.contains("encrypted") && m.contains("DURABLE_ENCRYPTION_KEY_FILE"),
+        m.contains("encrypted") && m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"),
         "{m}"
     );
     insert(&c, 61).unwrap();

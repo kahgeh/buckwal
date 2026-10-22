@@ -1,5 +1,5 @@
 //! Server configuration: [`ServeConfig`] and the bearer [`Token`]. Settings come from
-//! `DURABLE_SERVE_*` variables (an empty value counts as unset), and the listen address
+//! `BUCKWAL_SERVE_*` variables (an empty value counts as unset), and the listen address
 //! also from the `--listen` flag, which wins. Errors are plain strings naming the variable
 //! or flag at fault; none ever carries the token file's content.
 use sha2::{Digest, Sha256};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
-/// The listen address when neither `--listen` nor `DURABLE_SERVE_LISTEN` is given.
+/// The listen address when neither `--listen` nor `BUCKWAL_SERVE_LISTEN` is given.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9295";
 
 /// The shortest token the server accepts, in bytes (after trimming).
@@ -17,31 +17,31 @@ const MIN_TOKEN_LEN: usize = 16;
 /// The certificate chain and private key (PEM files) for HTTPS.
 #[derive(Debug, Clone)]
 pub struct TlsFiles {
-    /// The PEM certificate chain (`DURABLE_SERVE_TLS_CERT`).
+    /// The PEM certificate chain (`BUCKWAL_SERVE_TLS_CERT`).
     pub cert: PathBuf,
-    /// The PEM private key (`DURABLE_SERVE_TLS_KEY`).
+    /// The PEM private key (`BUCKWAL_SERVE_TLS_KEY`).
     pub key: PathBuf,
 }
 
 /// Everything `serve` needs besides the database's own `Config`.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
-    /// Where to listen: an IP and a port (`--listen`, `DURABLE_SERVE_LISTEN`).
+    /// Where to listen: an IP and a port (`--listen`, `BUCKWAL_SERVE_LISTEN`).
     pub listen: SocketAddr,
     /// Serve HTTPS when set.
     pub tls: Option<TlsFiles>,
-    /// The file holding the bearer token (`DURABLE_SERVE_TOKEN_FILE`); no auth when unset.
+    /// The file holding the bearer token (`BUCKWAL_SERVE_TOKEN_FILE`); no auth when unset.
     pub token_file: Option<PathBuf>,
     /// How long a stream may sit idle before it is closed
-    /// (`DURABLE_SERVE_STREAM_TIMEOUT_MS`, default 10 s).
+    /// (`BUCKWAL_SERVE_STREAM_TIMEOUT_MS`, default 10 s).
     pub stream_timeout: Duration,
-    /// How long shutdown waits for in-flight work (`DURABLE_SERVE_SHUTDOWN_MS`, default 45 s).
+    /// How long shutdown waits for in-flight work (`BUCKWAL_SERVE_SHUTDOWN_MS`, default 45 s).
     pub shutdown_timeout: Duration,
-    /// SQLite busy timeout of each connection (`DURABLE_SERVE_BUSY_TIMEOUT_MS`, default 5 s).
+    /// SQLite busy timeout of each connection (`BUCKWAL_SERVE_BUSY_TIMEOUT_MS`, default 5 s).
     pub busy_timeout: Duration,
-    /// The most streams open at once (`DURABLE_SERVE_MAX_STREAMS`, default 256).
+    /// The most streams open at once (`BUCKWAL_SERVE_MAX_STREAMS`, default 256).
     pub max_streams: usize,
-    /// Worker threads running statements (`DURABLE_SERVE_WORKERS`, default 32).
+    /// Worker threads running statements (`BUCKWAL_SERVE_WORKERS`, default 32).
     pub workers: usize,
 }
 
@@ -56,12 +56,15 @@ impl ServeConfig {
         listen_flag: Option<&str>,
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<ServeConfig, String> {
+        if let Some(m) = buckwal::config::legacy_env_refusal(&get) {
+            return Err(m);
+        }
         let get = |k: &str| get(k).filter(|v| !v.is_empty());
         let (listen_src, listen_text) = match listen_flag.filter(|v| !v.is_empty()) {
             Some(v) => ("--listen", v.to_string()),
             None => (
-                "DURABLE_SERVE_LISTEN",
-                get("DURABLE_SERVE_LISTEN").unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
+                "BUCKWAL_SERVE_LISTEN",
+                get("BUCKWAL_SERVE_LISTEN").unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
             ),
         };
         let listen: SocketAddr = listen_text.parse().map_err(|_| {
@@ -69,17 +72,17 @@ impl ServeConfig {
                 "{listen_src} must be IP:port (for example 127.0.0.1:9295), not {listen_text:?}"
             )
         })?;
-        let tls = match (get("DURABLE_SERVE_TLS_CERT"), get("DURABLE_SERVE_TLS_KEY")) {
+        let tls = match (get("BUCKWAL_SERVE_TLS_CERT"), get("BUCKWAL_SERVE_TLS_KEY")) {
             (None, None) => None,
             (Some(cert), Some(key)) => Some(TlsFiles {
                 cert: cert.into(),
                 key: key.into(),
             }),
             (Some(_), None) => {
-                return Err("DURABLE_SERVE_TLS_CERT needs DURABLE_SERVE_TLS_KEY".to_string())
+                return Err("BUCKWAL_SERVE_TLS_CERT needs BUCKWAL_SERVE_TLS_KEY".to_string())
             }
             (None, Some(_)) => {
-                return Err("DURABLE_SERVE_TLS_KEY needs DURABLE_SERVE_TLS_CERT".to_string())
+                return Err("BUCKWAL_SERVE_TLS_KEY needs BUCKWAL_SERVE_TLS_CERT".to_string())
             }
         };
         let ms = |var: &str, default: u64| -> Result<Duration, String> {
@@ -88,12 +91,12 @@ impl ServeConfig {
         Ok(ServeConfig {
             listen,
             tls,
-            token_file: get("DURABLE_SERVE_TOKEN_FILE").map(PathBuf::from),
-            stream_timeout: ms("DURABLE_SERVE_STREAM_TIMEOUT_MS", 10_000)?,
-            shutdown_timeout: ms("DURABLE_SERVE_SHUTDOWN_MS", 45_000)?,
-            busy_timeout: ms("DURABLE_SERVE_BUSY_TIMEOUT_MS", 5_000)?,
-            max_streams: positive(&get, "DURABLE_SERVE_MAX_STREAMS", 256)? as usize,
-            workers: positive(&get, "DURABLE_SERVE_WORKERS", 32)? as usize,
+            token_file: get("BUCKWAL_SERVE_TOKEN_FILE").map(PathBuf::from),
+            stream_timeout: ms("BUCKWAL_SERVE_STREAM_TIMEOUT_MS", 10_000)?,
+            shutdown_timeout: ms("BUCKWAL_SERVE_SHUTDOWN_MS", 45_000)?,
+            busy_timeout: ms("BUCKWAL_SERVE_BUSY_TIMEOUT_MS", 5_000)?,
+            max_streams: positive(&get, "BUCKWAL_SERVE_MAX_STREAMS", 256)? as usize,
+            workers: positive(&get, "BUCKWAL_SERVE_WORKERS", 32)? as usize,
         })
     }
 
@@ -104,8 +107,8 @@ impl ServeConfig {
             return Ok(());
         }
         Err(format!(
-            "listening on {} (not loopback) needs TLS (DURABLE_SERVE_TLS_CERT and \
-             DURABLE_SERVE_TLS_KEY) and a token (DURABLE_SERVE_TOKEN_FILE)",
+            "listening on {} (not loopback) needs TLS (BUCKWAL_SERVE_TLS_CERT and \
+             BUCKWAL_SERVE_TLS_KEY) and a token (BUCKWAL_SERVE_TOKEN_FILE)",
             self.listen
         ))
     }
@@ -132,31 +135,31 @@ impl Token {
         let shown = path.display();
         let bytes = std::fs::read(path).map_err(|e| {
             format!(
-                "DURABLE_SERVE_TOKEN_FILE {shown}: cannot read: {}",
+                "BUCKWAL_SERVE_TOKEN_FILE {shown}: cannot read: {}",
                 e.kind()
             )
         })?;
         let text = bytes.trim_ascii();
         if text.is_empty() {
-            return Err(format!("DURABLE_SERVE_TOKEN_FILE {shown}: file is empty"));
+            return Err(format!("BUCKWAL_SERVE_TOKEN_FILE {shown}: file is empty"));
         }
         if text.len() < MIN_TOKEN_LEN {
             return Err(format!(
-                "DURABLE_SERVE_TOKEN_FILE {shown}: token is shorter than {MIN_TOKEN_LEN} bytes"
+                "BUCKWAL_SERVE_TOKEN_FILE {shown}: token is shorter than {MIN_TOKEN_LEN} bytes"
             ));
         }
         if text.iter().any(u8::is_ascii_whitespace) {
             return Err(format!(
-                "DURABLE_SERVE_TOKEN_FILE {shown}: token contains whitespace"
+                "BUCKWAL_SERVE_TOKEN_FILE {shown}: token contains whitespace"
             ));
         }
         if !text.iter().all(|b| (0x21..=0x7e).contains(b)) {
             return Err(format!(
-                "DURABLE_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)"
+                "BUCKWAL_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)"
             ));
         }
         let text = std::str::from_utf8(text).map_err(|_| {
-            format!("DURABLE_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)")
+            format!("BUCKWAL_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)")
         })?;
         Ok(Token::from_text(text))
     }
@@ -205,6 +208,33 @@ mod tests {
     }
 
     #[test]
+    fn serve_config_from_lookup_refuses_old_token_file() {
+        let e = ServeConfig::from_lookup(None, |k| {
+            (k == "DURABLE_SERVE_TOKEN_FILE").then(|| "/t".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "DURABLE_SERVE_TOKEN_FILE is no longer read, set BUCKWAL_SERVE_TOKEN_FILE instead"
+        );
+    }
+
+    #[test]
+    fn serve_twins_of_legacy_names_are_read() {
+        // Setting only a BUCKWAL_SERVE_* twin is no refusal, and the value is read.
+        for old in buckwal::config::LEGACY_ENV {
+            let Some(rest) = old.strip_prefix("DURABLE_SERVE_") else {
+                continue;
+            };
+            let new = format!("BUCKWAL_SERVE_{rest}");
+            let r = ServeConfig::from_lookup(None, |k| (k == new).then(|| "1".to_string()));
+            if let Err(e) = r {
+                assert!(!e.contains("no longer read"), "{e}");
+            }
+        }
+    }
+
+    #[test]
     fn defaults() {
         let c = ServeConfig::from_lookup(None, |_| None).unwrap();
         assert_eq!(c.listen, "127.0.0.1:9295".parse().unwrap());
@@ -219,10 +249,10 @@ mod tests {
 
     #[test]
     fn flag_overrides_env() {
-        let get = lookup(&[("DURABLE_SERVE_LISTEN", "127.0.0.1:1")]);
+        let get = lookup(&[("BUCKWAL_SERVE_LISTEN", "127.0.0.1:1")]);
         let c = ServeConfig::from_lookup(Some("127.0.0.1:0"), get).unwrap();
         assert_eq!(c.listen, "127.0.0.1:0".parse().unwrap());
-        let get = lookup(&[("DURABLE_SERVE_LISTEN", "127.0.0.1:1")]);
+        let get = lookup(&[("BUCKWAL_SERVE_LISTEN", "127.0.0.1:1")]);
         let c = ServeConfig::from_lookup(None, get).unwrap();
         assert_eq!(c.listen.port(), 1);
     }
@@ -237,18 +267,18 @@ mod tests {
 
     #[test]
     fn tls_needs_both_files() {
-        let e = ServeConfig::from_lookup(None, lookup(&[("DURABLE_SERVE_TLS_CERT", "c.pem")]))
+        let e = ServeConfig::from_lookup(None, lookup(&[("BUCKWAL_SERVE_TLS_CERT", "c.pem")]))
             .unwrap_err();
-        assert!(e.contains("DURABLE_SERVE_TLS_KEY"), "{e}");
-        let e = ServeConfig::from_lookup(None, lookup(&[("DURABLE_SERVE_TLS_KEY", "k.pem")]))
+        assert!(e.contains("BUCKWAL_SERVE_TLS_KEY"), "{e}");
+        let e = ServeConfig::from_lookup(None, lookup(&[("BUCKWAL_SERVE_TLS_KEY", "k.pem")]))
             .unwrap_err();
-        assert!(e.contains("DURABLE_SERVE_TLS_CERT"), "{e}");
+        assert!(e.contains("BUCKWAL_SERVE_TLS_CERT"), "{e}");
         let c = ServeConfig::from_lookup(
             None,
             lookup(&[
-                ("DURABLE_SERVE_TLS_CERT", "c.pem"),
-                ("DURABLE_SERVE_TLS_KEY", "k.pem"),
-                ("DURABLE_SERVE_TOKEN_FILE", ""),
+                ("BUCKWAL_SERVE_TLS_CERT", "c.pem"),
+                ("BUCKWAL_SERVE_TLS_KEY", "k.pem"),
+                ("BUCKWAL_SERVE_TOKEN_FILE", ""),
             ]),
         )
         .unwrap();
@@ -259,16 +289,16 @@ mod tests {
     #[test]
     fn bad_numbers_are_errors() {
         for var in [
-            "DURABLE_SERVE_STREAM_TIMEOUT_MS",
-            "DURABLE_SERVE_WORKERS",
-            "DURABLE_SERVE_MAX_STREAMS",
+            "BUCKWAL_SERVE_STREAM_TIMEOUT_MS",
+            "BUCKWAL_SERVE_WORKERS",
+            "BUCKWAL_SERVE_MAX_STREAMS",
         ] {
             for bad in ["0", "x"] {
                 let e = ServeConfig::from_lookup(None, lookup(&[(var, bad)])).unwrap_err();
                 assert!(e.contains(var), "{var}={bad}: {e}");
             }
         }
-        let c = ServeConfig::from_lookup(None, lookup(&[("DURABLE_SERVE_WORKERS", "3")])).unwrap();
+        let c = ServeConfig::from_lookup(None, lookup(&[("BUCKWAL_SERVE_WORKERS", "3")])).unwrap();
         assert_eq!(c.workers, 3);
     }
 
@@ -284,8 +314,8 @@ mod tests {
         for l in ["0.0.0.0:0", "192.168.1.10:0"] {
             for (tls, token) in [(false, false), (true, false), (false, true)] {
                 let e = cfg(l, tls, token).check_bind().unwrap_err();
-                assert!(e.contains("DURABLE_SERVE_TLS_CERT"), "{e}");
-                assert!(e.contains("DURABLE_SERVE_TOKEN_FILE"), "{e}");
+                assert!(e.contains("BUCKWAL_SERVE_TLS_CERT"), "{e}");
+                assert!(e.contains("BUCKWAL_SERVE_TOKEN_FILE"), "{e}");
             }
             cfg(l, true, true).check_bind().unwrap();
         }
@@ -328,7 +358,7 @@ mod tests {
             let (_d, p) = token_file(content);
             let e = Token::load(&p).unwrap_err();
             assert!(
-                e.starts_with(&format!("DURABLE_SERVE_TOKEN_FILE {}", p.display())),
+                e.starts_with(&format!("BUCKWAL_SERVE_TOKEN_FILE {}", p.display())),
                 "{e}"
             );
             assert!(e.contains(text), "{e}");

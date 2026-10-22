@@ -72,9 +72,9 @@ pub(crate) fn tls_acceptor(files: &TlsFiles) -> Result<TlsAcceptor, String> {
     let certs = load_certs(&files.cert)?;
     let key = PrivateKeyDer::from_pem_file(&files.key).map_err(|e| match e {
         pem::Error::NoItemsFound => {
-            format!("DURABLE_SERVE_TLS_KEY {key_path}: no PEM private key in the file")
+            format!("BUCKWAL_SERVE_TLS_KEY {key_path}: no PEM private key in the file")
         }
-        e => format!("DURABLE_SERVE_TLS_KEY {key_path}: {}", pem_problem(&e)),
+        e => format!("BUCKWAL_SERVE_TLS_KEY {key_path}: {}", pem_problem(&e)),
     })?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -84,12 +84,12 @@ pub(crate) fn tls_acceptor(files: &TlsFiles) -> Result<TlsAcceptor, String> {
         .with_single_cert(certs, key)
         .map_err(|e| match e {
             rustls::Error::InconsistentKeys(_) => format!(
-                "DURABLE_SERVE_TLS_KEY {key_path}: does not match the certificate in \
-                 DURABLE_SERVE_TLS_CERT {cert_path}"
+                "BUCKWAL_SERVE_TLS_KEY {key_path}: does not match the certificate in \
+                 BUCKWAL_SERVE_TLS_CERT {cert_path}"
             ),
             // rustls errors describe the key's kind, never its bytes.
             e => format!(
-                "DURABLE_SERVE_TLS_CERT {cert_path} and DURABLE_SERVE_TLS_KEY {key_path}: {e}"
+                "BUCKWAL_SERVE_TLS_CERT {cert_path} and BUCKWAL_SERVE_TLS_KEY {key_path}: {e}"
             ),
         })?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -100,10 +100,10 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let shown = path.display();
     let certs = CertificateDer::pem_file_iter(path)
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| format!("DURABLE_SERVE_TLS_CERT {shown}: {}", pem_problem(&e)))?;
+        .map_err(|e| format!("BUCKWAL_SERVE_TLS_CERT {shown}: {}", pem_problem(&e)))?;
     if certs.is_empty() {
         return Err(format!(
-            "DURABLE_SERVE_TLS_CERT {shown}: no PEM certificate in the file"
+            "BUCKWAL_SERVE_TLS_CERT {shown}: no PEM certificate in the file"
         ));
     }
     Ok(certs)
@@ -313,11 +313,11 @@ mod tests {
         let other_key = other.join("server/rustfs_key.pem");
         let ca = m.join("ca.pem");
         for (cert, key, names, says) in [
-            (&missing, &key, &missing, "DURABLE_SERVE_TLS_CERT"),
+            (&missing, &key, &missing, "BUCKWAL_SERVE_TLS_CERT"),
             (&key, &key, &key, "no PEM certificate"),
-            (&cert, &missing, &missing, "DURABLE_SERVE_TLS_KEY"),
+            (&cert, &missing, &missing, "BUCKWAL_SERVE_TLS_KEY"),
             (&cert, &ca, &ca, "no PEM private key"),
-            (&cert, &fake, &fake, "DURABLE_SERVE_TLS_KEY"),
+            (&cert, &fake, &fake, "BUCKWAL_SERVE_TLS_KEY"),
             (&cert, &other_key, &other_key, "does not match"),
         ] {
             let e = acceptor_error(cert, key);

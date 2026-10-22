@@ -4,7 +4,7 @@
 //! row a 200 with an `ok` result acknowledged must survive SIGKILL plus the loss of the local
 //! disk, a takeover and a SIGTERM under load.
 //!
-//! In the second pass of `scripts/test.sh` (`TURSO_DURABLE_TLS_DIR` set) every server serves
+//! In the second pass of `scripts/test.sh` (`BUCKWAL_TLS_DIR` set) every server serves
 //! HTTPS with a bearer token from a file in the test's temp directory, and the database is
 //! encrypted; the first pass serves plain HTTP on loopback with no token. Run through
 //! `./scripts/test.sh` (`--test-threads=1`).
@@ -38,7 +38,7 @@ const CREATE: &str = "CREATE TABLE IF NOT EXISTS soak(id INTEGER PRIMARY KEY, pa
 
 const INSERT: &str = "INSERT INTO soak(id, payload) VALUES (?, ?)";
 
-/// The shutdown bound every server runs under (`DURABLE_SERVE_SHUTDOWN_MS`), below the 45 s
+/// The shutdown bound every server runs under (`BUCKWAL_SERVE_SHUTDOWN_MS`), below the 45 s
 /// default so a test stays short.
 const SHUTDOWN_MS: u64 = 20_000;
 
@@ -83,10 +83,10 @@ impl Access {
         }
     }
 
-    /// The pass's access: `secured` with `$TURSO_DURABLE_TLS_DIR` when it is set, else
+    /// The pass's access: `secured` with `$BUCKWAL_TLS_DIR` when it is set, else
     /// `plain`.
     fn of_pass(ctx: &Ctx) -> Access {
-        match std::env::var("TURSO_DURABLE_TLS_DIR") {
+        match std::env::var("BUCKWAL_TLS_DIR") {
             Ok(d) if !d.is_empty() => Access::secured(ctx, d.into()),
             _ => Access::plain(),
         }
@@ -104,15 +104,15 @@ impl Access {
         Some(self.material.as_ref()?.join("ca.pem"))
     }
 
-    /// The `DURABLE_SERVE_*` settings a server gets.
+    /// The `BUCKWAL_SERVE_*` settings a server gets.
     fn vars(&self) -> Vec<(&'static str, PathBuf)> {
         let mut v = Vec::new();
         if let (Some(cert), Some(key)) = (self.cert(), self.key()) {
-            v.push(("DURABLE_SERVE_TLS_CERT", cert));
-            v.push(("DURABLE_SERVE_TLS_KEY", key));
+            v.push(("BUCKWAL_SERVE_TLS_CERT", cert));
+            v.push(("BUCKWAL_SERVE_TLS_KEY", key));
         }
         if let Some(t) = &self.token_file {
-            v.push(("DURABLE_SERVE_TOKEN_FILE", t.clone()));
+            v.push(("BUCKWAL_SERVE_TOKEN_FILE", t.clone()));
         }
         v
     }
@@ -133,7 +133,7 @@ impl Access {
 
 /// A test's `Ctx` with the shutdown bound set, and the pass's access.
 fn serve_ctx(name: &str) -> (Ctx, Access) {
-    let ctx = Ctx::new(name).set("DURABLE_SERVE_SHUTDOWN_MS", &SHUTDOWN_MS.to_string());
+    let ctx = Ctx::new(name).set("BUCKWAL_SERVE_SHUTDOWN_MS", &SHUTDOWN_MS.to_string());
     let access = Access::of_pass(&ctx);
     (ctx, access)
 }
@@ -845,10 +845,10 @@ fn serve_sigterm_during_load_loses_no_ack() {
     );
 }
 
-/// The TLS material: `$TURSO_DURABLE_TLS_DIR` when set, else `scripts/tls-material.sh` into
+/// The TLS material: `$BUCKWAL_TLS_DIR` when set, else `scripts/tls-material.sh` into
 /// the test's temp directory.
 fn tls_material(ctx: &Ctx) -> PathBuf {
-    if let Ok(d) = std::env::var("TURSO_DURABLE_TLS_DIR") {
+    if let Ok(d) = std::env::var("BUCKWAL_TLS_DIR") {
         if !d.is_empty() {
             return d.into();
         }
@@ -888,7 +888,7 @@ fn grep_count(token_file: &Path, file: &Path) -> String {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn serve_security_bind_rules_and_token() {
     let ctx = Ctx::new("serve_security_bind_rules_and_token")
-        .set("DURABLE_SERVE_SHUTDOWN_MS", &SHUTDOWN_MS.to_string());
+        .set("BUCKWAL_SERVE_SHUTDOWN_MS", &SHUTDOWN_MS.to_string());
     let material = tls_material(&ctx);
     let secured = Access::secured(&ctx, material);
     let token_file = secured.token_file.clone().unwrap();
@@ -929,7 +929,7 @@ fn serve_security_bind_rules_and_token() {
         let status = wait_exit(&mut child, label, Duration::from_secs(30));
         let stderr = redact(&fs::read_to_string(&err).unwrap(), Some(&token));
         assert_eq!(status.code(), Some(2), "{label}: {stderr}");
-        for setting in ["DURABLE_SERVE_TLS_CERT", "DURABLE_SERVE_TOKEN_FILE"] {
+        for setting in ["BUCKWAL_SERVE_TLS_CERT", "BUCKWAL_SERVE_TOKEN_FILE"] {
             assert!(stderr.contains(setting), "{label}: {setting} in {stderr}");
         }
         captured.extend([out, err]);

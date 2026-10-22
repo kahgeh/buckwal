@@ -43,12 +43,12 @@ impl fmt::Debug for Encryption {
     }
 }
 
-/// `DURABLE_ENCRYPTION_CIPHER`: any name `CipherMode::try_from` accepts
+/// `BUCKWAL_ENCRYPTION_CIPHER`: any name `CipherMode::try_from` accepts
 /// (storage/encryption.rs:425-444), else `Config`.
 pub(crate) fn parse_cipher(name: &str) -> Result<CipherMode> {
     CipherMode::try_from(name).map_err(|_| {
         Error::Config(format!(
-            "DURABLE_ENCRYPTION_CIPHER {name} is not a cipher turso supports"
+            "BUCKWAL_ENCRYPTION_CIPHER {name} is not a cipher turso supports"
         ))
     })
 }
@@ -103,7 +103,7 @@ fn page_size(page1: &[u8]) -> Option<usize> {
     (ps >= 512 && ps.is_power_of_two()).then_some(ps)
 }
 
-const WRONG_KEY: &str = "the key in DURABLE_ENCRYPTION_KEY_FILE does not decrypt this database \
+const WRONG_KEY: &str = "the key in BUCKWAL_ENCRYPTION_KEY_FILE does not decrypt this database \
                          (wrong key, or page 1 is damaged)";
 
 /// Page 1 (any version of it: every one decrypts with the right key) against the setting.
@@ -119,7 +119,7 @@ pub(crate) fn check_page_one(page1: Option<&[u8]>, enc: Option<&Encryption>) -> 
             None => Ok(()),
             Some(_) => Err(Error::Encryption(
                 "the database is not encrypted and cannot be encrypted in place: unset \
-                 DURABLE_ENCRYPTION_KEY_FILE or use a new prefix"
+                 BUCKWAL_ENCRYPTION_KEY_FILE or use a new prefix"
                     .into(),
             )),
         };
@@ -134,12 +134,12 @@ pub(crate) fn check_page_one(page1: Option<&[u8]>, enc: Option<&Encryption>) -> 
         CipherMode::from_cipher_id(id).map_or_else(|_| format!("id {id}"), |c| c.to_string());
     let Some(enc) = enc else {
         return Err(Error::Encryption(format!(
-            "the database is encrypted (cipher {name}): set DURABLE_ENCRYPTION_KEY_FILE"
+            "the database is encrypted (cipher {name}): set BUCKWAL_ENCRYPTION_KEY_FILE"
         )));
     };
     if id != enc.cipher.cipher_id() {
         return Err(Error::Encryption(format!(
-            "the database uses cipher {name}, not DURABLE_ENCRYPTION_CIPHER {}",
+            "the database uses cipher {name}, not BUCKWAL_ENCRYPTION_CIPHER {}",
             enc.cipher
         )));
     }
@@ -323,11 +323,11 @@ mod tests {
         assert_eq!(
             encryption_err(check_page_one(Some(&plain), Some(&on))),
             "the database is not encrypted and cannot be encrypted in place: unset \
-             DURABLE_ENCRYPTION_KEY_FILE or use a new prefix"
+             BUCKWAL_ENCRYPTION_KEY_FILE or use a new prefix"
         );
         assert_eq!(
             encryption_err(check_page_one(Some(&enc), None)),
-            "the database is encrypted (cipher aegis256): set DURABLE_ENCRYPTION_KEY_FILE"
+            "the database is encrypted (cipher aegis256): set BUCKWAL_ENCRYPTION_KEY_FILE"
         );
         let other = Encryption {
             cipher: CipherMode::Aes256Gcm,
@@ -335,13 +335,13 @@ mod tests {
         };
         assert_eq!(
             encryption_err(check_page_one(Some(&enc), Some(&other))),
-            "the database uses cipher aegis256, not DURABLE_ENCRYPTION_CIPHER aes256gcm"
+            "the database uses cipher aegis256, not BUCKWAL_ENCRYPTION_CIPHER aes256gcm"
         );
         let wrong = Encryption {
             cipher: CipherMode::Aegis256,
             key: EncryptionKey::new_256([0x22; 32]),
         };
-        let wrong_key = "the key in DURABLE_ENCRYPTION_KEY_FILE does not decrypt this database \
+        let wrong_key = "the key in BUCKWAL_ENCRYPTION_KEY_FILE does not decrypt this database \
                          (wrong key, or page 1 is damaged)";
         assert_eq!(
             encryption_err(check_page_one(Some(&enc), Some(&wrong))),

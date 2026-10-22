@@ -177,7 +177,7 @@ pub fn meets(expect: Expect, report: &ScanReport, needles: &[(String, Vec<u8>)])
     }
 }
 
-/// `buckwal scan`: the `DURABLE_*` settings name the bucket, the prefix, the CA bundle
+/// `buckwal scan`: the `BUCKWAL_*` settings name the bucket, the prefix, the CA bundle
 /// and the key file.
 pub fn run(a: &ScanArgs) -> CliResult<()> {
     let config = config(Path::new("."))?;

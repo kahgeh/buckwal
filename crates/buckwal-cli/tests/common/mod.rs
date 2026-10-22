@@ -14,57 +14,57 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_buckwal");
 
 /// Settings a test may set; every child gets them removed first, so the caller's
 /// environment never leaks into a test (the TLS and encryption ones come back through
-/// `env()`). `DURABLE_OTEL*` and `DURABLE_TEST_RUN_ID` are not here: `scripts/test.sh` sets
+/// `env()`). `BUCKWAL_OTEL*` and `BUCKWAL_TEST_RUN_ID` are not here: `scripts/test.sh` sets
 /// them so the children export under its run id.
 pub const OPTIONAL: [&str; 25] = [
-    "DURABLE_PREFIX",
-    "DURABLE_RETRY_DEADLINE_MS",
-    "DURABLE_REQUEST_TIMEOUT_MS",
-    "DURABLE_UPLOAD_CONCURRENCY",
-    "DURABLE_TRIM_GRACE_SECS",
-    "DURABLE_PREFETCH",
-    "DURABLE_BATCHING",
-    "DURABLE_MAINTENANCE_LOG_OBJECTS",
-    "DURABLE_MAINTENANCE_WAL_MIB",
-    "DURABLE_MAINTENANCE_GATE_WAIT_MS",
-    "DURABLE_LEASE_MS",
-    "DURABLE_GC_AFTER_SEAL",
-    "DURABLE_CA_BUNDLE",
-    "DURABLE_ENCRYPTION_KEY_FILE",
-    "DURABLE_ENCRYPTION_CIPHER",
-    "DURABLE_JOURNAL_MODE",
-    "DURABLE_SERVE_LISTEN",
-    "DURABLE_SERVE_TLS_CERT",
-    "DURABLE_SERVE_TLS_KEY",
-    "DURABLE_SERVE_TOKEN_FILE",
-    "DURABLE_SERVE_STREAM_TIMEOUT_MS",
-    "DURABLE_SERVE_SHUTDOWN_MS",
-    "DURABLE_SERVE_BUSY_TIMEOUT_MS",
-    "DURABLE_SERVE_MAX_STREAMS",
-    "DURABLE_SERVE_WORKERS",
+    "BUCKWAL_PREFIX",
+    "BUCKWAL_RETRY_DEADLINE_MS",
+    "BUCKWAL_REQUEST_TIMEOUT_MS",
+    "BUCKWAL_UPLOAD_CONCURRENCY",
+    "BUCKWAL_TRIM_GRACE_SECS",
+    "BUCKWAL_PREFETCH",
+    "BUCKWAL_BATCHING",
+    "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
+    "BUCKWAL_MAINTENANCE_WAL_MIB",
+    "BUCKWAL_MAINTENANCE_GATE_WAIT_MS",
+    "BUCKWAL_LEASE_MS",
+    "BUCKWAL_GC_AFTER_SEAL",
+    "BUCKWAL_CA_BUNDLE",
+    "BUCKWAL_ENCRYPTION_KEY_FILE",
+    "BUCKWAL_ENCRYPTION_CIPHER",
+    "BUCKWAL_JOURNAL_MODE",
+    "BUCKWAL_SERVE_LISTEN",
+    "BUCKWAL_SERVE_TLS_CERT",
+    "BUCKWAL_SERVE_TLS_KEY",
+    "BUCKWAL_SERVE_TOKEN_FILE",
+    "BUCKWAL_SERVE_STREAM_TIMEOUT_MS",
+    "BUCKWAL_SERVE_SHUTDOWN_MS",
+    "BUCKWAL_SERVE_BUSY_TIMEOUT_MS",
+    "BUCKWAL_SERVE_MAX_STREAMS",
+    "BUCKWAL_SERVE_WORKERS",
 ];
 
 /// Passed through from the caller when set: the second pass of `scripts/test.sh` runs every
 /// test over HTTPS with encryption.
 pub const PASSED_THROUGH: [&str; 3] = [
-    "DURABLE_CA_BUNDLE",
-    "DURABLE_ENCRYPTION_KEY_FILE",
-    "DURABLE_ENCRYPTION_CIPHER",
+    "BUCKWAL_CA_BUNDLE",
+    "BUCKWAL_ENCRYPTION_KEY_FILE",
+    "BUCKWAL_ENCRYPTION_CIPHER",
 ];
 
-/// The `DURABLE_*` connection settings, with the defaults of `scripts/rustfs.sh env`, then
+/// The `BUCKWAL_*` connection settings, with the defaults of `scripts/rustfs.sh env`, then
 /// the `PASSED_THROUGH` ones the caller set.
 pub fn env() -> Vec<(String, String)> {
     let set = PASSED_THROUGH
         .iter()
         .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)));
     [
-        ("DURABLE_ENDPOINT", "http://127.0.0.1:9290"),
-        ("DURABLE_REGION", "us-east-1"),
-        ("DURABLE_PATH_STYLE", "true"),
-        ("DURABLE_BUCKET", "turso-durable"),
-        ("DURABLE_ACCESS_KEY", "turso-durable-admin"),
-        ("DURABLE_SECRET_KEY", "turso-durable-local-secret-not-real"),
+        ("BUCKWAL_ENDPOINT", "http://127.0.0.1:9290"),
+        ("BUCKWAL_REGION", "us-east-1"),
+        ("BUCKWAL_PATH_STYLE", "true"),
+        ("BUCKWAL_BUCKET", "turso-durable"),
+        ("BUCKWAL_ACCESS_KEY", "turso-durable-admin"),
+        ("BUCKWAL_SECRET_KEY", "turso-durable-local-secret-not-real"),
     ]
     .iter()
     .map(|(k, d)| {
@@ -153,9 +153,9 @@ pub struct Ctx {
     pub name: String,
     pub vars: Vec<(String, String)>,
     pub tmp: TempDir,
-    /// Keep the prefix when the test fails (`DURABLE_KEEP_FAILED=1`).
+    /// Keep the prefix when the test fails (`BUCKWAL_KEEP_FAILED=1`).
     pub keep_failed: bool,
-    /// Keep the prefix, pass or fail (`DURABLE_KEEP_PREFIXES=1`): `scripts/test.sh` scans
+    /// Keep the prefix, pass or fail (`BUCKWAL_KEEP_PREFIXES=1`): `scripts/test.sh` scans
     /// every object each pass leaves.
     pub keep_all: bool,
 }
@@ -170,13 +170,13 @@ pub struct Run {
 impl Ctx {
     pub fn new(name: &str) -> Ctx {
         let mut vars = env();
-        vars.push(("DURABLE_PREFIX".into(), prefix(name)));
+        vars.push(("BUCKWAL_PREFIX".into(), prefix(name)));
         Ctx {
             name: name.to_string(),
             vars,
             tmp: tempfile::tempdir().unwrap(),
-            keep_failed: std::env::var("DURABLE_KEEP_FAILED").as_deref() == Ok("1"),
-            keep_all: std::env::var("DURABLE_KEEP_PREFIXES").as_deref() == Ok("1"),
+            keep_failed: std::env::var("BUCKWAL_KEEP_FAILED").as_deref() == Ok("1"),
+            keep_all: std::env::var("BUCKWAL_KEEP_PREFIXES").as_deref() == Ok("1"),
         }
     }
 
@@ -200,7 +200,7 @@ impl Ctx {
     }
 
     pub fn prefix(&self) -> String {
-        self.var("DURABLE_PREFIX")
+        self.var("BUCKWAL_PREFIX")
     }
 
     /// A path in this test's temp directory that does not exist yet.
@@ -266,18 +266,18 @@ impl Ctx {
     pub fn config(&self, dir: &Path) -> Config {
         let mut c = Config::new(
             dir,
-            &self.var("DURABLE_ENDPOINT"),
-            &self.var("DURABLE_BUCKET"),
-            &self.var("DURABLE_ACCESS_KEY"),
-            &self.var("DURABLE_SECRET_KEY"),
+            &self.var("BUCKWAL_ENDPOINT"),
+            &self.var("BUCKWAL_BUCKET"),
+            &self.var("BUCKWAL_ACCESS_KEY"),
+            &self.var("BUCKWAL_SECRET_KEY"),
         );
-        c.region = self.var("DURABLE_REGION");
-        c.path_style = self.var("DURABLE_PATH_STYLE") == "true";
+        c.region = self.var("BUCKWAL_REGION");
+        c.path_style = self.var("BUCKWAL_PATH_STYLE") == "true";
         c.prefix = self.prefix();
         let set = |k: &str| self.opt_var(k).filter(|v| !v.is_empty());
-        c.ca_bundle = set("DURABLE_CA_BUNDLE").map(Into::into);
-        c.encryption_key_file = set("DURABLE_ENCRYPTION_KEY_FILE").map(Into::into);
-        if let Some(cipher) = set("DURABLE_ENCRYPTION_CIPHER") {
+        c.ca_bundle = set("BUCKWAL_CA_BUNDLE").map(Into::into);
+        c.encryption_key_file = set("BUCKWAL_ENCRYPTION_KEY_FILE").map(Into::into);
+        if let Some(cipher) = set("BUCKWAL_ENCRYPTION_CIPHER") {
             c.encryption_cipher = cipher;
         }
         c
@@ -285,15 +285,15 @@ impl Ctx {
 
     pub fn try_store(&self) -> Result<S3Store, buckwal::Error> {
         S3Store::new(S3Config {
-            endpoint: self.var("DURABLE_ENDPOINT"),
-            region: self.var("DURABLE_REGION"),
-            bucket: self.var("DURABLE_BUCKET"),
-            access_key: self.var("DURABLE_ACCESS_KEY"),
-            secret_key: self.var("DURABLE_SECRET_KEY"),
-            path_style: self.var("DURABLE_PATH_STYLE") == "true",
+            endpoint: self.var("BUCKWAL_ENDPOINT"),
+            region: self.var("BUCKWAL_REGION"),
+            bucket: self.var("BUCKWAL_BUCKET"),
+            access_key: self.var("BUCKWAL_ACCESS_KEY"),
+            secret_key: self.var("BUCKWAL_SECRET_KEY"),
+            path_style: self.var("BUCKWAL_PATH_STYLE") == "true",
             request_timeout: Duration::from_secs(30),
             ca_bundle: self
-                .opt_var("DURABLE_CA_BUNDLE")
+                .opt_var("BUCKWAL_CA_BUNDLE")
                 .filter(|v| !v.is_empty())
                 .map(Into::into),
         })
@@ -351,7 +351,7 @@ impl Drop for Ctx {
         let prefix = self.prefix();
         if std::thread::panicking() && self.keep_failed {
             eprintln!(
-                "{}: failed; bucket prefix {prefix}/ kept (DURABLE_KEEP_FAILED=1)",
+                "{}: failed; bucket prefix {prefix}/ kept (BUCKWAL_KEEP_FAILED=1)",
                 self.name
             );
             return;
