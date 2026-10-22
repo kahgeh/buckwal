@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::JournalMode;
+use crate::format::LogFile;
 use crate::Error;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,6 +40,7 @@ fn key_parsers_round_trip_and_reject_malformed() {
 
 fn sample_extents() -> LogRecord {
     LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: "ab12".into(),
         syncs: vec![
             vec![
@@ -154,6 +157,7 @@ fn head_json_round_trip_and_null_manifest() {
     assert_eq!(
         h,
         Head {
+            journal_mode: JournalMode::Wal,
             format: 1,
             generation: 3,
             manifest: Some(2),
@@ -169,6 +173,7 @@ fn head_json_round_trip_and_null_manifest() {
     );
 
     let n = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 0,
         manifest: None,
@@ -310,6 +315,7 @@ fn golden_extents_record() {
     ))
     .unwrap();
     let r = LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: "w1".into(),
         syncs: vec![vec![Op::Write {
             off: 0x1000,
@@ -334,6 +340,7 @@ fn golden_truncate_op() {
     ))
     .unwrap();
     let r = LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: "w".into(),
         syncs: vec![vec![Op::Truncate { len: 5 }]],
     };
@@ -467,6 +474,7 @@ fn json_escapes_decode_and_encode() {
         assert!(is_corrupt(Head::decode(j.as_bytes())), "{bad}");
     }
     let nasty = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 0,
         manifest: None,
@@ -481,6 +489,7 @@ fn json_escapes_decode_and_encode() {
 #[test]
 fn head_encodes_epoch_last() {
     let h = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 3,
         manifest: Some(2),
@@ -581,4 +590,163 @@ fn stage2_local_state_reads_with_defaults() {
     )
     .unwrap();
     assert_eq!((before.seal_not_before_ms, before.seal_quiet_ms), (99, 0));
+}
+
+// ---- Task 1: journal mode, format v2 and record kind 3 ----
+
+#[test]
+fn v1_head_bytes_are_unchanged() {
+    let h = Head {
+        format: FORMAT,
+        generation: 3,
+        manifest: Some(2),
+        writer_id: "w1".into(),
+        epoch: 5,
+        journal_mode: JournalMode::Wal,
+    };
+    // Golden: exactly today's encoding, no journal_mode key.
+    assert_eq!(
+        String::from_utf8(h.encode()).unwrap(),
+        r#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"w1","epoch":5}"#
+    );
+    assert_eq!(Head::decode(&h.encode()).unwrap(), h);
+    // A v1 head decodes as a WAL head.
+    assert_eq!(
+        Head::decode(&h.encode()).unwrap().journal_mode,
+        JournalMode::Wal
+    );
+}
+
+#[test]
+fn v2_head_roundtrip_has_journal_mode_mvcc() {
+    let h = Head {
+        format: FORMAT_V2,
+        generation: 1,
+        manifest: Some(1),
+        writer_id: "w1".into(),
+        epoch: 1,
+        journal_mode: JournalMode::Mvcc,
+    };
+    assert_eq!(
+        String::from_utf8(h.encode()).unwrap(),
+        r#"{"format":2,"generation":1,"manifest":"manifest/0000000001","writer_id":"w1","epoch":1,"journal_mode":"mvcc"}"#
+    );
+    assert_eq!(Head::decode(&h.encode()).unwrap(), h);
+    // A format 2 head without the key, or with an unknown mode, is corrupt.
+    assert!(is_corrupt(Head::decode(
+        br#"{"format":2,"generation":1,"manifest":null,"writer_id":"w1","epoch":1}"#
+    )));
+    assert!(is_corrupt(Head::decode(
+        br#"{"format":2,"generation":1,"manifest":null,"writer_id":"w1","epoch":1,"journal_mode":"x"}"#
+    )));
+    // Format 3 is still unknown.
+    assert!(is_corrupt(Head::decode(
+        br#"{"format":3,"generation":1,"manifest":null,"writer_id":"w1","journal_mode":"mvcc"}"#
+    )));
+}
+
+#[test]
+fn v1_decoder_style_refusal() {
+    let h = Head {
+        format: FORMAT_V2,
+        generation: 1,
+        manifest: None,
+        writer_id: "w1".into(),
+        epoch: 1,
+        journal_mode: JournalMode::Mvcc,
+    };
+    assert_eq!(
+        Head::decode_accepting(&h.encode(), &[FORMAT]),
+        Err(Error::Corrupt("head: unsupported format 2".into()))
+    );
+    assert_eq!(
+        Head::decode_accepting(&h.encode(), &[FORMAT, FORMAT_V2]),
+        Ok(h)
+    );
+}
+
+#[test]
+fn kind3_record_roundtrip() {
+    let r = LogRecord::Extents {
+        file: LogFile::Log,
+        writer_id: "w1".into(),
+        syncs: vec![vec![Op::Write {
+            off: 0x1000,
+            bytes: vec![10, 11, 12],
+        }]],
+    };
+    // Kind 3 body = kind 1 body with the kind byte 3.
+    let body = hex::decode(concat!(
+        "54444c4f47000001",
+        "03",
+        "02",
+        "7731",
+        "01000000",
+        "01000000",
+        "01",
+        "0010000000000000",
+        "03000000",
+        "0a0b0c",
+    ))
+    .unwrap();
+    assert_eq!(encode_record(&r), seal(body.clone()));
+    assert_eq!(decode_record(&seal(body)).unwrap(), r);
+    // The same payload as a WAL record differs only in the kind byte (and checksum).
+    let wal = LogRecord::Extents {
+        file: LogFile::Wal,
+        writer_id: "w1".into(),
+        syncs: match &r {
+            LogRecord::Extents { syncs, .. } => syncs.clone(),
+            _ => unreachable!(),
+        },
+    };
+    let (a, b) = (encode_record(&wal), encode_record(&r));
+    assert_eq!(a[8], 1);
+    assert_eq!(b[8], 3);
+    assert_eq!(a[9..a.len() - 32], b[9..b.len() - 32]);
+    assert_eq!(decode_record(&a).unwrap(), wal);
+}
+
+#[test]
+fn kind3_checksum_mismatch_is_corrupt() {
+    let r = LogRecord::Extents {
+        file: LogFile::Log,
+        writer_id: "w1".into(),
+        syncs: vec![vec![Op::Truncate { len: 5 }]],
+    };
+    let mut b = encode_record(&r);
+    assert_eq!(decode_record(&b).unwrap(), r);
+    // Flip the kind byte from 3 to 1: the checksum no longer matches.
+    b[8] = 1;
+    assert!(is_corrupt(decode_record(&b)));
+    let mut b = encode_record(&r);
+    let n = b.len();
+    b[n - 1] ^= 1;
+    assert!(is_corrupt(decode_record(&b)));
+}
+
+#[test]
+fn local_state_v2_roundtrip() {
+    let s = LocalState {
+        format: FORMAT_V2,
+        writer_id: "w1".into(),
+        generation: 3,
+        complete: true,
+        claimed: true,
+        head_etag: String::new(),
+        epoch: 2,
+        claim_id: String::new(),
+        seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
+    };
+    assert_eq!(LocalState::decode(&s.encode()).unwrap(), s);
+    assert!(String::from_utf8(s.encode())
+        .unwrap()
+        .starts_with(r#"{"format":2,"#));
+    let dir = tempfile::tempdir().unwrap();
+    s.write_atomic(dir.path()).unwrap();
+    assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s));
+    assert!(is_corrupt(LocalState::decode(
+        br#"{"format":3,"writer_id":"w1","generation":3,"complete":true}"#
+    )));
 }

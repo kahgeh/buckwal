@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Event;
 use crate::format::encode_record;
+use crate::format::LogFile;
 use crate::format::{decode_record, Keys, LogRecord};
 use crate::store::{
     CondPut, FaultStore, MemStore, Object, ObjectStore, RetryPolicy, StatsSnap, StoreError,
@@ -66,7 +67,9 @@ fn stored_ops(mem: &MemStore, pos: LogPos) -> Vec<Vec<Op>> {
         .unwrap()
         .body;
     match decode_record(&body).unwrap() {
-        LogRecord::Extents { writer_id, syncs } => {
+        LogRecord::Extents {
+            writer_id, syncs, ..
+        } => {
             assert_eq!(writer_id, "w1");
             syncs
         }
@@ -575,6 +578,7 @@ fn fence_fails_every_waiting_window_commit_and_later_ones() {
     let mem = Arc::new(MemStore::new());
     let u = Uploader::spawn(bucket(mem.clone()), None, None, Arc::default());
     let foreign = encode_record(&LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: "w2".into(),
         syncs: vec![],
     });

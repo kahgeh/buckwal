@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::Event;
+use crate::config::JournalMode;
 use crate::store::{CondPut, MemStore, Object, ObjectStat, StatsSnap, StoreError};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -13,6 +14,7 @@ fn keys() -> Keys {
 
 fn head(generation: u64, manifest: Option<u64>) -> Head {
     Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation,
         manifest,

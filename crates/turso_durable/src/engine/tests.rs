@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::JournalMode;
 use crate::config::{Event, EventHook};
 use crate::error::Error;
 use crate::format::{Head, Keys, LocalState, Manifest};
@@ -599,6 +600,7 @@ fn restore_with_manifest_missing_page_one_is_corrupt() {
     mem.put(&k.manifest(1), &m.encode()).unwrap();
     mem.put(&k.page(1, 2), &[0u8; 4096]).unwrap();
     let h = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 2,
         manifest: Some(1),

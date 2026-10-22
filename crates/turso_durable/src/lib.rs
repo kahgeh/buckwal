@@ -25,7 +25,7 @@ pub(crate) mod trim;
 pub(crate) mod uploader;
 
 pub use batching::Batching;
-pub use config::Config;
+pub use config::{Config, JournalMode};
 /// Test and diagnostics hooks (`Config::on_event`), not part of the supported API.
 #[doc(hidden)]
 pub use config::{Event, EventHook};

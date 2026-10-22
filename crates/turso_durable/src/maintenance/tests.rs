@@ -1,4 +1,5 @@
 use super::*;
+use crate::format::LogFile;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{mpsc, Mutex};
 use std::thread;
@@ -408,6 +409,7 @@ fn maintenance_skips_during_takeover_quiet() {
     let gen = db_generation(&*store, &keys);
     let next = store.list(&keys.log_prefix(gen)).unwrap().len() as u64 + 1;
     let rec = LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: LocalState::read(a.path()).unwrap().unwrap().writer_id,
         syncs: Vec::new(),
     };

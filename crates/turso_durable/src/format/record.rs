@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 const MAGIC: &[u8; 8] = b"TDLOG\0\0\x01";
 const KIND_EXTENTS: u8 = 1;
 const KIND_FENCE: u8 = 2;
+const KIND_LOG_EXTENTS: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -14,9 +15,18 @@ pub(crate) enum Op {
     Truncate { len: u64 },
 }
 
+/// Which local file an extents record's ops apply to: kind 1 is `app.db-wal`, kind 3 (bucket
+/// format v2) is `app.db-log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogFile {
+    Wal,
+    Log,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LogRecord {
     Extents {
+        file: LogFile,
         writer_id: String,
         syncs: Vec<Vec<Op>>,
     },
@@ -42,8 +52,15 @@ fn put_writer_id(out: &mut Vec<u8>, id: &str) {
 pub(crate) fn encode_record(r: &LogRecord) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     match r {
-        LogRecord::Extents { writer_id, syncs } => {
-            out.push(KIND_EXTENTS);
+        LogRecord::Extents {
+            file,
+            writer_id,
+            syncs,
+        } => {
+            out.push(match file {
+                LogFile::Wal => KIND_EXTENTS,
+                LogFile::Log => KIND_LOG_EXTENTS,
+            });
             put_writer_id(&mut out, writer_id);
             out.extend((syncs.len() as u32).to_le_bytes());
             for ops in syncs {
@@ -127,7 +144,7 @@ pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
                 epoch: r.u64()?,
             }
         }
-        KIND_EXTENTS => {
+        KIND_EXTENTS | KIND_LOG_EXTENTS => {
             let sync_count = r.u32()?;
             let mut syncs = Vec::new();
             for _ in 0..sync_count {
@@ -149,7 +166,16 @@ pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
                 }
                 syncs.push(ops);
             }
-            LogRecord::Extents { writer_id, syncs }
+            let file = if kind == KIND_LOG_EXTENTS {
+                LogFile::Log
+            } else {
+                LogFile::Wal
+            };
+            LogRecord::Extents {
+                file,
+                writer_id,
+                syncs,
+            }
         }
         k => return Err(corrupt(&format!("unknown kind {k}"))),
     };

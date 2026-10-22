@@ -7,9 +7,11 @@
 //! another writer fences this one for good.
 
 use crate::clock::Stamp;
-use crate::config::{Event, EventHook};
+use crate::config::{Event, EventHook, JournalMode};
 use crate::error::{Error, Result};
-use crate::format::{decode_record, encode_record, Head, Keys, LogRecord, Manifest, Op, FORMAT};
+use crate::format::{
+    decode_record, encode_record, Head, Keys, LogFile, LogRecord, Manifest, Op, FORMAT,
+};
 use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -406,7 +408,9 @@ fn other_writer_mid_seal(records: &[LogRecord], ours: &str) -> bool {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     records.iter().rev().any(|rec| {
         let (writer, seal_start) = match rec {
-            LogRecord::Extents { writer_id, syncs } => (writer_id.as_str(), syncs.is_empty()),
+            LogRecord::Extents {
+                writer_id, syncs, ..
+            } => (writer_id.as_str(), syncs.is_empty()),
             LogRecord::Fence { writer_id, .. } => (writer_id.as_str(), false),
         };
         writer != ours && seen.insert(writer) && seal_start
@@ -467,6 +471,7 @@ impl Bucket {
             manifest: None,
             writer_id,
             epoch: 1,
+            journal_mode: JournalMode::Wal,
         };
         let body = head.encode();
         let key = keys.head();
@@ -760,6 +765,7 @@ impl Bucket {
             });
         }
         let body = encode_record(&LogRecord::Extents {
+            file: LogFile::Wal,
             writer_id: self.head.writer_id.clone(),
             syncs,
         });
@@ -1152,11 +1158,12 @@ impl Bucket {
     /// The head a seal of the current generation publishes.
     fn sealed_head(&self) -> Head {
         Head {
-            format: FORMAT,
+            format: self.head.format,
             generation: self.head.generation + 1,
             manifest: Some(self.head.generation),
             writer_id: self.head.writer_id.clone(),
             epoch: self.head.epoch,
+            journal_mode: self.head.journal_mode,
         }
     }
 
@@ -1430,6 +1437,7 @@ impl Bucket {
     /// writer wrote its key fails its condition.
     fn seal_start(&mut self, start: Instant) -> Result<()> {
         let body = encode_record(&LogRecord::Extents {
+            file: LogFile::Wal,
             writer_id: self.head.writer_id.clone(),
             syncs: Vec::new(),
         });

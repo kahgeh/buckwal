@@ -1,10 +1,12 @@
 use super::*;
+use crate::config::JournalMode;
 use crate::engine::tests::{
     cfg, cfg_deadline, commit_row, crash, create_table, head, ids, integrity, keys, log_seqs,
     restored, run, seal_now, writer, writer_with,
 };
 use crate::engine::{open_engine, Engine};
 use crate::files::DIRTY_FILE;
+use crate::format::LogFile;
 use crate::format::{encode_record, Head, LogRecord};
 use crate::io::db_storage::seal_page_set;
 use crate::io::stash;
@@ -362,6 +364,7 @@ fn foreign_record_in_log_is_fenced() {
     let crashed = crash(e, conn, d.path());
     let next = log_seqs(&*mem, 1).len() as u64 + 1;
     let rec = encode_record(&LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: "f".repeat(32),
         syncs: vec![vec![]],
     });
@@ -618,6 +621,7 @@ fn claimed_generation_accepts_old_writer_prefix_only() {
     let next = log_seqs(&*mem, old.generation).len() as u64 + 1;
     let empty = |w: &str| {
         encode_record(&LogRecord::Extents {
+            file: LogFile::Wal,
             writer_id: w.to_string(),
             syncs: vec![vec![]],
         })
@@ -673,6 +677,7 @@ mod fence_image {
         for (i, r) in recs.iter().enumerate() {
             let rec = match r {
                 R::Ext(w, n) => LogRecord::Extents {
+                    file: LogFile::Wal,
                     writer_id: w.to_string(),
                     syncs: vec![vec![Op::Write {
                         off: *n - 1,
@@ -688,6 +693,7 @@ mod fence_image {
                 .unwrap();
         }
         let head = Head {
+            journal_mode: JournalMode::Wal,
             format: 1,
             generation: 1,
             manifest: None,

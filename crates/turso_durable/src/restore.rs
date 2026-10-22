@@ -7,7 +7,7 @@ use crate::db::DirGuard;
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
-    apply_ops, decode_record, Head, Keys, LocalState, LogRecord, Manifest, FORMAT,
+    apply_ops, decode_record, Head, Keys, LocalState, LogFile, LogRecord, Manifest, FORMAT,
 };
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
@@ -230,7 +230,17 @@ fn generation_image_counted(
     for (i, rec) in records.iter().enumerate() {
         let seq = i + 1;
         match rec {
-            LogRecord::Extents { writer_id, syncs } => {
+            LogRecord::Extents {
+                file: LogFile::Log, ..
+            } => {
+                // Kind 3 (an MVCC bucket) is applied by a later task; never write it to the WAL.
+                return Err(Error::Unsupported("MVCC: restoring a kind 3 log record"));
+            }
+            LogRecord::Extents {
+                file: LogFile::Wal,
+                writer_id,
+                syncs,
+            } => {
                 if let Some((fencer, epoch)) = fence {
                     if writer_id != fencer {
                         return Err(Error::Fenced(format!(

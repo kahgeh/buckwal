@@ -7,6 +7,9 @@ pub(crate) const DB_FILE: &str = "app.db";
 /// The engine's WAL. The engine itself opens `format!("{db_path}-wal")` (database.rs:1495),
 /// which is this name next to [`DB_FILE`].
 pub(crate) const WAL_FILE: &str = "app.db-wal";
+/// The MVCC engine's logical log (`format!("{db_path}-log")`), next to [`DB_FILE`].
+#[allow(dead_code)] // first used by the MVCC log wrapper (later task)
+pub(crate) const LOG_FILE: &str = "app.db-log";
 /// The local state (`LocalState`, flat JSON).
 pub(crate) const STATE_FILE: &str = "app.db-durable";
 /// Page numbers checkpointed since the last seal (u32 LE each).

@@ -1,7 +1,8 @@
 //! `head` object (bucket) and `app.db-durable` (local state): flat JSON.
 use super::json::{escape, Obj};
-use super::FORMAT;
+use super::{FORMAT, FORMAT_V2};
 use crate::config::defaults;
+use crate::config::JournalMode;
 use crate::error::{Error, Result};
 use crate::files::{io_err, STATE_FILE};
 use std::fs::{self, File};
@@ -14,12 +15,15 @@ fn corrupt(m: &str) -> Error {
     Error::Corrupt(m.to_string())
 }
 
-fn check_format(o: &Obj, what: &str) -> Result<u32> {
+/// The formats a decoder of this build accepts.
+const ACCEPTED: &[u32] = &[FORMAT, FORMAT_V2];
+
+fn check_format(o: &Obj, what: &str, accepted: &[u32]) -> Result<u32> {
     let f = o.num("format")?;
-    if f != FORMAT as u64 {
-        return Err(corrupt(&format!("{what}: unsupported format {f}")));
+    match accepted.iter().find(|a| u64::from(**a) == f) {
+        Some(a) => Ok(*a),
+        None => Err(corrupt(&format!("{what}: unsupported format {f}"))),
     }
-    Ok(FORMAT)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +34,8 @@ pub(crate) struct Head {
     pub writer_id: String,
     /// The writer-lease epoch; a head without the key reads as 0.
     pub epoch: u64,
+    /// Encoded (as `"journal_mode"`) only when `format` is 2; a format 1 head is always `Wal`.
+    pub journal_mode: JournalMode,
 }
 
 impl Head {
@@ -38,20 +44,38 @@ impl Head {
             Some(g) => format!("\"manifest/{g:010}\""),
             None => "null".to_string(),
         };
+        let mode = if self.format == FORMAT_V2 {
+            format!(",\"journal_mode\":\"{}\"", self.journal_mode.as_str())
+        } else {
+            String::new()
+        };
         format!(
-            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{},\"epoch\":{}}}",
+            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{},\"epoch\":{}{}}}",
             self.format,
             self.generation,
             manifest,
             escape(&self.writer_id),
-            self.epoch
+            self.epoch,
+            mode
         )
         .into_bytes()
     }
 
     pub(crate) fn decode(b: &[u8]) -> Result<Head> {
+        Head::decode_accepting(b, ACCEPTED)
+    }
+
+    /// Decode a head, accepting only the listed formats (a v1 build passes `[FORMAT]`).
+    pub(crate) fn decode_accepting(b: &[u8], accepted: &[u32]) -> Result<Head> {
         let o = Obj::parse(b)?;
-        let format = check_format(&o, "head")?;
+        let format = check_format(&o, "head", accepted)?;
+        let journal_mode = if format == FORMAT_V2 {
+            let m = o.str("journal_mode")?;
+            JournalMode::parse(m)
+                .ok_or_else(|| corrupt(&format!("head: unknown journal_mode {m:?}")))?
+        } else {
+            JournalMode::Wal
+        };
         let manifest = match o.opt_str("manifest")? {
             None => None,
             Some(s) => {
@@ -72,6 +96,7 @@ impl Head {
             manifest,
             writer_id: o.str("writer_id")?.to_string(),
             epoch: if o.has("epoch") { o.num("epoch")? } else { 0 },
+            journal_mode,
         })
     }
 }
@@ -133,7 +158,7 @@ impl LocalState {
             )));
         }
         Ok(LocalState {
-            format: check_format(&o, "local state")?,
+            format: check_format(&o, "local state", ACCEPTED)?,
             writer_id: o.str("writer_id")?.to_string(),
             generation: o.num("generation")?,
             complete: o.bool("complete")?,

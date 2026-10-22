@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::tests::{head, keys, log_seqs, PREFIX};
+use crate::format::LogFile;
 use crate::format::{decode_record, Head, LocalState, LogRecord};
 use crate::reconcile::Reconciled;
 use crate::restore::restore_with_store;
@@ -1998,6 +1999,7 @@ fn writer_left_in_a_seal(store: &Arc<MemStore>, n: i64) -> TempDir {
     let gen = head(&**store).generation;
     let next = log_seqs(&**store, gen).last().map_or(1, |s| s + 1);
     let rec = LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: state(a.path()).writer_id,
         syncs: Vec::new(),
     };

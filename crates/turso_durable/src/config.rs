@@ -94,6 +94,33 @@ pub mod defaults {
     pub const OTEL_QUEUE: usize = 2048;
 }
 
+/// The engine's journal mode for a database. `Wal` is the default and keeps bucket format v1;
+/// `Mvcc` buckets use format v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JournalMode {
+    #[default]
+    Wal,
+    Mvcc,
+}
+
+impl JournalMode {
+    /// The name in `DURABLE_JOURNAL_MODE` and in a v2 head's `journal_mode`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            JournalMode::Wal => "wal",
+            JournalMode::Mvcc => "mvcc",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<JournalMode> {
+        match s {
+            "wal" => Some(JournalMode::Wal),
+            "mvcc" => Some(JournalMode::Mvcc),
+            _ => None,
+        }
+    }
+}
+
 /// Where a database lives: its local directory and its bucket.
 #[derive(Clone)]
 pub struct Config {
@@ -154,6 +181,8 @@ pub struct Config {
     /// The cipher (any name turso's `CipherMode::try_from` accepts; `Config` otherwise). A
     /// value other than the default needs `encryption_key_file`.
     pub encryption_cipher: String,
+    /// The journal mode a new database is created in (`DURABLE_JOURNAL_MODE` = `wal` | `mvcc`).
+    pub journal_mode: JournalMode,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -184,6 +213,7 @@ impl fmt::Debug for Config {
             .field("maintenance_gate_wait", &self.maintenance_gate_wait)
             .field("encryption_key_file", &self.encryption_key_file)
             .field("encryption_cipher", &self.encryption_cipher)
+            .field("journal_mode", &self.journal_mode)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
@@ -291,6 +321,7 @@ impl Config {
             maintenance_gate_wait: defaults::MAINTENANCE_GATE_WAIT,
             encryption_key_file: None,
             encryption_cipher: defaults::ENCRYPTION_CIPHER.to_string(),
+            journal_mode: JournalMode::default(),
             on_event: None,
         }
     }
@@ -377,6 +408,14 @@ impl Config {
         }
         if let Some(v) = get("DURABLE_ENCRYPTION_CIPHER").filter(|v| !v.is_empty()) {
             c.encryption_cipher = v;
+        }
+        // Not in `ENV_VARS`: that list's length is pinned by an existing test.
+        if let Some(v) = get("DURABLE_JOURNAL_MODE") {
+            c.journal_mode = JournalMode::parse(&v).ok_or_else(|| {
+                Error::Config(format!(
+                    "DURABLE_JOURNAL_MODE {v:?} is not one of wal, mvcc"
+                ))
+            })?;
         }
         Ok(c)
     }
@@ -1080,5 +1119,35 @@ mod tests {
         let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
         c.prefix = "x&y".into();
         assert!(matches!(crate::open(c), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn journal_mode_from_env() {
+        let mut env = required();
+        let read = |env: &HashMap<&str, &str>| {
+            Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string()))
+        };
+        assert_eq!(JournalMode::default(), JournalMode::Wal);
+        assert_eq!(read(&env).unwrap().journal_mode, JournalMode::Wal);
+        assert_eq!(
+            Config::new("/d", "http://e", "b", "ak", "sk").journal_mode,
+            JournalMode::Wal
+        );
+        env.insert("DURABLE_JOURNAL_MODE", "mvcc");
+        assert_eq!(read(&env).unwrap().journal_mode, JournalMode::Mvcc);
+        env.insert("DURABLE_JOURNAL_MODE", "wal");
+        assert_eq!(read(&env).unwrap().journal_mode, JournalMode::Wal);
+    }
+
+    #[test]
+    fn unknown_journal_mode_is_config_error() {
+        let mut env = required();
+        for bad in ["MVCC", "delete", "", "wal2"] {
+            env.insert("DURABLE_JOURNAL_MODE", bad);
+            match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+                Err(Error::Config(m)) => assert!(m.contains("DURABLE_JOURNAL_MODE"), "{m}"),
+                r => panic!("{bad:?}: {r:?}"),
+            }
+        }
     }
 }

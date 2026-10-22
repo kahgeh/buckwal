@@ -1,6 +1,8 @@
 use super::*;
 use crate::config::Event;
+use crate::config::JournalMode;
 use crate::format::decode_record;
+use crate::format::LogFile;
 use crate::store::fault::HoldStore;
 use crate::store::{FaultStore, MemStore};
 use std::time::Duration;
@@ -71,7 +73,9 @@ fn syncs(tag: u8) -> Vec<Vec<Op>> {
 fn stored_ops(mem: &MemStore, pos: LogPos) -> Vec<Vec<Op>> {
     let body = mem.get(&keys().log(pos.generation, pos.seq)).unwrap();
     match decode_record(&body.expect("a record at pos").body).unwrap() {
-        LogRecord::Extents { writer_id, syncs } if writer_id == "w1" => syncs,
+        LogRecord::Extents {
+            writer_id, syncs, ..
+        } if writer_id == "w1" => syncs,
         r => panic!("not our record: {r:?}"),
     }
 }
@@ -89,6 +93,7 @@ fn fault_bucket_with_short_deadline() -> (Arc<MemStore>, Arc<FaultStore>, Bucket
 
 fn ours(tag: u8) -> LogRecord {
     LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: "w1".into(),
         syncs: syncs(tag),
     }
@@ -103,6 +108,7 @@ fn create_then_attach_round_trip() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
     let want = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
@@ -261,6 +267,7 @@ fn foreign_object_fences_and_stops() {
 
 fn empty(writer_id: &str) -> LogRecord {
     LogRecord::Extents {
+        file: LogFile::Wal,
         writer_id: writer_id.into(),
         syncs: vec![],
     }
@@ -316,6 +323,7 @@ fn seal_start_with_moved_head_fences_before_any_upload() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 2,
         manifest: Some(1),
@@ -345,6 +353,7 @@ fn seal_start_accepts_our_own_late_head() {
     let mut b = f.create(fast(), 4);
     b.append_log(syncs(1)).unwrap();
     let late = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 2,
         manifest: Some(1),
@@ -442,6 +451,7 @@ fn a_record_landing_past_the_lease_checks_the_head() {
     let mut b = f.create(retry, 4);
     b.set_lease(Duration::from_millis(100));
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
@@ -508,6 +518,7 @@ fn a_writer_that_slept_checks_the_head() {
     let mut b = f.create(fast(), 4);
     b.set_lease(Duration::from_millis(100));
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
@@ -814,6 +825,7 @@ fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
     b.set_lease(Duration::ZERO);
     b.append_log(syncs(1)).unwrap();
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 2,
         manifest: Some(1),
@@ -863,6 +875,7 @@ fn lapsed_append_with_our_head_proceeds() {
         Ok((2, 1))
     );
     let late = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 3,
         manifest: Some(2),
@@ -1075,6 +1088,7 @@ fn seal_uploads_pages_manifest_head_in_order() {
     assert_eq!(
         f.record(1, 2),
         Some(LogRecord::Extents {
+            file: LogFile::Wal,
             writer_id: "w1".into(),
             syncs: vec![]
         })
@@ -1291,6 +1305,7 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
         Err(Error::UploadFailed(_))
     ));
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
@@ -1418,6 +1433,7 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
     assert!(b.seal_generation(pages(1), 4096, 1).is_err());
     f.fault.fail_next_puts(0);
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
@@ -1496,6 +1512,7 @@ fn head_conflict_fences() {
     let f = Fixture::new();
     let mut b = f.create(fast(), 4);
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
@@ -1951,6 +1968,7 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
     let (mem, _fault, mut b) = fault_bucket_with_short_deadline();
     b.set_lease(Duration::ZERO);
     let other = Head {
+        journal_mode: JournalMode::Wal,
         format: 1,
         generation: 1,
         manifest: None,
