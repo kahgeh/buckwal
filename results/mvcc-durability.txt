@@ -57,3 +57,21 @@ Task 10 (CLI --journal-mode, soak --concurrent, MVCC system tests)
   mvcc tests: plain 16 passed (36.4 s) + server 1; https+encryption 16 passed (39.0 s) + server 1; peak turso-durable-objects 66 / 67 MB; whole-bucket scan: pass 1 finds CREATE TABLE, pass 2 finds nothing.
 
 Task 12 (documentation): ./scripts/test.sh unit exit 0, 697 unit tests (32 cli + 6 hrana client + 81 server + 36 http + 1 span + 489 library + 33 batching + 5 fencing + 8 mvcc_fencing + 5 mvcc_limits + 1 otel_down), up from the baseline 588. Cargo.lock unchanged since 332b45f. Doc comments only in Rust (conn.rs, db.rs, io/log_file.rs). docs/architecture.md and docs/mvcc-recon.md diagrams render with mmdc.
+
+Final fix wave (whole-branch review)
+  Task 2 round 1 (earlier, from task-2-report.md): MVCC directory opened as WAL.
+    before: thread 'db::tests::mvcc_directory_opened_as_wal_says_switching_back' panicked ... left: "MVCC" right: "MVCC: switching back to WAL" / test result: FAILED. 0 passed; 1 failed
+    after: that test ok. 1 passed; ./scripts/test.sh unit exit 0, 610 passed.
+  Task 4 round 1 (earlier, from task-4-report.md): the shipped lock held until the requeue (mutation proof).
+    before (lock released after submit): io::log_file::tests::follower_waits_for_the_leads_requeue FAILED, left: [] right: [3] (the follower was acked with no PUT), test result: FAILED. 9 passed; 1 failed
+    after: test result: ok. 10 passed; 0 failed (5 runs).
+  1. LogShippingFile::truncate(0) before the first sync cleared UNKNOWN without shipping.
+    before: io::log_file::tests::truncate_zero_before_first_sync_still_replaces_the_image FAILED, assertion left == right failed (image held the old 200-byte 0x01 tail after the new 56+10 bytes)
+    after: io:: tests 18 passed; 0 failed
+  2. Format 2 head with journal_mode "wal" accepted.
+    before: format::tests::head_mode_must_match_its_format FAILED: assertion failed: is_corrupt(Head::decode({"format":2,...,"journal_mode":"wal"}))
+    after: Corrupt "head: format 2 with journal_mode \"wal\"" (also format 1 with a journal_mode key)
+  3. clear_interrupted_create deleted a foreign app.db and app.db-log when app.db-creating was stale.
+    before: db::tests::stale_staging_dir_never_deletes_a_foreign_app_db FAILED: panicked "opened over a foreign app.db" (the foreign file had been deleted and a database created)
+    after: refused with Config "holds an app.db not created by turso_durable", foreign files untouched
+  turso_durable lib: 492 passed; 0 failed.

@@ -3861,6 +3861,41 @@ fn create_crash_at_each_step() {
     }
 }
 
+/// A stale `app.db-creating` and no state file must not make the open delete an `app.db`
+/// that is not the creation's: the foreign-file guard refuses it, the file untouched.
+#[test]
+fn stale_staging_dir_never_deletes_a_foreign_app_db() {
+    for state_in_staging in [false, true] {
+        let store = mem();
+        let t = tempdir();
+        let dir = fresh(&t);
+        std::fs::create_dir_all(dir.join("app.db-creating")).unwrap();
+        // Still in staging: the creation had not moved it, so the one in `dir` is not its.
+        std::fs::write(dir.join("app.db-creating").join("app.db"), b"staged").unwrap();
+        std::fs::write(dir.join("app.db-creating").join("app.db-log"), b"staged").unwrap();
+        if state_in_staging {
+            std::fs::write(dir.join("app.db-creating").join("app.db-durable"), b"{}").unwrap();
+        }
+        std::fs::write(dir.join("app.db"), b"foreign sqlite").unwrap();
+        std::fs::write(dir.join("app.db-log"), b"foreign log").unwrap();
+        let e = open_with_store(mvcc_config(&dir), store.clone())
+            .err()
+            .unwrap_or_else(|| panic!("opened over a foreign app.db"));
+        assert!(
+            matches!(&e, Error::Config(m) if m.contains("holds an app.db not created by turso_durable")),
+            "state_in_staging={state_in_staging}: {e:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("app.db")).unwrap(),
+            b"foreign sqlite"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("app.db-log")).unwrap(),
+            b"foreign log"
+        );
+    }
+}
+
 /// The head and the `app.db` image of `manifest/1`, whatever the log holds (a takeover's
 /// fence record, say).
 fn head_and_image(store: &dyn ObjectStore) -> (Head, Vec<u8>) {

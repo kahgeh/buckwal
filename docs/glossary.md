@@ -11,7 +11,7 @@ One line per term, as the code on this branch uses it. The README has the full r
 - **log record**: one object `log/<generation>/<seq>`: magic, kind, writer id, syncs of ops, `sha256`. Kind 1 holds `app.db-wal` extents, kind 2 is a fence record, kind 3 (format 2 only) holds `app.db-log` extents.
 - **epoch**: a counter in the head. A new database starts at 1, a takeover writes the next one, every other writer open raises it by one, so a late head PUT from an earlier process fails its `If-Match`.
 - **fence**: a record (kind 2) a takeover appends to the log. Any writer whose append collides with it, or whose head check finds another writer, gets `Fenced` and stays fenced.
-- **lease**: how long (30 s) a writer trusts its last confirmation that the head is its own. Past it, the next append reads the head first.
+- **lease**: how long (default 30 s, `DURABLE_LEASE_MS`) a writer trusts its last confirmation that the head is its own. Past it, the next append reads the head first.
 - **quiet (takeover quiet)**: the wait (`lease` + `request_timeout`) before the new writer seals a generation whose old writer may still be uploading a seal.
 - **takeover**: restoring a database and writing the head with a new writer id at the next epoch, then a fence record. The old writer is fenced for good.
 - **claim**: a writer open of a restored or empty directory takes the database over with a new writer id (the claim id, persisted before the head write so a crash resumes it).

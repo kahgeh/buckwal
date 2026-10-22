@@ -71,9 +71,16 @@ impl Head {
         let format = check_format(&o, "head", accepted)?;
         let journal_mode = if format == FORMAT_V2 {
             let m = o.str("journal_mode")?;
-            JournalMode::parse(m)
-                .ok_or_else(|| corrupt(&format!("head: unknown journal_mode {m:?}")))?
+            let mode = JournalMode::parse(m)
+                .ok_or_else(|| corrupt(&format!("head: unknown journal_mode {m:?}")))?;
+            if mode == JournalMode::Wal {
+                return Err(corrupt("head: format 2 with journal_mode \"wal\""));
+            }
+            mode
         } else {
+            if o.has("journal_mode") {
+                return Err(corrupt("head: format 1 with a journal_mode key"));
+            }
             JournalMode::Wal
         };
         let manifest = match o.opt_str("manifest")? {

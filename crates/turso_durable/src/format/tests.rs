@@ -646,6 +646,17 @@ fn v2_head_roundtrip_has_journal_mode_mvcc() {
 }
 
 #[test]
+fn head_mode_must_match_its_format() {
+    // Format 2 means MVCC: a "wal" mode is corrupt. A format 1 head carries no mode key.
+    assert!(is_corrupt(Head::decode(
+        br#"{"format":2,"generation":1,"manifest":null,"writer_id":"w1","epoch":1,"journal_mode":"wal"}"#
+    )));
+    assert!(is_corrupt(Head::decode(
+        br#"{"format":1,"generation":1,"manifest":null,"writer_id":"w1","epoch":1,"journal_mode":"mvcc"}"#
+    )));
+}
+
+#[test]
 fn v1_decoder_style_refusal() {
     let h = Head {
         format: FORMAT_V2,

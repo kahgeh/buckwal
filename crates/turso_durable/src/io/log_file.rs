@@ -386,9 +386,10 @@ impl File for LogShippingFile {
             let g = self.uploader.generation();
             if g == s.generation {
                 p.push(Op::Truncate { len: 0 });
-            } else {
+            } else if s.generation != UNKNOWN {
                 s.generation = g;
             }
+            // UNKNOWN stays: the first sync ships Truncate{0} plus the whole file.
         }
         r
     }
@@ -1214,6 +1215,27 @@ mod tests {
         assert_eq!(r.image(2), r.local_bytes());
         let stats = r.up.stats().snapshot();
         assert_eq!((stats.log_puts, stats.commits_uploaded), (1, 1));
+    }
+
+    /// A `truncate(0)` before the first sync of a file opened with `ship_whole_file_next`
+    /// (`reset_to_fresh_header`, no seal) keeps "ship the whole file": the image must not
+    /// keep the old bytes the bucket holds.
+    #[test]
+    fn truncate_zero_before_first_sync_still_replaces_the_image() {
+        let r = rig();
+        let old = r.file();
+        write(&old, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        write(&old, &*r.io, HEADER as u64, frame(1, 200)).unwrap();
+        assert_eq!(sync(&old, &*r.io), Ok(()));
+        assert_eq!(r.image(2).len(), HEADER + 200);
+        let f = r.file();
+        f.ship_whole_file_next();
+        trunc(&f, &*r.io, 0);
+        write(&f, &*r.io, 0, frame(0xBB, HEADER)).unwrap();
+        write(&f, &*r.io, HEADER as u64, frame(2, 10)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(r.local_bytes().len(), HEADER + 10);
+        assert_eq!(r.image(2), r.local_bytes());
     }
 
     /// A poisoned file refuses every write before the inner file sees it, and records

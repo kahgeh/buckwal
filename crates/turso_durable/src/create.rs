@@ -213,17 +213,24 @@ fn crash_point(moved: usize) -> Result<()> {
 }
 
 /// Remove what an interrupted creation left in `dir` (held by the caller), never opening it.
-/// With `app.db-creating` present and no local state in `dir`, the files a creation moves in
-/// (`app.db-log`, `app.db`) are removed too: they can only be that creation's, moved before
-/// its state file. With the state file in `dir` the move finished; only the staging
+/// The creation moves its files in only after it staged all three, the state file last, and
+/// each move is a rename out of `staging`. So with `app.db-creating` present, no local state
+/// in `dir` and the state file still in `staging` (the moves began), a file of `CREATED` is
+/// in `dir` as the creation's only if `staging` no longer holds it; those are removed. A
+/// file `staging` still holds, or any file when the state file is not staged (a crash during
+/// the build, before any move), is not the creation's and stays: the open's foreign-`app.db`
+/// guard then refuses it. With the state file in `dir` the move finished; only the staging
 /// directory is left to remove.
 pub(crate) fn clear_interrupted_create(dir: &Path) -> Result<()> {
     let staging = staging_dir(dir);
     if !staging.exists() {
         return Ok(());
     }
-    if !dir.join(STATE_FILE).exists() {
+    if !dir.join(STATE_FILE).exists() && staging.join(STATE_FILE).exists() {
         for f in [LOG_FILE, DB_FILE] {
+            if staging.join(f).exists() {
+                continue;
+            }
             match fs::remove_file(dir.join(f)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
