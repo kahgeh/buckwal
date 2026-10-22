@@ -391,8 +391,8 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
 /// `maybe_allocate_page1`, so the first writes to a fresh database on several connections at
 /// once can allocate it twice and panic (pager.rs:3290-3297, 5644-5648). `BEGIN IMMEDIATE`
 /// allocates it (`begin_write_tx`) and `ROLLBACK` commits nothing, so no ack waits on any
-/// batching. A database that is not fresh is only read: the check is one library call, so a
-/// seal already due at open runs during open instead of at the first commit. The connection
+/// batching. A database that is not fresh is only read: the check is one `PRAGMA page_count`
+/// and starts no seal of its own (its automatic WAL actions are off, below). The connection
 /// is dropped before this returns, and is the only one then, so its close would be the last
 /// and checkpoint the WAL, which commits a log record: its automatic WAL actions are
 /// disabled, and the open commits nothing for it. Only a writer's open calls it: a read-only
