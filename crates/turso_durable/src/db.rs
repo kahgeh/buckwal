@@ -258,7 +258,10 @@ pub fn open_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Result<Da
 
 /// Open for reading only (verification): nothing is ever written to the bucket. The
 /// directory is not claimed, no GC runs, every statement that writes is refused, and
-/// close never checkpoints.
+/// close never checkpoints. An MVCC database's own recovery at open may still write the
+/// local files (backfill into `app.db`, the log header, a cut of `-wal`); those writes
+/// stay local, are never uploaded and never seal. A read-only open never creates
+/// `app.db-log`. A WAL database's files are not written.
 #[doc(hidden)]
 pub fn open_read_only(config: Config) -> Result<Database> {
     let store = config.s3_store()?;

@@ -139,6 +139,7 @@ pub(crate) fn open_engine(
         state: state.clone(),
         manifest,
         read_only: cfg.read_only,
+        mvcc: cfg.journal_mode == JournalMode::Mvcc,
     }));
     storage.adopt_persisted_dirty()?;
     // D16: page 1, as the engine will read it, against the encryption setting.

@@ -134,9 +134,10 @@ pub(crate) fn reconcile_files(
         if head.manifest.is_some() && (behind || wal_new) {
             truncate_dirty_file(&dir.join(DIRTY_FILE))?;
         }
-        // An unclaimed directory (restored, or only ever opened read-only) never checkpointed
-        // the replaced WAL into `app.db`: pages the new generation's manifest maps elsewhere
-        // must come from the bucket. A claimed writer's `app.db` holds every page it sealed.
+        // An unclaimed directory (restored, or only ever opened read-only) never sealed: its
+        // `app.db` holds the restore's pages, plus whatever a read-only MVCC open's bootstrap
+        // backfilled locally. Pages the new generation's manifest maps elsewhere must come
+        // from the bucket. A claimed writer's `app.db` holds every page it sealed.
         if !state.claimed {
             state.complete = false;
         }

@@ -92,8 +92,12 @@ pub(crate) struct BucketDbStorage {
     local: Mutex<HashSet<u32>>,
     dirty: Mutex<Dirty>,
     lazy_gets: AtomicU64,
-    /// A read-only open: every engine write is refused (fetched pages are still cached).
+    /// A read-only open: every engine write is refused (fetched pages are still cached),
+    /// unless `mvcc`.
     read_only: bool,
+    /// An MVCC database: a read-only open lets the engine's bootstrap write the local file
+    /// (backfill); the pages are tracked as dirty locally and nothing is uploaded.
+    mvcc: bool,
 }
 
 pub(crate) struct StorageParts {
@@ -109,6 +113,7 @@ pub(crate) struct StorageParts {
     pub state: LocalState,
     pub manifest: Option<Manifest>,
     pub read_only: bool,
+    pub mvcc: bool,
 }
 
 impl BucketDbStorage {
@@ -138,6 +143,7 @@ impl BucketDbStorage {
             }),
             lazy_gets: AtomicU64::new(0),
             read_only: p.read_only,
+            mvcc: p.mvcc,
         }
     }
 
@@ -372,9 +378,10 @@ impl BucketDbStorage {
 }
 
 impl BucketDbStorage {
-    /// The backstop of a read-only open: the engine never gets to write the database file.
+    /// The backstop of a read-only open: a WAL database's engine never gets to write the
+    /// database file (an MVCC one's bootstrap backfills it).
     fn refuse_if_read_only(&self) -> turso_core::Result<()> {
-        if self.read_only {
+        if self.read_only && !self.mvcc {
             return Err(stash(Error::Unsupported(READ_ONLY)));
         }
         Ok(())

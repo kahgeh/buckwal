@@ -281,12 +281,19 @@ impl ShippingFile {
         Ok(())
     }
 
-    /// The backstop of a read-only open: the engine never gets to change the `-wal`.
+    /// The backstop of a read-only open: a WAL database's engine never gets to change the
+    /// `-wal`.
     fn refuse_if_read_only(&self) -> turso_core::Result<()> {
-        if self.read_only {
+        if self.read_only && !self.mvcc {
             return Err(stash(Error::Unsupported(READ_ONLY)));
         }
         Ok(())
+    }
+
+    /// A read-only MVCC open's `-wal`: the engine's recovery writes (a checkpoint's
+    /// bootstrap) reach the local file only, never the bucket.
+    fn local_only(&self) -> bool {
+        self.read_only && self.mvcc
     }
 
     /// Record `ops` once the inner call that issued them returned `Ok`: a write or truncate
@@ -330,6 +337,9 @@ impl File for ShippingFile {
         c: Completion,
     ) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        if self.local_only() {
+            return self.inner.pwrite(pos, buffer, c);
+        }
         if pos == 0 {
             self.on_header(buffer.as_slice())?;
         }
@@ -346,6 +356,9 @@ impl File for ShippingFile {
         c: Completion,
     ) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        if self.local_only() {
+            return self.inner.pwritev(pos, buffers, c);
+        }
         if pos == 0 {
             if let Some(first) = buffers.first() {
                 self.on_header(first.as_slice())?;
@@ -363,6 +376,9 @@ impl File for ShippingFile {
         self.record_if_ok(ops, self.inner.pwritev(pos, buffers, c))
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if self.local_only() {
+            return self.inner.sync(c, sync_type);
+        }
         // Upload (or queue) before any completion exists: a failed upload is a synchronous
         // `Err`, which rolls the commit back, never a failed completion (which would panic,
         // D3). A queued Window commit is fsynced locally now and acked by its call later.
@@ -379,6 +395,9 @@ impl File for ShippingFile {
     }
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        if self.local_only() {
+            return self.inner.truncate(len, c);
+        }
         if len == 0 {
             let mut h = self.header.lock().unwrap();
             if h.is_some() && !self.mvcc {

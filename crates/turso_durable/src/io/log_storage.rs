@@ -100,8 +100,20 @@ impl LogDurableStorage {
         let path = log_path
             .to_str()
             .ok_or_else(|| Error::Config(format!("{} is not UTF-8", log_path.display())))?;
+        // A read-only open never creates the log.
+        if read_only && !log_path.exists() {
+            return Err(Error::Corrupt(format!(
+                "{} is missing: restore the database again",
+                log_path.display()
+            )));
+        }
+        let flags = if read_only {
+            OpenFlags::None
+        } else {
+            OpenFlags::Create
+        };
         let local = platform
-            .open_file(path, OpenFlags::Create, false)
+            .open_file(path, flags, false)
             .map_err(|e| io_err("open app.db-log", e))?;
         let log_path = std::fs::canonicalize(log_path).map_err(|e| io_err("app.db-log", e))?;
         #[cfg(test)]
@@ -218,7 +230,7 @@ impl DurableStorage for LogDurableStorage {
         checkpointed_through_ts: u64,
     ) -> turso_core::Result<(Completion, LogicalLogTruncateOutcome)> {
         if self.read_only {
-            // Verify's local recovery writes are Task 7's; the file refuses the truncate.
+            // Verify's recovery cut stays local: no seal, nothing shipped.
             return self.inner.truncate(checkpointed_through_ts);
         }
         self.refuse_if_poisoned().map_err(stash)?;

@@ -24,7 +24,6 @@
 //! and makes the one sync, so its call carries one ack per frame.
 //!
 //! It never seals and never measures the file (maintenance does, Task 9).
-use super::db_storage::READ_ONLY;
 use super::read_at;
 use super::stash::stash;
 use crate::batching::{ctx, Batching, PendingAck};
@@ -77,7 +76,8 @@ pub(crate) struct LogShippingFile {
     /// Set once a local step after a seal failed (`LogDurableStorage`): every write is
     /// refused with it until the database is reopened.
     poisoned: Mutex<Option<Error>>,
-    /// A read-only open: every write and truncate is refused, and a sync ships nothing.
+    /// A read-only open (`verify`): the engine's recovery writes and truncates go to the
+    /// local file only. Nothing is recorded, shipped or sealed.
     read_only: bool,
 }
 
@@ -240,14 +240,6 @@ impl LogShippingFile {
         }
     }
 
-    /// The backstop of a read-only open: the engine never gets to change the `.db-log`.
-    fn refuse_if_read_only(&self) -> turso_core::Result<()> {
-        if self.read_only {
-            return Err(stash(Error::Unsupported(READ_ONLY)));
-        }
-        Ok(())
-    }
-
     /// Record the ops of one write or truncate call once the inner call that issued them
     /// returned `Ok`: one refused synchronously never happened, so it must never be shipped.
     /// A write call is one commit's frame unless it is a header-only write.
@@ -293,7 +285,9 @@ impl File for LogShippingFile {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        self.refuse_if_read_only()?;
+        if self.read_only {
+            return self.inner.pwrite(pos, buffer, c);
+        }
         // A poisoned commit is refused at its write, so it rolls back (P3 variant C).
         self.refuse_if_poisoned()?;
         let op = Op::Write {
@@ -308,7 +302,9 @@ impl File for LogShippingFile {
         buffers: Vec<Arc<Buffer>>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        self.refuse_if_read_only()?;
+        if self.read_only {
+            return self.inner.pwritev(pos, buffers, c);
+        }
         self.refuse_if_poisoned()?;
         let mut off = pos;
         let mut ops = Vec::with_capacity(buffers.len());
@@ -346,7 +342,9 @@ impl File for LogShippingFile {
     /// length is recorded as an op (not expected from the engine but after a discarded
     /// write, and `reset_to_fresh_header`).
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
-        self.refuse_if_read_only()?;
+        if self.read_only {
+            return self.inner.truncate(len, c);
+        }
         if len > 0 {
             return self.record_write(vec![Op::Truncate { len }], self.inner.truncate(len, c));
         }
@@ -375,7 +373,6 @@ mod tests {
     use crate::bucket::Bucket;
     use crate::create::Image;
     use crate::format::{apply_ops, decode_record, encode_record, Keys, LogRecord};
-    use crate::io::db_storage::READ_ONLY;
     use crate::io::stash;
     use crate::store::fault::HoldStore;
     use crate::store::{
@@ -1047,30 +1044,29 @@ mod tests {
         assert_eq!(f.pending.lock().unwrap().len(), 0, "phantom ops recorded");
     }
 
-    /// A read-only open never changes the `.db-log` and never ships.
+    /// A read-only open (`verify`) lets the engine's recovery writes and truncates reach the
+    /// local file, and never records, ships or seals them.
     #[test]
-    fn read_only_refuses_writes() {
+    fn read_only_writes_stay_local_and_ship_nothing() {
         let r = rig();
         write(&*r.local, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
         let f = r.file_over(r.local.clone(), true);
         let buf = || Arc::new(Buffer::new(vec![1u8; 8]));
-        let calls: [&dyn Fn() -> turso_core::Result<Completion>; 4] = [
-            &|| f.pwrite(0, buf(), Completion::new_write(|_| {})),
-            &|| f.pwritev(0, vec![buf()], Completion::new_write(|_| {})),
-            &|| f.truncate(0, Completion::new_trunc(|_| {})),
-            &|| f.truncate(8, Completion::new_trunc(|_| {})),
-        ];
-        for (i, call) in calls.iter().enumerate() {
-            stash::clear();
-            assert!(call().is_err(), "call {i}");
-            assert_eq!(
-                stash::take(),
-                Some(Error::Unsupported(READ_ONLY)),
-                "call {i}"
-            );
-        }
-        assert_eq!(r.local_bytes(), frame(0xAA, HEADER), "unchanged");
-        assert_eq!(read_at(&f, &*r.io, 0, 4).unwrap(), [0xAA; 4], "reads pass");
+        drop(f.pwrite(0, buf(), Completion::new_write(|_| {})).unwrap());
+        let mut want = frame(0xAA, HEADER);
+        want[..8].copy_from_slice(&[1u8; 8]);
+        assert_eq!(r.local_bytes(), want, "the write reached the local file");
+        drop(
+            f.pwritev(8, vec![buf(), buf()], Completion::new_write(|_| {}))
+                .unwrap(),
+        );
+        want[8..24].copy_from_slice(&[1u8; 16]);
+        assert_eq!(r.local_bytes(), want, "so did the vectored write");
+        drop(f.truncate(8, Completion::new_trunc(|_| {})).unwrap());
+        assert_eq!(r.local_bytes(), vec![1u8; 8], "so did the truncate");
+        drop(f.truncate(0, Completion::new_trunc(|_| {})).unwrap());
+        assert!(r.local_bytes().is_empty());
+        assert_eq!(f.pending.lock().unwrap().len(), 0, "nothing recorded");
         assert_eq!(sync(&f, &*r.io), Ok(()));
         assert!(r.records(2).is_empty(), "a read-only sync ships nothing");
     }
