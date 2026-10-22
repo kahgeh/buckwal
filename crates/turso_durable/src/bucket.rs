@@ -8,9 +8,10 @@
 
 use crate::clock::Stamp;
 use crate::config::{Event, EventHook, JournalMode};
+use crate::create::Image;
 use crate::error::{Error, Result};
 use crate::format::{
-    decode_record, encode_record, Head, Keys, LogFile, LogRecord, Manifest, Op, FORMAT,
+    decode_record, encode_record, Head, Keys, LogFile, LogRecord, Manifest, Op, FORMAT, FORMAT_V2,
 };
 use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -213,6 +214,16 @@ pub(crate) struct Bucket {
     quiet: Option<SealQuiet>,
     counters: Arc<Counters>,
     events: Option<EventHook>,
+}
+
+/// A writer id goes into every record and the head: ASCII, at most 255 bytes.
+fn check_writer_id(writer_id: &str) -> Result<()> {
+    if !writer_id.is_ascii() || writer_id.len() > u8::MAX as usize {
+        return Err(Error::Config(
+            "writer id must be ASCII and at most 255 bytes".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// `with_retry` that also counts extra attempts in `counters.retries`.
@@ -460,11 +471,7 @@ impl Bucket {
         concurrency: usize,
         writer_id: String,
     ) -> Result<Bucket> {
-        if !writer_id.is_ascii() || writer_id.len() > u8::MAX as usize {
-            return Err(Error::Config(
-                "writer id must be ASCII and at most 255 bytes".into(),
-            ));
-        }
+        check_writer_id(&writer_id)?;
         let head = Head {
             format: FORMAT,
             generation: 1,
@@ -473,6 +480,81 @@ impl Bucket {
             epoch: 1,
             journal_mode: JournalMode::Wal,
         };
+        Bucket::create_head(store, keys, retry, concurrency, head)
+    }
+
+    /// Start a new MVCC database as a seal of generation 1 holding its empty image
+    /// (`create::build_mvcc_image`): every page, as the file holds it (ciphertext when
+    /// encrypted), at `pages/1/*`, the manifest a seal of generation 1 writes
+    /// (`Manifest::sealed`) at `manifest/1`, then the head (`put_if_absent`, last) as that
+    /// seal publishes it (`sealed_head`): generation 2, manifest 1, epoch 1, format 2, journal
+    /// mode MVCC. It is the bucket a WAL database's first seal leaves, without log objects.
+    /// A head at generation 1 naming manifest 1 would not do: the first seal of generation 1
+    /// overwrites `pages/1/*` and `manifest/1`, which that head would still reference until
+    /// the new one lands.
+    ///
+    /// Pages and manifest go with plain PUTs: a crashed creation may have left them, and no
+    /// head references them until this head lands, so a retry overwrites them. Nothing is
+    /// sent with `put_if_absent` but the head (a seal-start record, say, would be a key a
+    /// crashed attempt may hold). Two racing creators: the head decides, and the loser
+    /// returns `Config` as `create` does; its pages may have overwritten the winner's (the
+    /// same empty database).
+    pub(crate) fn create_sealed(
+        store: Arc<dyn ObjectStore>,
+        keys: Keys,
+        retry: RetryPolicy,
+        concurrency: usize,
+        writer_id: String,
+        image: Image,
+    ) -> Result<Bucket> {
+        check_writer_id(&writer_id)?;
+        let gen = 1;
+        let (page_size, page_count) = (image.page_size, image.page_count());
+        let pages = image.pages;
+        let counters = Counters::default();
+        for (p, body) in &pages {
+            let key = keys.page(gen, *p);
+            retrying(&counters, &retry, &key, || store.put(&key, body))?;
+            counters.page_puts.fetch_add(1, Relaxed);
+        }
+        let dirty: BTreeSet<u32> = pages.iter().map(|(p, _)| *p).collect();
+        let manifest = Manifest {
+            page_size,
+            page_count,
+            pages: BTreeMap::new(),
+        }
+        .sealed(gen, &dirty, page_size, page_count);
+        let key = keys.manifest(gen);
+        retrying(&counters, &retry, &key, || {
+            store.put(&key, &manifest.encode())
+        })?;
+        let head = Head {
+            format: FORMAT_V2,
+            generation: gen + 1,
+            manifest: Some(gen),
+            writer_id,
+            epoch: 1,
+            journal_mode: JournalMode::Mvcc,
+        };
+        let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
+        b.manifest = Some(manifest);
+        b.counters
+            .retries
+            .fetch_add(counters.retries.load(Relaxed), Relaxed);
+        b.counters
+            .page_puts
+            .store(counters.page_puts.load(Relaxed), Relaxed);
+        Ok(b)
+    }
+
+    /// `put_if_absent(head)`: the commit point of a new database.
+    fn create_head(
+        store: Arc<dyn ObjectStore>,
+        keys: Keys,
+        retry: RetryPolicy,
+        concurrency: usize,
+        head: Head,
+    ) -> Result<Bucket> {
         let body = head.encode();
         let key = keys.head();
         let counters = Counters::default();

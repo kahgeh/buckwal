@@ -3,6 +3,7 @@ use crate::batching::Batching;
 use crate::bucket::{self, Bucket, FenceOutcome};
 use crate::config::{Config, EngineConfig, Event, EventHook, JournalMode};
 use crate::conn::Connection;
+use crate::create::{self, clear_interrupted_create};
 use crate::encryption::{self, check_page_one};
 use crate::engine::{engine_error, open_engine, Engine, EngineDb};
 use crate::error::{Error, Result};
@@ -278,6 +279,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     cfg.encryption = encryption;
     let keys = config.keys();
     clear_interrupted_restore(&dir)?;
+    clear_interrupted_create(&dir)?;
     let local = LocalState::read(&dir)?;
     // The recorded mode first: an MVCC directory opened as WAL is "switching back", not just
     // an MVCC file. Before the claim, the epoch raise or any other write to the bucket.
@@ -311,9 +313,10 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             )))
         }
         None if cfg.journal_mode == JournalMode::Mvcc => {
-            // A new MVCC database is created once the MVCC engine is wired in; until then it
-            // must not become a WAL bucket.
-            return Err(Error::Unsupported("MVCC"));
+            // Until the MVCC engine is wired in, `open_engine` still refuses it
+            // (`Unsupported("MVCC")`), after the database is created.
+            let (bucket, state) = create_new_mvcc(&dir, &store, &keys, &cfg)?;
+            (bucket, state, None)
         }
         None => {
             let (bucket, state) = create_new(&dir, &store, &keys, &cfg)?;
@@ -514,6 +517,48 @@ fn create_new(
         seal_quiet_ms: 0,
     };
     state.write_atomic(dir)?;
+    Ok((bucket, state))
+}
+
+/// A new MVCC database (`create`): the empty image built in `<dir>/app.db-creating`, the
+/// bucket created as a seal of it (`Bucket::create_sealed`, the head last), then the local
+/// state (format 2, at the head's generation, claimed, complete) written into the staging
+/// directory and the files moved in (`create::move_created`). Nothing goes to the bucket
+/// before the image is whole; a failure or crash before the head leaves only the staging
+/// directory (and unreferenced `pages/1/*`, `manifest/1`), which the next open removes and
+/// a retry overwrites. A crash after the head leaves a bucket the next open restores.
+fn create_new_mvcc(
+    dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+) -> Result<(Bucket, LocalState)> {
+    let staging = create::staging_dir(dir);
+    let image = create::build_mvcc_image(&staging, cfg.encryption.as_deref())?;
+    let writer_id = new_writer_id()?;
+    let mut bucket = Bucket::create_sealed(
+        store.clone(),
+        keys.clone(),
+        cfg.retry.clone(),
+        cfg.upload_concurrency,
+        writer_id.clone(),
+        image,
+    )?;
+    bucket.set_lease(cfg.lease);
+    let state = LocalState {
+        format: FORMAT_V2,
+        writer_id,
+        generation: bucket.head().generation,
+        complete: true,
+        claimed: true,
+        head_etag: String::new(),
+        epoch: bucket.head().epoch,
+        claim_id: String::new(),
+        seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
+    };
+    state.write_atomic(&staging)?;
+    create::move_created(&staging, dir)?;
     Ok((bucket, state))
 }
 

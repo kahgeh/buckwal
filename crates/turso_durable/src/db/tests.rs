@@ -3441,13 +3441,22 @@ fn mvcc_bucket_opened_as_wal_is_refused() {
 }
 
 #[test]
-fn new_mvcc_database_is_not_created_yet() {
-    // Until the MVCC engine is wired in, a new MVCC database must not become a WAL bucket.
+fn new_mvcc_database_is_created_then_refused_at_engine_open() {
+    // Until the MVCC engine is wired in, `open` creates the MVCC bucket (never a WAL one) and
+    // the engine open still refuses it.
     let store = mem();
     let t = tempdir();
-    let r = open_with_store(mvcc_config(&fresh(&t)), store.clone());
+    let dir = fresh(&t);
+    let r = open_with_store(mvcc_config(&dir), store.clone());
     assert_eq!(unsupported(r), "MVCC");
-    assert_eq!(store.stats().puts, 0, "the bucket was touched");
+    let (h, image) = created_bucket(&*store);
+    assert_eq!(h.epoch, 1);
+    assert_eq!(std::fs::read(dir.join("app.db")).unwrap(), image);
+    assert_eq!(state(&dir).format, crate::format::FORMAT_V2);
+    // A reopen continues the directory's database, and is refused at the same place.
+    let r = open_with_store(mvcc_config(&dir), store.clone());
+    assert_eq!(unsupported(r), "MVCC");
+    assert_eq!(created_bucket(&*store).1, image);
 }
 
 #[test]
@@ -3565,5 +3574,388 @@ fn takeover_refuses_a_mode_mismatch_without_writing() {
         log_seqs(&*store, head(&*store).generation),
         log0,
         "a fence was appended"
+    );
+}
+
+// Creating a new MVCC database.
+
+/// The engine config `open` builds for `c`, with its encryption.
+fn engine_cfg(c: &Config) -> EngineConfig {
+    let mut cfg = c.engine(false);
+    cfg.encryption = encryption::load(c).unwrap();
+    cfg
+}
+
+/// `create_new_mvcc` for `c` against `store`, as `open` runs it (the directory exists).
+fn create_mvcc(store: Arc<dyn ObjectStore>, c: &Config) -> Result<(Bucket, LocalState)> {
+    std::fs::create_dir_all(&c.dir).unwrap();
+    create_new_mvcc(&c.dir, &store, &c.keys(), &engine_cfg(c))
+}
+
+/// `mvcc_config` with a 100 ms retry deadline, so a failing store fails fast.
+fn mvcc_fast_config(dir: &Path) -> Config {
+    let mut c = config_with_lease(dir, Duration::from_millis(500));
+    c.journal_mode = JournalMode::Mvcc;
+    c
+}
+
+/// The bucket a creation left: the head (format 2, MVCC, generation 2, manifest 1),
+/// `manifest/1` mapping every page to generation 1, `pages/1/*` of the manifest's page size,
+/// no log object. Returns the head and the `app.db` image the pages make.
+fn created_bucket(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
+    let h = head(store);
+    assert_eq!(
+        (h.format, h.generation, h.manifest, h.journal_mode),
+        (crate::format::FORMAT_V2, 2, Some(1), JournalMode::Mvcc),
+        "{h:?}"
+    );
+    let body = store
+        .get(&keys().manifest(1))
+        .unwrap()
+        .expect("manifest/1")
+        .body;
+    let m = crate::format::Manifest::decode(&body).unwrap();
+    assert_eq!(m.page_size, 4096);
+    assert!(m.page_count >= 1, "{m:?}");
+    assert_eq!(m.pages, (1..=m.page_count).map(|p| (p, 1)).collect());
+    let mut image = Vec::new();
+    for p in 1..=m.page_count {
+        let page = store.get(&keys().page(1, p)).unwrap().expect("page").body;
+        assert_eq!(page.len(), 4096);
+        image.extend(page);
+    }
+    assert_eq!(
+        store.list(&keys().log_root()).unwrap(),
+        Vec::<String>::new()
+    );
+    (h, image)
+}
+
+/// No head without its manifest and every page that manifest maps.
+fn head_has_its_manifest(store: &dyn ObjectStore) {
+    let Some(obj) = store.get(&keys().head()).unwrap() else {
+        return;
+    };
+    let h = Head::decode(&obj.body).unwrap();
+    let Some(g) = h.manifest else {
+        return;
+    };
+    let body = store.get(&keys().manifest(g)).unwrap();
+    let m = crate::format::Manifest::decode(&body.expect("the head's manifest").body).unwrap();
+    for (p, pg) in m.pages {
+        assert!(
+            store.get(&keys().page(pg, p)).unwrap().is_some(),
+            "page {p}"
+        );
+    }
+}
+
+/// The engine's log header: `LOG_MAGIC` ("LML2" LE), `hdr_len` 56, 56 bytes.
+fn is_log_header(b: &[u8]) -> bool {
+    b.len() == 56 && b[0..4] == 0x4C4D_4C32u32.to_le_bytes() && b[6..8] == 56u16.to_le_bytes()
+}
+
+/// `db` as `app.db` and `log` as `app.db-log` in a new directory, opened with turso_core over
+/// plain IO (with `enc`'s key): MVCC mode and `integrity_check` ok, a commit, and the row
+/// still there after a reopen.
+fn plain_mvcc_open_works(db: &[u8], log: &[u8], enc: Option<&encryption::Encryption>) {
+    use turso_core::{DatabaseOpts, EncryptionOpts, OpenOptions, PlatformIO, SqliteDialect};
+    let t = tempdir();
+    std::fs::write(t.path().join("app.db"), db).unwrap();
+    std::fs::write(t.path().join("app.db-log"), log).unwrap();
+    let path = t.path().join("app.db");
+    let query = |conn: &Arc<turso_core::Connection>, sql: &str| {
+        conn.query(sql)
+            .unwrap()
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+    };
+    for round in 0..2 {
+        let io: Arc<dyn turso_core::IO> = Arc::new(PlatformIO::new().unwrap());
+        let mut opts = OpenOptions::new(Arc::new(SqliteDialect));
+        if let Some(enc) = enc {
+            opts = opts
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(EncryptionOpts {
+                    cipher: enc.cipher.to_string(),
+                    hexkey: hex::encode(enc.key.as_slice()),
+                });
+        }
+        let db = turso_core::Database::open(io, path.to_str().unwrap(), opts).unwrap();
+        assert!(db.mvcc_enabled());
+        let conn = db
+            .connect_with_encryption(enc.map(|e| e.key.clone()))
+            .unwrap();
+        let mode = query(&conn, "PRAGMA journal_mode");
+        assert_eq!(text(&mode[0][0]), "mvcc");
+        let check = query(&conn, "PRAGMA integrity_check");
+        assert_eq!(text(&check[0][0]), "ok");
+        if round == 0 {
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (7)").unwrap();
+        } else {
+            let rows = query(&conn, "SELECT id FROM t");
+            assert_eq!(rows[0][0].as_int(), Some(7));
+        }
+        conn.close().unwrap();
+    }
+}
+
+/// The local files of a finished creation in `dir`: `app.db` (bytes 18/19 = 255) equal to the
+/// bucket's image, `app.db-log` holding the 56-byte header only, the local state (format 2,
+/// the head's generation and epoch, claimed, complete), no staging directory. (The refused
+/// engine open after it leaves an empty `-wal`; `create_new_mvcc` moves none in.)
+fn created_locally(dir: &Path, image: &[u8], h: &Head) {
+    let db = std::fs::read(dir.join("app.db")).unwrap();
+    assert_eq!(db, image);
+    let log = std::fs::read(dir.join("app.db-log")).unwrap();
+    assert!(is_log_header(&log), "{log:?}");
+    let s = state(dir);
+    assert_eq!(
+        (s.format, s.generation, s.epoch, s.claimed, s.complete),
+        (crate::format::FORMAT_V2, h.generation, h.epoch, true, true)
+    );
+    assert_eq!(s.writer_id, h.writer_id);
+    assert!(!dir.join("app.db-creating").exists());
+}
+
+#[test]
+fn create_mvcc_makes_head_manifest_pages_and_local_files() {
+    let store = mem();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let (bucket, st) = create_mvcc(store.clone(), &mvcc_config(&dir)).unwrap();
+    let (h, image) = created_bucket(&*store);
+    assert_eq!(h.epoch, 1);
+    assert_eq!(h.writer_id, st.writer_id);
+    assert_eq!(bucket.head(), &h);
+    assert_eq!(bucket.manifest().map(|m| m.page_count), Some(2));
+    assert_eq!(header_bytes(&dir), (255, 255));
+    let log = std::fs::read(dir.join("app.db-log")).unwrap();
+    assert_eq!(log.len(), 56);
+    created_locally(&dir, &image, &h);
+    assert!(!dir.join("app.db-wal").exists());
+    assert_eq!(state(&dir), st);
+    // The head's If-None-Match is the only conditional PUT: 2 pages, the manifest, the head.
+    assert_eq!(store.stats().puts, 4);
+    // Trim against this head deletes nothing: it is a normal sealed head.
+    let m = bucket.manifest().unwrap();
+    assert_eq!(crate::trim::trim_once(&*store, &keys(), &h, Some(m)), Ok(0));
+    // The local files are an MVCC database turso opens and writes.
+    plain_mvcc_open_works(&image, &log, None);
+    // A second machine: the restore reads the head and manifest; the bucket's pages alone
+    // (with the empty log a TRUNCATE checkpoint leaves) are the same database.
+    let t2 = tempdir();
+    let rep = restore_with_store(&mvcc_config(&fresh(&t2)), store.clone(), &fresh(&t2)).unwrap();
+    assert_eq!(rep.generation, 2);
+    assert_eq!(state(&fresh(&t2)).format, crate::format::FORMAT_V2);
+    plain_mvcc_open_works(&image, &[], None);
+}
+
+#[test]
+fn create_crash_at_each_step() {
+    // A clean creation's PUTs: the pages, the manifest, the head.
+    let clean = mem();
+    let t = tempdir();
+    create_mvcc(clean.clone(), &mvcc_config(&fresh(&t))).unwrap();
+    let total = clean.stats().puts;
+    assert_eq!(total, 4);
+    for n in 0..=total {
+        let inner = mem();
+        let fault = Arc::new(FaultStore::new(inner.clone()));
+        fault.fail_puts_after(n);
+        let t = tempdir();
+        let dir = fresh(&t);
+        let c = mvcc_fast_config(&dir);
+        let r = create_mvcc(fault.clone(), &c);
+        head_has_its_manifest(&*inner);
+        if n < total {
+            assert!(r.is_err(), "n={n}: {:?}", r.map(|(_, s)| s));
+            assert!(inner.get(&keys().head()).unwrap().is_none(), "n={n}");
+            assert!(LocalState::read(&dir).unwrap().is_none(), "n={n}");
+            assert!(!dir.join("app.db").exists(), "n={n}");
+            // A crash mid-build leaves a staging dir that must never be opened again.
+            let staging = dir.join("app.db-creating");
+            assert!(staging.exists(), "n={n}");
+            std::fs::write(staging.join("app.db"), b"torn switch").unwrap();
+        } else {
+            r.unwrap();
+        }
+        // The next open removes the staging dir, never opening it, and creates again
+        // (overwriting what the crashed attempt left), then stops at the engine.
+        fault.fail_puts_after(u64::MAX);
+        let r = open_with_store(c.clone(), fault.clone());
+        assert_eq!(unsupported(r), "MVCC", "n={n}");
+        let (h, image) = created_bucket(&*inner);
+        created_locally(&dir, &image, &h);
+        head_has_its_manifest(&*inner);
+        // A second machine restores the final state.
+        let t2 = tempdir();
+        let rep = restore_with_store(&mvcc_config(&fresh(&t2)), inner.clone(), &fresh(&t2));
+        assert_eq!(rep.unwrap().generation, 2, "n={n}");
+        plain_mvcc_open_works(&image, &[], None);
+    }
+
+    // Stored, then an error: a page or the manifest is PUT again; the head is found as ours.
+    for key in ["pages/", "manifest/", "head"] {
+        let inner = mem();
+        let fault = Arc::new(FaultStore::new(inner.clone()));
+        fault.only_keys_containing(key);
+        fault.store_then_fail_next_puts(1);
+        let t = tempdir();
+        let dir = fresh(&t);
+        create_mvcc(fault.clone(), &mvcc_fast_config(&dir))
+            .unwrap_or_else(|e| panic!("{key}: {e}"));
+        let (h, image) = created_bucket(&*inner);
+        created_locally(&dir, &image, &h);
+    }
+
+    // A crash while moving the files in, after the head landed (0..=2 files moved, or all of
+    // them with the staging dir left).
+    for moved in 0..=3 {
+        let store = mem();
+        let t = tempdir();
+        let dir = fresh(&t);
+        crate::create::CRASH_AFTER_MOVING.with(|c| c.set(Some(moved)));
+        let r = create_mvcc(store.clone(), &mvcc_config(&dir)).map(|(_, s)| s);
+        crate::create::CRASH_AFTER_MOVING.with(|c| c.set(None));
+        assert!(matches!(r, Err(Error::Io(_))), "moved={moved}: {r:?}");
+        assert!(dir.join("app.db-creating").exists());
+        let (_, image) = created_bucket(&*store);
+        // The next open removes the staging dir; a directory without its state file is
+        // emptied first, and the database comes back from the bucket (restored, claimed).
+        let r = open_with_store(mvcc_config(&dir), store.clone());
+        assert_eq!(unsupported(r), "MVCC", "moved={moved}");
+        assert!(!dir.join("app.db-creating").exists(), "moved={moved}");
+        let s = state(&dir);
+        assert_eq!(
+            (s.format, s.generation, s.claimed),
+            (crate::format::FORMAT_V2, 2, true)
+        );
+        let (h, again) = head_and_image(&*store);
+        assert_eq!(again, image, "moved={moved}");
+        assert_eq!(h.writer_id, s.writer_id, "moved={moved}");
+        head_has_its_manifest(&*store);
+        let t2 = tempdir();
+        let rep = restore_with_store(&mvcc_config(&fresh(&t2)), store.clone(), &fresh(&t2));
+        assert_eq!(rep.unwrap().generation, 2, "moved={moved}");
+    }
+}
+
+/// The head and the `app.db` image of `manifest/1`, whatever the log holds (a takeover's
+/// fence record, say).
+fn head_and_image(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
+    let h = head(store);
+    assert_eq!((h.generation, h.manifest), (2, Some(1)), "{h:?}");
+    let body = store.get(&keys().manifest(1)).unwrap().unwrap().body;
+    let m = crate::format::Manifest::decode(&body).unwrap();
+    let image = (1..=m.page_count)
+        .flat_map(|p| store.get(&keys().page(1, p)).unwrap().unwrap().body)
+        .collect();
+    (h, image)
+}
+
+#[test]
+fn racing_creators_one_head_wins() {
+    let store = mem();
+    let (ta, tb) = (tempdir(), tempdir());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let runs: Vec<_> = [fresh(&ta), fresh(&tb)]
+        .into_iter()
+        .map(|dir| {
+            let (store, barrier) = (store.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let c = mvcc_config(&dir);
+                barrier.wait();
+                create_mvcc(store, &c).map(|(_, s)| (dir, s))
+            })
+        })
+        .collect();
+    let results: Vec<_> = runs.into_iter().map(|h| h.join().unwrap()).collect();
+    let won: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(won.len(), 1, "{results:?}");
+    let lost: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert_eq!(
+        lost,
+        vec![&Error::Config(
+            "a database already exists at this prefix".into()
+        )]
+    );
+    let (dir, st) = won[0];
+    let (h, image) = created_bucket(&*store);
+    assert_eq!(h.writer_id, st.writer_id);
+    head_has_its_manifest(&*store);
+    // The loser's pages may have replaced the winner's: either way the bucket is a whole
+    // empty MVCC database, and the winner's directory is its own.
+    plain_mvcc_open_works(&image, &[], None);
+    let local = std::fs::read(dir.join("app.db")).unwrap();
+    let log = std::fs::read(dir.join("app.db-log")).unwrap();
+    plain_mvcc_open_works(&local, &log, None);
+}
+
+/// Plaintext a creation would show without encryption: the SQLite header, the schema of
+/// the engine's MVCC meta table, and the key in every spelling.
+fn creation_needles(store: &dyn ObjectStore, local: &[Vec<u8>]) -> BTreeSet<&'static str> {
+    let hex = key_hex();
+    let needles: [(&str, Vec<u8>); 5] = [
+        ("SQLite header", b"SQLite format 3\0".to_vec()),
+        ("CREATE TABLE", "CREATE TABLE".into()),
+        ("meta table", "__turso_internal_mvcc_meta".into()),
+        ("key hex", hex.into_bytes()),
+        ("raw key", vec![0x11; 32]),
+    ];
+    let mut bodies: Vec<Vec<u8>> = store
+        .list("")
+        .unwrap()
+        .iter()
+        .map(|k| store.get(k).unwrap().unwrap().body)
+        .collect();
+    bodies.extend(local.iter().cloned());
+    let mut found = BTreeSet::new();
+    for body in bodies {
+        for (name, needle) in &needles {
+            if body.windows(needle.len()).any(|w| w == &needle[..]) {
+                found.insert(*name);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn create_mvcc_encrypted_has_no_plaintext() {
+    let store = mem();
+    let k = tempdir();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let mut c = enc_config(&dir, &k, &key_hex());
+    c.journal_mode = JournalMode::Mvcc;
+    create_mvcc(store.clone(), &c).unwrap();
+    let (h, image) = created_bucket(&*store);
+    created_locally(&dir, &image, &h);
+    assert!(image.starts_with(b"Turso"), "app.db is not encrypted");
+    let enc = encryption::load(&c).unwrap().unwrap();
+    // Page 1 decrypts with the key, and its header is MVCC's.
+    let ctx = turso_core::EncryptionContext::new(enc.cipher, &enc.key, 4096).unwrap();
+    let page1 = ctx.decrypt_page(&image[..4096], 1).unwrap();
+    assert_eq!((page1[18], page1[19]), (255, 255));
+    let local = vec![
+        std::fs::read(dir.join("app.db")).unwrap(),
+        std::fs::read(dir.join("app.db-log")).unwrap(),
+    ];
+    assert_eq!(creation_needles(&*store, &local), BTreeSet::new());
+    plain_mvcc_open_works(&local[0], &local[1], Some(&enc));
+    plain_mvcc_open_works(&image, &[], Some(&enc));
+
+    // The control: without encryption the same search finds the header and the schema.
+    let plain = mem();
+    let t2 = tempdir();
+    create_mvcc(plain.clone(), &mvcc_config(&fresh(&t2))).unwrap();
+    let found = creation_needles(&*plain, &[]);
+    assert!(
+        found.contains("SQLite header") && found.contains("meta table"),
+        "{found:?}"
     );
 }
