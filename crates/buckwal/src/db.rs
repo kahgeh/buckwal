@@ -357,7 +357,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         dir = %dir.display(),
         "database opened"
     );
-    Ok(Database {
+    let db = Database {
         shared: Arc::new_cyclic(|weak| Shared {
             read_only,
             store,
@@ -379,7 +379,41 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             events: cfg.events.clone(),
             reconciled,
         }),
-    })
+    };
+    if !read_only {
+        allocate_page_one(&db)?;
+    }
+    Ok(db)
+}
+
+/// Allocate page 1 of a fresh database (`PRAGMA page_count` is 0) on a connection of its own,
+/// alone, before the open returns. turso_core 0.8.3 checks, then locks, in
+/// `maybe_allocate_page1`, so the first writes to a fresh database on several connections at
+/// once can allocate it twice and panic (pager.rs:3290-3297, 5644-5648). `BEGIN IMMEDIATE`
+/// allocates it (`begin_write_tx`) and `ROLLBACK` commits nothing, so no ack waits on any
+/// batching. A database that is not fresh is only read: the check is one library call, so a
+/// seal already due at open runs during open instead of at the first commit. The connection
+/// is dropped before this returns, and is the only one then, so its close would be the last
+/// and checkpoint the WAL, which commits a log record: its automatic WAL actions are
+/// disabled, and the open commits nothing for it. Only a writer's open calls it: a read-only
+/// open refuses `BEGIN IMMEDIATE`, and every other write, so it has nothing to race.
+fn allocate_page_one(db: &Database) -> Result<()> {
+    let conn = db.connect_with(|core| core.wal_auto_actions_disable())?;
+    let rows = conn.query("PRAGMA page_count", &[])?;
+    if rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(crate::Value::as_int)
+        != Some(0)
+    {
+        return Ok(());
+    }
+    match conn.execute("BEGIN IMMEDIATE", &[]) {
+        Err(Error::Unsupported(_)) => return Ok(()),
+        r => r?,
+    };
+    conn.execute("ROLLBACK", &[])?;
+    Ok(())
 }
 
 /// What `open_impl` keeps of an `Attached`.
@@ -973,12 +1007,18 @@ impl Database {
 
     /// A new connection; open one per thread.
     pub fn connect(&self) -> Result<Connection> {
+        self.connect_with(|_| {})
+    }
+
+    /// `connect`, with `setup` run on the engine connection before it is wrapped.
+    fn connect_with(&self, setup: impl FnOnce(&turso_core::Connection)) -> Result<Connection> {
         let open = lock(&self.shared.open);
         let Some(open) = open.as_ref() else {
             return Err(Error::Config("the database is closed".into()));
         };
         crate::io::stash::clear();
         let core = open.engine.db.connect().map_err(engine_error)?;
+        setup(&core);
         self.shared.connections.fetch_add(1, SeqCst);
         let io: Arc<dyn IO> = open.engine.io.clone();
         Ok(Connection::new(self.shared.clone(), core, io))
