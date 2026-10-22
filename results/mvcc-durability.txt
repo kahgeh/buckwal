@@ -83,3 +83,42 @@ peak turso-durable-objects: 722 MB (plain), 764 MB (https+encryption). Baseline 
 scan: pass 1 found CREATE TABLE in 13240 objects; pass 2 found no plaintext (CREATE TABLE, SQLite header, bench payload, marker 1, the encryption key: all not found).
 otel check PASSED.
 raw log: .superpowers/sdd/mvcc-durability/final.log (git-ignored, not committed).
+
+== Coordinator rejection fixes ==
+Date: 2026-10-22. HEAD before: 19a3b7d. RustFS: existing turso-durable-rustfs container, plain HTTP; env from: eval "$(./scripts/rustfs.sh env)".
+
+-- 1. transaction_with refuses Window in MVCC (commit bcad767) --
+Test: crates/turso_durable/src/db/tests/mvcc.rs transaction_with_window_refused_in_mvcc_and_still_works_in_wal
+Before the check_mode call (cargo test --locked -p turso_durable --lib transaction_with_window):
+  test db::tests::mvcc::transaction_with_window_refused_in_mvcc_and_still_works_in_wal ... FAILED
+  panicked at crates/turso_durable/src/db/tests.rs:78:14: expected Unsupported, got Ok(())
+  test result: FAILED. 0 passed; 1 failed
+After:
+  test db::tests::mvcc::transaction_with_window_refused_in_mvcc_and_still_works_in_wal ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 492 filtered out
+Other Batching entries: Config::validate (config.rs:466), Database::set_batching (db.rs:1007), Connection::set_batching (conn.rs:140) and the guard's PRAGMA check (guard.rs:104) already call check_mode. The server only calls Connection::set_batching. The PRAGMA path is covered by the guard before batching_pragma runs (the new test asserts it inside BEGIN). Only transaction_with was a gap.
+
+-- 2. Commit 389cd5a: CLI writers follow the head's journal mode --
+Command: DURABLE_KEEP_PREFIXES=1 cargo test --locked -p turso-durable-cli --test system -- --ignored --test-threads=1 mvcc_refusals_cli mvcc_takeover_cli
+With writer_config temporarily NOT following the head (if !explicit && NEVER_SET_X set), FAILING:
+  test mvcc_refusals_cli ... FAILED
+  test mvcc_takeover_cli ... FAILED
+  mvcc_refusals_cli_mvcc: ["sql", "--dir", "$TMP/.tmpoOwIdW/a", "SELECT count(*) FROM t"] failed (exit status: 1)
+  error: MVCC: switching back to WAL is not supported yet by turso_durable
+  mvcc_takeover_cli: ["takeover", "--dir", "$TMP/.tmpZcEvii/b"] failed (exit status: 1)
+  error: MVCC: switching back to WAL is not supported yet by turso_durable
+  test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 50 filtered out; finished in 1.65s
+main.rs restored from backup; git diff --stat empty. PASSING:
+  test mvcc_refusals_cli ... ok
+  test mvcc_takeover_cli ... ok
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 4.53s
+
+-- 3. mvcc_takeover_fences_a_running_soak, five runs --
+Command (each run): DURABLE_KEEP_PREFIXES=1 cargo test --locked -p turso-durable-cli --test system -- --ignored --test-threads=1 --nocapture mvcc_takeover_fences_a_running_soak
+The test asserts epoch == before+1, the old writer fenced and silent, and restore --verify of every ack; all five passed those assertions.
+run 1: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=240; test result: ok. 1 passed
+run 2: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=240; test result: ok. 1 passed
+run 3: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=243; test result: ok. 1 passed
+run 4: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=243; test result: ok. 1 passed
+run 5: mvcc_takeover_fences_a_running_soak: took over; soak acks=349; first fenced error "error fenced by a newer writer: sys/mvcc_takeover_fences_a_running_soak-1792672697029098000/log/0000000002/00000000000000000177 holds another writer's record"; acked=359 restored generation=2 log_object; test result: ok. 1 passed
+Observed: 4 of 5 timed out (64 fence probes), 1 of 5 took over. README and docs/mvcc-recon.md changed from "5 of 5" to "4 of 5".
