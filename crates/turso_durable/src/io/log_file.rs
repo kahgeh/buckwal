@@ -12,10 +12,18 @@
 //! Generation changes: when the bucket's generation is not the one this file last shipped
 //! to (a seal adopted by `settle_log`, or a seal elsewhere), the new generation's `.db-log`
 //! image is the local file as it then stands, so the whole file, from offset 0, is what the
-//! next record ships (the generation-change invariant).
+//! next record ships (the generation-change invariant). The same happens at the first sync
+//! after `ship_whole_file_next` (the open), over whatever the image held.
+//!
+//! The truncate of a generation change (`LogDurableStorage::truncate`, after its seal) is not
+//! recorded: the new generation's image is empty, as the file then is. Only if a sync shipped
+//! into the new generation first is it recorded, so the image follows the file.
+//!
+//! Commits are counted per engine frame: each pwrite is one commit's frame (recon Q2), except
+//! a header-only write (56 bytes at offset 0). A group commit's lead writes every queued frame
+//! and makes the one sync, so its call carries one ack per frame.
 //!
 //! It never seals and never measures the file (maintenance does, Task 9).
-#![cfg_attr(not(test), allow(dead_code))]
 use super::db_storage::READ_ONLY;
 use super::read_at;
 use super::stash::stash;
@@ -24,11 +32,19 @@ use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::format::{LogFile, Op};
 use crate::uploader::{op_bytes, LogFailure, Uploader};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use tracing::field::Empty;
 use tracing::{info_span, Span};
 use turso_core::io::FileSyncType;
 use turso_core::{Buffer, Completion, File, IO};
+
+/// The engine's log header (`LOG_HDR_SIZE`): a write of exactly this at offset 0 is a header
+/// rewrite, not a commit.
+const LOG_HEADER: usize = 56;
+
+/// A generation no bucket has: the image is not known to equal the local file.
+const UNKNOWN: u64 = 0;
 
 fn engine_io(e: turso_core::LimboError) -> Error {
     io_err(".db-log", e)
@@ -40,9 +56,10 @@ struct Shipped {
     /// Ops recorded but not confirmed and not in doubt, oldest first: they ship, in front
     /// of newer ones, with the next sync.
     unconfirmed: Vec<Op>,
-    /// How many syncs' commits `unconfirmed` carries (for the stats).
+    /// How many engine commits (frames) `unconfirmed` carries (for the stats).
     commits: u64,
-    /// The generation `unconfirmed` and everything confirmed belong to.
+    /// The generation `unconfirmed` and everything confirmed belong to; `UNKNOWN` until the
+    /// first sync after `ship_whole_file_next`.
     generation: u64,
     /// Fenced for good: every later sync fails with this.
     fenced: Option<Error>,
@@ -54,14 +71,19 @@ pub(crate) struct LogShippingFile {
     uploader: Arc<Uploader>,
     /// Ops written since the last sync took them. Locked after `shipped`.
     pending: Mutex<Vec<Op>>,
+    /// How many commit frames `pending` holds; changed only under `pending`'s lock.
+    pending_frames: AtomicU64,
     shipped: Mutex<Shipped>,
+    /// Set once a local step after a seal failed (`LogDurableStorage`): every write is
+    /// refused with it until the database is reopened.
+    poisoned: Mutex<Option<Error>>,
     /// A read-only open: every write and truncate is refused, and a sync ships nothing.
     read_only: bool,
 }
 
 impl LogShippingFile {
     /// Wrap the opened `app.db-log`, whose bytes are the bucket's current generation's image
-    /// (reconcile made them so at open).
+    /// (reconcile made them so at open), unless `ship_whole_file_next` says otherwise.
     pub(crate) fn new(
         inner: Arc<dyn File>,
         io: Arc<dyn IO>,
@@ -74,14 +96,36 @@ impl LogShippingFile {
             io,
             uploader,
             pending: Mutex::new(Vec::new()),
+            pending_frames: AtomicU64::new(0),
             shipped: Mutex::new(Shipped {
                 unconfirmed: Vec::new(),
                 commits: 0,
                 generation,
                 fenced: None,
             }),
+            poisoned: Mutex::new(None),
             read_only,
         })
+    }
+
+    /// The next sync ships the whole local file, from offset 0 and over whatever the
+    /// current generation's image holds, before it returns Ok: the image is then the local
+    /// file whatever it was. The open calls it, so a log the bucket lacks (a new database's
+    /// header, a tail left by a crash) is never left out of the image.
+    pub(crate) fn ship_whole_file_next(&self) {
+        crate::db::lock(&self.shipped).generation = UNKNOWN;
+    }
+
+    /// Refuse every later write with `e` (the first poison sticks).
+    pub(crate) fn poison(&self, e: Error) {
+        crate::db::lock(&self.poisoned).get_or_insert(e);
+    }
+
+    fn refuse_if_poisoned(&self) -> turso_core::Result<()> {
+        match &*crate::db::lock(&self.poisoned) {
+            Some(e) => Err(stash(e.clone())),
+            None => Ok(()),
+        }
     }
 
     /// `e` failed a sync: a fence sticks, and nothing is kept to send again.
@@ -90,9 +134,16 @@ impl LogShippingFile {
             s.fenced = Some(e.clone());
             s.unconfirmed.clear();
             s.commits = 0;
-            crate::db::lock(&self.pending).clear();
+            self.take_pending();
         }
         e
+    }
+
+    /// The ops written since the last sync took them, and how many commit frames they hold.
+    fn take_pending(&self) -> (Vec<Op>, u64) {
+        let mut p = crate::db::lock(&self.pending);
+        let frames = self.pending_frames.swap(0, SeqCst);
+        (std::mem::take(&mut *p), frames)
     }
 
     /// The commit point. Settle, then ship every unconfirmed op as one kind-3 record and
@@ -119,25 +170,31 @@ impl LogShippingFile {
             Ok(g) => g,
             Err(e) => return Err(self.failed(&mut s, e)),
         };
+        // The commits this sync acks: the frames written since the last sync took them.
+        let mut acks = 0;
         if generation != s.generation {
             // The new generation's image is the local file as it stands: all of it ships.
             let len = self.inner.size().map_err(engine_io)?;
             let bytes = read_at(&*self.inner, &*self.io, 0, len as usize).map_err(engine_io)?;
-            let new = std::mem::take(&mut *crate::db::lock(&self.pending));
-            s.commits += u64::from(!new.is_empty());
-            s.unconfirmed = if bytes.is_empty() {
-                Vec::new()
-            } else {
-                vec![Op::Write { off: 0, bytes }]
-            };
+            // Pending ops are already in those bytes; their commits still count.
+            let (_, frames) = self.take_pending();
+            acks += frames;
+            s.commits += frames;
+            s.unconfirmed.clear();
+            if s.generation == UNKNOWN {
+                // The image may hold anything: replace it.
+                s.unconfirmed.push(Op::Truncate { len: 0 });
+            }
+            if !bytes.is_empty() {
+                s.unconfirmed.push(Op::Write { off: 0, bytes });
+            }
             s.generation = generation;
         }
         // 2. Ship what is unconfirmed, the newest ops last.
-        let new = std::mem::take(&mut *crate::db::lock(&self.pending));
-        if !new.is_empty() {
-            s.commits += 1;
-            s.unconfirmed.extend(new);
-        }
+        let (new, frames) = self.take_pending();
+        acks += frames;
+        s.commits += frames;
+        s.unconfirmed.extend(new);
         if s.unconfirmed.is_empty() {
             return Ok(None);
         }
@@ -158,12 +215,16 @@ impl LogShippingFile {
         span.record("durable.outcome", if r.is_ok() { "ok" } else { "error" });
         match r {
             Ok(_) => {
-                ctx::push(PendingAck::Done {
-                    commit,
-                    waited: submitted.elapsed(),
-                    batching: Batching::Off,
-                    span: span.clone(),
-                });
+                // One ack per commit the engine wrote since the last sync: under group
+                // commit the lead's call carries its followers' (their calls make no sync).
+                for _ in 0..acks {
+                    ctx::push(PendingAck::Done {
+                        commit,
+                        waited: submitted.elapsed(),
+                        batching: Batching::Off,
+                        span: span.clone(),
+                    });
+                }
                 Ok(Some(span))
             }
             Err(LogFailure { error, unsent }) => {
@@ -187,15 +248,30 @@ impl LogShippingFile {
         Ok(())
     }
 
-    /// Record `ops` once the inner call that issued them returned `Ok`: a write or truncate
-    /// refused synchronously never happened, so it must never be shipped.
-    fn record_if_ok(
+    /// Record the ops of one write or truncate call once the inner call that issued them
+    /// returned `Ok`: one refused synchronously never happened, so it must never be shipped.
+    /// A write call is one commit's frame unless it is a header-only write.
+    fn record_write(
         &self,
         ops: Vec<Op>,
         r: turso_core::Result<Completion>,
     ) -> turso_core::Result<Completion> {
         if r.is_ok() && !ops.is_empty() {
-            crate::db::lock(&self.pending).extend(ops);
+            let len: usize = ops
+                .iter()
+                .map(|op| match op {
+                    Op::Write { bytes, .. } => bytes.len(),
+                    Op::Truncate { .. } => 0,
+                })
+                .sum();
+            let write = matches!(ops.first(), Some(Op::Write { .. }));
+            let header_only =
+                matches!(ops.first(), Some(Op::Write { off: 0, .. })) && len == LOG_HEADER;
+            let mut p = crate::db::lock(&self.pending);
+            p.extend(ops);
+            if write && !header_only {
+                self.pending_frames.fetch_add(1, SeqCst);
+            }
         }
         r
     }
@@ -218,11 +294,13 @@ impl File for LogShippingFile {
         c: Completion,
     ) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        // A poisoned commit is refused at its write, so it rolls back (P3 variant C).
+        self.refuse_if_poisoned()?;
         let op = Op::Write {
             off: pos,
             bytes: buffer.as_slice().to_vec(),
         };
-        self.record_if_ok(vec![op], self.inner.pwrite(pos, buffer, c))
+        self.record_write(vec![op], self.inner.pwrite(pos, buffer, c))
     }
     fn pwritev(
         &self,
@@ -231,6 +309,7 @@ impl File for LogShippingFile {
         c: Completion,
     ) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        self.refuse_if_poisoned()?;
         let mut off = pos;
         let mut ops = Vec::with_capacity(buffers.len());
         for b in &buffers {
@@ -240,7 +319,7 @@ impl File for LogShippingFile {
             });
             off += b.len() as u64;
         }
-        self.record_if_ok(ops, self.inner.pwritev(pos, buffers, c))
+        self.record_write(ops, self.inner.pwritev(pos, buffers, c))
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
         if self.read_only {
@@ -259,20 +338,32 @@ impl File for LogShippingFile {
     fn size(&self) -> turso_core::Result<u64> {
         self.inner.size()
     }
-    /// A truncate to 0 is a generation change's (Task 5 decides when): it is not recorded,
-    /// and what was pending or unconfirmed is dropped with the bytes. Any other length is
-    /// recorded as an op (not expected from the engine but after a discarded write).
+    /// A truncate to 0 is a generation change's (`LogDurableStorage::truncate`, after its
+    /// seal): what was pending or unconfirmed is dropped with the bytes (every frame is in
+    /// the sealed pages). It is recorded only when this file already shipped into the
+    /// current generation (a sync between the seal and the truncate); otherwise that
+    /// generation's image is empty, as the file now is, and nothing is recorded. Any other
+    /// length is recorded as an op (not expected from the engine but after a discarded
+    /// write, and `reset_to_fresh_header`).
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
         if len > 0 {
-            return self.record_if_ok(vec![Op::Truncate { len }], self.inner.truncate(len, c));
+            return self.record_write(vec![Op::Truncate { len }], self.inner.truncate(len, c));
         }
         let mut s = crate::db::lock(&self.shipped);
         let r = self.inner.truncate(0, c);
         if r.is_ok() {
             s.unconfirmed.clear();
             s.commits = 0;
-            crate::db::lock(&self.pending).clear();
+            let mut p = crate::db::lock(&self.pending);
+            p.clear();
+            self.pending_frames.store(0, SeqCst);
+            let g = self.uploader.generation();
+            if g == s.generation {
+                p.push(Op::Truncate { len: 0 });
+            } else {
+                s.generation = g;
+            }
         }
         r
     }
@@ -1034,5 +1125,92 @@ mod tests {
             "the next append lands after it"
         );
         assert_eq!(r.image(3), r.local_bytes());
+    }
+
+    fn trunc(f: &dyn File, io: &dyn IO, len: u64) {
+        let c = f.truncate(len, Completion::new_trunc(|_| {})).unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    /// A generation change's `truncate(0)`: right after a seal it is not recorded (the new
+    /// generation's image is empty, as the file now is), and the next sync ships nothing. If a
+    /// sync shipped into the new generation before the truncate (the engine's checkpoint lock
+    /// keeps commits out; this is the backstop), the truncate is recorded and shipped, so the
+    /// new generation's image is still the local file.
+    #[test]
+    fn truncate_after_a_seal_is_recorded_only_if_the_new_generation_holds_bytes() {
+        let r = rig();
+        let f = r.file();
+        write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        let page = || vec![(1, vec![0u8; 4096])];
+
+        // The normal path: the seal, then the truncate.
+        assert_eq!(r.up.seal_generation(page(), 4096, 1), Ok(3));
+        trunc(&f, &*r.io, 0);
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert!(r.records(3).is_empty(), "nothing shipped into generation 3");
+        write(&f, &*r.io, 0, frame(0xBB, HEADER + 30)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(kinds(&r.records(3)), [3]);
+        assert_eq!(r.image(3), r.local_bytes());
+
+        // A sync between the seal and the truncate ships the whole file into generation 4;
+        // the truncate after it is shipped too.
+        assert_eq!(r.up.seal_generation(page(), 4096, 1), Ok(4));
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(r.image(4), r.local_bytes());
+        assert!(!r.local_bytes().is_empty());
+        trunc(&f, &*r.io, 0);
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(kinds(&r.records(4)), [3, 3]);
+        assert_eq!(r.image(4), Vec::<u8>::new());
+        assert_eq!(r.local_bytes(), Vec::<u8>::new());
+    }
+
+    /// `ship_whole_file_next` (the open): the next sync ships the whole local file from
+    /// offset 0, over whatever the generation's image held, so the image is the local file.
+    #[test]
+    fn ship_whole_file_next_makes_the_image_the_local_file() {
+        let r = rig();
+        // The local file already holds a header (a new database's) the bucket does not.
+        write(&*r.local, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        let f = r.file();
+        f.ship_whole_file_next();
+        write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(kinds(&r.records(2)), [3]);
+        assert_eq!(r.image(2), r.local_bytes());
+        let stats = r.up.stats().snapshot();
+        assert_eq!((stats.log_puts, stats.commits_uploaded), (1, 1));
+    }
+
+    /// A poisoned file refuses every write before the inner file sees it, and records
+    /// nothing.
+    #[test]
+    fn poisoned_file_refuses_writes() {
+        let r = rig();
+        let f = r.file();
+        write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        let e = Error::Io("poisoned: reopen".into());
+        f.poison(e.clone());
+        stash::clear();
+        assert!(write(&f, &*r.io, HEADER as u64, frame(1, 55)).is_err());
+        assert_eq!(stash::take(), Some(e.clone()));
+        stash::clear();
+        let c = f.pwritev(
+            HEADER as u64,
+            vec![Arc::new(Buffer::new(frame(2, 10)))],
+            Completion::new_write(|_| {}),
+        );
+        assert!(c.is_err());
+        assert_eq!(stash::take(), Some(e));
+        assert_eq!(r.local_bytes(), frame(0xAA, HEADER));
+        assert_eq!(
+            crate::db::lock(&f.pending).len(),
+            1,
+            "only the write before it"
+        );
     }
 }

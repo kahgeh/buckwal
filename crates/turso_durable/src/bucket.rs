@@ -842,6 +842,13 @@ impl Bucket {
         syncs: Vec<Vec<Op>>,
         retries: u64,
     ) -> std::result::Result<Appended, AppendFailure> {
+        // Kind 3 exists only in format 2 (an MVCC bucket); a v1 reader would misread it.
+        if matches!(file, LogFile::Log) && self.head.format != FORMAT_V2 {
+            return Err(AppendFailure {
+                error: Error::Unsupported("MVCC: a .db-log record in a WAL bucket"),
+                unsent: Some(syncs),
+            });
+        }
         let start = Instant::now();
         if let Err(e) = self.check_fenced().and_then(|()| self.before_record(start)) {
             return Err(AppendFailure {

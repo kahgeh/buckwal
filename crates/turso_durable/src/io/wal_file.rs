@@ -4,13 +4,19 @@
 //! the uploader's batch and fsyncs at once (the commit's call waits for the upload). A
 //! rewrite of the WAL header with new salts, or a truncate to 0, starts a new generation:
 //! the old one is sealed first (D6).
+//!
+//! In an MVCC database (`in_mvcc`) the `-wal` holds only checkpoint frames, and the seal is
+//! `LogDurableStorage`'s, before the engine cuts the log: this file never seals (not at a new
+//! epoch, not at `truncate(0)`), its syncs carry no commit and no ack, and the `truncate(0)` of
+//! a generation change is not recorded (that generation's image is empty, as the file then
+//! is).
 use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
 use crate::batching::{ctx, record_outcome, Batching, PendingAck};
 use crate::error::{Error, Result};
 use crate::files::io_err;
-use crate::format::Op;
+use crate::format::{LogFile, Op};
 use crate::uploader::{op_bytes, Ticket, Uploader};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -100,6 +106,12 @@ pub(crate) struct ShippingFile {
     high_water: Arc<AtomicU64>,
     /// A read-only open: every write and truncate is refused.
     read_only: bool,
+    /// An MVCC database's `-wal` (`in_mvcc`).
+    mvcc: bool,
+    /// The generation whose image holds this file's bytes: the current one at open when the
+    /// file is not empty, then the generation of each record this file shipped; 0 for none.
+    /// In MVCC mode a `truncate(0)` is recorded only while it is the current generation.
+    shipped_generation: AtomicU64,
 }
 
 impl ShippingFile {
@@ -120,6 +132,7 @@ impl ShippingFile {
             None
         };
         high_water.store(size, SeqCst);
+        let shipped_generation = AtomicU64::new(if size > 0 { uploader.generation() } else { 0 });
         Ok(ShippingFile {
             inner,
             io,
@@ -130,7 +143,29 @@ impl ShippingFile {
             header: Mutex::new(header),
             high_water,
             read_only,
+            mvcc: false,
+            shipped_generation,
         })
+    }
+
+    /// The `-wal` of an MVCC database: it never seals (the module doc).
+    pub(crate) fn in_mvcc(mut self) -> Self {
+        self.mvcc = true;
+        self
+    }
+
+    /// An MVCC database's `-wal` sync (a checkpoint's frames): one record of its own,
+    /// carrying no commit and pushing no ack. Ops never sent are dropped, as an `Off` sync's
+    /// are: the checkpoint fails and the engine discards its frames.
+    fn ship_checkpoint_frames(&self, ops: Vec<Op>, span: &Span) -> Result<()> {
+        span.record("durable.batching", display(Batching::Off));
+        span.record("durable.bytes", op_bytes(&ops));
+        let ticket = span.in_scope(|| self.uploader.submit_log_file(LogFile::Wal, ops, 0));
+        span.record("durable.commit_no", ticket.commit);
+        let r = ticket.wait_in(span).map_err(|f| f.error);
+        record_outcome(span, &r);
+        self.shipped_generation.store(r?.generation, SeqCst);
+        Ok(())
     }
 
     /// The ops written since the last sync, and their commit's span (its
@@ -184,6 +219,10 @@ impl ShippingFile {
             return Ok(None);
         }
         let span = span.unwrap_or_else(Span::none);
+        if self.mvcc {
+            self.ship_checkpoint_frames(ops, &span)?;
+            return Ok(Some(span));
+        }
         let b = ctx::current().unwrap_or(Batching::Off);
         if b == Batching::Off || self.uploader.degraded() {
             let ticket = self.submit(&span, ops, Batching::Off, b);
@@ -233,7 +272,9 @@ impl ShippingFile {
             _ => false,
         };
         if boundary {
-            self.seal().map_err(stash)?;
+            if !self.mvcc {
+                self.seal().map_err(stash)?;
+            }
             self.high_water.store(0, SeqCst);
         }
         *h = Some(header[..header.len().min(WAL_HEADER)].to_vec());
@@ -340,7 +381,7 @@ impl File for ShippingFile {
         self.refuse_if_read_only()?;
         if len == 0 {
             let mut h = self.header.lock().unwrap();
-            if h.is_some() {
+            if h.is_some() && !self.mvcc {
                 self.seal().map_err(stash)?;
             }
             *h = None;
@@ -348,6 +389,13 @@ impl File for ShippingFile {
         let r = self.inner.truncate(len, c);
         if len == 0 && r.is_ok() {
             self.high_water.store(0, SeqCst);
+        }
+        if self.mvcc
+            && len == 0
+            && self.shipped_generation.load(SeqCst) != self.uploader.generation()
+        {
+            // A generation change's truncate: the new generation holds none of this file.
+            return r;
         }
         self.record_if_ok(vec![Op::Truncate { len }], r)
     }
@@ -446,5 +494,82 @@ mod tests {
         high_water.store(4096, SeqCst);
         assert!(f.truncate(0, Completion::new_trunc(|_| {})).is_err());
         assert_eq!(high_water.load(SeqCst), 4096);
+    }
+
+    /// In an MVCC database the `-wal` never seals: not at a header with a new epoch, not at
+    /// `truncate(0)`. A `truncate(0)` is recorded only while the current generation's image
+    /// holds bytes of this file; right after a generation change it holds none, and it is
+    /// not recorded.
+    #[test]
+    fn mvcc_wal_never_seals_and_skips_the_truncate_of_a_generation_change() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let path = d.path().join("other-wal");
+        let local = io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+        let f = ShippingFile::new(
+            local,
+            io.clone(),
+            e.uploader.clone(),
+            e.storage.clone(),
+            Arc::default(),
+            false,
+        )
+        .unwrap()
+        .in_mvcc();
+        let header = |epoch: u8| {
+            let mut h = vec![0u8; WAL_HEADER];
+            h[8..12].copy_from_slice(&4096u32.to_be_bytes());
+            h[EPOCH].fill(epoch);
+            h
+        };
+        let put = |bytes: Vec<u8>| {
+            let c = f
+                .pwrite(
+                    0,
+                    Arc::new(Buffer::new(bytes)),
+                    Completion::new_write(|_| {}),
+                )
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+        };
+        let sync = || {
+            let c = f
+                .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+        };
+        let trunc = || {
+            let c = f.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+            io.wait_for_completion(c).unwrap();
+        };
+        let g = e.uploader.generation();
+        put(header(1));
+        sync();
+        put(header(2));
+        sync();
+        assert_eq!(e.uploader.generation(), g, "a new epoch sealed");
+        trunc();
+        assert_eq!(e.uploader.generation(), g, "truncate(0) sealed");
+        assert_eq!(
+            f.pending.lock().unwrap().clone(),
+            vec![Op::Truncate { len: 0 }],
+            "the generation's image holds this file's bytes: recorded"
+        );
+        sync();
+        put(header(3));
+        sync();
+        e.storage.note_page_size(4096);
+        let g2 = e.storage.seal(&BTreeSet::new()).unwrap();
+        assert_eq!(g2, g + 1);
+        trunc();
+        assert_eq!(e.uploader.generation(), g2);
+        assert!(
+            f.pending.lock().unwrap().is_empty(),
+            "the truncate of a generation change is not recorded"
+        );
     }
 }

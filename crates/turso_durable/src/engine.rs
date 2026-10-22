@@ -1,14 +1,16 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Assemble the engine: the uploader, the bucket-backed database file and the IO that ships
-//! the `-wal`, opened through `Database::open`.
+//! the `-wal`, opened through `Database::open`. An MVCC database also gets its durable
+//! storage (`LogDurableStorage`, over `app.db-log`), passed with `OpenOptions::durable_storage`.
 
 use crate::bucket::Bucket;
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, JournalMode};
 use crate::encryption::{check_page_one, local_page_one};
 use crate::error::{Error, Result};
-use crate::files::{io_err, DB_FILE};
+use crate::files::{io_err, DB_FILE, LOG_FILE};
 use crate::format::LocalState;
 use crate::io::db_storage::StorageParts;
+use crate::io::log_storage::LogDurableStorage;
 use crate::io::{stash, BucketDbStorage, DurableIo};
 use crate::uploader::{TrimSnapshot, Uploader};
 use std::path::Path;
@@ -17,9 +19,12 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use turso_core::{
-    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, OpenOptions, PlatformIO,
-    SqliteDialect, IO,
+    Database, DatabaseOpts, EncryptionContext, EncryptionKey, EncryptionOpts, OpenFlags,
+    OpenOptions, PlatformIO, SqliteDialect, IO,
 };
+
+/// The page size an MVCC database's log context is built with when no manifest names one.
+const DEFAULT_PAGE_SIZE: usize = 4096;
 
 /// The engine's database, with the key every connection to it needs (D16). turso builds each
 /// connection's pager from the key that connection is given (database.rs:2386-2395,
@@ -106,6 +111,9 @@ pub(crate) fn open_engine(
     let store = bucket.store();
     let keys = bucket.keys().clone();
     let manifest = bucket.manifest().cloned();
+    let page_size = manifest
+        .as_ref()
+        .map_or(DEFAULT_PAGE_SIZE, |m| m.page_size as usize);
     // D10: the open wakes the trimmer first; each seal wakes it again.
     if let Some(tx) = &trim_tx {
         // No trimmer listening is not an open failure.
@@ -139,6 +147,28 @@ pub(crate) fn open_engine(
         cfg.encryption.as_deref(),
     )?;
     let wal_bytes = Arc::new(AtomicU64::new(0));
+    let mvcc = cfg.journal_mode == JournalMode::Mvcc;
+    let log = if mvcc {
+        // The log's context: the same cipher and key as `EncryptionOpts` below.
+        let enc = match &cfg.encryption {
+            Some(e) => Some(
+                EncryptionContext::new(e.cipher, &e.key, page_size)
+                    .map_err(|e| Error::Encryption(e.to_string()))?,
+            ),
+            None => None,
+        };
+        Some(Arc::new(LogDurableStorage::open(
+            platform.clone(),
+            &dir.join(LOG_FILE),
+            Path::new(&wal_path),
+            uploader.clone(),
+            storage.clone(),
+            enc,
+            cfg.read_only,
+        )?))
+    } else {
+        None
+    };
     let io = Arc::new(DurableIo::new(
         platform,
         wal_path,
@@ -146,10 +176,15 @@ pub(crate) fn open_engine(
         storage.clone(),
         wal_bytes.clone(),
         cfg.read_only,
+        log.clone(),
     ));
     let mut opts = OpenOptions::new(Arc::new(SqliteDialect))
         .storage(storage.clone())
         .flags(OpenFlags::Create);
+    if let Some(log) = &log {
+        let log: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = log.clone();
+        opts = opts.durable_storage(log);
+    }
     // All three of turso's switches (D16): the database option, the cipher and key at open
     // (a new database gets its reserved bytes from them), and the key on every connection.
     if let Some(enc) = &cfg.encryption {
@@ -164,8 +199,12 @@ pub(crate) fn open_engine(
         db: Database::open(io.clone(), &db_path, opts).map_err(engine_error)?,
         key: cfg.encryption.as_ref().map(|e| e.key.clone()),
     };
-    if db.mvcc_enabled() {
-        return Err(Error::Unsupported("MVCC"));
+    // The page-1 header and the bucket's mode were compared before (`db::refuse_mode_
+    // mismatch`); this is the engine's own word on it.
+    match (db.mvcc_enabled(), mvcc) {
+        (true, false) => return Err(Error::Unsupported("MVCC")),
+        (false, true) => return Err(Error::Unsupported("MVCC: switching back to WAL")),
+        _ => {}
     }
     let prefetch = if cfg.prefetch {
         let s = storage.clone();

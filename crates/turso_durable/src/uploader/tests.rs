@@ -16,6 +16,16 @@ fn fast() -> RetryPolicy {
     }
 }
 
+/// An MVCC bucket (format 2, generation 2, as `create_sealed` leaves it): kind-3 records go
+/// only there.
+fn mvcc_bucket_with(store: Arc<dyn ObjectStore>, retry: RetryPolicy) -> Bucket {
+    let image = crate::create::Image {
+        page_size: 8,
+        pages: vec![(1, vec![0u8; 8])],
+    };
+    Bucket::create_sealed(store, Keys::new("db"), retry, 4, "w1".into(), image).unwrap()
+}
+
 fn bucket(store: Arc<dyn ObjectStore>) -> Bucket {
     bucket_with(store, fast())
 }
@@ -785,7 +795,7 @@ fn a_failed_seal_on_an_idle_bucket_clears_only_after_a_head_get() {
 #[test]
 fn log_file_unsent_ops_come_back_to_the_caller() {
     let store = Arc::new(HeadGetsFail::default());
-    let mut b = bucket_with(store.clone(), short());
+    let mut b = mvcc_bucket_with(store.clone(), short());
     b.set_lease(Duration::ZERO);
     let u = Uploader::spawn(b, None, None, Arc::default());
     store.failing.store(true, SeqCst);
@@ -798,12 +808,12 @@ fn log_file_unsent_ops_come_back_to_the_caller() {
     assert!(!u.degraded(), "nothing owed, nothing in doubt");
     assert!(u.settle_log().is_err(), "the head GET still fails");
     store.failing.store(false, SeqCst);
-    assert_eq!(u.settle_log(), Ok(1));
+    assert_eq!(u.settle_log(), Ok(2));
     let p = u.submit_log_file(LogFile::Log, op(1), 1).wait().unwrap();
-    assert_eq!(p, pos(1, 1));
+    assert_eq!(p, pos(2, 1));
     let body = store
         .inner
-        .get(&Keys::new("db").log(1, 1))
+        .get(&Keys::new("db").log(2, 1))
         .unwrap()
         .unwrap()
         .body;
@@ -817,7 +827,7 @@ fn log_file_unsent_ops_come_back_to_the_caller() {
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let u = Uploader::spawn(
-        bucket_with(fault.clone(), short()),
+        mvcc_bucket_with(fault.clone(), short()),
         None,
         None,
         Arc::default(),
@@ -835,9 +845,9 @@ fn log_file_unsent_ops_come_back_to_the_caller() {
     assert!(u.degraded());
     assert!(u.settle_log().is_err());
     fault.fail_puts_after(u64::MAX);
-    assert_eq!(u.settle_log(), Ok(1));
+    assert_eq!(u.settle_log(), Ok(2));
     assert!(!u.degraded());
-    assert_eq!(stored_ops(&mem, pos(1, 1)), vec![op(2)]);
+    assert_eq!(stored_ops(&mem, pos(2, 1)), vec![op(2)]);
 }
 
 /// `settle_log` adopts a seal whose head PUT stored but whose reply was lost: the uploader
@@ -848,7 +858,7 @@ fn settle_log_adopts_a_published_pending_seal() {
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let (trim_tx, trim_rx) = mpsc::channel();
     let u = Uploader::spawn(
-        bucket_with(fault.clone(), short()),
+        mvcc_bucket_with(fault.clone(), short()),
         Some(trim_tx),
         None,
         Arc::default(),
@@ -859,14 +869,14 @@ fn settle_log_adopts_a_published_pending_seal() {
     assert!(u.seal_generation(vec![(1, vec![1; 8])], 8, 1).is_err());
     assert!(u.degraded());
     fault.fail_puts_after(u64::MAX);
-    assert_eq!(u.settle_log(), Ok(2));
-    assert_eq!(u.generation(), 2);
+    assert_eq!(u.settle_log(), Ok(3));
+    assert_eq!(u.generation(), 3);
     assert!(!u.degraded());
     assert_eq!(
         trim_rx.try_recv().unwrap().head.generation,
-        2,
+        3,
         "the trimmer is told"
     );
     let p = u.submit_log_file(LogFile::Log, op(3), 1).wait().unwrap();
-    assert_eq!(p, pos(2, 1));
+    assert_eq!(p, pos(3, 1));
 }

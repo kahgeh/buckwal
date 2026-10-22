@@ -10,6 +10,12 @@ use std::time::Duration;
 /// (a request whose reply was lost, so its record may have landed). That record's commits
 /// get an error ack at once, and when the record is later settled at its seq (re-put, or
 /// found already there), it is confirmed in the bucket but counted nowhere here.
+///
+/// In an MVCC database a commit is one engine frame of `app.db-log`: a group commit's record
+/// counts each of its frames, and its lead's call acks them all (the followers' calls make no
+/// sync). A checkpoint's `-wal` record carries no commit. After a failed log sync,
+/// `commits_acked` can undercount: a commit whose frame was in that sync's record and is
+/// acked by a later sync is not counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UploadStats {
     /// Commits whose ack returned `Ok`.

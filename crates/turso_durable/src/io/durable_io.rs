@@ -1,7 +1,14 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! The engine's IO: the platform IO with exactly one file wrapped, `<dir>/app.db-wal`. It
 //! keeps the default "no shared-WAL coordination", so the engine coordinates in-process.
+//!
+//! The MVCC log, `app.db-log`, is never opened here. In an MVCC database the engine does not
+//! open it (it is given `LogDurableStorage`, storage/journal_mode.rs:85-100), whose one
+//! `LogShippingFile` is the only handle on it: a second wrapper would keep its own ops and
+//! break the confirmed-sync rule. So every open of a `.db-log` is refused, and so is any
+//! path that resolves to the wrapped log (another spelling, a link).
 use super::db_storage::BucketDbStorage;
+use super::log_storage::LogDurableStorage;
 use super::stash::stash;
 use super::wal_file::ShippingFile;
 use crate::error::Error;
@@ -25,6 +32,8 @@ pub(crate) struct DurableIo {
     wal_bytes: Arc<AtomicU64>,
     /// A read-only open: the `-wal` refuses every write.
     read_only: bool,
+    /// An MVCC database's durable storage, which owns `app.db-log`.
+    log: Option<Arc<LogDurableStorage>>,
 }
 
 impl DurableIo {
@@ -35,6 +44,7 @@ impl DurableIo {
         storage: Arc<BucketDbStorage>,
         wal_bytes: Arc<AtomicU64>,
         read_only: bool,
+        log: Option<Arc<LogDurableStorage>>,
     ) -> DurableIo {
         DurableIo {
             inner,
@@ -43,7 +53,16 @@ impl DurableIo {
             storage,
             wal_bytes,
             read_only,
+            log,
         }
+    }
+
+    /// `path` names the wrapped `app.db-log`, however it is spelled.
+    fn is_wrapped_log(&self, path: &str) -> bool {
+        self.log.as_ref().is_some_and(|log| {
+            std::fs::canonicalize(path).is_ok_and(|p| p == log.log_path())
+                || path.ends_with(".db-log")
+        })
     }
 }
 
@@ -63,7 +82,13 @@ impl IO for DurableIo {
         flags: OpenFlags,
         direct: bool,
     ) -> turso_core::Result<Arc<dyn File>> {
-        // The MVCC log: refused before it exists (D5).
+        // An MVCC database's log: only its wrapper holds it (the module doc).
+        if self.is_wrapped_log(path) {
+            return Err(stash(Error::Unsupported(
+                "MVCC: app.db-log opened outside its wrapper",
+            )));
+        }
+        // A WAL database's: the MVCC log is refused before it exists (D5).
         if path.ends_with(".db-log") {
             return Err(stash(Error::Unsupported("MVCC")));
         }
@@ -71,14 +96,19 @@ impl IO for DurableIo {
         if path != self.wal_path {
             return Ok(f);
         }
-        Ok(Arc::new(ShippingFile::new(
+        let wal = ShippingFile::new(
             f,
             self.inner.clone(),
             self.uploader.clone(),
             self.storage.clone(),
             self.wal_bytes.clone(),
             self.read_only,
-        )?))
+        )?;
+        Ok(Arc::new(if self.log.is_some() {
+            wal.in_mvcc()
+        } else {
+            wal
+        }))
     }
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         // The engine deletes a WAL holding frames next to an empty database file as an orphan

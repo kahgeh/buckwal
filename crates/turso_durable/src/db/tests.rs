@@ -3441,22 +3441,26 @@ fn mvcc_bucket_opened_as_wal_is_refused() {
 }
 
 #[test]
-fn new_mvcc_database_is_created_then_refused_at_engine_open() {
-    // Until the MVCC engine is wired in, `open` creates the MVCC bucket (never a WAL one) and
-    // the engine open still refuses it.
+fn new_mvcc_database_is_created_and_opens() {
+    // `open` creates the MVCC bucket (never a WAL one), then opens the engine on it in MVCC
+    // mode.
     let store = mem();
     let t = tempdir();
     let dir = fresh(&t);
-    let r = open_with_store(mvcc_config(&dir), store.clone());
-    assert_eq!(unsupported(r), "MVCC");
+    let db = open_with_store(mvcc_config(&dir), store.clone()).unwrap();
     let (h, image) = created_bucket(&*store);
     assert_eq!(h.epoch, 1);
-    assert_eq!(std::fs::read(dir.join("app.db")).unwrap(), image);
     assert_eq!(state(&dir).format, crate::format::FORMAT_V2);
-    // A reopen continues the directory's database, and is refused at the same place.
-    let r = open_with_store(mvcc_config(&dir), store.clone());
-    assert_eq!(unsupported(r), "MVCC");
+    let c = db.connect().unwrap();
+    let mode = c.query("PRAGMA journal_mode", &[]).unwrap();
+    assert_eq!(text(&mode[0][0]), "mvcc");
+    c.close().unwrap();
+    db.close().unwrap();
+    // A reopen continues the directory's database.
+    let db = open_with_store(mvcc_config(&dir), store.clone()).unwrap();
+    assert_eq!(db.generation(), 2);
     assert_eq!(created_bucket(&*store).1, image);
+    db.close().unwrap();
 }
 
 #[test]
@@ -3705,8 +3709,8 @@ fn plain_mvcc_open_works(db: &[u8], log: &[u8], enc: Option<&encryption::Encrypt
 
 /// The local files of a finished creation in `dir`: `app.db` (bytes 18/19 = 255) equal to the
 /// bucket's image, `app.db-log` holding the 56-byte header only, the local state (format 2,
-/// the head's generation and epoch, claimed, complete), no staging directory. (The refused
-/// engine open after it leaves an empty `-wal`; `create_new_mvcc` moves none in.)
+/// the head's generation and epoch, claimed, complete), no staging directory. (An engine
+/// open after it leaves an empty `-wal`; `create_new_mvcc` moves none in.)
 fn created_locally(dir: &Path, image: &[u8], h: &Head) {
     let db = std::fs::read(dir.join("app.db")).unwrap();
     assert_eq!(db, image);
@@ -3784,10 +3788,12 @@ fn create_crash_at_each_step() {
             r.unwrap();
         }
         // The next open removes the staging dir, never opening it, and creates again
-        // (overwriting what the crashed attempt left), then stops at the engine.
+        // (overwriting what the crashed attempt left), then opens the engine.
         fault.fail_puts_after(u64::MAX);
-        let r = open_with_store(c.clone(), fault.clone());
-        assert_eq!(unsupported(r), "MVCC", "n={n}");
+        open_with_store(c.clone(), fault.clone())
+            .unwrap_or_else(|e| panic!("n={n}: {e}"))
+            .close()
+            .unwrap();
         let (h, image) = created_bucket(&*inner);
         created_locally(&dir, &image, &h);
         head_has_its_manifest(&*inner);
@@ -3826,8 +3832,10 @@ fn create_crash_at_each_step() {
         let (_, image) = created_bucket(&*store);
         // The next open removes the staging dir; a directory without its state file is
         // emptied first, and the database comes back from the bucket (restored, claimed).
-        let r = open_with_store(mvcc_config(&dir), store.clone());
-        assert_eq!(unsupported(r), "MVCC", "moved={moved}");
+        open_with_store(mvcc_config(&dir), store.clone())
+            .unwrap_or_else(|e| panic!("moved={moved}: {e}"))
+            .close()
+            .unwrap();
         assert!(!dir.join("app.db-creating").exists(), "moved={moved}");
         let s = state(&dir);
         assert_eq!(
@@ -3959,3 +3967,5 @@ fn create_mvcc_encrypted_has_no_plaintext() {
         "{found:?}"
     );
 }
+
+mod mvcc;

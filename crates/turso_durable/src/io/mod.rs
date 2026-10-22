@@ -5,6 +5,7 @@
 pub(crate) mod db_storage;
 pub(crate) mod durable_io;
 pub(crate) mod log_file;
+pub(crate) mod log_storage;
 pub(crate) mod stash;
 pub(crate) mod wal_file;
 

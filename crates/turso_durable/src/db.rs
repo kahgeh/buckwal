@@ -313,8 +313,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             )))
         }
         None if cfg.journal_mode == JournalMode::Mvcc => {
-            // Until the MVCC engine is wired in, `open_engine` still refuses it
-            // (`Unsupported("MVCC")`), after the database is created.
+            // Created, then opened by `open_engine` in MVCC mode like any other.
             let (bucket, state) = create_new_mvcc(&dir, &store, &keys, &cfg)?;
             (bucket, state, None)
         }
@@ -962,6 +961,11 @@ fn last_record_is_foreign(bucket: &Bucket, writer_id: &str, cfg: &EngineConfig) 
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn engine_io(&self) -> Arc<crate::io::DurableIo> {
+        lock(&self.shared.open).as_ref().unwrap().engine.io.clone()
+    }
+
     /// A new connection; open one per thread.
     pub fn connect(&self) -> Result<Connection> {
         let open = lock(&self.shared.open);

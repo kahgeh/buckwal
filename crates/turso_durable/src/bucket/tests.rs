@@ -38,6 +38,14 @@ impl Fixture {
     fn create(&self, retry: RetryPolicy, concurrency: usize) -> Bucket {
         Bucket::create(self.store(), keys(), retry, concurrency, "w1".into()).unwrap()
     }
+    /// An MVCC bucket (format 2) as `create_sealed` leaves it: generation 2.
+    fn create_mvcc(&self, retry: RetryPolicy, concurrency: usize) -> Bucket {
+        let image = crate::create::Image {
+            page_size: 4096,
+            pages: vec![(1, vec![0u8; 4096])],
+        };
+        Bucket::create_sealed(self.store(), keys(), retry, concurrency, "w1".into(), image).unwrap()
+    }
     fn attach(&self, writer_id: &str) -> Result<Bucket> {
         Bucket::attach(self.store(), keys(), fast(), 4, writer_id, 0)
     }
@@ -2665,16 +2673,16 @@ fn a_seal_against_a_store_that_answers_412_forever_times_out() {
 #[test]
 fn append_log_writes_the_kind_of_its_file() {
     let f = Fixture::new();
-    let mut b = f.create(fast(), 4);
+    let mut b = f.create_mvcc(fast(), 4);
     let a = b.append_log(LogFile::Log, syncs(1)).unwrap();
     let w = b.append_log(LogFile::Wal, syncs(2)).unwrap();
     assert_eq!((a.pos.seq, w.pos.seq), (1, 2));
     assert!(matches!(
-        f.record(1, 1),
+        f.record(2, 1),
         Some(LogRecord::Extents { file: LogFile::Log, syncs: s, .. }) if s == syncs(1)
     ));
     assert!(matches!(
-        f.record(1, 2),
+        f.record(2, 2),
         Some(LogRecord::Extents { file: LogFile::Wal, syncs: s, .. }) if s == syncs(2)
     ));
 }
@@ -2689,7 +2697,7 @@ fn settle_all_settles_in_doubt_and_adopts_a_published_seal() {
         ..fast()
     };
     let f = Fixture::new();
-    let mut b = f.create(short, 4);
+    let mut b = f.create_mvcc(short, 4);
     f.fault.only_keys_containing("/log/");
     f.fault.store_then_fail_next_puts(1);
     f.fault.fail_puts_after(0);
@@ -2700,8 +2708,8 @@ fn settle_all_settles_in_doubt_and_adopts_a_published_seal() {
     assert_eq!(b.settle_all(), Ok(false));
     assert!(!b.degraded());
     assert_eq!(
-        f.log_keys(1),
-        [keys().log(1, 1)],
+        f.log_keys(2),
+        [keys().log(2, 1)],
         "settled once, at its seq"
     );
 
@@ -2709,13 +2717,13 @@ fn settle_all_settles_in_doubt_and_adopts_a_published_seal() {
     f.fault.store_then_fail_next_puts(1);
     f.fault.fail_puts_after(0);
     assert!(b.seal_generation(pages(1), 4096, 1).is_err());
-    assert_eq!(f.stored_head().generation, 2);
+    assert_eq!(f.stored_head().generation, 3);
     assert_eq!(
         b.settle_all(),
         Ok(true),
         "a published seal needs no PUT to adopt"
     );
-    assert_eq!(b.head().generation, 2);
+    assert_eq!(b.head().generation, 3);
     assert!(!b.degraded());
     f.fault.fail_puts_after(u64::MAX);
     assert_eq!(
@@ -2723,8 +2731,32 @@ fn settle_all_settles_in_doubt_and_adopts_a_published_seal() {
             .map(|a| a.pos)
             .map_err(|f| f.error),
         Ok(LogPos {
-            generation: 2,
+            generation: 3,
             seq: 1
         })
+    );
+}
+
+/// A kind-3 record belongs to an MVCC bucket: a format-1 (WAL) bucket refuses it before any
+/// request, and hands its syncs back.
+#[test]
+fn kind3_record_is_refused_in_a_format1_bucket() {
+    let f = Fixture::new();
+    let mut b = f.create(fast(), 4);
+    let requests = f.fault.events().len();
+    match b.append_log(LogFile::Log, syncs(1)) {
+        Err(AppendFailure { error, unsent }) => {
+            assert_eq!(
+                error,
+                Error::Unsupported("MVCC: a .db-log record in a WAL bucket")
+            );
+            assert_eq!(unsent, Some(syncs(1)));
+        }
+        Ok(a) => panic!("appended at {:?}", a.pos),
+    }
+    assert_eq!(f.fault.events().len(), requests, "a request was sent");
+    assert_eq!(
+        b.append_log(LogFile::Wal, syncs(2)).map(|a| a.pos.seq).ok(),
+        Some(1)
     );
 }

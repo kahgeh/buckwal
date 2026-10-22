@@ -74,7 +74,6 @@ impl Ticket {
 
 /// Why a `submit_log_file` record is not confirmed, and whether its ops may be sent again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LogFailure {
     pub error: Error,
     /// `Some(ops)`, as submitted, when no PUT of the record was attempted
@@ -85,7 +84,6 @@ pub(crate) struct LogFailure {
 }
 
 /// The reply to one `submit_log_file`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LogTicket {
     /// Its commit number, from the same sequence as `Ticket::commit`.
     pub commit: u64,
@@ -93,7 +91,6 @@ pub(crate) struct LogTicket {
     rx: Receiver<std::result::Result<LogPos, LogFailure>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl LogTicket {
     /// Block until the record is in the bucket (or its upload failed).
     pub(crate) fn wait(self) -> std::result::Result<LogPos, LogFailure> {
@@ -125,9 +122,7 @@ struct FilePending {
 
 enum Job {
     Log(Pending),
-    #[cfg_attr(not(test), allow(dead_code))]
     File(FilePending),
-    #[cfg_attr(not(test), allow(dead_code))]
     Settle(Sender<Result<u64>>),
     Seal {
         pages: Vec<(u32, Vec<u8>)>,
@@ -247,7 +242,6 @@ impl Uploader {
     /// return at once; it carries `commits` commits, as the stats count them. A record that
     /// was never sent hands its ops back (`LogFailure::unsent`) instead of being dropped or
     /// owed. The current span is its commit span.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn submit_log_file(&self, file: LogFile, ops: Vec<Op>, commits: u64) -> LogTicket {
         let (reply, rx) = mpsc::channel();
         let jobs = self.jobs.lock().unwrap();
@@ -274,7 +268,6 @@ impl Uploader {
     /// (`Bucket::settle_all`): a record in doubt is settled at its seq, and a seal whose head
     /// is published is adopted (the generation moves on). Ok only when nothing is left to
     /// settle; returns the current generation.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn settle_log(&self) -> Result<u64> {
         let (reply, rx) = mpsc::channel();
         self.send(Job::Settle(reply));
