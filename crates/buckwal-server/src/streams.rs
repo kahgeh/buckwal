@@ -7,7 +7,7 @@
 //!
 //! Batons are never logged. Connections are closed outside the map's lock.
 use crate::exec::{open_stream, StreamState};
-use buckwal::{Connection, Database, Value};
+use buckwal::{Connection, Database};
 use rustls::crypto::ring::default_provider;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -144,32 +144,11 @@ pub struct CloseOutcome {
     pub error: Option<buckwal::Error>,
 }
 
-/// Allocate page 1 of a fresh database (`PRAGMA page_count` is 0) on `conn`, alone, before
-/// any request runs. turso_core 0.8.3 checks, then locks, in `maybe_allocate_page1`, so the
-/// first writes to a fresh database on several connections at once can allocate it twice and
-/// panic (pager.rs:3290-3297, 5644-5648). `BEGIN IMMEDIATE` allocates it
-/// (`begin_write_tx`) and `ROLLBACK` commits nothing, so no ack waits on any batching.
-/// A database that is not fresh is only read: the check is one library call, so a seal already
-/// due at open runs at startup instead of at the first request. A read-only open refuses
-/// `BEGIN IMMEDIATE`, and every other write, so it has nothing to race.
-fn allocate_page_one(conn: &Connection) -> buckwal::Result<()> {
-    let rows = conn.query("PRAGMA page_count", &[])?;
-    if rows.first().and_then(|r| r.first()).and_then(Value::as_int) != Some(0) {
-        return Ok(());
-    }
-    match conn.execute("BEGIN IMMEDIATE", &[]) {
-        Err(buckwal::Error::Unsupported(_)) => return Ok(()),
-        r => r?,
-    };
-    conn.execute("ROLLBACK", &[])?;
-    Ok(())
-}
-
 impl Streams {
-    /// Connect the anchor, and allocate page 1 on it when the database is fresh.
+    /// Connect the anchor. The library's writer open has already allocated page 1 of a fresh
+    /// database.
     pub fn new(db: Database, cfg: StreamsCfg) -> buckwal::Result<Streams> {
         let anchor = db.connect()?;
-        allocate_page_one(&anchor)?;
         Ok(Streams {
             db,
             cfg,

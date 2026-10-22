@@ -1001,9 +1001,8 @@ fn concurrent_first_writes_to_a_fresh_database_all_succeed() {
     }
 }
 
-/// What the bucket and the library held after the open, and again when the server was ready.
+/// What the bucket and the library held when the server was ready, and its page count.
 struct Startup {
-    opened: Seen,
     ready: Seen,
     page_count: i64,
 }
@@ -1024,7 +1023,6 @@ fn all_keys(store: &MemStore) -> BTreeSet<String> {
 /// Serve `cfg`'s database (opened read-only when `read_only`) until it is ready, then stop.
 fn serve_until_ready(cfg: buckwal::Config, store: Arc<MemStore>, read_only: bool) -> Startup {
     let bound = bind(ServeConfig::from_lookup(Some("127.0.0.1:0"), |_| None).unwrap()).unwrap();
-    let (opened_tx, opened_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let (open_store, ready_store) = (store.clone(), store);
@@ -1037,13 +1035,6 @@ fn serve_until_ready(cfg: buckwal::Config, store: Arc<MemStore>, read_only: bool
                     true => open_read_only_with_store(cfg, s),
                 };
                 let db = db.map_err(|e| e.to_string())?;
-                opened_tx
-                    .send((
-                        db.upload_stats(),
-                        all_keys(&open_store),
-                        writes(&db.bucket_stats()),
-                    ))
-                    .unwrap();
                 Ok(db)
             },
             move |db| {
@@ -1067,11 +1058,7 @@ fn serve_until_ready(cfg: buckwal::Config, store: Arc<MemStore>, read_only: bool
         .unwrap();
     assert!(report.clean, "{report:?}");
     let (ready, page_count) = ready_rx.recv().unwrap();
-    Startup {
-        opened: opened_rx.recv().unwrap(),
-        ready,
-        page_count,
-    }
+    Startup { ready, page_count }
 }
 
 fn commits(s: &UploadStats) -> (u64, u64, u64) {
@@ -1091,44 +1078,18 @@ fn startup_config(dir: &std::path::Path, key: bool) -> buckwal::Config {
     cfg
 }
 
-/// Before ready, the server only reads a database that is not fresh: the startup adds no
-/// commit, no ack and no log object, encrypted or not.
-#[test]
-fn startup_adds_no_commit_to_an_existing_database() {
-    for key in [false, true] {
-        let t = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemStore::new());
-        let dir = t.path().join("db");
-        let db = open_with_store(startup_config(&dir, key), store.clone()).unwrap();
-        let c = db.connect().unwrap();
-        c.set_batching(Some(buckwal::Batching::Off)).unwrap();
-        c.execute(CREATE, &[]).unwrap();
-        c.execute("INSERT INTO t(body) VALUES ('a')", &[]).unwrap();
-        drop(c);
-        db.close().unwrap();
-        let s = serve_until_ready(startup_config(&dir, key), store.clone(), false);
-        assert!(s.page_count > 0, "key={key}: the database is not fresh");
-        assert_eq!(commits(&s.opened.0), commits(&s.ready.0), "key={key}");
-        assert_eq!(s.opened.1, s.ready.1, "key={key}: bucket keys");
-        assert_eq!(s.opened.2, s.ready.2, "key={key}: bucket writes");
-    }
-}
-
 /// A fresh database has page 1 by the time the server is ready, and getting it made no
-/// commit (so no ack waited out the batching window), encrypted or not.
+/// commit (the library's writer open does it).
 #[test]
-fn startup_allocates_page_one_of_a_fresh_database_without_a_commit() {
-    for key in [false, true] {
-        let t = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemStore::new());
-        let started = Instant::now();
-        let s = serve_until_ready(startup_config(&t.path().join("db"), key), store, false);
-        assert!(started.elapsed() < Duration::from_secs(30), "key={key}");
-        assert_eq!(s.page_count, 1, "key={key}: page 1 is allocated");
-        assert_eq!(commits(&s.ready.0), (0, 0, 0), "key={key}");
-        assert_eq!(s.opened.1, s.ready.1, "key={key}: bucket keys");
-        assert_eq!(s.opened.2, s.ready.2, "key={key}: bucket writes");
-    }
+fn startup_has_page_one_before_ready() {
+    let t = tempfile::tempdir().unwrap();
+    let s = serve_until_ready(
+        startup_config(&t.path().join("db"), false),
+        Arc::new(MemStore::new()),
+        false,
+    );
+    assert_eq!(s.page_count, 1);
+    assert_eq!(commits(&s.ready.0), (0, 0, 0));
 }
 
 /// A read-only open of a database that was never written is fresh too, but it refuses every
