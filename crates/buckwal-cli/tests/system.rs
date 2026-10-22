@@ -992,7 +992,13 @@ fn verify_while_writer_runs_loses_nothing() {
 fn sql_on_a_fresh_prefix_prints_page_count_1() {
     let ctx = Ctx::new("sql_on_a_fresh_prefix_prints_page_count_1");
     let dir = ctx.dir("db");
-    let out = ctx.ok(&["sql", "--dir", dir.to_str().unwrap(), "PRAGMA page_count"]);
+    let out = ctx.ok(&[
+        "sql",
+        "--claim",
+        "--dir",
+        dir.to_str().unwrap(),
+        "PRAGMA page_count",
+    ]);
     assert_eq!(out.stdout.trim(), "1", "{}\n{}", out.stdout, out.stderr);
 }
 
