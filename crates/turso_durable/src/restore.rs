@@ -5,9 +5,9 @@
 use crate::config::{Config, EngineConfig, JournalMode};
 use crate::db::{refuse_mode_mismatch, DirGuard};
 use crate::error::{Error, Result};
-use crate::files::{io_err, DB_FILE, DIRTY_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
+use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
-    apply_ops, decode_record, Head, Keys, LocalState, LogFile, LogRecord, Manifest,
+    apply_ops, decode_record, Head, Keys, LocalState, LogFile, LogRecord, Manifest, FORMAT_V2,
 };
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
+use turso_core::io::FileSyncType;
+use turso_core::mvcc::persistent_storage::{DurableStorage, Storage};
+use turso_core::{Completion, OpenFlags, PlatformIO, IO};
 
 #[derive(Debug, Clone)]
 pub struct RestoreReport {
@@ -171,9 +174,19 @@ pub(crate) fn sealed_page_one(
         .transpose()
 }
 
-/// The `-wal` image `B` of the head's generation: every record of `log/<generation>`
-/// replayed in order, and the number of records (which is also the highest seq: the seqs run
-/// 1, 2, 3, …).
+/// The two images of the head's generation, and the number of records they were made from
+/// (which is also the highest seq: the seqs run 1, 2, 3, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Images {
+    /// The `-wal` image `B`: the kind-1 records replayed in order.
+    pub wal: Vec<u8>,
+    /// The `app.db-log` image: the kind-3 records replayed in order (empty in a WAL bucket).
+    pub log: Vec<u8>,
+    pub records: u64,
+}
+
+/// The images of the head's generation: every record of `log/<generation>` replayed in
+/// order, kind 1 into the `-wal` image and kind 3 into the `app.db-log` image.
 ///
 /// Which writers' records a generation may hold: runs of records by other writer ids (one run
 /// per writer), then only records of `head.writer_id`. A takeover
@@ -193,7 +206,7 @@ pub(crate) fn generation_image(
     keys: &Keys,
     head: &Head,
     cfg: &EngineConfig,
-) -> Result<(Vec<u8>, u64)> {
+) -> Result<Images> {
     generation_image_counted(store, keys, head, cfg, &AtomicU64::new(0))
 }
 
@@ -204,7 +217,7 @@ fn generation_image_counted(
     head: &Head,
     cfg: &EngineConfig,
     retries: &AtomicU64,
-) -> Result<(Vec<u8>, u64)> {
+) -> Result<Images> {
     let records = fetch_generation(
         store,
         keys,
@@ -220,6 +233,7 @@ fn generation_image_counted(
         ))
     };
     let mut wal = Vec::new();
+    let mut log = Vec::new();
     // Writers whose run of records has ended; each writer's records are one run.
     let mut ended: Vec<&str> = Vec::new();
     let mut current: Option<&str> = None;
@@ -229,16 +243,17 @@ fn generation_image_counted(
         let seq = i + 1;
         match rec {
             LogRecord::Extents {
-                file: LogFile::Log, ..
-            } => {
-                // Kind 3 (an MVCC bucket) is applied by a later task; never write it to the WAL.
-                return Err(Error::Unsupported("MVCC: restoring a kind 3 log record"));
-            }
-            LogRecord::Extents {
-                file: LogFile::Wal,
+                file,
                 writer_id,
                 syncs,
             } => {
+                // Kind 3 exists only in format 2 (an MVCC bucket).
+                if *file == LogFile::Log && head.format != FORMAT_V2 {
+                    return Err(Error::Corrupt(format!(
+                        "log/{} seq {seq}: a .db-log record in a format {} bucket",
+                        head.generation, head.format
+                    )));
+                }
                 if let Some((fencer, epoch)) = fence {
                     if writer_id != fencer {
                         return Err(Error::Fenced(format!(
@@ -263,8 +278,12 @@ fn generation_image_counted(
                     }
                     current = Some(writer_id);
                 }
+                let image = match file {
+                    LogFile::Wal => &mut wal,
+                    LogFile::Log => &mut log,
+                };
                 for ops in syncs {
-                    apply_ops(&mut wal, ops)?;
+                    apply_ops(image, ops)?;
                 }
             }
             LogRecord::Fence { writer_id, epoch } => {
@@ -284,7 +303,11 @@ fn generation_image_counted(
             }
         }
     }
-    Ok((wal, records.len() as u64))
+    Ok(Images {
+        wal,
+        log,
+        records: records.len() as u64,
+    })
 }
 
 /// The database file to put next to the `-wal` image `wal` while the bucket holds no page
@@ -300,6 +323,70 @@ pub(crate) fn page_one_seed(wal: &[u8], head: &Head, mode: JournalMode) -> Resul
         }
         None => Ok(Vec::new()),
     }
+}
+
+/// The engine's logical-log header size (`LOG_HDR_SIZE`).
+const LOG_HEADER_LEN: u64 = 56;
+
+/// The `-wal` header (32 bytes) and the frame header (24 bytes) of the SQLite WAL format.
+const WAL_HEADER_LEN: u64 = 32;
+const WAL_FRAME_HEADER_LEN: u64 = 24;
+
+fn file_len(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(io_err("stat", e)),
+    }
+}
+
+/// Whether `<dir>/app.db-wal` holds at least one whole frame.
+fn wal_holds_frames(wal: &Path) -> Result<bool> {
+    let len = file_len(wal)?;
+    if len < WAL_HEADER_LEN {
+        return Ok(false);
+    }
+    let mut header = [0u8; 12];
+    fs::File::open(wal)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+        .map_err(|e| io_err("read -wal header", e))?;
+    let page_size = u64::from(u32::from_be_bytes(header[8..12].try_into().unwrap()));
+    Ok(page_size > 0 && len >= WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN + page_size)
+}
+
+/// The engine refuses to open WAL frames next to a log under 56 bytes ("WAL has committed
+/// frames but logical log header is missing", docs/mvcc-recon.md Q4). When `<dir>` is in that
+/// state, write the log a fresh header with the engine's own `reset_to_fresh_header` (a
+/// standalone `Storage`, pinned by `reset_to_fresh_header_works_standalone`), and fsync it.
+/// The header is never encrypted, so no key is needed. Returns whether it wrote. Called with
+/// the directory held and the engine not open: after a restore, and before every MVCC open
+/// (a crash between a seal's log truncate and its `-wal` truncate leaves this state).
+pub(crate) fn repair_wal_without_log(dir: &Path) -> Result<bool> {
+    let log_path = dir.join(LOG_FILE);
+    if file_len(&log_path)? >= LOG_HEADER_LEN || !wal_holds_frames(&dir.join(WAL_FILE))? {
+        return Ok(false);
+    }
+    let path = log_path
+        .to_str()
+        .ok_or_else(|| Error::Config(format!("{} is not UTF-8", log_path.display())))?;
+    let engine = |what: &str, e: turso_core::LimboError| io_err(what, e);
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| io_err("platform IO", e))?);
+    let file = io
+        .open_file(path, OpenFlags::Create, false)
+        .map_err(|e| engine("open app.db-log", e))?;
+    let storage = Storage::new(file.clone(), io.clone(), None);
+    let c = storage
+        .reset_to_fresh_header()
+        .map_err(|e| engine("write the app.db-log header", e))?;
+    io.wait_for_completion(c)
+        .map_err(|e| engine("write the app.db-log header", e))?;
+    let c = file
+        .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+        .map_err(|e| engine("fsync app.db-log", e))?;
+    io.wait_for_completion(c)
+        .map_err(|e| engine("fsync app.db-log", e))?;
+    fsync_dir(dir)?;
+    Ok(true)
 }
 
 /// Write `bytes` to `path` and fsync it.
@@ -377,7 +464,7 @@ fn restore_files(
 ) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let start = Instant::now();
     let before = store.stats();
-    for f in [DB_FILE, WAL_FILE] {
+    for f in [DB_FILE, WAL_FILE, LOG_FILE] {
         if dir.join(f).exists() {
             return Err(Error::Config(format!(
                 "{} already holds a database ({f})",
@@ -400,7 +487,11 @@ fn restore_files(
         }
         None => None,
     };
-    let (wal, log_objects) = generation_image_counted(&*store, keys, &head, cfg, retries)?;
+    let Images {
+        wal,
+        log,
+        records: log_objects,
+    } = generation_image_counted(&*store, keys, &head, cfg, retries)?;
     // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).
     let db = match head.manifest {
         Some(_) => Vec::new(),
@@ -408,6 +499,11 @@ fn restore_files(
     };
     fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
     write_synced(&dir.join(WAL_FILE), &wal)?;
+    // Only an MVCC database has an `app.db-log`; a WAL restore writes exactly what it did.
+    if head.journal_mode == JournalMode::Mvcc {
+        write_synced(&dir.join(LOG_FILE), &log)?;
+        repair_wal_without_log(dir)?;
+    }
     write_synced(&dir.join(DB_FILE), &db)?;
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
@@ -469,7 +565,7 @@ pub(crate) struct Staged {
 }
 
 /// Moved in this order: the local state last, so a directory with a state file is whole.
-const RESTORED: [&str; 3] = [WAL_FILE, DB_FILE, STATE_FILE];
+const RESTORED: [&str; 4] = [WAL_FILE, LOG_FILE, DB_FILE, STATE_FILE];
 
 /// Restore into `dir` (held by the caller: `DirGuard`) without ever leaving it half
 /// restored: the files are built in a staging directory next to it (same filesystem), then
@@ -483,7 +579,7 @@ pub(crate) fn restore_staged(
     cfg: &EngineConfig,
 ) -> Result<Staged> {
     clear_interrupted_restore(dir)?;
-    for f in [DB_FILE, WAL_FILE, STATE_FILE] {
+    for f in [DB_FILE, WAL_FILE, LOG_FILE, STATE_FILE] {
         if dir.join(f).exists() {
             return Err(Error::Config(format!(
                 "{} already holds a database ({f})",

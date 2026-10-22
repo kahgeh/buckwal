@@ -3712,10 +3712,19 @@ fn plain_mvcc_open_works(db: &[u8], log: &[u8], enc: Option<&encryption::Encrypt
 /// the head's generation and epoch, claimed, complete), no staging directory. (An engine
 /// open after it leaves an empty `-wal`; `create_new_mvcc` moves none in.)
 fn created_locally(dir: &Path, image: &[u8], h: &Head) {
+    created_locally_with(dir, image, h, false);
+}
+
+/// [`created_locally`]; with `reopened`, the log may also be empty: the reopen's reconcile
+/// replaces a header-only local `.db-log` with the new generation's empty image (Task 6).
+fn created_locally_with(dir: &Path, image: &[u8], h: &Head, reopened: bool) {
     let db = std::fs::read(dir.join("app.db")).unwrap();
     assert_eq!(db, image);
     let log = std::fs::read(dir.join("app.db-log")).unwrap();
-    assert!(is_log_header(&log), "{log:?}");
+    assert!(
+        is_log_header(&log) || (reopened && log.is_empty()),
+        "{log:?}"
+    );
     let s = state(dir);
     assert_eq!(
         (s.format, s.generation, s.epoch, s.claimed, s.complete),
@@ -3795,7 +3804,7 @@ fn create_crash_at_each_step() {
             .close()
             .unwrap();
         let (h, image) = created_bucket(&*inner);
-        created_locally(&dir, &image, &h);
+        created_locally_with(&dir, &image, &h, true);
         head_has_its_manifest(&*inner);
         // A second machine restores the final state.
         let t2 = tempdir();

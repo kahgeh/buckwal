@@ -1786,8 +1786,9 @@ fn append_fence_steps_over_an_old_writer_record() {
     let r = a.append_log(LogFile::Wal, syncs(3)).map_err(|f| f.error);
     assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
     // The restore image: w1's two records, then the fence.
-    let (_, n) =
-        crate::restore::generation_image(&*f.store(), &keys(), b.head(), &engine_cfg()).unwrap();
+    let n = crate::restore::generation_image(&*f.store(), &keys(), b.head(), &engine_cfg())
+        .unwrap()
+        .records;
     assert_eq!(n, 3);
 
     // A losing concurrent takeover's fence (a lower epoch) is stepped over too.

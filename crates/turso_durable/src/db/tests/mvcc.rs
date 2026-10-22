@@ -755,3 +755,5 @@ fn set_batching_window_refused_in_an_open_mvcc_database() {
     c.close().unwrap();
     db.close().unwrap();
 }
+
+mod restore;

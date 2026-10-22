@@ -8,21 +8,26 @@
 //! - otherwise the `-wal` holds commits whose upload never finished; they are uploaded as the
 //!   next record (`Ahead`), because the engine will recover them as committed.
 //!
+//! An MVCC directory does the same for `app.db-log` (record kind 3), file by file. A
+//! new-generation `.db-log` image that is empty next to a non-empty local file is
+//! `NewGeneration` too. Last, WAL frames next to a log under 56 bytes get a fresh log header
+//! (`repair_wal_without_log`), or the engine refuses the open.
+//!
 //! It reads and writes `app.db-wal` with `std::fs`, which D4 allows only because the engine
 //! has not opened the files yet and `durable.lock` keeps every other process out.
 
 use crate::bucket::{Bucket, LogPos};
 use crate::config::{EngineConfig, JournalMode};
 use crate::error::{Error, Result};
-use crate::files::{io_err, DB_FILE, DIRTY_FILE, WAL_FILE};
+use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, WAL_FILE};
 use crate::format::{Head, LocalState, LogFile, Op};
 use crate::io::db_storage::{truncate_dirty_file, READ_ONLY};
 use crate::io::wal_file::EPOCH;
-use crate::restore::{generation_image, page_one_seed, write_synced};
+use crate::restore::{generation_image, page_one_seed, repair_wal_without_log, write_synced};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reconciled {
     Level,
     Behind,
@@ -42,6 +47,41 @@ pub(crate) fn reconcile(
     state: &mut LocalState,
     cfg: &EngineConfig,
 ) -> Result<Reconciled> {
+    reconcile_files(dir, bucket, state, cfg).map(Outcomes::combined)
+}
+
+/// What each file of `dir` needed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Outcomes {
+    pub wal: Reconciled,
+    /// None for a WAL database (it has no `.db-log`).
+    pub log: Option<Reconciled>,
+}
+
+impl Outcomes {
+    /// One outcome for the directory: the strongest of the files' (NewGeneration, Ahead,
+    /// Behind, Level).
+    fn combined(self) -> Reconciled {
+        let rank = |r: &Reconciled| match r {
+            Reconciled::Level => 0,
+            Reconciled::Behind => 1,
+            Reconciled::Ahead { .. } => 2,
+            Reconciled::NewGeneration => 3,
+        };
+        match self.log {
+            Some(log) if rank(&log) > rank(&self.wal) => log,
+            _ => self.wal,
+        }
+    }
+}
+
+/// [`reconcile`], with each file's outcome.
+pub(crate) fn reconcile_files(
+    dir: &Path,
+    bucket: &mut Bucket,
+    state: &mut LocalState,
+    cfg: &EngineConfig,
+) -> Result<Outcomes> {
     let head = bucket.head().clone();
     crate::db::refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
     if head.writer_id != state.writer_id {
@@ -71,10 +111,23 @@ pub(crate) fn reconcile(
             head.manifest
         )));
     }
-    let image = generation_image(&*bucket.store(), bucket.keys(), &head, cfg)?.0;
-    let local = read_wal(dir)?;
-    let outcome = if state.generation < head.generation || holds_older_generation(&local, &image) {
-        // The seal of the local WAL's generation published `manifest/(head.generation - 1)`,
+    let images = generation_image(&*bucket.store(), bucket.keys(), &head, cfg)?;
+    let mvcc = head.journal_mode == JournalMode::Mvcc;
+    let wal_local = read_file(dir, WAL_FILE, "-wal")?;
+    // Only an MVCC directory has a `.db-log`; a WAL one is never given the file.
+    let log_local = if mvcc {
+        read_file(dir, LOG_FILE, ".db-log")?
+    } else {
+        Vec::new()
+    };
+    let behind = state.generation < head.generation;
+    let wal_new = behind || holds_older_generation(&wal_local, &images.wal);
+    // The `.db-log` of the same rule (docs/mvcc-recon.md, Stage-2 design, Invariant): a
+    // new-generation image that is empty next to a non-empty local file. No acked commit is in
+    // such a file, and every frame it holds is in the sealed pages.
+    let log_new = mvcc && (behind || (images.log.is_empty() && !log_local.is_empty()));
+    if wal_new || log_new {
+        // The seal of the local generation published `manifest/(head.generation - 1)`,
         // which covers every page that WAL and the dirty file name.
         if head.manifest.is_some() {
             truncate_dirty_file(&dir.join(DIRTY_FILE))?;
@@ -85,37 +138,88 @@ pub(crate) fn reconcile(
         if !state.claimed {
             state.complete = false;
         }
-        replace_file(dir, WAL_FILE, &image)?;
+        if log_new {
+            replace_file(dir, LOG_FILE, &images.log)?;
+        }
+        if wal_new {
+            replace_file(dir, WAL_FILE, &images.wal)?;
+        }
         state.generation = head.generation;
         state.write_atomic(dir)?;
+    }
+    let wal = if wal_new {
         Reconciled::NewGeneration
-    } else if local == image {
-        Reconciled::Level
-    } else if local.len() < image.len() {
-        // The local disk lost what the bucket has, so it may have lost database pages too:
-        // pages not read yet in this process come from the bucket. Recorded before the
-        // `-wal` is replaced, so a crash in between repeats this.
-        state.complete = false;
-        state.write_atomic(dir)?;
-        replace_file(dir, WAL_FILE, &image)?;
-        Reconciled::Behind
-    } else if cfg.read_only {
-        return Err(Error::Unsupported(READ_ONLY));
     } else {
-        let uploaded = bucket
-            .append_log(LogFile::Wal, vec![catch_up_ops(&image, &local)])
-            .map_err(|f| f.error)?
-            .pos;
-        Reconciled::Ahead { uploaded }
+        level_file(dir, bucket, state, cfg, File::Wal, &wal_local, &images.wal)?
+    };
+    let log = if !mvcc {
+        None
+    } else if log_new {
+        Some(Reconciled::NewGeneration)
+    } else {
+        Some(level_file(
+            dir,
+            bucket,
+            state,
+            cfg,
+            File::Log,
+            &log_local,
+            &images.log,
+        )?)
     };
     if head.manifest.is_none() {
-        let wal = match outcome {
-            Reconciled::Level | Reconciled::Ahead { .. } => &local,
-            Reconciled::Behind | Reconciled::NewGeneration => &image,
+        let bytes = match wal {
+            Reconciled::Level | Reconciled::Ahead { .. } => &wal_local,
+            Reconciled::Behind | Reconciled::NewGeneration => &images.wal,
         };
-        seed_database_file(dir, wal, &head, cfg.journal_mode)?;
+        seed_database_file(dir, bytes, &head, cfg.journal_mode)?;
     }
-    Ok(outcome)
+    if mvcc && !cfg.read_only {
+        // A crash between the seal's steps 6 and 8 leaves WAL frames next to a cut log.
+        repair_wal_without_log(dir)?;
+    }
+    Ok(Outcomes { wal, log })
+}
+
+/// Level, Behind or Ahead for one file: `local` against the bucket's `image`.
+fn level_file(
+    dir: &Path,
+    bucket: &mut Bucket,
+    state: &mut LocalState,
+    cfg: &EngineConfig,
+    file: File,
+    local: &[u8],
+    image: &[u8],
+) -> Result<Reconciled> {
+    let (name, kind) = match file {
+        File::Wal => (WAL_FILE, LogFile::Wal),
+        File::Log => (LOG_FILE, LogFile::Log),
+    };
+    if local == image {
+        Ok(Reconciled::Level)
+    } else if local.len() < image.len() {
+        // The local disk lost what the bucket has, so it may have lost database pages too:
+        // pages not read yet in this process come from the bucket. Recorded before the file is
+        // replaced, so a crash in between repeats this.
+        state.complete = false;
+        state.write_atomic(dir)?;
+        replace_file(dir, name, image)?;
+        Ok(Reconciled::Behind)
+    } else if cfg.read_only {
+        Err(Error::Unsupported(READ_ONLY))
+    } else {
+        let uploaded = bucket
+            .append_log(kind, vec![catch_up_ops(image, local)])
+            .map_err(|f| f.error)?
+            .pos;
+        Ok(Reconciled::Ahead { uploaded })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum File {
+    Wal,
+    Log,
 }
 
 /// The local `-wal` still holds the generation before `bucket`'s (state and head already
@@ -167,11 +271,12 @@ fn catch_up_ops(bucket: &[u8], local: &[u8]) -> Vec<Op> {
     ops
 }
 
-fn read_wal(dir: &Path) -> Result<Vec<u8>> {
-    match fs::read(dir.join(WAL_FILE)) {
+/// `<dir>/<name>`'s bytes; empty for a missing file. `what` names it in an error.
+fn read_file(dir: &Path, name: &str, what: &str) -> Result<Vec<u8>> {
+    match fs::read(dir.join(name)) {
         Ok(b) => Ok(b),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(io_err("read -wal", e)),
+        Err(e) => Err(io_err(&format!("read {what}"), e)),
     }
 }
 

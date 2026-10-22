@@ -61,7 +61,7 @@ fn reopen(store: Arc<dyn ObjectStore>, dir: &Path) -> (Reconciled, Engine, Arc<C
 fn bucket_image(store: &dyn ObjectStore) -> Vec<u8> {
     generation_image(store, &keys(), &head(store), &cfg())
         .unwrap()
-        .0
+        .wal
 }
 
 fn local_wal(dir: &Path) -> Vec<u8> {
@@ -629,8 +629,8 @@ fn claimed_generation_accepts_old_writer_prefix_only() {
     mem.put(&keys().log(old.generation, next), &empty(&claimer))
         .unwrap();
     let with_claimer = generation_image(&*mem, &keys(), &claimed, &cfg()).unwrap();
-    assert_eq!(with_claimer.0, image.0);
-    assert_eq!(with_claimer.1, image.1 + 1);
+    assert_eq!(with_claimer.wal, image.wal);
+    assert_eq!(with_claimer.records, image.records + 1);
 
     mem.put(
         &keys().log(old.generation, next + 1),
@@ -648,7 +648,7 @@ fn claimed_generation_accepts_old_writer_prefix_only() {
     mem.put(&keys().log(gen, next + 1), &empty(&claimer))
         .unwrap();
     let three = generation_image(&*mem, &keys(), &claimed, &cfg()).unwrap();
-    assert_eq!(three.1, image.1 + 2);
+    assert_eq!(three.records, image.records + 2);
     mem.put(&keys().log(gen, next + 1), &empty(&old.writer_id))
         .unwrap();
     mem.put(&keys().log(gen, next + 2), &empty(&claimer))
@@ -700,7 +700,7 @@ mod fence_image {
             writer_id: head_writer.to_string(),
             epoch: 0,
         };
-        generation_image(&mem, &keys(), &head, &cfg())
+        generation_image(&mem, &keys(), &head, &cfg()).map(|i| (i.wal, i.records))
     }
 
     #[test]

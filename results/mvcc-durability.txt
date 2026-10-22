@@ -13,3 +13,17 @@ Task 3 fix round 1 (review): move_created fsynced the db dir once after all rena
     left:  ["rename app.db-log", "rename app.db", "rename app.db-durable", "fsync db", "fsync db"]
     right: ["rename app.db-log", "fsync db", "rename app.db", "fsync db", "rename app.db-durable", "fsync db", "fsync db"]
   after:  test create::tests::move_created_fsyncs_the_dir_after_each_rename ... ok (902821b)
+
+Task 6: reopen or restore of an MVCC database whose current generation holds kind-3 records
+  before (restore refused kind 3; the tests run with that arm put back):
+    test db::tests::mvcc::restore::restore_v2_bucket_writes_wal_and_log_images ... FAILED
+      called `Result::unwrap()` on an `Err` value: Unsupported("MVCC: restoring a kind 3 log record")
+    also FAILED: reopen_with_commits_in_current_generation_and_restore, restore_prefix_of_log_gives_prefix_rows,
+      restore_with_wal_frames_and_empty_log_image_writes_a_header, restore_of_created_mvcc_bucket_opens,
+      restore_after_adopt_and_failed_checkpoint_opens, reconcile_log_level_behind_ahead_newgeneration
+    test result: FAILED. 6 passed; 7 failed
+  after: test result: ok. 13 passed; 0 failed (mvcc::restore), ./scripts/test.sh unit exit 0 (470 lib tests)
+Task 6: WAL frames next to an empty app.db-log (engine: "logical log header is missing")
+  before: wal_frames_with_empty_log_is_repaired_and_opens asserts the engine refuses the
+    directory; repair_wal_without_log (the engine's reset_to_fresh_header) then opens it, rows 1..=10
+  mutation (repair call removed from restore): restore_with_wal_frames_and_empty_log_image_writes_a_header FAILED
