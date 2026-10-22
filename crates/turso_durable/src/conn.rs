@@ -503,7 +503,9 @@ impl Connection {
     }
 
     /// No transaction is open: true outside `BEGIN`…`COMMIT`, and again after the engine
-    /// rolled a transaction back by itself or an upload failure did.
+    /// rolled a transaction back by itself or an upload failure did. In MVCC mode a `COMMIT`
+    /// whose upload failed also leaves this true, but the commit was not rolled back: it is
+    /// kept in the local database and shipped by the next commit (outcome unknown).
     pub fn is_autocommit(&self) -> bool {
         self.core.as_ref().is_none_or(|c| c.get_auto_commit())
     }
@@ -511,6 +513,10 @@ impl Connection {
     /// `BEGIN`, then `f`, then `COMMIT`; `ROLLBACK` when `f` or the commit fails, and `f`'s
     /// (or the commit's) error is returned. Each statement is its own call, so the `COMMIT`
     /// returns only once the transaction is confirmed in the bucket.
+    ///
+    /// A commit error is rolled back locally in WAL mode with batching Off. It is not in MVCC
+    /// mode: there the engine keeps a commit whose upload failed (the transaction has already
+    /// ended), and the error means "outcome unknown" (the next commit ships it).
     pub fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         self.run_transaction(None, f)
     }

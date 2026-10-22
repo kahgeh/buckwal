@@ -23,7 +23,8 @@
 //! a header-only write (56 bytes at offset 0). A group commit's lead writes every queued frame
 //! and makes the one sync, so its call carries one ack per frame.
 //!
-//! It never seals and never measures the file (maintenance does, Task 9).
+//! It never seals (`LogDurableStorage::truncate` does). It keeps the file's high-water mark
+//! (`high_water`, shared with `Engine::wal_bytes`) for the maintenance trigger, which reads it.
 use super::read_at;
 use super::stash::stash;
 use crate::batching::{ctx, Batching, PendingAck};

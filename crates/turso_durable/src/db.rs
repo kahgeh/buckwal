@@ -261,7 +261,9 @@ pub fn open_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Result<Da
 /// close never checkpoints. An MVCC database's own recovery at open may still write the
 /// local files (backfill into `app.db`, the log header, a cut of `-wal`); those writes
 /// stay local, are never uploaded and never seal. A read-only open never creates
-/// `app.db-log`. A WAL database's files are not written.
+/// `app.db-log`. A WAL database's files are written less: reconcile still replaces a `-wal`
+/// that is behind the bucket's image (and records `complete=false` in `app.db-durable`)
+/// before the engine opens, and a local file ahead of the bucket is refused, not uploaded.
 #[doc(hidden)]
 pub fn open_read_only(config: Config) -> Result<Database> {
     let store = config.s3_store()?;
