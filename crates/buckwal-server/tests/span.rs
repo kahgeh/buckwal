@@ -1,4 +1,4 @@
-//! The `durable.server.request` span, in its own test binary: the capturing subscriber is
+//! The `buckwal.server.request` span, in its own test binary: the capturing subscriber is
 //! the process-wide default, because the server runs on tokio worker and blocking threads.
 mod common;
 
@@ -133,43 +133,43 @@ fn request_span_has_no_sql_or_token() {
     let spans = capture.spans.lock().unwrap().clone();
     let reqs: Vec<&SpanRec> = spans[from..refused_from]
         .iter()
-        .filter(|s| s.name == "durable.server.request")
+        .filter(|s| s.name == "buckwal.server.request")
         .collect();
     assert_eq!(reqs.len(), 1, "{reqs:?}");
     let req = reqs[0];
     let f = |k: &str| req.fields.get(k).map(String::as_str);
     assert_eq!(f("http.route"), Some("/v2/pipeline"), "{req:?}");
     assert_eq!(f("http.status"), Some("200"), "{req:?}");
-    assert_eq!(f("durable.statements"), Some("1"), "{req:?}");
-    assert_eq!(f("durable.outcome"), Some("ok"), "{req:?}");
-    let stream: u64 = f("durable.stream").unwrap().parse().unwrap();
+    assert_eq!(f("buckwal.statements"), Some("1"), "{req:?}");
+    assert_eq!(f("buckwal.outcome"), Some("ok"), "{req:?}");
+    let stream: u64 = f("buckwal.stream").unwrap().parse().unwrap();
     assert!(stream >= 1, "{req:?}");
     // Only the spans opened during the INSERT request: span ids are reused once closed.
     let during = &spans[from..refused_from];
     assert!(
         during
             .iter()
-            .any(|s| s.name == "durable.commit" && s.parent == Some(req.id)),
+            .any(|s| s.name == "buckwal.commit" && s.parent == Some(req.id)),
         "the library's commit span is a child of the request span: {during:?}"
     );
     let refused: Vec<&SpanRec> = spans[refused_from..keyed_from]
         .iter()
-        .filter(|s| s.name == "durable.server.request")
+        .filter(|s| s.name == "buckwal.server.request")
         .collect();
     assert_eq!(refused.len(), 1, "{refused:?}");
     let g = |k: &str| refused[0].fields.get(k).map(String::as_str);
     assert_eq!(g("http.status"), Some("401"), "{refused:?}");
-    assert_eq!(g("durable.outcome"), Some("unauthorized"), "{refused:?}");
-    assert_eq!(g("durable.stream"), None, "{refused:?}");
+    assert_eq!(g("buckwal.outcome"), Some("unauthorized"), "{refused:?}");
+    assert_eq!(g("buckwal.stream"), None, "{refused:?}");
     let keyed: Vec<&SpanRec> = spans[keyed_from..]
         .iter()
-        .filter(|s| s.name == "durable.server.request")
+        .filter(|s| s.name == "buckwal.server.request")
         .collect();
     assert_eq!(keyed.len(), 1, "{keyed:?}");
     let k = |f: &str| keyed[0].fields.get(f).map(String::as_str);
     assert_eq!(k("http.status"), Some("400"), "{keyed:?}");
-    assert_eq!(k("durable.outcome"), Some("bad_request"), "{keyed:?}");
-    assert_eq!(k("durable.stream"), None, "{keyed:?}");
+    assert_eq!(k("buckwal.outcome"), Some("bad_request"), "{keyed:?}");
+    assert_eq!(k("buckwal.stream"), None, "{keyed:?}");
     let secret_part = baton.split_once('.').unwrap().1.to_string();
     let events = capture.events.lock().unwrap().clone();
     let values = spans

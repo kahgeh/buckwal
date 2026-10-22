@@ -214,7 +214,7 @@ impl Connection {
     /// Wait, in commit order, for every commit the current call made. Each counts as acked
     /// (`UploadStats::commits_acked`, the wait histogram, `Event::CommitAcked`) only when all
     /// of them succeeded; otherwise the first error is returned. Each commit's span closes as
-    /// its own ack resolves, with its own outcome; a wait is its `durable.ack_wait`.
+    /// its own ack resolves, with its own outcome; a wait is its `buckwal.ack_wait`.
     fn await_acks(&self) -> Result<()> {
         let mut acked = Vec::new();
         let mut first_err = None;

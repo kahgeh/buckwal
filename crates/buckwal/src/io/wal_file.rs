@@ -61,8 +61,8 @@ fn engine_io(e: turso_core::LimboError) -> Error {
     io_err("-wal", e)
 }
 
-/// The spans of the commit whose ops are pending: `durable.commit`, and its
-/// `durable.local_write`, which closes when the sync starts.
+/// The spans of the commit whose ops are pending: `buckwal.commit`, and its
+/// `buckwal.local_write`, which closes when the sync starts.
 struct CommitSpans {
     commit: Span,
     local_write: Span,
@@ -73,13 +73,13 @@ impl CommitSpans {
     fn start() -> CommitSpans {
         let commit = info_span!(
             target: "buckwal",
-            "durable.commit",
-            durable.batching = Empty,
-            durable.commit_no = Empty,
-            durable.bytes = Empty,
-            durable.outcome = Empty,
+            "buckwal.commit",
+            buckwal.batching = Empty,
+            buckwal.commit_no = Empty,
+            buckwal.bytes = Empty,
+            buckwal.outcome = Empty,
         );
-        let local_write = info_span!(target: "buckwal", parent: &commit, "durable.local_write");
+        let local_write = info_span!(target: "buckwal", parent: &commit, "buckwal.local_write");
         CommitSpans {
             commit,
             local_write,
@@ -157,10 +157,10 @@ impl ShippingFile {
     /// carrying no commit and pushing no ack. Ops never sent are dropped, as an `Off` sync's
     /// are: the checkpoint fails and the engine discards its frames.
     fn ship_checkpoint_frames(&self, ops: Vec<Op>, span: &Span) -> Result<()> {
-        span.record("durable.batching", display(Batching::Off));
-        span.record("durable.bytes", op_bytes(&ops));
+        span.record("buckwal.batching", display(Batching::Off));
+        span.record("buckwal.bytes", op_bytes(&ops));
         let ticket = span.in_scope(|| self.uploader.submit_log_file(LogFile::Wal, ops, 0));
-        span.record("durable.commit_no", ticket.commit);
+        span.record("buckwal.commit_no", ticket.commit);
         let r = ticket.wait_in(span).map_err(|f| f.error);
         record_outcome(span, &r);
         self.shipped_generation.store(r?.generation, SeqCst);
@@ -168,7 +168,7 @@ impl ShippingFile {
     }
 
     /// The ops written since the last sync, and their commit's span (its
-    /// `durable.local_write` is closed here; `None` exactly when there are no ops).
+    /// `buckwal.local_write` is closed here; `None` exactly when there are no ops).
     fn take_pending(&self) -> (Vec<Op>, Option<Span>) {
         let mut pending = self.pending.lock().unwrap();
         let spans = self.commit.lock().unwrap().take();
@@ -183,10 +183,10 @@ impl ShippingFile {
     /// Hand `ops` to the uploader as one sync uploaded with `b`, with `commit` as its span,
     /// which shows `made_with`: the setting the commit was made with.
     fn submit(&self, commit: &Span, ops: Vec<Op>, b: Batching, made_with: Batching) -> Ticket {
-        commit.record("durable.batching", display(made_with));
-        commit.record("durable.bytes", op_bytes(&ops));
+        commit.record("buckwal.batching", display(made_with));
+        commit.record("buckwal.bytes", op_bytes(&ops));
         let ticket = commit.in_scope(|| self.uploader.submit_log(ops, b));
-        commit.record("durable.commit_no", ticket.commit);
+        commit.record("buckwal.commit_no", ticket.commit);
         ticket
     }
 
@@ -211,7 +211,7 @@ impl ShippingFile {
     /// on its ticket after the engine returns (`Connection::await_acks`).
     ///
     /// Returns the commit's span (`None` with nothing to ship), which goes with its ack. A
-    /// blocking wait records its `durable.outcome` here (`ok`, or `error`, which closes it).
+    /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`, which closes it).
     fn ship_commit(&self) -> Result<Option<Span>> {
         let (ops, span) = self.take_pending();
         if ops.is_empty() {
@@ -382,7 +382,7 @@ impl File for ShippingFile {
         // `Err`, which rolls the commit back, never a failed completion (which would panic,
         // D3). A queued Window commit is fsynced locally now and acked by its call later.
         match self.ship_commit().map_err(stash)? {
-            Some(commit) => info_span!(target: "buckwal", parent: &commit, "durable.local_fsync")
+            Some(commit) => info_span!(target: "buckwal", parent: &commit, "buckwal.local_fsync")
                 .in_scope(|| self.inner.sync(c, sync_type)),
             None => self.inner.sync(c, sync_type),
         }

@@ -29,9 +29,9 @@ use tracing_subscriber::layer::{self as layer_, Filter, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 /// The service every export names.
-const SERVICE: &str = "turso-durable";
+const SERVICE: &str = "buckwal";
 /// The instrumentation scope of every span and log record.
-const SCOPE: &str = "turso_durable";
+const SCOPE: &str = "buckwal";
 /// The span and log attribute that names a test run.
 const RUN_ID: &str = "test_run_id";
 

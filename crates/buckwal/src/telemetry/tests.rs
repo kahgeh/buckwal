@@ -149,34 +149,34 @@ fn capture_faulty(f: impl FnOnce(&FaultStore, &crate::Connection)) -> Spans {
 #[test]
 fn off_commit_has_its_three_children_and_one_upload() {
     let spans = capture_run(Batching::Off, 1);
-    let c = spans.last_named("durable.commit");
+    let c = spans.last_named("buckwal.commit");
     assert_eq!(c.target, "buckwal");
     assert_eq!(c.level, Level::INFO);
-    assert_eq!(c.field("durable.batching"), Some("off"));
-    assert_eq!(c.field("durable.outcome"), Some("ok"));
-    assert!(c.field("durable.commit_no").is_some());
-    assert!(c.field("durable.bytes").unwrap().parse::<u64>().unwrap() > 0);
+    assert_eq!(c.field("buckwal.batching"), Some("off"));
+    assert_eq!(c.field("buckwal.outcome"), Some("ok"));
+    assert!(c.field("buckwal.commit_no").is_some());
+    assert!(c.field("buckwal.bytes").unwrap().parse::<u64>().unwrap() > 0);
     for child in [
-        "durable.local_write",
-        "durable.local_fsync",
-        "durable.ack_wait",
+        "buckwal.local_write",
+        "buckwal.local_fsync",
+        "buckwal.ack_wait",
     ] {
         assert_eq!(spans.children_of(c.id, child).len(), 1, "{child}");
     }
-    let u = spans.with_parent(c.id, "durable.upload");
+    let u = spans.with_parent(c.id, "buckwal.upload");
     assert_eq!(u.target, "buckwal");
-    assert_eq!(u.field("durable.commits"), Some("1"));
+    assert_eq!(u.field("buckwal.commits"), Some("1"));
     assert_eq!(u.field("s3.status"), Some("200"));
-    assert_eq!(u.field("durable.retries"), Some("0"));
-    assert!(u.field("durable.bytes").unwrap().parse::<u64>().unwrap() > 0);
-    assert!(u.field("durable.seq").is_some() && u.field("durable.generation").is_some());
+    assert_eq!(u.field("buckwal.retries"), Some("0"));
+    assert!(u.field("buckwal.bytes").unwrap().parse::<u64>().unwrap() > 0);
+    assert!(u.field("buckwal.seq").is_some() && u.field("buckwal.generation").is_some());
     let child = |name| spans.by_id(spans.children_of(c.id, name)[0]);
-    let (write, fsync) = (child("durable.local_write"), child("durable.local_fsync"));
+    let (write, fsync) = (child("buckwal.local_write"), child("buckwal.local_fsync"));
     assert!(
         write.closed.is_some_and(|t| t <= fsync.created),
         "local_write closes at sync entry"
     );
-    let ack = child("durable.ack_wait");
+    let ack = child("buckwal.ack_wait");
     assert!(ack.closed.is_some() && ack.closed <= c.closed);
     assert!(c.closed.is_some());
     // An info record at open, from the library.
@@ -232,11 +232,11 @@ fn window_upload_span_counts_its_commits_and_links_the_rest() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while cap
             .spans()
-            .named("durable.commit")
+            .named("buckwal.commit")
             .iter()
             .filter(|c| {
-                c.field("durable.batching") == Some("window 50ms 64 1MiB")
-                    && c.field("durable.commit_no").is_some()
+                c.field("buckwal.batching") == Some("window 50ms 64 1MiB")
+                    && c.field("buckwal.commit_no").is_some()
             })
             .count()
             < 4
@@ -254,26 +254,26 @@ fn window_upload_span_counts_its_commits_and_links_the_rest() {
         cap.spans()
     });
     let commits: Vec<_> = spans
-        .named("durable.commit")
+        .named("buckwal.commit")
         .into_iter()
-        .filter(|c| c.field("durable.batching") == Some("window 50ms 64 1MiB"))
+        .filter(|c| c.field("buckwal.batching") == Some("window 50ms 64 1MiB"))
         .collect();
     assert_eq!(commits.len(), 4, "{commits:#?}");
     let ids: Vec<usize> = commits.iter().map(|c| c.id).collect();
     for c in &commits {
-        assert_eq!(c.field("durable.outcome"), Some("ok"));
-        assert_eq!(spans.children_of(c.id, "durable.ack_wait").len(), 1);
+        assert_eq!(c.field("buckwal.outcome"), Some("ok"));
+        assert_eq!(spans.children_of(c.id, "buckwal.ack_wait").len(), 1);
     }
     let uploads: Vec<_> = spans
-        .named("durable.upload")
+        .named("buckwal.upload")
         .into_iter()
-        .filter(|u| u.field("durable.commits") == Some("4"))
+        .filter(|u| u.field("buckwal.commits") == Some("4"))
         .collect();
-    assert_eq!(uploads.len(), 1, "{:#?}", spans.named("durable.upload"));
+    assert_eq!(uploads.len(), 1, "{:#?}", spans.named("buckwal.upload"));
     let u = uploads[0];
     let parent = u.parent.expect("the upload has a parent");
     assert!(ids.contains(&parent), "parent {parent} not in {ids:?}");
-    assert_eq!(u.parent_name, Some("durable.commit"));
+    assert_eq!(u.parent_name, Some("buckwal.commit"));
     let mut linked = u.follows_from.clone();
     linked.sort_unstable();
     let mut rest: Vec<usize> = ids.iter().copied().filter(|&i| i != parent).collect();
@@ -308,13 +308,13 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
     });
     let (spans, logged) = spans;
     let logged = |g: usize| logged[g - 1].clone();
-    let cp = spans.last_named("durable.checkpoint_upload");
+    let cp = spans.last_named("buckwal.checkpoint_upload");
     assert_eq!(cp.target, "buckwal");
-    assert_eq!(cp.field("durable.generation"), Some("1"));
+    assert_eq!(cp.field("buckwal.generation"), Some("1"));
     // The seal-start record is generation 1's last.
-    assert_eq!(cp.field("durable.seq"), Some(logged(1).as_str()));
-    assert!(cp.field("durable.pages").unwrap().parse::<u64>().unwrap() > 0);
-    assert_eq!(cp.field("durable.retries"), Some("0"));
+    assert_eq!(cp.field("buckwal.seq"), Some(logged(1).as_str()));
+    assert!(cp.field("buckwal.pages").unwrap().parse::<u64>().unwrap() > 0);
+    assert_eq!(cp.field("buckwal.retries"), Some("0"));
     assert_eq!(cp.field("s3.status"), Some("200"));
     assert!(cp.closed.is_some());
     assert!(
@@ -324,16 +324,16 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
             && e.field("ms").is_some()),
         "no seal record"
     );
-    let r = spans.last_named("durable.restore");
+    let r = spans.last_named("buckwal.restore");
     assert_eq!(r.target, "buckwal");
-    assert_eq!(r.field("durable.generation"), Some("2"));
-    assert!(r.field("durable.gets").unwrap().parse::<u64>().unwrap() > 0);
-    assert!(r.field("durable.log_objects").is_some());
+    assert_eq!(r.field("buckwal.generation"), Some("2"));
+    assert!(r.field("buckwal.gets").unwrap().parse::<u64>().unwrap() > 0);
+    assert!(r.field("buckwal.log_objects").is_some());
     // The highest seq replayed: generation 2's last record.
     assert_ne!(logged(2), "0");
-    assert_eq!(r.field("durable.seq"), Some(logged(2).as_str()));
-    assert_eq!(r.field("durable.retries"), Some("0"));
-    assert!(r.field("durable.bytes").is_some());
+    assert_eq!(r.field("buckwal.seq"), Some(logged(2).as_str()));
+    assert_eq!(r.field("buckwal.retries"), Some("0"));
+    assert!(r.field("buckwal.bytes").is_some());
     assert!(
         spans.events.iter().any(|e| e.level == Level::INFO
             && e.target == "buckwal"
@@ -399,7 +399,7 @@ fn restore_span_counts_its_retries_and_an_empty_log_is_seq_0() {
         // Nothing committed yet: generation 1's log is empty.
         assert!(store.list(&keys.log_prefix(1)).unwrap().is_empty());
         crate::restore_with_store(&config(a.path()), store.clone(), a.path()).unwrap();
-        let empty = cap.spans().last_named("durable.restore").clone();
+        let empty = cap.spans().last_named("buckwal.restore").clone();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
             .unwrap();
@@ -409,12 +409,12 @@ fn restore_span_counts_its_retries_and_an_empty_log_is_seq_0() {
         (empty, cap.spans())
     });
     let (empty, spans) = spans;
-    assert_eq!(empty.field("durable.log_objects"), Some("0"));
-    assert_eq!(empty.field("durable.seq"), Some("0"));
-    assert_eq!(empty.field("durable.retries"), Some("0"));
-    let r = spans.last_named("durable.restore");
-    assert_eq!(r.field("durable.retries"), Some("2"));
-    assert_ne!(r.field("durable.seq"), Some("0"));
+    assert_eq!(empty.field("buckwal.log_objects"), Some("0"));
+    assert_eq!(empty.field("buckwal.seq"), Some("0"));
+    assert_eq!(empty.field("buckwal.retries"), Some("0"));
+    let r = spans.last_named("buckwal.restore");
+    assert_eq!(r.field("buckwal.retries"), Some("2"));
+    assert_ne!(r.field("buckwal.seq"), Some("0"));
 }
 
 #[test]
@@ -423,9 +423,9 @@ fn retries_are_counted_on_the_upload_span() {
         fault.fail_next_puts(2);
         insert(conn, 1).unwrap();
     });
-    let c = spans.last_named("durable.commit");
-    let u = spans.with_parent(c.id, "durable.upload");
-    assert_eq!(u.field("durable.retries"), Some("2"));
+    let c = spans.last_named("buckwal.commit");
+    let u = spans.with_parent(c.id, "buckwal.upload");
+    assert_eq!(u.field("buckwal.retries"), Some("2"));
     assert_eq!(u.field("s3.status"), Some("200"));
 }
 
@@ -444,9 +444,9 @@ fn failed_flush_logs_a_warning_and_marks_the_commit_error() {
         spans.events
     );
     let decided: Vec<_> = spans
-        .named("durable.commit")
+        .named("buckwal.commit")
         .into_iter()
-        .filter_map(|c| c.field("durable.outcome"))
+        .filter_map(|c| c.field("buckwal.outcome"))
         .collect();
     assert_eq!(decided.last(), Some(&"error"), "{decided:?}");
 }
@@ -605,12 +605,12 @@ fn an_off_commit_in_a_failed_call_closes_with_outcome_ok() {
         cap.spans()
     });
     let c = spans
-        .named("durable.commit")
+        .named("buckwal.commit")
         .into_iter()
         .rev()
         .find(|c| c.closed.is_some())
         .expect("a closed commit");
-    assert_eq!(c.field("durable.outcome"), Some("ok"), "{c:?}");
+    assert_eq!(c.field("buckwal.outcome"), Some("ok"), "{c:?}");
 }
 
 /// A MemStore that logs every PUT (of any flavour, as "put") and `get` (as a store with its
@@ -693,7 +693,7 @@ fn seal_and_restore_threads_run_under_the_callers_subscriber() {
 }
 
 /// The maintenance thread reports under the opening thread's subscriber: a
-/// `durable.maintenance` span with its fields, the seal's `durable.checkpoint_upload` under it.
+/// `buckwal.maintenance` span with its fields, the seal's `buckwal.checkpoint_upload` under it.
 #[test]
 fn maintenance_span_carries_its_fields_and_parents_the_seal() {
     let cap = Capture::new();
@@ -712,7 +712,7 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
         loop {
             let spans = cap.spans();
             let done = spans
-                .named("durable.maintenance")
+                .named("buckwal.maintenance")
                 .iter()
                 .any(|s| s.closed.is_some());
             if done {
@@ -723,28 +723,28 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
         }
     });
     let m = *spans
-        .named("durable.maintenance")
+        .named("buckwal.maintenance")
         .iter()
         .find(|s| s.closed.is_some())
         .unwrap();
     assert_eq!((m.target.as_str(), m.level), ("buckwal", Level::INFO));
-    assert_eq!(m.field("durable.generation"), Some("1"));
+    assert_eq!(m.field("buckwal.generation"), Some("1"));
     assert!(
-        m.field("durable.log_objects")
+        m.field("buckwal.log_objects")
             .unwrap()
             .parse::<u64>()
             .unwrap()
             >= 5
     );
     assert!(
-        m.field("durable.wal_bytes")
+        m.field("buckwal.wal_bytes")
             .unwrap()
             .parse::<u64>()
             .unwrap()
             > 0
     );
-    assert!(m.field("durable.gate_wait_ms").is_some());
-    assert_eq!(m.field("durable.outcome"), Some("sealed"));
+    assert!(m.field("buckwal.gate_wait_ms").is_some());
+    assert_eq!(m.field("buckwal.outcome"), Some("sealed"));
     // Through the engine's own spans (`pager_checkpoint`), which are never exported.
     let under_m = |s: &SpanRec| {
         let mut parent = s.parent;
@@ -756,11 +756,11 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
         }
         false
     };
-    let seals = spans.named("durable.checkpoint_upload");
+    let seals = spans.named("buckwal.checkpoint_upload");
     assert!(seals.iter().any(|s| under_m(s)), "{seals:?}");
 }
 
-/// A run that panics still closes its `durable.maintenance` span, with outcome `error`.
+/// A run that panics still closes its `buckwal.maintenance` span, with outcome `error`.
 #[test]
 fn a_panicking_maintenance_run_closes_its_span_as_error() {
     let cap = Capture::new();
@@ -780,7 +780,7 @@ fn a_panicking_maintenance_run_closes_its_span_as_error() {
         loop {
             let spans = cap.spans();
             if spans
-                .named("durable.maintenance")
+                .named("buckwal.maintenance")
                 .iter()
                 .any(|s| s.closed.is_some())
             {
@@ -790,9 +790,9 @@ fn a_panicking_maintenance_run_closes_its_span_as_error() {
             std::thread::sleep(Duration::from_millis(5));
         }
     });
-    let m = spans.named("durable.maintenance");
+    let m = spans.named("buckwal.maintenance");
     let first = m.iter().find(|s| s.closed.is_some()).unwrap();
-    assert_eq!(first.field("durable.outcome"), Some("error"), "{m:?}");
+    assert_eq!(first.field("buckwal.outcome"), Some("error"), "{m:?}");
 }
 
 // --- The export pipeline -------------------------------------------------------------
@@ -923,7 +923,7 @@ fn spans_carry_service_name_and_run_id_and_engine_spans_are_dropped() {
     p.force_flush();
     let got = spans.get_finished_spans().unwrap();
     let names: Vec<&str> = got.iter().map(|s| s.name.as_ref()).collect();
-    for want in ["durable.commit", "durable.upload"] {
+    for want in ["buckwal.commit", "buckwal.upload"] {
         assert!(names.contains(&want), "{want} not in {names:?}");
     }
     for s in &got {
@@ -933,7 +933,7 @@ fn spans_carry_service_name_and_run_id_and_engine_spans_are_dropped() {
             .map(|kv| (kv.key.as_str(), kv.value.to_string()))
             .collect();
         assert_eq!(attrs.get("test_run_id").map(String::as_str), Some("run-42"));
-        assert_eq!(s.instrumentation_scope.name(), "turso_durable");
+        assert_eq!(s.instrumentation_scope.name(), "buckwal");
         let target = attrs.get("target").expect("a target attribute");
         assert!(target.starts_with("buckwal"), "{target}");
         assert!(!target.starts_with("turso_core"), "{target}");
@@ -943,7 +943,7 @@ fn spans_carry_service_name_and_run_id_and_engine_spans_are_dropped() {
         resource
             .get(&Key::new("service.name"))
             .map(|v| v.to_string()),
-        Some("turso-durable".to_string())
+        Some("buckwal".to_string())
     );
     // The log records name the same service: the open record, at least.
     let records = logs.get_emitted_logs().unwrap();
@@ -953,7 +953,7 @@ fn spans_carry_service_name_and_run_id_and_engine_spans_are_dropped() {
             l.resource
                 .get(&Key::new("service.name"))
                 .map(|v| v.to_string()),
-            Some("turso-durable".to_string())
+            Some("buckwal".to_string())
         );
         assert!(l.record.target().is_some_and(|t| t == "buckwal"));
     }
@@ -1087,34 +1087,34 @@ fn takeover_exports_takeover_and_fence_spans() {
         let rep = crate::takeover_with_store(config(b.path()), store.clone()).unwrap();
         (cap.spans(), rep)
     });
-    let takeovers = spans.named("durable.takeover");
+    let takeovers = spans.named("buckwal.takeover");
     assert_eq!(takeovers.len(), 1, "{takeovers:?}");
     let t = takeovers[0];
     assert_eq!(t.target, "buckwal");
     assert_eq!(t.level, Level::INFO);
     let (epoch, seq) = (rep.epoch.to_string(), rep.fence_seq.to_string());
     assert_eq!(
-        t.field("durable.generation"),
+        t.field("buckwal.generation"),
         Some(rep.generation.to_string().as_str())
     );
-    assert_eq!(t.field("durable.epoch"), Some(epoch.as_str()));
-    assert_eq!(t.field("durable.seq"), Some(seq.as_str()));
-    assert_eq!(t.field("durable.retries"), Some("0"));
-    assert_eq!(t.field("durable.outcome"), Some("ok"));
+    assert_eq!(t.field("buckwal.epoch"), Some(epoch.as_str()));
+    assert_eq!(t.field("buckwal.seq"), Some(seq.as_str()));
+    assert_eq!(t.field("buckwal.retries"), Some("0"));
+    assert_eq!(t.field("buckwal.outcome"), Some("ok"));
     assert_eq!(t.field("s3.status"), Some("200"));
     assert!(t.closed.is_some());
-    assert_eq!(spans.named("durable.fence").len(), 1);
-    let f = spans.with_parent(t.id, "durable.fence");
+    assert_eq!(spans.named("buckwal.fence").len(), 1);
+    let f = spans.with_parent(t.id, "buckwal.fence");
     assert_eq!(f.target, "buckwal");
-    assert_eq!(f.field("durable.generation"), t.field("durable.generation"));
-    assert_eq!(f.field("durable.seq"), Some(seq.as_str()));
-    assert_eq!(f.field("durable.epoch"), Some(epoch.as_str()));
-    assert_eq!(f.field("durable.retries"), Some("0"));
+    assert_eq!(f.field("buckwal.generation"), t.field("buckwal.generation"));
+    assert_eq!(f.field("buckwal.seq"), Some(seq.as_str()));
+    assert_eq!(f.field("buckwal.epoch"), Some(epoch.as_str()));
+    assert_eq!(f.field("buckwal.retries"), Some("0"));
     assert_eq!(f.field("s3.status"), Some("200"));
 }
 
 /// A takeover whose head write landed and whose fence then failed still exports the new
-/// epoch on its `durable.takeover` span (the outcome is `error`, and no fence seq).
+/// epoch on its `buckwal.takeover` span (the outcome is `error`, and no fence seq).
 #[test]
 fn takeover_failing_at_the_fence_exports_its_epoch() {
     let cap = Capture::new();
@@ -1138,15 +1138,15 @@ fn takeover_failing_at_the_fence_exports_its_epoch() {
         .unwrap()
         .epoch
         .to_string();
-    let takeovers = spans.named("durable.takeover");
+    let takeovers = spans.named("buckwal.takeover");
     assert_eq!(takeovers.len(), 1, "{takeovers:?}");
     let t = takeovers[0];
-    assert_eq!(t.field("durable.outcome"), Some("error"));
-    assert_eq!(t.field("durable.epoch"), Some(epoch.as_str()));
+    assert_eq!(t.field("buckwal.outcome"), Some("error"));
+    assert_eq!(t.field("buckwal.epoch"), Some(epoch.as_str()));
 }
 
 /// M3: a takeover resumed through `open` (its fence failed, so the generation's last record is
-/// still the old writer's) is a takeover too: the open's fence runs in a `durable.takeover`
+/// still the old writer's) is a takeover too: the open's fence runs in a `buckwal.takeover`
 /// span with outcome `ok`, the fence's seq and the head's epoch, and emits `Event::TookOver`.
 #[test]
 fn a_takeover_resumed_through_open_exports_a_takeover_span() {
@@ -1176,24 +1176,24 @@ fn a_takeover_resumed_through_open_exports_a_takeover_span() {
         (cap.spans(), resumed)
     });
     let head = crate::format::Head::decode(&mem.get("head").unwrap().unwrap().body).unwrap();
-    let takeovers = spans.named("durable.takeover");
+    let takeovers = spans.named("buckwal.takeover");
     assert_eq!(
         takeovers.len(),
         2,
         "the takeover, then its resumption: {takeovers:?}"
     );
     let t = takeovers[1];
-    assert_eq!(t.field("durable.outcome"), Some("ok"));
+    assert_eq!(t.field("buckwal.outcome"), Some("ok"));
     assert_eq!(
-        t.field("durable.generation"),
+        t.field("buckwal.generation"),
         Some(head.generation.to_string().as_str())
     );
     assert_eq!(
-        t.field("durable.epoch"),
+        t.field("buckwal.epoch"),
         Some(head.epoch.to_string().as_str())
     );
-    let f = spans.with_parent(t.id, "durable.fence");
-    assert_eq!(f.field("durable.seq"), t.field("durable.seq"));
+    let f = spans.with_parent(t.id, "buckwal.fence");
+    assert_eq!(f.field("buckwal.seq"), t.field("buckwal.seq"));
     let events = took.lock().unwrap().clone();
     assert!(
         matches!(
@@ -1201,14 +1201,14 @@ fn a_takeover_resumed_through_open_exports_a_takeover_span() {
             [crate::Event::TookOver { generation, epoch, fence_seq }]
                 if *generation == head.generation
                     && *epoch == head.epoch
-                    && Some(fence_seq.to_string().as_str()) == t.field("durable.seq")
+                    && Some(fence_seq.to_string().as_str()) == t.field("buckwal.seq")
         ),
         "{events:?}"
     );
     db.close().unwrap();
 }
 
-/// `gc` runs in a `durable.gc` span: the head's generation, the manifest trimmed against and
+/// `gc` runs in a `buckwal.gc` span: the head's generation, the manifest trimmed against and
 /// its age, what was deleted, and the outcome.
 #[test]
 fn gc_exports_a_gc_span() {
@@ -1236,32 +1236,32 @@ fn gc_exports_a_gc_span() {
     });
     assert_eq!(young.outcome, crate::GcOutcome::TooYoung);
     assert_eq!(old.outcome, crate::GcOutcome::Trimmed);
-    let gcs = spans.named("durable.gc");
+    let gcs = spans.named("buckwal.gc");
     assert_eq!(gcs.len(), 2, "{gcs:?}");
     for g in &gcs {
         assert_eq!(g.target, "buckwal");
         assert_eq!(g.level, Level::INFO);
         assert_eq!(
-            g.field("durable.generation"),
+            g.field("buckwal.generation"),
             Some(old.generation.to_string().as_str())
         );
         assert!(g.closed.is_some());
     }
-    assert_eq!(gcs[0].field("durable.outcome"), Some("too_young"));
-    assert_eq!(gcs[0].field("durable.manifest"), None);
-    assert_eq!(gcs[0].field("durable.deleted"), Some("0"));
+    assert_eq!(gcs[0].field("buckwal.outcome"), Some("too_young"));
+    assert_eq!(gcs[0].field("buckwal.manifest"), None);
+    assert_eq!(gcs[0].field("buckwal.deleted"), Some("0"));
     let t = gcs[1];
-    assert_eq!(t.field("durable.outcome"), Some("trimmed"));
+    assert_eq!(t.field("buckwal.outcome"), Some("trimmed"));
     assert_eq!(
-        t.field("durable.manifest"),
+        t.field("buckwal.manifest"),
         Some(old.trimmed_against.unwrap().to_string().as_str())
     );
     assert_eq!(
-        t.field("durable.deleted"),
+        t.field("buckwal.deleted"),
         Some(old.deleted.to_string().as_str())
     );
     assert!(old.deleted > 0);
-    let age_ms: u128 = t.field("durable.age_ms").unwrap().parse().unwrap();
+    let age_ms: u128 = t.field("buckwal.age_ms").unwrap().parse().unwrap();
     assert!(age_ms >= min_age.as_millis(), "{age_ms}");
 }
 
@@ -1282,9 +1282,9 @@ fn failed_gc_exports_error_outcome() {
         (cap.spans(), r)
     });
     assert!(r.is_err(), "{r:?}");
-    let gcs = spans.named("durable.gc");
+    let gcs = spans.named("buckwal.gc");
     assert_eq!(gcs.len(), 1, "{gcs:?}");
-    assert_eq!(gcs[0].field("durable.outcome"), Some("error"));
+    assert_eq!(gcs[0].field("buckwal.outcome"), Some("error"));
 }
 
 #[test]
@@ -1295,5 +1295,61 @@ fn telemetry_from_lookup_refuses_old_otel() {
     assert!(
         e.contains("DURABLE_OTEL is no longer read, set BUCKWAL_OTEL instead"),
         "{e}"
+    );
+}
+
+/// Open a database under a test provider and return the finished span names and the
+/// resource the exporter was given.
+fn spans_and_resource_of_a_takeover() -> (Vec<String>, Resource) {
+    keep_interest_per_call();
+    let spans = InMemorySpanExporter::default();
+    let seen = Arc::new(Mutex::new(None));
+    let spy = ResourceSpy {
+        inner: spans.clone(),
+        seen: seen.clone(),
+    };
+    let (sub, p) = build_for_test(spy, InMemoryLogExporter::default(), None);
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mem = Arc::new(MemStore::new());
+    tracing::subscriber::with_default(sub, || {
+        let db = crate::open_with_store(config(a.path()), mem.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        insert(&conn, 1).unwrap();
+        drop(conn);
+        let taken = crate::takeover_with_store(config(b.path()), mem.clone()).unwrap();
+        drop(taken);
+        drop(db);
+    });
+    p.force_flush();
+    let names = spans
+        .get_finished_spans()
+        .unwrap()
+        .iter()
+        .map(|s| s.name.to_string())
+        .collect();
+    let resource = seen.lock().unwrap().clone().expect("a resource");
+    (names, resource)
+}
+
+#[test]
+fn service_name_is_buckwal() {
+    let (_, resource) = spans_and_resource_of_a_takeover();
+    assert_eq!(
+        resource
+            .get(&Key::new("service.name"))
+            .map(|v| v.to_string()),
+        Some("buckwal".to_string())
+    );
+}
+
+#[test]
+fn span_names_use_buckwal_prefix() {
+    let (names, _) = spans_and_resource_of_a_takeover();
+    assert!(names.iter().any(|n| n == "buckwal.takeover"), "{names:?}");
+    assert!(
+        names.iter().all(|n| !n.starts_with("durable.")),
+        "{names:?}"
     );
 }

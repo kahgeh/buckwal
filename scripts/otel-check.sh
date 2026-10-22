@@ -13,7 +13,7 @@ RUN_ID="${1:-}"
 CH_URL="${DURABLE_CH_URL:-http://localhost:8123}"
 CH_USER="${DURABLE_CH_USER:-hyperdx_ro}"
 USERS_SQL="$HOME/Dev/p/sre/stack/clickhouse/00_database_users.sql"
-SPANS="durable.commit durable.local_write durable.local_fsync durable.ack_wait durable.upload durable.checkpoint_upload durable.restore durable.takeover durable.fence durable.gc durable.server.request"
+SPANS="buckwal.commit buckwal.local_write buckwal.local_fsync buckwal.ack_wait buckwal.upload buckwal.checkpoint_upload buckwal.restore buckwal.takeover buckwal.fence buckwal.gc buckwal.server.request"
 DEADLINE=60
 
 fail() { echo "otel check FAILED: $*"; exit 1; }
@@ -64,8 +64,8 @@ query() {
   [[ "$code" == 200 ]] || fail "HTTP $code: $(head -c 300 <<<"$OUT" | tr '\n' ' ')"
 }
 
-TRACES="FROM otel.otel_traces WHERE ServiceName='turso-durable' AND SpanAttributes['test_run_id']='$RUN_ID'"
-LOGS="FROM otel.otel_logs WHERE ServiceName='turso-durable' AND LogAttributes['test_run_id']='$RUN_ID'"
+TRACES="FROM otel.otel_traces WHERE ServiceName='buckwal' AND SpanAttributes['test_run_id']='$RUN_ID'"
+LOGS="FROM otel.otel_logs WHERE ServiceName='buckwal' AND LogAttributes['test_run_id']='$RUN_ID'"
 
 start=$SECONDS
 while :; do

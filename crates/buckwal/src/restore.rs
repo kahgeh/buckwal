@@ -410,9 +410,9 @@ pub(crate) fn restore_into(
 }
 
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
-/// writes nothing to the bucket. Runs in a `durable.restore` span, and logs the finished
-/// restore. The span's `durable.seq` is the highest log seq replayed (0 for an empty log), and
-/// `durable.retries` the extra attempts of the restore's requests. Also returns page 1 as the
+/// writes nothing to the bucket. Runs in a `buckwal.restore` span, and logs the finished
+/// restore. The span's `buckwal.seq` is the highest log seq replayed (0 for an empty log), and
+/// `buckwal.retries` the extra attempts of the restore's requests. Also returns page 1 as the
 /// restore saw it: the sealed page 1 it fetched for the MVCC check, or the WAL's page-1 frame
 /// it seeded `app.db` with; None when it saw neither.
 fn restore_into_seen(
@@ -423,26 +423,26 @@ fn restore_into_seen(
 ) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let span = tracing::info_span!(
         target: "buckwal",
-        "durable.restore",
-        durable.generation = Empty,
-        durable.log_objects = Empty,
-        durable.gets = Empty,
-        durable.bytes = Empty,
-        durable.seq = Empty,
-        durable.retries = Empty,
+        "buckwal.restore",
+        buckwal.generation = Empty,
+        buckwal.log_objects = Empty,
+        buckwal.gets = Empty,
+        buckwal.bytes = Empty,
+        buckwal.seq = Empty,
+        buckwal.retries = Empty,
         s3.status = Empty,
     );
     let _in = span.enter();
     let retries = AtomicU64::new(0);
     let r = restore_files(store, keys, dir, cfg, &retries);
-    span.record("durable.retries", retries.load(Relaxed));
+    span.record("buckwal.retries", retries.load(Relaxed));
     let (r, page1) = r?;
-    span.record("durable.generation", r.generation);
-    span.record("durable.log_objects", r.log_objects);
+    span.record("buckwal.generation", r.generation);
+    span.record("buckwal.log_objects", r.log_objects);
     // The seqs replayed run 1..=log_objects.
-    span.record("durable.seq", r.log_objects);
-    span.record("durable.gets", r.gets);
-    span.record("durable.bytes", r.bytes);
+    span.record("buckwal.seq", r.log_objects);
+    span.record("buckwal.gets", r.gets);
+    span.record("buckwal.bytes", r.bytes);
     tracing::info!(
         target: "buckwal",
         generation = r.generation,

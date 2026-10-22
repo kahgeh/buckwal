@@ -19,7 +19,7 @@
 //! for `retry`; repeated gate timeouts and busy refusals double it up to `retry_max`
 //! (growth does not fix their cause), and a failed run is retried sooner only once the
 //! generation has grown by another threshold. Its outcome is an event, a
-//! `durable.maintenance` span and, on failure, a warning: never an error to any caller.
+//! `buckwal.maintenance` span and, on failure, a warning: never an error to any caller.
 use crate::batching::{ctx, Batching};
 use crate::config::{defaults, Config, Event};
 use crate::conn::BUSY_TIMEOUT;
@@ -390,12 +390,12 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
             let generation = shared.uploader.generation();
             let span = tracing::info_span!(
                 target: "buckwal",
-                "durable.maintenance",
-                durable.generation = generation,
-                durable.log_objects = log_objects,
-                durable.wal_bytes = wal_bytes,
-                durable.gate_wait_ms = Empty,
-                durable.outcome = Empty,
+                "buckwal.maintenance",
+                buckwal.generation = generation,
+                buckwal.log_objects = log_objects,
+                buckwal.wal_bytes = wal_bytes,
+                buckwal.gate_wait_ms = Empty,
+                buckwal.outcome = Empty,
             );
             let _entered = span.enter();
             catch_unwind(AssertUnwindSafe(|| {
@@ -409,7 +409,7 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
             }))
             .unwrap_or_else(|_| {
                 // The run may have emitted `MaintenanceStarted`: it gets an end event too.
-                span.record("durable.outcome", Outcome::Error.as_str());
+                span.record("buckwal.outcome", Outcome::Error.as_str());
                 tracing::warn!(
                     target: "buckwal",
                     generation,
@@ -470,7 +470,7 @@ struct Measured<'a> {
 /// One run: unless the bucket is failing or a takeover quiet lasts, close and drain the gate,
 /// checkpoint, reopen.
 ///
-/// It runs inside its `durable.maintenance` `span`, which the caller made (for
+/// It runs inside its `buckwal.maintenance` `span`, which the caller made (for
 /// `generation`, `log_objects` and `wal_bytes`) and entered, so a panic's outcome is
 /// recorded on it too.
 fn run_once(
@@ -493,7 +493,7 @@ fn run_once(
         None => None,
     };
     if let Some((outcome, reason)) = skip {
-        span.record("durable.outcome", outcome.as_str());
+        span.record("buckwal.outcome", outcome.as_str());
         tracing::info!(
             target: "buckwal",
             generation,
@@ -519,7 +519,7 @@ fn run_once(
     let start = Instant::now();
     let drained = shared.gate.close_and_drain(cfg.gate_wait);
     let gate_wait = start.elapsed();
-    span.record("durable.gate_wait_ms", gate_wait.as_millis() as u64);
+    span.record("buckwal.gate_wait_ms", gate_wait.as_millis() as u64);
     let r = if drained {
         let _reopen = Reopen(&shared.gate);
         #[cfg(test)]
@@ -540,7 +540,7 @@ fn run_once(
         ),
         Err((o, reason)) => (o, Some(reason)),
     };
-    span.record("durable.outcome", outcome.as_str());
+    span.record("buckwal.outcome", outcome.as_str());
     match reason {
         None => shared.emit(Event::MaintenanceFinished {
             generation,

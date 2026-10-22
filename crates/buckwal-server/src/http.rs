@@ -1,5 +1,5 @@
 //! The axum router: health, the version probes, SQL over HTTP v3's `/v3/pipeline` and
-//! `/v3/cursor` (and `/v2/pipeline`), the bearer-token check and the `durable.server.request`
+//! `/v3/cursor` (and `/v2/pipeline`), the bearer-token check and the `buckwal.server.request`
 //! span.
 //!
 //! A pipeline runs in `spawn_blocking` inside the request span, so the library's commit
@@ -138,7 +138,7 @@ pub(crate) fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// How a request ended: its response and the span's `durable.outcome`.
+/// How a request ended: its response and the span's `buckwal.outcome`.
 struct Done {
     resp: Box<Response>,
     outcome: &'static str,
@@ -312,19 +312,19 @@ fn bad_json(e: serde_json::Error) -> Done {
 /// Record the status and outcome on the span; return the response.
 fn finish(span: &Span, done: Done) -> Response {
     span.record("http.status", done.resp.status().as_u16());
-    span.record("durable.outcome", done.outcome);
+    span.record("buckwal.outcome", done.outcome);
     *done.resp
 }
 
 fn request_span(route: &'static str) -> Span {
     tracing::info_span!(
         target: "buckwal::server",
-        "durable.server.request",
+        "buckwal.server.request",
         http.route = route,
         http.status = Empty,
-        durable.stream = Empty,
-        durable.statements = Empty,
-        durable.outcome = Empty,
+        buckwal.stream = Empty,
+        buckwal.statements = Empty,
+        buckwal.outcome = Empty,
     )
 }
 
@@ -434,7 +434,7 @@ where
         Err(e) => return finish(span, bad_json(e)),
     };
     drop(body);
-    span.record("durable.statements", parsed.statements());
+    span.record("buckwal.statements", parsed.statements());
     let Ok(permit) = app.permits.clone().acquire_owned().await else {
         return finish(span, shutting_down());
     };
@@ -453,7 +453,7 @@ where
 fn checkout(app: &App, streams: &Streams, baton: Option<&str>) -> Result<Leased, Done> {
     match streams.checkout(baton) {
         Checkout::Stream(leased) => {
-            Span::current().record("durable.stream", leased.id);
+            Span::current().record("buckwal.stream", leased.id);
             Ok(leased)
         }
         Checkout::Expired => Err(error(
@@ -524,7 +524,7 @@ fn outcome_of<'a>(errors: impl Iterator<Item = &'a ProtoError>) -> &'static str 
 fn protocol_error(streams: &Streams, baton: Option<&str>, e: &ProtoError) -> Done {
     if let Some(b) = baton {
         if let Checkout::Stream(mut leased) = streams.checkout(Some(b)) {
-            Span::current().record("durable.stream", leased.id);
+            Span::current().record("buckwal.stream", leased.id);
             leased.state.closed = true;
             streams.give_back(leased);
         }

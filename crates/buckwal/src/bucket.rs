@@ -810,8 +810,8 @@ impl Bucket {
     /// numbers, so the uploader emits it. (Claim and reconcile records are appended before
     /// the uploader sets the event hook.) A record settled on the way is emitted here.
     ///
-    /// It records `durable.generation` and `durable.seq` (the record's position, or the one
-    /// it was meant for) and `durable.retries` (`Appended::retries`) on the current span.
+    /// It records `buckwal.generation` and `buckwal.seq` (the record's position, or the one
+    /// it was meant for) and `buckwal.retries` (`Appended::retries`) on the current span.
     pub(crate) fn append_log(
         &mut self,
         file: LogFile,
@@ -827,10 +827,10 @@ impl Bucket {
                 seq: self.seq,
             },
         };
-        span.record("durable.generation", pos.generation);
-        span.record("durable.seq", pos.seq);
+        span.record("buckwal.generation", pos.generation);
+        span.record("buckwal.seq", pos.seq);
         span.record(
-            "durable.retries",
+            "buckwal.retries",
             self.counters.retries.load(Relaxed).saturating_sub(retries),
         );
         r
@@ -893,18 +893,18 @@ impl Bucket {
     /// Our own identical bytes count as landed. An ambiguous PUT leaves the fence in doubt at
     /// its seq, like any record.
     ///
-    /// It runs in a `durable.fence` span (`durable.generation`, `durable.seq`,
-    /// `durable.epoch`, `durable.retries`, `s3.status`).
+    /// It runs in a `buckwal.fence` span (`buckwal.generation`, `buckwal.seq`,
+    /// `buckwal.epoch`, `buckwal.retries`, `s3.status`).
     pub(crate) fn append_fence(&mut self) -> Result<FenceOutcome> {
         let start = Instant::now();
         let retries = self.counters.retries.load(Relaxed);
         let span = tracing::info_span!(
             target: "buckwal",
-            "durable.fence",
-            durable.generation = self.head.generation,
-            durable.seq = Empty,
-            durable.epoch = self.head.epoch,
-            durable.retries = Empty,
+            "buckwal.fence",
+            buckwal.generation = self.head.generation,
+            buckwal.seq = Empty,
+            buckwal.epoch = self.head.epoch,
+            buckwal.retries = Empty,
             s3.status = Empty,
         );
         let r = span.in_scope(|| {
@@ -912,9 +912,9 @@ impl Bucket {
                 .and_then(|()| self.append_fence_at(start))
                 .map_err(upload_error)
         });
-        span.record("durable.seq", r.as_ref().map_or(self.seq, |o| o.pos.seq));
+        span.record("buckwal.seq", r.as_ref().map_or(self.seq, |o| o.pos.seq));
         span.record(
-            "durable.retries",
+            "buckwal.retries",
             self.counters.retries.load(Relaxed).saturating_sub(retries),
         );
         r
@@ -1375,8 +1375,8 @@ impl Bucket {
     /// out (`wait_quiet`); its retry deadline starts after the wait. That includes the
     /// close-time TRUNCATE seal: closing during the quiet waits too.
     ///
-    /// It records `durable.generation` (G), `durable.pages` and `durable.retries` on the
-    /// current span, and `durable.seq`: the seq of the seal-start record (written now, or by
+    /// It records `buckwal.generation` (G), `buckwal.pages` and `buckwal.retries` on the
+    /// current span, and `buckwal.seq`: the seq of the seal-start record (written now, or by
     /// the earlier attempt whose head this seal adopts) once the seal reaches it. It logs the
     /// finished seal.
     pub(crate) fn seal_generation(
@@ -1392,14 +1392,14 @@ impl Bucket {
         let (generation, n) = (self.head.generation, pages.len() as u64);
         let retries = self.counters.retries.load(Relaxed);
         let span = Span::current();
-        span.record("durable.generation", generation);
-        span.record("durable.pages", n);
+        span.record("buckwal.generation", generation);
+        span.record("buckwal.pages", n);
         let r = self.check_fenced().and_then(|()| {
             self.seal(start, pages, page_size, page_count)
                 .map_err(upload_error)
         });
         span.record(
-            "durable.retries",
+            "buckwal.retries",
             self.counters.retries.load(Relaxed).saturating_sub(retries),
         );
         if r.is_ok() {
@@ -1448,11 +1448,11 @@ impl Bucket {
                 .expect("a published seal is pending");
             // Nothing was appended since that attempt's seal-start record (`before_record`
             // refuses while its head may be published): it is the generation's last.
-            Span::current().record("durable.seq", self.seq - 1);
+            Span::current().record("buckwal.seq", self.seq - 1);
             return Ok(self.finish_seal(start, p.head, etag, p.manifest));
         }
         self.settle(start)?;
-        Span::current().record("durable.seq", self.seq);
+        Span::current().record("buckwal.seq", self.seq);
         self.seal_start(start)?;
         let gen = self.head.generation;
         self.emit(Event::SealStarted {

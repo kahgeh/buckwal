@@ -792,9 +792,9 @@ fn raise_at_open(
         .ok_or_else(|| Error::Fenced("the head moved again during the open; open again".into()))
 }
 
-/// A takeover of a restored copy, in a `durable.takeover` span (`durable.generation`,
-/// `durable.epoch`, `durable.seq` (the fence's), `durable.retries`, `s3.status`,
-/// `durable.outcome`):
+/// A takeover of a restored copy, in a `buckwal.takeover` span (`buckwal.generation`,
+/// `buckwal.epoch`, `buckwal.seq` (the fence's), `buckwal.retries`, `s3.status`,
+/// `buckwal.outcome`):
 ///
 /// 1. The claim id: `state.claim_id`, an interrupted claim's, or a new id persisted as
 ///    `claim_id` before anything is sent, so a crash after the head write resumes under the
@@ -803,7 +803,7 @@ fn raise_at_open(
 ///    claimed state `{writer_id: claim_id, claimed: true, head_etag, epoch, claim_id: ""}`.
 /// 3. Attach, and the fence record (`Bucket::append_fence`).
 ///
-/// `durable.epoch` is recorded as soon as the head write has landed, so a takeover that fails
+/// `buckwal.epoch` is recorded as soon as the head write has landed, so a takeover that fails
 /// after it (a fence `Timeout`) still reports the epoch it took.
 ///
 /// It emits `Event::TookOver` and logs the takeover.
@@ -817,24 +817,24 @@ fn claim(
     let span = takeover_span(state.generation);
     let retries = AtomicU64::new(0);
     let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries, &span));
-    span.record("durable.retries", retries.load(SeqCst));
+    span.record("buckwal.retries", retries.load(SeqCst));
     let ended = r.as_ref().map(|(bucket, fence)| (bucket, fence));
     took_over(&span, cfg, &state.writer_id, ended);
     r
 }
 
-/// A `durable.takeover` span for `generation`, its other fields filled in as the takeover
+/// A `buckwal.takeover` span for `generation`, its other fields filled in as the takeover
 /// goes.
 fn takeover_span(generation: u64) -> tracing::Span {
     tracing::info_span!(
         target: "buckwal",
-        "durable.takeover",
-        durable.generation = generation,
-        durable.epoch = Empty,
-        durable.seq = Empty,
-        durable.retries = Empty,
+        "buckwal.takeover",
+        buckwal.generation = generation,
+        buckwal.epoch = Empty,
+        buckwal.seq = Empty,
+        buckwal.retries = Empty,
         s3.status = Empty,
-        durable.outcome = Empty,
+        buckwal.outcome = Empty,
     )
 }
 
@@ -847,12 +847,12 @@ fn took_over(
     ended: std::result::Result<(&Bucket, &FenceOutcome), &Error>,
 ) {
     let Ok((bucket, fence)) = ended else {
-        span.record("durable.outcome", "error");
+        span.record("buckwal.outcome", "error");
         return;
     };
     let (generation, epoch) = (bucket.head().generation, bucket.head().epoch);
-    span.record("durable.seq", fence.pos.seq);
-    span.record("durable.outcome", "ok");
+    span.record("buckwal.seq", fence.pos.seq);
+    span.record("buckwal.outcome", "ok");
     span.in_scope(|| {
         tracing::info!(
             target: "buckwal",
@@ -875,7 +875,7 @@ fn took_over(
 /// The fence of a takeover resumed through `open`: the head already names this writer (its
 /// claim's head write landed, and this open raised the epoch again), but the generation's
 /// last record is still another writer's, because the claim's fence never landed. The fence
-/// completes the takeover, so it runs in a `durable.takeover` span like `claim`'s (the head's
+/// completes the takeover, so it runs in a `buckwal.takeover` span like `claim`'s (the head's
 /// generation and epoch, the fence's seq, the open's retries so far) and emits
 /// `Event::TookOver`.
 fn resume_takeover(
@@ -884,9 +884,9 @@ fn resume_takeover(
     bucket: &mut Bucket,
 ) -> Result<FenceOutcome> {
     let span = takeover_span(bucket.head().generation);
-    span.record("durable.epoch", bucket.head().epoch);
+    span.record("buckwal.epoch", bucket.head().epoch);
     let r = span.in_scope(|| bucket.append_fence());
-    span.record("durable.retries", bucket.counters().retries.load(SeqCst));
+    span.record("buckwal.retries", bucket.counters().retries.load(SeqCst));
     took_over(&span, cfg, writer_id, r.as_ref().map(|f| (&*bucket, f)));
     r
 }
@@ -912,7 +912,7 @@ fn claim_in_span(
         &state.claim_id,
         retries,
     )?;
-    span.record("durable.epoch", head.epoch);
+    span.record("buckwal.epoch", head.epoch);
     #[cfg(test)]
     if FAIL_AFTER_CLAIM_HEAD.with(|f| f.get()) {
         return Err(Error::Io(

@@ -1,20 +1,20 @@
 //! Telemetry: the library reports through `tracing` only. Spans (all INFO, target
 //! `buckwal`) and log events are a contract with the HyperDX searches:
 //!
-//! - `durable.commit` (`durable.batching`, `durable.commit_no`, `durable.bytes`,
-//!   `durable.outcome`), with children `durable.local_write`, `durable.local_fsync` and
-//!   `durable.ack_wait` (`io/wal_file.rs`, `conn.rs`);
-//! - `durable.upload` (`durable.commits`, `durable.bytes`, `durable.generation`,
-//!   `durable.seq`, `durable.retries`, `s3.status`) and `durable.checkpoint_upload`
-//!   (`durable.generation`, `durable.seq`, `durable.pages`, `durable.retries`, `s3.status`),
+//! - `buckwal.commit` (`buckwal.batching`, `buckwal.commit_no`, `buckwal.bytes`,
+//!   `buckwal.outcome`), with children `buckwal.local_write`, `buckwal.local_fsync` and
+//!   `buckwal.ack_wait` (`io/wal_file.rs`, `conn.rs`);
+//! - `buckwal.upload` (`buckwal.commits`, `buckwal.bytes`, `buckwal.generation`,
+//!   `buckwal.seq`, `buckwal.retries`, `s3.status`) and `buckwal.checkpoint_upload`
+//!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`),
 //!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);
-//! - `durable.restore` (`durable.generation`, `durable.log_objects`, `durable.gets`,
-//!   `durable.bytes`, `durable.seq`, `durable.retries`, `s3.status`) (`restore.rs`);
-//! - `durable.takeover` (`durable.generation`, `durable.epoch`, `durable.seq` (the fence's),
-//!   `durable.retries`, `s3.status`, `durable.outcome`), around a takeover's head write and
+//! - `buckwal.restore` (`buckwal.generation`, `buckwal.log_objects`, `buckwal.gets`,
+//!   `buckwal.bytes`, `buckwal.seq`, `buckwal.retries`, `s3.status`) (`restore.rs`);
+//! - `buckwal.takeover` (`buckwal.generation`, `buckwal.epoch`, `buckwal.seq` (the fence's),
+//!   `buckwal.retries`, `s3.status`, `buckwal.outcome`), around a takeover's head write and
 //!   fence, or around the fence of a takeover an `open` resumes (`db.rs`), and
-//!   `durable.fence` (`durable.generation`, `durable.seq`, `durable.epoch`,
-//!   `durable.retries`, `s3.status`) around each fence record (`bucket.rs`).
+//!   `buckwal.fence` (`buckwal.generation`, `buckwal.seq`, `buckwal.epoch`,
+//!   `buckwal.retries`, `s3.status`) around each fence record (`bucket.rs`).
 //!
 //! Log events have the target `buckwal` exactly.
 //!
@@ -121,7 +121,7 @@ fn endpoint(cfg: &TelemetryConfig) -> Result<&str> {
 }
 
 /// Export spans and log records over OTLP/gRPC to `cfg.endpoint`, with `service.name =
-/// turso-durable`, through a global `tracing` subscriber. Only `buckwal*` targets are
+/// buckwal`, through a global `tracing` subscriber. Only `buckwal*` targets are
 /// exported: spans at INFO and above, log records at `cfg.level` and above. Export runs on
 /// background threads through bounded queues ([`defaults::OTEL_QUEUE`]) that drop when full,
 /// so a slow or missing collector never slows a commit.

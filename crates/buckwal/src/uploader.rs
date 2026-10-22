@@ -65,9 +65,9 @@ impl Ticket {
         self.rx.recv().unwrap_or_else(|_| Err(stopped()))
     }
 
-    /// [`Ticket::wait`] inside a `durable.ack_wait` child of `commit`.
+    /// [`Ticket::wait`] inside a `buckwal.ack_wait` child of `commit`.
     pub(crate) fn wait_in(self, commit: &Span) -> Result<LogPos> {
-        info_span!(target: "buckwal", parent: commit, "durable.ack_wait").in_scope(|| self.wait())
+        info_span!(target: "buckwal", parent: commit, "buckwal.ack_wait").in_scope(|| self.wait())
     }
 }
 
@@ -101,9 +101,9 @@ impl LogTicket {
         })
     }
 
-    /// [`LogTicket::wait`] inside a `durable.ack_wait` child of `commit`.
+    /// [`LogTicket::wait`] inside a `buckwal.ack_wait` child of `commit`.
     pub(crate) fn wait_in(self, commit: &Span) -> std::result::Result<LogPos, LogFailure> {
-        info_span!(target: "buckwal", parent: commit, "durable.ack_wait").in_scope(|| self.wait())
+        info_span!(target: "buckwal", parent: commit, "buckwal.ack_wait").in_scope(|| self.wait())
     }
 }
 
@@ -127,7 +127,7 @@ enum Job {
         page_size: u32,
         page_count: u32,
         reply: Sender<Result<u64>>,
-        /// The caller's current span: the parent of `durable.checkpoint_upload`.
+        /// The caller's current span: the parent of `buckwal.checkpoint_upload`.
         parent: Span,
     },
 }
@@ -505,7 +505,7 @@ impl Worker {
     /// Upload the owed syncs, then the batch, as one record, and reply to each. Returns the
     /// error every item got, if any. Nothing to upload is `Ok`.
     ///
-    /// The record's `durable.upload` span is a child of its first commit's span and follows
+    /// The record's `buckwal.upload` span is a child of its first commit's span and follows
     /// from the others'; it closes, and drops its hold on the commit spans, before any reply.
     fn flush(&mut self) -> Result<()> {
         let mut items: Vec<Pending> = self.owed.drain(..).collect();
@@ -516,12 +516,12 @@ impl Worker {
         let span = info_span!(
             target: "buckwal",
             parent: &items[0].span,
-            "durable.upload",
-            durable.commits = items.len() as u64,
-            durable.bytes = Empty,
-            durable.generation = Empty,
-            durable.seq = Empty,
-            durable.retries = Empty,
+            "buckwal.upload",
+            buckwal.commits = items.len() as u64,
+            buckwal.bytes = Empty,
+            buckwal.generation = Empty,
+            buckwal.seq = Empty,
+            buckwal.retries = Empty,
             s3.status = Empty,
         );
         let mut syncs = Vec::with_capacity(items.len());
@@ -538,7 +538,7 @@ impl Worker {
         let r = span.in_scope(|| self.bucket.append_log(LogFile::Wal, syncs));
         match &r {
             Ok(a) => {
-                span.record("durable.bytes", a.bytes);
+                span.record("buckwal.bytes", a.bytes);
             }
             Err(f) => span.in_scope(|| {
                 tracing::warn!(
@@ -608,7 +608,7 @@ impl Worker {
 
     /// Flush first; while owed syncs remain the seal fails with the flush's error, so it
     /// never seals (or adopts a published head) over them. Then seal as in stage 1, inside a
-    /// `durable.checkpoint_upload` span under `parent` (the bucket records its fields).
+    /// `buckwal.checkpoint_upload` span under `parent` (the bucket records its fields).
     fn seal(
         &mut self,
         pages: Vec<(u32, Vec<u8>)>,
@@ -624,11 +624,11 @@ impl Worker {
         let span = info_span!(
             target: "buckwal",
             parent: parent,
-            "durable.checkpoint_upload",
-            durable.generation = Empty,
-            durable.seq = Empty,
-            durable.pages = Empty,
-            durable.retries = Empty,
+            "buckwal.checkpoint_upload",
+            buckwal.generation = Empty,
+            buckwal.seq = Empty,
+            buckwal.pages = Empty,
+            buckwal.retries = Empty,
             s3.status = Empty,
         );
         let g = span.in_scope(|| self.bucket.seal_generation(pages, page_size, page_count))?;
@@ -682,18 +682,18 @@ impl Worker {
         let span = info_span!(
             target: "buckwal",
             parent: &commit_span,
-            "durable.upload",
-            durable.commits = commits,
-            durable.bytes = Empty,
-            durable.generation = Empty,
-            durable.seq = Empty,
-            durable.retries = Empty,
+            "buckwal.upload",
+            buckwal.commits = commits,
+            buckwal.bytes = Empty,
+            buckwal.generation = Empty,
+            buckwal.seq = Empty,
+            buckwal.retries = Empty,
             s3.status = Empty,
         );
         let r = span.in_scope(|| self.bucket.append_log(file, vec![ops]));
         match &r {
             Ok(a) => {
-                span.record("durable.bytes", a.bytes);
+                span.record("buckwal.bytes", a.bytes);
             }
             Err(f) => span.in_scope(|| {
                 tracing::warn!(

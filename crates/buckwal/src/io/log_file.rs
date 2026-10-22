@@ -210,17 +210,17 @@ impl LogShippingFile {
         let commits = std::mem::take(&mut s.commits);
         let span = info_span!(
             target: "buckwal",
-            "durable.commit",
-            durable.batching = %Batching::Off,
-            durable.commit_no = Empty,
-            durable.bytes = op_bytes(&ops),
-            durable.outcome = Empty,
+            "buckwal.commit",
+            buckwal.batching = %Batching::Off,
+            buckwal.commit_no = Empty,
+            buckwal.bytes = op_bytes(&ops),
+            buckwal.outcome = Empty,
         );
         let ticket = span.in_scope(|| self.uploader.submit_log_file(LogFile::Log, ops, commits));
-        span.record("durable.commit_no", ticket.commit);
+        span.record("buckwal.commit_no", ticket.commit);
         let (commit, submitted) = (ticket.commit, ticket.submitted);
         let r = ticket.wait_in(&span);
-        span.record("durable.outcome", if r.is_ok() { "ok" } else { "error" });
+        span.record("buckwal.outcome", if r.is_ok() { "ok" } else { "error" });
         match r {
             Ok(_) => {
                 // One ack per commit the engine wrote since the last sync: under group
@@ -342,7 +342,7 @@ impl File for LogShippingFile {
         // Upload before any completion exists: a failure is a synchronous `Err` (the commit
         // fails, the engine keeps its frame), never a failed completion.
         match self.ship().map_err(stash)? {
-            Some(commit) => info_span!(target: "buckwal", parent: &commit, "durable.local_fsync")
+            Some(commit) => info_span!(target: "buckwal", parent: &commit, "buckwal.local_fsync")
                 .in_scope(|| self.inner.sync(c, sync_type)),
             None => self.inner.sync(c, sync_type),
         }

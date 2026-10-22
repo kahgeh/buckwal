@@ -27,7 +27,7 @@ pub enum GcOutcome {
 }
 
 impl GcOutcome {
-    /// `trimmed`, `too_young` or `nothing`: the span's `durable.outcome` and the CLI's word.
+    /// `trimmed`, `too_young` or `nothing`: the span's `buckwal.outcome` and the CLI's word.
     pub fn as_str(self) -> &'static str {
         match self {
             GcOutcome::Trimmed => "trimmed",
@@ -100,8 +100,8 @@ fn bucket_err(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Bucket(format!("{what}: {e}"))
 }
 
-/// One pass, in a `durable.gc` span (`durable.generation`, `durable.manifest`,
-/// `durable.age_ms`, `durable.deleted`, `durable.outcome`: `trimmed`, `too_young`,
+/// One pass, in a `buckwal.gc` span (`buckwal.generation`, `buckwal.manifest`,
+/// `buckwal.age_ms`, `buckwal.deleted`, `buckwal.outcome`: `trimmed`, `too_young`,
 /// `nothing` or `error`):
 ///
 /// 1. GET the head; none, or no manifest yet: `Nothing`.
@@ -120,27 +120,27 @@ pub(crate) fn gc_once(
 ) -> Result<GcPass> {
     let span = tracing::info_span!(
         target: "buckwal",
-        "durable.gc",
-        durable.generation = Empty,
-        durable.manifest = Empty,
-        durable.age_ms = Empty,
-        durable.deleted = Empty,
-        durable.outcome = Empty,
+        "buckwal.gc",
+        buckwal.generation = Empty,
+        buckwal.manifest = Empty,
+        buckwal.age_ms = Empty,
+        buckwal.deleted = Empty,
+        buckwal.outcome = Empty,
     );
     let r = span.in_scope(|| pass(store, keys, min_age, last, &span));
     match &r {
         Ok(p) => {
             if let Some(m) = p.trimmed_against {
-                span.record("durable.manifest", m);
+                span.record("buckwal.manifest", m);
             }
             if let Some(age) = p.age {
-                span.record("durable.age_ms", age.as_millis() as u64);
+                span.record("buckwal.age_ms", age.as_millis() as u64);
             }
-            span.record("durable.deleted", p.deleted);
-            span.record("durable.outcome", p.outcome.as_str());
+            span.record("buckwal.deleted", p.deleted);
+            span.record("buckwal.outcome", p.outcome.as_str());
         }
         Err(_) => {
-            span.record("durable.outcome", "error");
+            span.record("buckwal.outcome", "error");
         }
     }
     r
@@ -170,7 +170,7 @@ fn pass(
     };
     let head = Head::decode(&obj.body)?;
     out.generation = head.generation;
-    span.record("durable.generation", head.generation);
+    span.record("buckwal.generation", head.generation);
     let Some(head_manifest) = head.manifest else {
         return Ok(out);
     };
