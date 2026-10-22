@@ -235,10 +235,15 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
         .iter()
         .map(to_value)
         .collect::<Result<Vec<Value>, _>>()?;
+    // Names match with the prefix stripped (PROTOCOL.md 8.1), so `:x`, `@x`, `$x` and `x` all
+    // bind whichever of `:x`, `@x` and `$x` the statement has; `run` tries a bare name with each.
     let named = stmt
         .named_args
         .iter()
-        .map(|a| Ok((a.name.clone(), to_value(&a.value)?)))
+        .map(|a| {
+            let name = a.name.strip_prefix([':', '@', '$']).unwrap_or(&a.name);
+            Ok((name.to_owned(), to_value(&a.value)?))
+        })
         .collect::<Result<Vec<(String, Value)>, ProtoError>>()?;
     let insert = insert_kind(&sql);
     // An upsert's changed row may have been updated, which leaves the rowid alone, so it
@@ -664,6 +669,31 @@ mod tests {
             r["result"]["rows"][0][0],
             json!({"type":"integer","value":"1"})
         );
+    }
+
+    /// The name is matched with its prefix stripped (PROTOCOL.md 8.1): `x`, `:x`, `@x` and
+    /// `$x` each bind `:x`, `@x` or `$x`.
+    #[test]
+    fn named_args_bind_whatever_their_prefix() {
+        let mut f = fx();
+        for param in [":x", "@x", "$x"] {
+            for name in ["x", ":x", "@x", "$x"] {
+                let r = f.ok(
+                    json!({"type":"execute","stmt":{"sql":format!("SELECT {param}"),
+                    "named_args":[{"name":name,"value":{"type":"integer","value":"7"}}]}}),
+                );
+                assert_eq!(r["result"]["rows"][0][0]["value"], "7", "{param} {name:?}");
+            }
+        }
+        let r = f.ok(json!({"type":"execute","stmt":{"sql":"SELECT $a, :b",
+            "named_args":[{"name":":a","value":{"type":"integer","value":"1"}},
+                          {"name":"@b","value":{"type":"integer","value":"2"}}]}}));
+        assert_eq!(r["result"]["rows"][0][0]["value"], "1");
+        assert_eq!(r["result"]["rows"][0][1]["value"], "2");
+        // A name the statement does not have is still an error.
+        let unknown = json!({"type":"execute","stmt":{"sql":"SELECT :x",
+            "named_args":[{"name":"$y","value":{"type":"integer","value":"7"}}]}});
+        assert_eq!(f.err(Version::V3, unknown), "SQL_INPUT_ERROR");
     }
 
     #[test]
