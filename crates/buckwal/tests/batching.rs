@@ -4,7 +4,7 @@
 use buckwal::store::{FaultStore, MemStore, ObjectStore};
 use buckwal::{
     open_read_only_with_store, open_with_store, restore_with_store, Batching, CheckpointMode,
-    Config, Connection, Database, Error, Event, EventHook, UploadStats, Value,
+    Config, Connection, Database, Error, Event, EventHook, JournalMode, UploadStats, Value,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -705,9 +705,9 @@ fn ack_settings(rec: &Recorder, thread: ThreadId, from: usize) -> Vec<Batching> 
     rec.acks_on(thread)[from..].iter().map(|a| a.1).collect()
 }
 
-/// What `PRAGMA durable_batching` reads on `c`.
+/// What `PRAGMA buckwal_batching` reads on `c`.
 fn setting_text(c: &Connection) -> String {
-    let rows = c.query("PRAGMA durable_batching", &[]).unwrap();
+    let rows = c.query("PRAGMA buckwal_batching", &[]).unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     rows[0][0].to_text().unwrap().to_string()
 }
@@ -777,7 +777,7 @@ fn transaction_with_batches_only_that_transaction() {
 }
 
 #[test]
-fn durable_batching_pragma_sets_the_transaction() {
+fn buckwal_batching_pragma_sets_the_transaction() {
     let rec = Recorder::default();
     let (_d, db) = open(mem(), rec.clone());
     let c = db.connect().unwrap();
@@ -785,16 +785,16 @@ fn durable_batching_pragma_sets_the_transaction() {
     let me = thread::current().id();
     let win = w(40, 64, 1 << 20);
     let text = |s: &str| vec![vec![Value::from_text(s.to_string())]];
-    let setting = |c: &Connection| c.query("PRAGMA durable_batching", &[]).unwrap();
+    let setting = |c: &Connection| c.query("PRAGMA buckwal_batching", &[]).unwrap();
     assert_eq!(setting(&c), text("off"));
 
     c.execute("BEGIN", &[]).unwrap();
     assert_eq!(
-        c.execute("PRAGMA durable_batching = 'window 40ms 64 1MiB'", &[]),
+        c.execute("PRAGMA buckwal_batching = 'window 40ms 64 1MiB'", &[]),
         Ok(0)
     );
     assert_eq!(setting(&c), text("window 40ms 64 1MiB"));
-    assert_eq!(c.execute("PRAGMA durable_batching", &[]), Ok(0));
+    assert_eq!(c.execute("PRAGMA buckwal_batching", &[]), Ok(0));
     assert_eq!(
         c.batching(),
         None,
@@ -817,7 +817,7 @@ fn durable_batching_pragma_sets_the_transaction() {
     let n = rec.acks_on(me).len();
     let t = Instant::now();
     c.execute_batch(
-        "BEGIN; PRAGMA durable_batching = 'window 40ms 64 1MiB'; INSERT INTO t VALUES (2); \
+        "BEGIN; PRAGMA buckwal_batching = 'window 40ms 64 1MiB'; INSERT INTO t VALUES (2); \
          COMMIT",
     )
     .unwrap();
@@ -832,7 +832,7 @@ fn durable_batching_pragma_sets_the_transaction() {
     // the waiting window commit with it).
     let n = rec.acks_on(me).len();
     c.execute_batch(
-        "BEGIN; PRAGMA durable_batching = 'window 10s 64 1MiB'; INSERT INTO t VALUES (3); \
+        "BEGIN; PRAGMA buckwal_batching = 'window 10s 64 1MiB'; INSERT INTO t VALUES (3); \
          COMMIT; INSERT INTO t VALUES (4)",
     )
     .unwrap();
@@ -848,30 +848,30 @@ fn durable_batching_pragma_sets_the_transaction() {
 }
 
 #[test]
-fn durable_batching_pragma_outside_transaction_or_malformed_is_refused() {
+fn buckwal_batching_pragma_outside_transaction_or_malformed_is_refused() {
     let (_d, db) = open(mem(), Recorder::default());
     let conn = db.connect().unwrap();
     create(&conn);
-    let r = conn.execute("PRAGMA durable_batching = 'window 40ms 64 1MiB'", &[]);
+    let r = conn.execute("PRAGMA buckwal_batching = 'window 40ms 64 1MiB'", &[]);
     assert!(
         matches!(&r, Err(Error::Config(m)) if m.contains("current transaction")),
         "{r:?}"
     );
     conn.execute("BEGIN", &[]).unwrap();
     // Our own parse error (the engine never prepares the PRAGMA; it would not know it).
-    let r = conn.execute("PRAGMA durable_batching = 'window x'", &[]);
+    let r = conn.execute("PRAGMA buckwal_batching = 'window x'", &[]);
     assert!(
         matches!(&r, Err(Error::Config(m)) if m.starts_with("batching \"window x\"")),
         "{r:?}"
     );
-    let r = conn.execute("PRAGMA durable_batching = 'window 1ms 0 1'", &[]);
+    let r = conn.execute("PRAGMA buckwal_batching = 'window 1ms 0 1'", &[]);
     assert!(
         matches!(&r, Err(Error::Config(m)) if m.contains("max_commits")),
         "{r:?}"
     );
-    let r = conn.execute("PRAGMA durable_batching = off", &[Value::from_i64(1)]);
+    let r = conn.execute("PRAGMA buckwal_batching = off", &[Value::from_i64(1)]);
     assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
-    let r = conn.execute("PRAGMA durable_batching = off; SELECT 1", &[]);
+    let r = conn.execute("PRAGMA buckwal_batching = off; SELECT 1", &[]);
     assert!(
         matches!(&r, Err(Error::Config(m)) if m.contains("its own statement")),
         "{r:?}"
@@ -879,13 +879,13 @@ fn durable_batching_pragma_outside_transaction_or_malformed_is_refused() {
     conn.execute("COMMIT", &[]).unwrap();
     assert_eq!(conn.batching(), None);
     assert!(matches!(
-        conn.execute_batch("SELECT 1; PRAGMA durable_batching = off"),
+        conn.execute_batch("SELECT 1; PRAGMA buckwal_batching = off"),
         Err(Error::Config(_))
     ));
     // Never handed to the engine, which would ignore it and return Ok.
     for sql in [
-        "PRAGMA temp.durable_batching = off",
-        "EXPLAIN PRAGMA durable_batching",
+        "PRAGMA temp.buckwal_batching = off",
+        "EXPLAIN PRAGMA buckwal_batching",
     ] {
         let r = conn.execute(sql, &[]);
         assert!(matches!(r, Err(Error::Config(_))), "{sql}: {r:?}");
@@ -894,18 +894,82 @@ fn durable_batching_pragma_outside_transaction_or_malformed_is_refused() {
     }
     // A refused statement anywhere in a batch means none of it runs, a bad value included.
     conn.execute("BEGIN", &[]).unwrap();
-    let r = conn.execute_batch("INSERT INTO t VALUES (1); PRAGMA durable_batching = 'nope'");
+    let r = conn.execute_batch("INSERT INTO t VALUES (1); PRAGMA buckwal_batching = 'nope'");
     assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     conn.execute("COMMIT", &[]).unwrap();
     assert_eq!(count(&conn), 0);
-    let r = conn.execute_batch("INSERT INTO t VALUES (1); PRAGMA durable_batching = 'nope'");
+    let r = conn.execute_batch("INSERT INTO t VALUES (1); PRAGMA buckwal_batching = 'nope'");
     assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     assert_eq!(count(&conn), 0);
     let r = conn.execute_batch(
-        "INSERT INTO t VALUES (1); PRAGMA durable_batching = off; PRAGMA synchronous = off",
+        "INSERT INTO t VALUES (1); PRAGMA buckwal_batching = off; PRAGMA synchronous = off",
     );
     assert_eq!(r, Err(Error::Unsupported("synchronous below FULL")));
     assert_eq!(count(&conn), 0);
+}
+
+const OLD_REFUSAL: &str =
+    "PRAGMA durable_batching is no longer read, use PRAGMA buckwal_batching instead";
+
+fn assert_old_refused<T: std::fmt::Debug>(what: &str, r: Result<T, Error>) {
+    assert!(
+        matches!(&r, Err(Error::Config(m)) if m == OLD_REFUSAL),
+        "{what}: {r:?}"
+    );
+}
+
+#[test]
+fn old_durable_batching_pragma_is_refused() {
+    let (_d, db) = open(mem(), Recorder::default());
+    let conn = db.connect().unwrap();
+    create(&conn);
+    for sql in [
+        "PRAGMA durable_batching = off",
+        "PRAGMA durable_batching",
+        "PRAGMA durable_batching('off')",
+        "PRAGMA temp.durable_batching = off",
+        "PRAGMA main.durable_batching = off",
+        "PRAGMA DURABLE_BATCHING",
+        "EXPLAIN PRAGMA durable_batching",
+        "EXPLAIN QUERY PLAN PRAGMA durable_batching",
+    ] {
+        assert_old_refused(sql, conn.execute(sql, &[]));
+        assert_old_refused(sql, conn.query(sql, &[]));
+        assert_old_refused(sql, conn.describe(sql));
+    }
+    // Refused before any statement of the batch runs.
+    assert_old_refused(
+        "batch",
+        conn.execute_batch("INSERT INTO t VALUES (77); PRAGMA durable_batching = off"),
+    );
+    assert_old_refused(
+        "batch",
+        conn.execute_batch("SELECT 1; PRAGMA durable_batching = off"),
+    );
+    assert_eq!(count(&conn), 0, "a statement of the refused batch ran");
+    // A string, not a PRAGMA.
+    conn.execute("SELECT 'durable_batching'", &[]).unwrap();
+    // The new name still works.
+    conn.execute("BEGIN", &[]).unwrap();
+    conn.execute("PRAGMA buckwal_batching = off", &[]).unwrap();
+    conn.execute("ROLLBACK", &[]).unwrap();
+
+    // MVCC: the same refusal, not Unsupported("MVCC: Window batching").
+    let (_d2, mvcc) = open_with(mem(), Recorder::default(), |c| {
+        c.journal_mode = JournalMode::Mvcc
+    });
+    let conn = mvcc.connect().unwrap();
+    for sql in [
+        "PRAGMA durable_batching = 'window 10ms 4 1KiB'",
+        "PRAGMA durable_batching",
+    ] {
+        assert_old_refused(sql, conn.execute(sql, &[]));
+    }
+    conn.execute("BEGIN", &[]).unwrap();
+    assert_old_refused(
+        "in txn",
+        conn.execute("PRAGMA durable_batching = 'window 10ms 4 1KiB'", &[]),
+    );
 }
 
 #[test]
@@ -932,7 +996,7 @@ fn a_failed_transaction_clears_its_override() {
     assert_eq!(ack_settings(&rec, me, n), vec![Batching::Off]);
     // ROLLBACK clears a PRAGMA's override too.
     c.execute("BEGIN", &[]).unwrap();
-    c.execute("PRAGMA durable_batching = 'window 10s 64 1MiB'", &[])
+    c.execute("PRAGMA buckwal_batching = 'window 10s 64 1MiB'", &[])
         .unwrap();
     c.execute("ROLLBACK", &[]).unwrap();
     insert(&c, 3).unwrap();
@@ -961,7 +1025,7 @@ fn a_failed_commit_clears_its_override() {
     // While degraded the commit takes the Off path, its WAL sync fails and the engine
     // rolls the transaction back.
     c.execute("BEGIN", &[]).unwrap();
-    c.execute("PRAGMA durable_batching = 'window 20ms 64 1MiB'", &[])
+    c.execute("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'", &[])
         .unwrap();
     insert(&c, 2).unwrap();
     let r = c.execute("COMMIT", &[]);

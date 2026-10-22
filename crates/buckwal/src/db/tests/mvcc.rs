@@ -776,9 +776,9 @@ fn transaction_with_window_refused_in_mvcc_and_still_works_in_wal() {
     assert_eq!(unsupported(r), "MVCC: Window batching");
     assert!(!ran, "the closure ran");
     assert!(c.is_autocommit(), "BEGIN ran");
-    // PRAGMA durable_batching inside a transaction is refused too.
+    // PRAGMA buckwal_batching inside a transaction is refused too.
     c.execute("BEGIN", &[]).unwrap();
-    let r = c.execute("PRAGMA durable_batching = 'window 10ms 4 1KiB'", &[]);
+    let r = c.execute("PRAGMA buckwal_batching = 'window 10ms 4 1KiB'", &[]);
     assert_eq!(unsupported(r), "MVCC: Window batching");
     c.execute("ROLLBACK", &[]).unwrap();
     c.transaction_with(Batching::Off, |_| Ok(())).unwrap();

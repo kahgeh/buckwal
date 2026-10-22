@@ -437,11 +437,11 @@ fn eval_cond(c: &BatchCond, outcome: &[Option<bool>], st: &StreamState) -> bool 
     }
 }
 
-/// `sql` is exactly one `PRAGMA [main.]durable_batching = value` or `(value)`: the batching
+/// `sql` is exactly one `PRAGMA [main.]buckwal_batching = value` or `(value)`: the batching
 /// it asks for (or the error for a value that is not text). `None` for anything else, which
 /// then goes to the library (including a read of the setting).
 fn batching_set(sql: &str) -> Option<buckwal::Result<Batching>> {
-    if !mentions(sql, b"durable_batching") {
+    if !mentions(sql, b"buckwal_batching") {
         return None;
     }
     let mut parser = Parser::new(sql.as_bytes());
@@ -457,14 +457,14 @@ fn batching_set(sql: &str) -> Option<buckwal::Result<Batching>> {
     Some(match pragma_value(value) {
         Some(text) => Batching::from_str(&text),
         None => Err(Error::Config(
-            "PRAGMA durable_batching takes off or 'window <max_wait> <max_commits> <max_bytes>'"
+            "PRAGMA buckwal_batching takes off or 'window <max_wait> <max_commits> <max_bytes>'"
                 .into(),
         )),
     })
 }
 
 fn is_batching(name: &QualifiedName) -> bool {
-    name.name.as_str().eq_ignore_ascii_case("durable_batching")
+    name.name.as_str().eq_ignore_ascii_case("buckwal_batching")
         && name
             .db_name
             .as_ref()
@@ -560,7 +560,7 @@ mod tests {
     }
 
     fn setting(f: &mut Fx) -> String {
-        let r = f.sql("PRAGMA durable_batching");
+        let r = f.sql("PRAGMA buckwal_batching");
         r["rows"][0][0]["value"].as_str().unwrap().to_string()
     }
 
@@ -652,7 +652,7 @@ mod tests {
             null.clone(),
             0,
         );
-        check("PRAGMA durable_batching = off", null.clone(), 0);
+        check("PRAGMA buckwal_batching = off", null.clone(), 0);
         let r = f.ok(json!({"type":"execute","stmt":{
             "sql":"INSERT INTO t VALUES (?, 'arg') RETURNING id",
             "args":[{"type":"integer","value":"40"}]}}));
@@ -1027,12 +1027,12 @@ mod tests {
     #[test]
     fn describe_of_batching_pragma_is_fixed_and_not_intercepted() {
         let mut f = fx();
-        f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
-        for sql in ["PRAGMA durable_batching = 'off'", "PRAGMA durable_batching"] {
+        f.sql("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'");
+        for sql in ["PRAGMA buckwal_batching = 'off'", "PRAGMA buckwal_batching"] {
             let r = f.ok(json!({"type":"describe","sql":sql}));
             assert_eq!(
                 r["result"],
-                json!({"params":[],"cols":[{"name":"durable_batching","decltype":null}],
+                json!({"params":[],"cols":[{"name":"buckwal_batching","decltype":null}],
                     "is_explain":false,"is_readonly":false}),
                 "{sql}"
             );
@@ -1081,14 +1081,35 @@ mod tests {
     fn batching_pragma_variants_are_not_intercepted() {
         let mut f = fx();
         for sql in [
-            "PRAGMA durable_batching = 'off'; SELECT 1",
-            "EXPLAIN PRAGMA durable_batching = 'off'",
-            "PRAGMA temp.durable_batching = 'off'",
+            "PRAGMA buckwal_batching = 'off'; SELECT 1",
+            "EXPLAIN PRAGMA buckwal_batching = 'off'",
+            "PRAGMA temp.buckwal_batching = 'off'",
         ] {
-            f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+            f.sql("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'");
             f.err(Version::V3, json!({"type":"execute","stmt":{"sql":sql}}));
             assert_eq!(setting(&mut f), "window 20ms 64 1MiB", "{sql}");
         }
+    }
+
+    #[test]
+    fn old_durable_batching_pragma_is_refused_over_serve() {
+        let mut f = fx();
+        let want = "PRAGMA durable_batching is no longer read, use PRAGMA buckwal_batching instead";
+        for req in [
+            json!({"type":"execute","stmt":{"sql":"PRAGMA durable_batching = off"}}),
+            json!({"type":"execute","stmt":{"sql":"PRAGMA durable_batching"}}),
+            json!({"type":"describe","sql":"PRAGMA durable_batching"}),
+        ] {
+            match f.req(Version::V3, req.clone()) {
+                StreamResult::Error { error } => {
+                    assert_eq!(error.message, format!("config error: {want}"), "{req}");
+                    assert_eq!(error.code.as_deref(), Some("SQL_INPUT_ERROR"), "{req}");
+                }
+                StreamResult::Ok { response } => panic!("{req}: {response:?}"),
+            }
+        }
+        // Nothing was applied, and the new name still reads.
+        assert_eq!(setting(&mut f), "off");
     }
 
     #[test]
@@ -1155,7 +1176,7 @@ mod tests {
     fn per_stream_batching_pragma_in_autocommit() {
         let mut f = fx();
         assert_eq!(setting(&mut f), "off");
-        let r = f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+        let r = f.sql("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'");
         assert_eq!(r["rows"], json!([]));
         assert_eq!(setting(&mut f), "window 20ms 64 1MiB");
         let mut other = open_stream(&f.db, Duration::from_millis(100)).unwrap();
@@ -1163,7 +1184,7 @@ mod tests {
         let read = execute_request(
             &mut other,
             Version::V3,
-            json!({"type":"execute","stmt":{"sql":"PRAGMA durable_batching"}}),
+            json!({"type":"execute","stmt":{"sql":"PRAGMA buckwal_batching"}}),
             &fence,
         );
         match read {
@@ -1182,9 +1203,9 @@ mod tests {
     #[test]
     fn batching_pragma_inside_transaction_goes_to_library() {
         let mut f = fx();
-        f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+        f.sql("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'");
         f.sql("BEGIN");
-        f.sql("PRAGMA durable_batching = off");
+        f.sql("PRAGMA buckwal_batching = off");
         assert_eq!(setting(&mut f), "off");
         f.sql("COMMIT");
         assert_eq!(setting(&mut f), "window 20ms 64 1MiB");
@@ -1193,11 +1214,11 @@ mod tests {
     #[test]
     fn batching_pragma_with_args_is_not_intercepted() {
         let mut f = fx();
-        f.sql("PRAGMA durable_batching = 'window 20ms 64 1MiB'");
+        f.sql("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'");
         let arg = json!({"type":"integer","value":"1"});
         for stmt in [
-            json!({"sql":"PRAGMA durable_batching = 'off'","args":[arg]}),
-            json!({"sql":"PRAGMA durable_batching = 'off'","named_args":[{"name":"a","value":arg}]}),
+            json!({"sql":"PRAGMA buckwal_batching = 'off'","args":[arg]}),
+            json!({"sql":"PRAGMA buckwal_batching = 'off'","named_args":[{"name":"a","value":arg}]}),
         ] {
             match f.req(Version::V3, json!({"type":"execute","stmt":stmt})) {
                 StreamResult::Error { .. } => {}
@@ -1211,8 +1232,8 @@ mod tests {
     fn bad_batching_value_is_sql_input_error() {
         let mut f = fx();
         for sql in [
-            "PRAGMA durable_batching = 'bogus'",
-            "PRAGMA durable_batching = 'window 0ms 0 0'",
+            "PRAGMA buckwal_batching = 'bogus'",
+            "PRAGMA buckwal_batching = 'window 0ms 0 0'",
         ] {
             assert_eq!(
                 f.err(Version::V3, json!({"type":"execute","stmt":{"sql":sql}})),

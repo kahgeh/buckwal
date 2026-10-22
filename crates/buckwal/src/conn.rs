@@ -7,7 +7,7 @@
 //! effective batching setting, which the WAL sync reads. A call returns `Ok` only once every
 //! commit it made is confirmed in the bucket (`await_acks`).
 //!
-//! `PRAGMA durable_batching` is run here, never by the engine: it reads the effective setting,
+//! `PRAGMA buckwal_batching` is run here, never by the engine: it reads the effective setting,
 //! or sets the current transaction's own (`txn_batching`), which lasts until no transaction
 //! is open.
 //!
@@ -94,7 +94,7 @@ pub struct Connection {
     /// This connection's own setting; `None` falls back to the database's.
     batching: Mutex<Option<Batching>>,
     /// The open transaction's own setting ([`Connection::transaction_with`], `PRAGMA
-    /// durable_batching`), ahead of `batching`. Cleared by every call (or statement of a split
+    /// buckwal_batching`), ahead of `batching`. Cleared by every call (or statement of a split
     /// `execute_batch`) that leaves no transaction open.
     txn_batching: Mutex<Option<Batching>>,
     /// The gate entry an open explicit transaction holds from the call that leaves it open
@@ -275,7 +275,7 @@ impl Connection {
     }
 
     /// Guard, prepare, check and bind one statement, or run it here when it is `PRAGMA
-    /// durable_batching` (the engine never sees that one). `single`: `sql` must hold only that
+    /// buckwal_batching` (the engine never sees that one). `single`: `sql` must hold only that
     /// statement (the engine would silently ignore the rest); otherwise it is the first of
     /// the rest of a split `execute_batch`.
     ///
@@ -322,7 +322,7 @@ impl Connection {
         Ok(Prepared::Engine(Box::new(stmt)))
     }
 
-    /// Run `PRAGMA durable_batching`: a read is one row, the effective setting's text; a set
+    /// Run `PRAGMA buckwal_batching`: a read is one row, the effective setting's text; a set
     /// applies to the open transaction from its next commit on, and returns no rows.
     fn batching_pragma(&self, pragma: BatchingPragma) -> Result<Vec<Vec<Value>>> {
         let b = match pragma {
@@ -334,7 +334,7 @@ impl Connection {
         };
         if self.core().get_auto_commit() {
             return Err(Error::Config(
-                "PRAGMA durable_batching applies to the current transaction; use \
+                "PRAGMA buckwal_batching applies to the current transaction; use \
                  Connection::set_batching"
                     .into(),
             ));
@@ -369,7 +369,7 @@ impl Connection {
     }
 
     /// Run one statement; returns the number of rows it changed (0 for `PRAGMA
-    /// durable_batching`).
+    /// buckwal_batching`).
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         self.call(self.effective_batching(), || {
             let Prepared::Engine(mut stmt) = self.prepare(sql, params, None, true)? else {
@@ -405,7 +405,7 @@ impl Connection {
     }
 
     /// One statement at a time, so each is checked as read-only before it runs, a `PRAGMA
-    /// durable_batching` is run in place, and a transaction's setting ends with it.
+    /// buckwal_batching` is run in place, and a transaction's setting ends with it.
     fn execute_batch_split(&self, sql: &str) -> Result<()> {
         let mut rest = sql;
         while holds_a_statement(rest) {
@@ -469,8 +469,8 @@ impl Connection {
     /// whether it is an `EXPLAIN` and read-only. The SQL guard, the sync-mode check (D7) and
     /// the maintenance gate are those of [`Connection::run`]. The statement is prepared but
     /// never stepped, so nothing commits and nothing waits for an ack; it works on a
-    /// read-only database too. `PRAGMA durable_batching` is not run, only described as one
-    /// `durable_batching` column. Setter PRAGMAs that turso_core applies at prepare (e.g.
+    /// read-only database too. `PRAGMA buckwal_batching` is not run, only described as one
+    /// `buckwal_batching` column. Setter PRAGMAs that turso_core applies at prepare (e.g.
     /// `query_only`, `foreign_keys`) take effect on describe, as they do on `run`; the
     /// durability ones are refused by the guard. An `EXPLAIN` is read-only, as in SQLite.
     pub fn describe(&self, sql: &str) -> Result<Description> {
@@ -597,7 +597,7 @@ impl Drop for Connection {
     }
 }
 
-/// One prepared statement, or a `PRAGMA durable_batching` already run.
+/// One prepared statement, or a `PRAGMA buckwal_batching` already run.
 enum Prepared {
     /// Boxed: a `Statement` is large, and the enum is moved by value.
     Engine(Box<Statement>),
@@ -625,10 +625,10 @@ fn columns(stmt: &Statement) -> Vec<Column> {
         .collect()
 }
 
-/// The one column `PRAGMA durable_batching` reads.
+/// The one column `PRAGMA buckwal_batching` reads.
 fn batching_column() -> Column {
     Column {
-        name: "durable_batching".into(),
+        name: "buckwal_batching".into(),
         decltype: None,
     }
 }
@@ -906,24 +906,24 @@ mod tests {
             assert!(conn.run(sql, &[], &[text("delete")]).is_err(), "{sql}");
         }
         conn.execute("BEGIN", &[]).unwrap();
-        let r = conn.run("PRAGMA durable_batching = off", &[], &[text("off")]);
+        let r = conn.run("PRAGMA buckwal_batching = off", &[], &[text("off")]);
         assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
         assert!(conn
-            .run("PRAGMA durable_batching = :f", &[], &[text("off")])
+            .run("PRAGMA buckwal_batching = :f", &[], &[text("off")])
             .is_err());
         conn.execute("ROLLBACK", &[]).unwrap();
         assert_eq!(conn.query("SELECT 1", &[]).unwrap().len(), 1);
     }
 
     #[test]
-    fn run_pragma_durable_batching_reads_with_a_column() {
+    fn run_pragma_buckwal_batching_reads_with_a_column() {
         let (_t, db) = open_mem();
         let conn = db.connect().unwrap();
-        let out = conn.run("PRAGMA durable_batching", &[], &[]).unwrap();
+        let out = conn.run("PRAGMA buckwal_batching", &[], &[]).unwrap();
         assert_eq!(
             out.columns,
             vec![Column {
-                name: "durable_batching".to_string(),
+                name: "buckwal_batching".to_string(),
                 decltype: None
             }]
         );
@@ -1085,23 +1085,23 @@ mod tests {
     }
 
     #[test]
-    fn describe_of_durable_batching_is_fixed_and_applies_nothing() {
+    fn describe_of_buckwal_batching_is_fixed_and_applies_nothing() {
         let (_t, db) = open_mem();
         let conn = db.connect().unwrap();
         let fixed = Description {
             params: vec![],
-            columns: vec![col("durable_batching", None)],
+            columns: vec![col("buckwal_batching", None)],
             is_explain: false,
             is_readonly: false,
         };
-        let setting = |c: &Connection| c.query("PRAGMA durable_batching", &[]).unwrap();
+        let setting = |c: &Connection| c.query("PRAGMA buckwal_batching", &[]).unwrap();
         // Outside a transaction a set is refused by `run`; describe still describes it.
-        for sql in ["PRAGMA durable_batching", "PRAGMA durable_batching = 'off'"] {
+        for sql in ["PRAGMA buckwal_batching", "PRAGMA buckwal_batching = 'off'"] {
             assert_eq!(conn.describe(sql), Ok(fixed.clone()), "{sql}");
         }
         conn.execute("BEGIN", &[]).unwrap();
         let before = setting(&conn);
-        let d = conn.describe("PRAGMA durable_batching = 'window 40ms 64 1MiB'");
+        let d = conn.describe("PRAGMA buckwal_batching = 'window 40ms 64 1MiB'");
         assert_eq!(d, Ok(fixed));
         assert_eq!(setting(&conn), before);
         assert_eq!(*lock(&conn.txn_batching), None);

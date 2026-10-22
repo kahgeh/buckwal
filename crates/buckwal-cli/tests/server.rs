@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 const WAIT: Duration = Duration::from_secs(120);
 
 /// The per-stream Window setting the batched streams run under.
-const WINDOW_PRAGMA: &str = "PRAGMA durable_batching = 'window 20ms 64 1MiB'";
+const WINDOW_PRAGMA: &str = "PRAGMA buckwal_batching = 'window 20ms 64 1MiB'";
 
 /// The table `verify --acked` checks, as `soak` creates it.
 const CREATE: &str = "CREATE TABLE IF NOT EXISTS soak(id INTEGER PRIMARY KEY, payload BLOB)";

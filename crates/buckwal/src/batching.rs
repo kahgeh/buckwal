@@ -253,7 +253,7 @@ pub(crate) mod ctx {
     }
 
     /// The current call commits with `b` from its next commit on (a `PRAGMA
-    /// durable_batching`, or a transaction's end, in the middle of an `execute_batch`).
+    /// buckwal_batching`, or a transaction's end, in the middle of an `execute_batch`).
     pub(crate) fn set(b: Batching) {
         CTX.with(|c| {
             if let Some(c) = c.borrow_mut().as_mut() {
