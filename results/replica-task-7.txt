@@ -1,0 +1,33 @@
+== RED (mutations of sync.rs; each should fail the named tests) ==
+-- mutation 1: fence rule disabled
+test replica::sync::tests::second_fence_moves_rule_to_its_writer ... FAILED
+test replica::sync::tests::fenced_writer_late_record_is_skipped_and_counted ... FAILED
+test result: FAILED. 15 passed; 2 failed; 0 ignored; 0 measured; 594 filtered out; finished in 0.04s
+-- mutation 2: unbroken-run check disabled
+test replica::sync::tests::hole_with_head_not_moved_waits ... FAILED
+test replica::sync::tests::missing_seq_stops_before_n_plus_1_then_applies_both ... FAILED
+test replica::sync::tests::trimmed_log_object_requests_re_restore ... FAILED
+test result: FAILED. 14 passed; 3 failed; 0 ignored; 0 measured; 594 filtered out; finished in 0.04s
+-- mutation 3: kind 3 not stopped
+test replica::sync::tests::mvcc_record_stops_with_mvcc_reason ... FAILED
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 594 filtered out; finished in 0.04s
+== GREEN ==
+test replica::sync::tests::fenced_writer_late_record_is_skipped_and_counted ... ok
+test replica::sync::tests::fence_then_new_writer_records_applied ... ok
+test replica::sync::tests::missing_seq_stops_before_n_plus_1_then_applies_both ... ok
+test replica::sync::tests::duplicate_pass_finds_nothing_new ... ok
+test replica::sync::tests::gap_rereads_from_seq_1_then_re_restores ... ok
+test replica::sync::tests::hole_with_head_not_moved_waits ... ok
+test replica::sync::tests::mvcc_head_stops_with_mvcc_reason ... ok
+test replica::sync::tests::mvcc_record_stops_with_mvcc_reason ... ok
+test replica::sync::tests::pass_applies_new_records_in_order ... ok
+test replica::sync::tests::replica_issues_no_puts_or_deletes ... ok
+test replica::sync::tests::wrong_integrity_code_stops_and_applies_nothing ... ok
+test replica::sync::tests::pass_with_nothing_new_costs_one_list_and_one_head_get ... ok
+test replica::sync::tests::new_generation_is_reported_after_applying_the_rest ... ok
+test replica::sync::tests::trimmed_log_object_requests_re_restore ... ok
+test replica::sync::tests::redelivered_history_after_restart_is_harmless_and_conflict_stops ... ok
+test replica::sync::tests::rolled_back_large_transaction_never_visible ... ok
+test replica::sync::tests::second_fence_moves_rule_to_its_writer ... ok
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.09s
+== ./scripts/test.sh unit: exit 0, lib 611 passed (flaky db::tests::close_stops_prefetch_before_releasing_the_dir failed once in an earlier run, passed on rerun) ==

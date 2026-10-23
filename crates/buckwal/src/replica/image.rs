@@ -64,7 +64,12 @@ impl WalImage {
     }
 
     pub(crate) fn committed_frames(&self) -> Vec<Frame> {
-        (1..=self.committed_count())
+        self.committed_frames_from(0)
+    }
+
+    /// The committed frames after the first `skip` (numbers `skip + 1` on).
+    pub(crate) fn committed_frames_from(&self, skip: u64) -> Vec<Frame> {
+        (skip as usize + 1..=self.committed_count())
             .map(|n| {
                 let s = self.frame_start(n);
                 let mut header = [0u8; FRAME_HEADER_LEN];
