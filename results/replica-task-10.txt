@@ -1,0 +1,19 @@
+Task 10 replica telemetry: RED/GREEN evidence
+
+RED (tests written, no emission yet):
+$ cargo test --locked -p buckwal --lib -- sync_span re_restore_span replica_logs_carry stopped_reasons_integrity
+  replica::open::tests::sync_span_carries_all_attributes          timed out waiting for: 1 sync spans
+  replica::open::tests::sync_span_trigger_slow_poll               timed out waiting for: 2 sync spans
+  replica::open::tests::sync_span_outcome_error                   timed out waiting for: 1 sync spans
+  replica::open::tests::sync_span_outcome_re_restore              timed out waiting for: 3 sync spans
+  replica::open::tests::sync_span_outcome_checkpoint_deferred     timed out waiting for: 2 sync spans
+  replica::open::tests::re_restore_span_parents_restore_span      assertion `left == right` failed: [] left: 0 right: 1
+  replica::open::tests::replica_logs_carry_no_token_or_row_data   timed out waiting for: 2 sync spans
+  replica::open::tests::stopped_reasons_integrity_and_corrupt_carry_the_object_key  panicked
+  test result: FAILED. 0 passed; 8 failed
+
+GREEN (spans emitted in Runner::one_pass / re_restore; Corrupt carries the object key):
+$ cargo test --locked -p buckwal --lib replica::
+  test result: ok. 105 passed; 0 failed
+$ cargo test --locked -p buckwal --lib backs_off   (3 runs, widened: 4 s poll interval)
+  test result: ok. 2 passed (x3)

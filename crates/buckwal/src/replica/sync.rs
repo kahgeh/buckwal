@@ -27,6 +27,17 @@ pub(crate) enum Trigger {
     SlowPoll,
 }
 
+impl Trigger {
+    /// The `buckwal.trigger` of a sync span.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Trigger::Start => "start",
+            Trigger::Notification => "notification",
+            Trigger::SlowPoll => "slow_poll",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reason {
     /// A log object the follower needs is gone (trimmed) or missing after the head moved on.
@@ -59,7 +70,7 @@ pub(crate) enum StopReason {
     /// A record or the head failed its integrity check; carries the object key.
     Integrity(String),
     /// A record or the head is malformed in a way that is not an integrity failure (bad
-    /// encoding, ops that cannot be applied to the image).
+    /// encoding, ops that cannot be applied to the image); carries the object key.
     Corrupt(String),
 }
 
@@ -94,6 +105,20 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
+    /// The `buckwal.outcome` of a sync span. A pass that moved to a later generation took in
+    /// records, so `found_new` tells `applied` from `nothing`.
+    pub(crate) fn span_value(&self, found_new: bool) -> &'static str {
+        match self {
+            Outcome::Applied => "applied",
+            Outcome::Nothing => "nothing",
+            Outcome::CheckpointDeferred => "checkpoint_deferred",
+            Outcome::GenerationMoved { .. } if found_new => "applied",
+            Outcome::GenerationMoved { .. } => "nothing",
+            Outcome::ReRestore(_) | Outcome::Stopped(StopReason::Conflict) => "re_restore",
+            Outcome::Stopped(_) | Outcome::Failed(_) => "error",
+        }
+    }
+
     /// The reason to re-restore, for a `ReRestore` and for `Stopped(Conflict)` (the spec turns
     /// a conflict into an ERROR line, then a re-restore).
     pub(crate) fn re_restore(&self) -> Option<Reason> {
@@ -225,9 +250,9 @@ fn decode_failure(e: &Error, key: &str) -> Outcome {
             tracing::error!(target: "buckwal", key, error = %e, "replica: object failed its integrity check");
             Outcome::Stopped(StopReason::Integrity(key.to_string()))
         }
-        Error::Corrupt(m) => {
+        Error::Corrupt(_) => {
             tracing::error!(target: "buckwal", key, error = %e, "replica: malformed object");
-            Outcome::Stopped(StopReason::Corrupt(m.clone()))
+            Outcome::Stopped(StopReason::Corrupt(key.to_string()))
         }
         _ => Outcome::Failed(e.to_string()),
     }
@@ -790,7 +815,7 @@ impl Follower {
                 for ops in &syncs {
                     if let Err(e) = self.image.apply_sync(ops) {
                         t.detail = Some(e.to_string());
-                        return Some(Outcome::Stopped(StopReason::Corrupt(e.to_string())));
+                        return Some(Outcome::Stopped(StopReason::Corrupt(key.to_string())));
                     }
                 }
                 None

@@ -9,7 +9,9 @@
 # `otel check SKIPPED: no ClickHouse password` and exits 0.
 # Also checked (read-only SELECTs): a `buckwal.takeover` span of the run carries
 # `buckwal.quiet_ms` (and `buckwal.next_generation_floor`), and the encrypted tamper tests left
-# at least one ERROR record `integrity check failed` with no data or code field.
+# at least one ERROR record `integrity check failed` with no data or code field, and, when
+# replica tests ran under the run id (any `buckwal.replica.sync` span), those spans carry
+# `buckwal.lag_ms` and `buckwal.trigger`.
 # The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
@@ -94,7 +96,15 @@ while :; do
   query "SELECT count() $LOGS AND toDate(Timestamp) = today() AND Body = 'integrity check failed' AND mapContains(LogAttributes, 'data')"
   integrity_data="$OUT"
 
+  # Replica passes: when the run had any (replica tests ran), at least one must carry both the
+  # lag and the trigger (a failed pass has no lag to report).
+  query "SELECT count() $TRACES AND SpanName = 'buckwal.replica.sync' AND Timestamp > now() - INTERVAL 1 DAY"
+  replica_all="$OUT"
+  query "SELECT count() $TRACES AND SpanName = 'buckwal.replica.sync' AND Timestamp > now() - INTERVAL 1 DAY AND SpanAttributes['buckwal.lag_ms'] != '' AND SpanAttributes['buckwal.trigger'] IN ('notification', 'slow_poll', 'start')"
+  replica_sync="$OUT"
+
   missing=""
+  [[ "$replica_all" -eq 0 || "$replica_sync" -gt 0 ]] || missing="$missing buckwal.replica.sync(buckwal.lag_ms,buckwal.trigger)(of $replica_all)"
   for s in $SPANS; do
     awk -F'\t' -v s="$s" '$1 == s && $2 > 0 { found = 1 } END { exit !found }' <<<"$spans" \
       || missing="$missing $s"
@@ -104,7 +114,7 @@ while :; do
   [[ "$integrity" -gt 0 ]] || missing="$missing log:integrity-check-failed"
   [[ "$integrity_data" -eq 0 ]] || missing="$missing no-data-in-integrity-records(found $integrity_data)"
   if [[ -z "$missing" && "$logs" -gt 0 && "$untimed" -eq 0 ]]; then
-    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity"
+    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity replica_sync_spans=$replica_sync"
     exit 0
   fi
   if (( SECONDS - start >= DEADLINE )); then

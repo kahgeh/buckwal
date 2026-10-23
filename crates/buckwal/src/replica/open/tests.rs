@@ -782,12 +782,18 @@ struct Lag {
 }
 
 fn lag() -> Lag {
+    lag_with_poll(POLL)
+}
+
+fn lag_with_poll(poll: Duration) -> Lag {
     let store = Arc::new(MemStore::new());
     let (w, wdb, wc) = writer(&store, 3);
     let spy = Spy::new(store.clone());
     let r = tempfile::tempdir().unwrap();
     let dir = r.path().join("r");
-    let replica = open_replica_with_store(rconfig(&dir), spy.clone()).unwrap();
+    let mut c = rconfig(&dir);
+    c.replica_poll_interval = poll;
+    let replica = open_replica_with_store(c, spy.clone()).unwrap();
     let rc = replica.connect().unwrap();
     wait_rows(&rc, 3);
     rc.close().unwrap();
@@ -1108,7 +1114,9 @@ fn behind_ms_after_a_restart_comes_from_the_last_pass_before_it() {
 fn a_failing_re_restore_backs_off_and_logs_once_per_episode() {
     let cap = Capture::new();
     let (spans, attempts, passes) = tracing::subscriber::with_default(cap.subscriber(), || {
-        let l = lag();
+        // A long interval makes the backoff (a quarter of it, doubling) far longer than the
+        // wake loop below, however loaded the machine is.
+        let l = lag_with_poll(Duration::from_secs(4));
         l.spy.fail_gets_under("manifest/");
         l.fall_behind();
         until("a failed attempt", || l.spy.page_gets_failed() > 0);
@@ -1370,4 +1378,408 @@ fn a_refused_directory_says_what_to_delete() {
         panic!("expected a refusal");
     };
     assert!(m.contains("app.db") && m.contains("delete"), "{m}");
+}
+
+// ---- Telemetry (Task 10) ----
+
+use crate::telemetry::testing::{SpanRec, Spans};
+
+const SYNC: &str = "buckwal.replica.sync";
+
+fn sync_spans(s: &Spans) -> Vec<&SpanRec> {
+    s.named(SYNC)
+}
+
+/// Wait until at least `n` sync spans have closed.
+fn until_sync_spans(cap: &Capture, n: usize) {
+    until(&format!("{n} sync spans"), || {
+        cap.spans()
+            .named(SYNC)
+            .iter()
+            .filter(|s| s.closed.is_some())
+            .count()
+            >= n
+    });
+}
+
+fn num(s: &SpanRec, name: &str) -> u64 {
+    s.field(name)
+        .unwrap_or_else(|| panic!("{} has no {name}: {:?}", s.name, s.fields))
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is not a number: {:?}", s.field(name)))
+}
+
+fn check_sync_span(s: &SpanRec) {
+    assert_eq!(s.target, "buckwal");
+    assert_eq!(s.level, tracing::Level::INFO);
+    assert!(
+        s.field("buckwal.replica_id").is_some_and(|i| !i.is_empty()),
+        "{s:?}"
+    );
+    for n in [
+        "buckwal.generation",
+        "buckwal.seq",
+        "buckwal.objects",
+        "buckwal.lists",
+        "buckwal.gets",
+        "buckwal.skipped",
+    ] {
+        num(s, n);
+    }
+    assert!(
+        ["true", "false"].contains(&s.field("buckwal.found_new").unwrap_or("")),
+        "{s:?}"
+    );
+    assert!(
+        ["notification", "slow_poll", "start"].contains(&s.field("buckwal.trigger").unwrap_or("")),
+        "{s:?}"
+    );
+    assert!(
+        [
+            "applied",
+            "nothing",
+            "checkpoint_deferred",
+            "re_restore",
+            "error"
+        ]
+        .contains(&s.field("buckwal.outcome").unwrap_or("")),
+        "{s:?}"
+    );
+}
+
+#[test]
+fn sync_span_carries_all_attributes() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, wc) = writer(&store, 3);
+    let r = tempfile::tempdir().unwrap();
+    let cap = Capture::new();
+    let (spans, stats) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mut c = rconfig(&r.path().join("r"));
+        c.replica_poll_interval = Duration::from_secs(120);
+        let replica = open_replica_with_store(c, store.clone()).unwrap();
+        let rc = replica.connect().unwrap();
+        wait_rows(&rc, 3);
+        until_sync_spans(&cap, 1);
+        // A notification that finds nothing.
+        replica.waker().wake();
+        until_sync_spans(&cap, 2);
+        // A notification that finds a row.
+        add(&wc, 4);
+        replica.waker().wake();
+        wait_rows(&rc, 4);
+        until_sync_spans(&cap, 3);
+        let stats = replica.stats();
+        rc.close().unwrap();
+        replica.close().unwrap();
+        (cap.spans(), stats)
+    });
+    let all = sync_spans(&spans);
+    assert_eq!(all.len(), 3, "{all:?}");
+    all.iter().for_each(|s| check_sync_span(s));
+    let (start, nothing, applied) = (all[0], all[1], all[2]);
+    assert_eq!(start.field("buckwal.trigger"), Some("start"));
+    assert_eq!(nothing.field("buckwal.trigger"), Some("notification"));
+    assert_eq!(nothing.field("buckwal.outcome"), Some("nothing"));
+    assert_eq!(nothing.field("buckwal.found_new"), Some("false"));
+    assert_eq!(nothing.field("buckwal.lag_ms"), Some("0"));
+    assert_eq!(nothing.field("buckwal.objects"), Some("0"));
+    assert!(num(nothing, "buckwal.lists") >= 1);
+    assert_eq!(applied.field("buckwal.trigger"), Some("notification"));
+    assert_eq!(applied.field("buckwal.outcome"), Some("applied"));
+    assert_eq!(applied.field("buckwal.found_new"), Some("true"));
+    assert_eq!(num(applied, "buckwal.objects"), 1);
+    assert!(num(applied, "buckwal.gets") >= 1);
+    assert_eq!(applied.field("buckwal.skipped"), Some("0"));
+    // The values are the ones stats() reports after that pass.
+    assert_eq!(num(applied, "buckwal.generation"), stats.generation);
+    assert_eq!(num(applied, "buckwal.seq"), stats.seq);
+    assert_eq!(
+        num(applied, "buckwal.lag_ms"),
+        stats.lag_ms.expect("a measured lag")
+    );
+    assert_eq!(
+        applied.field("buckwal.replica_id"),
+        start.field("buckwal.replica_id")
+    );
+}
+
+#[test]
+fn sync_span_trigger_slow_poll() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, _wc) = writer(&store, 1);
+    let r = tempfile::tempdir().unwrap();
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let replica = open_replica_with_store(rconfig(&r.path().join("r")), store.clone()).unwrap();
+        until("a slow poll", || replica.stats().passes_slow_poll >= 1);
+        until_sync_spans(&cap, 2);
+        replica.close().unwrap();
+        cap.spans()
+    });
+    let all = sync_spans(&spans);
+    all.iter().for_each(|s| check_sync_span(s));
+    assert!(all
+        .iter()
+        .any(|s| s.field("buckwal.trigger") == Some("slow_poll")));
+}
+
+#[test]
+fn sync_span_outcome_error() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, wc) = writer(&store, 1);
+    let spy = Spy::new(store.clone());
+    let r = tempfile::tempdir().unwrap();
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mut c = rconfig(&r.path().join("r"));
+        c.replica_poll_interval = Duration::from_secs(120);
+        let replica = open_replica_with_store(c, spy.clone()).unwrap();
+        until_sync_spans(&cap, 1);
+        add(&wc, 2);
+        spy.fail_gets_under("/log/");
+        replica.waker().wake();
+        until_sync_spans(&cap, 2);
+        spy.heal();
+        replica.close().unwrap();
+        cap.spans()
+    });
+    let all = sync_spans(&spans);
+    assert_eq!(all[1].field("buckwal.outcome"), Some("error"), "{all:?}");
+    check_sync_span(all[1]);
+}
+
+#[test]
+fn sync_span_outcome_re_restore() {
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let l = lag();
+        l.fall_behind();
+        l.wait_re_restore();
+        until_sync_spans(&cap, 3);
+        l.replica.close().unwrap();
+        cap.spans()
+    });
+    let all = sync_spans(&spans);
+    all.iter().for_each(|s| check_sync_span(s));
+    assert!(
+        all.iter()
+            .any(|s| s.field("buckwal.outcome") == Some("re_restore")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn sync_span_outcome_checkpoint_deferred() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, wc) = writer(&store, 3);
+    let r = tempfile::tempdir().unwrap();
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let replica = open_replica_with_store(rconfig(&r.path().join("r")), store.clone()).unwrap();
+        let rc = replica.connect().unwrap();
+        wait_rows(&rc, 3);
+        // A reader holds its snapshot across a seal; the checkpoint is deferred once the
+        // follower's busy budget (two poll intervals) is spent.
+        rc.transaction(|tx| {
+            tx.query("SELECT count(*) FROM t", &[])?;
+            wc.checkpoint(CheckpointMode::Truncate).unwrap();
+            add(&wc, 4);
+            until("a deferred checkpoint", || {
+                replica.stats().deferred_checkpoints >= 1
+            });
+            Ok(())
+        })
+        .unwrap();
+        until_sync_spans(&cap, 2);
+        rc.close().unwrap();
+        replica.close().unwrap();
+        cap.spans()
+    });
+    let all = sync_spans(&spans);
+    all.iter().for_each(|s| check_sync_span(s));
+    assert!(
+        all.iter()
+            .any(|s| s.field("buckwal.outcome") == Some("checkpoint_deferred")),
+        "{:?}",
+        all.iter()
+            .map(|s| s.field("buckwal.outcome"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn re_restore_span_parents_restore_span() {
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let l = lag();
+        let applied = l.fall_behind();
+        l.wait_re_restore();
+        let stats = l.replica.stats();
+        l.replica.close().unwrap();
+        (cap.spans(), applied, stats)
+    });
+    let (spans, applied, stats) = spans;
+    let rr = spans.named("buckwal.replica.re_restore");
+    assert_eq!(rr.len(), 1, "{rr:?}");
+    let rr = rr[0];
+    assert_eq!(rr.target, "buckwal");
+    assert_eq!(rr.level, tracing::Level::INFO);
+    assert_eq!(rr.field("buckwal.reason"), Some("trimmed"));
+    assert_eq!(num(rr, "buckwal.generation"), 1);
+    assert_eq!(num(rr, "buckwal.seq"), applied);
+    assert_eq!(num(rr, "buckwal.generation_after"), stats.generation);
+    // The follower of the new copy has read no log yet; its first pass re-reads from seq 1.
+    num(rr, "buckwal.seq_after");
+    num(rr, "buckwal.behind_ms");
+    assert!(rr
+        .field("buckwal.replica_id")
+        .is_some_and(|i| !i.is_empty()));
+    let restore = spans.with_parent(rr.id, "buckwal.restore");
+    assert_eq!(restore.field("buckwal.outcome"), Some("ok"));
+    // The same WARN and span agree on the id and behind_ms.
+    let w = fell_behind_events(&spans)[0];
+    assert_eq!(w.field("replica_id"), rr.field("buckwal.replica_id"));
+    assert_eq!(w.field("behind_ms"), rr.field("buckwal.behind_ms"));
+}
+
+#[test]
+fn replica_logs_carry_no_token_or_row_data() {
+    const MARKER: &str = "ROWDATA-marker-5e1c0b77";
+    const TOKEN: &str = "TOKEN-like-secret-9d3f21ab";
+    let key_hex = "ab".repeat(32);
+    let store = Arc::new(MemStore::new());
+    let k = tempfile::tempdir().unwrap();
+    let t = tempfile::tempdir().unwrap();
+    let mut wc_cfg = key_config(&t.path().join("w"), k.path(), &key_hex, wconfig);
+    wc_cfg.secret_key = TOKEN.to_string();
+    let db = crate::open_with_store(wc_cfg, store.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    let put_marker = |id: i64| {
+        conn.execute(
+            &format!("INSERT INTO t(id, v) VALUES (?, '{MARKER}')"),
+            &[int(id)],
+        )
+        .unwrap()
+    };
+    put_marker(1);
+    let r = tempfile::tempdir().unwrap();
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mut c = key_config(&r.path().join("r"), k.path(), &key_hex, rconfig);
+        c.secret_key = TOKEN.to_string();
+        c.replica_poll_interval = Duration::from_secs(120);
+        let replica = open_replica_with_store(c, store.clone()).unwrap();
+        let rc = replica.connect().unwrap();
+        wait_rows(&rc, 1);
+        put_marker(2);
+        replica.waker().wake();
+        wait_rows(&rc, 2);
+        until_sync_spans(&cap, 2);
+        until("the second pass", || replica.stats().seq > 1);
+        // Replay an old record at the next seq: an integrity failure and a stop.
+        let seq = replica.stats().seq;
+        let keys = Keys::new(PREFIX);
+        let old = store.get(&keys.log(1, seq)).unwrap().unwrap().body;
+        put_marker(3);
+        store.put(&keys.log(1, seq + 1), &old).unwrap();
+        replica.waker().wake();
+        until("the follower to stop", || replica.thread_finished());
+        assert_eq!(replica.stats().stopped.as_deref(), Some("integrity"));
+        rc.close().unwrap();
+        replica.close().unwrap();
+        cap.spans()
+    });
+    let out = ours(&spans);
+    for secret in [MARKER, TOKEN, key_hex.as_str()] {
+        assert!(!out.contains(secret), "{secret} leaked into: {out}");
+    }
+    // And the same across a re-restore.
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let l = lag();
+        l.wc.execute(
+            &format!("INSERT INTO t(id, v) VALUES (100, '{MARKER}')"),
+            &[],
+        )
+        .unwrap();
+        l.fall_behind();
+        l.wait_re_restore();
+        l.replica.close().unwrap();
+        cap.spans()
+    });
+    assert!(!ours(&spans).contains(MARKER));
+}
+
+/// Everything buckwal itself emitted (target `buckwal`), as one string. The engine's own
+/// tracing is not ours and carries the SQL text.
+fn ours(s: &Spans) -> String {
+    let spans: Vec<_> = s.spans.iter().filter(|s| s.target == "buckwal").collect();
+    let events: Vec<_> = s.events.iter().filter(|e| e.target == "buckwal").collect();
+    assert!(!spans.is_empty() && !events.is_empty());
+    format!("{spans:?} {events:?}")
+}
+
+fn stopped_events(s: &Spans) -> Vec<&crate::telemetry::testing::EventRec> {
+    s.events
+        .iter()
+        .filter(|e| e.field("message") == Some("replica stopped"))
+        .collect()
+}
+
+#[test]
+fn stopped_reasons_integrity_and_corrupt_carry_the_object_key() {
+    for (reason, encrypted) in [("integrity", true), ("corrupt", false)] {
+        let store = Arc::new(MemStore::new());
+        let k = tempfile::tempdir().unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let hex = "cd".repeat(32);
+        let mk = |d: &Path, f: fn(&Path) -> Config| {
+            if encrypted {
+                key_config(d, k.path(), &hex, f)
+            } else {
+                f(d)
+            }
+        };
+        let db = crate::open_with_store(mk(&t.path().join("w"), wconfig), store.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .unwrap();
+        add(&conn, 1);
+        let r = tempfile::tempdir().unwrap();
+        let cap = Capture::new();
+        let (spans, seq) = tracing::subscriber::with_default(cap.subscriber(), || {
+            let mut c = mk(&r.path().join("r"), rconfig);
+            c.replica_poll_interval = Duration::from_secs(120);
+            let replica = open_replica_with_store(c, store.clone()).unwrap();
+            let rc = replica.connect().unwrap();
+            wait_rows(&rc, 1);
+            until("the start pass", || replica.stats().seq > 0);
+            let seq = replica.stats().seq;
+            let keys = Keys::new(PREFIX);
+            let old = store.get(&keys.log(1, seq)).unwrap().unwrap().body;
+            add(&conn, 2);
+            let body: &[u8] = if encrypted { &old } else { b"garbage" };
+            store.put(&keys.log(1, seq + 1), body).unwrap();
+            replica.waker().wake();
+            until("the follower to stop", || replica.thread_finished());
+            assert_eq!(replica.stats().stopped.as_deref(), Some(reason));
+            rc.close().unwrap();
+            replica.close().unwrap();
+            (cap.spans(), seq)
+        });
+        let ev = stopped_events(&spans);
+        assert_eq!(ev.len(), 1, "{reason}: {:?}", spans.events);
+        assert_eq!(ev[0].level, tracing::Level::ERROR);
+        assert_eq!(ev[0].target, "buckwal");
+        assert_eq!(ev[0].field("reason"), Some(reason));
+        assert_eq!(ev[0].field("generation"), Some("1"));
+        assert_eq!(ev[0].field("seq"), Some(seq.to_string().as_str()));
+        let key = Keys::new(PREFIX).log(1, seq + 1);
+        assert_eq!(ev[0].field("key"), Some(key.as_str()), "{reason}");
+        // The last sync span ended in error.
+        let all = sync_spans(&spans);
+        assert_eq!(all.last().unwrap().field("buckwal.outcome"), Some("error"));
+    }
 }

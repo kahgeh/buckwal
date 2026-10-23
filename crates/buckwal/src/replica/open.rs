@@ -704,6 +704,22 @@ impl Runner {
                 Trigger::Start => {}
             }
         }
+        let span = tracing::info_span!(
+            target: "buckwal",
+            "buckwal.replica.sync",
+            buckwal.replica_id = self.follower.replica_id(),
+            buckwal.generation = tracing::field::Empty,
+            buckwal.seq = tracing::field::Empty,
+            buckwal.trigger = trigger.as_str(),
+            buckwal.lag_ms = tracing::field::Empty,
+            buckwal.objects = tracing::field::Empty,
+            buckwal.lists = tracing::field::Empty,
+            buckwal.gets = tracing::field::Empty,
+            buckwal.found_new = tracing::field::Empty,
+            buckwal.skipped = tracing::field::Empty,
+            buckwal.outcome = tracing::field::Empty,
+        );
+        let entered = span.enter();
         let r = self.follower.pass(trigger);
         let ok = matches!(
             r.outcome,
@@ -729,6 +745,23 @@ impl Runner {
                 }
             }
         }
+        {
+            let s = lock(&self.stats);
+            span.record("buckwal.generation", s.generation);
+            span.record("buckwal.seq", s.seq);
+            if let Some(lag) = s.lag_ms.filter(|_| ok) {
+                span.record("buckwal.lag_ms", lag);
+            }
+        }
+        span.record("buckwal.objects", r.objects);
+        span.record("buckwal.lists", r.lists);
+        span.record("buckwal.gets", r.gets);
+        span.record("buckwal.found_new", r.found_new);
+        span.record("buckwal.skipped", r.skipped);
+        span.record("buckwal.outcome", r.outcome.span_value(r.found_new));
+        // The pass is over; a re-restore or a stop that follows is not part of its duration.
+        drop(entered);
+        drop(span);
         if ok {
             self.caught_up = Instant::now();
             self.episode = None;
@@ -809,7 +842,24 @@ impl Runner {
                 });
             }
         }
-        if let Err(e) = self.restore_again() {
+        let span = tracing::info_span!(
+            target: "buckwal",
+            "buckwal.replica.re_restore",
+            buckwal.replica_id = self.follower.replica_id(),
+            buckwal.generation = generation,
+            buckwal.seq = seq,
+            buckwal.generation_after = tracing::field::Empty,
+            buckwal.seq_after = tracing::field::Empty,
+            buckwal.behind_ms = behind.as_millis() as u64,
+            buckwal.reason = reason,
+        );
+        let restored = span.in_scope(|| self.restore_again());
+        if restored.is_ok() {
+            span.record("buckwal.generation_after", self.follower.generation());
+            span.record("buckwal.seq_after", self.follower.last_seq());
+        }
+        drop(span);
+        if let Err(e) = restored {
             let wait = self.backoff();
             let ep = self.episode.get_or_insert(Episode {
                 failures: 0,
