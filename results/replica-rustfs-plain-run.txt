@@ -1,0 +1,26 @@
+Plain-mode run of the replica RustFS file (scripts/rustfs.sh env; cargo test --locked -p buckwal-cli --test replica -- --ignored --test-threads=1) at tip cfb7fe7, 2026-10-24:
+test replica_dropped_notification_slow_poll_applies ... ok
+test replica_duplicate_and_out_of_order_notifications ... ok
+test replica_encrypted_bucket_edited_behind_back_stops_with_integrity ... ok
+test replica_follows_before_prefetch_finishes ... ok
+test replica_follows_seal_new_generation_and_third_machine_takeover ... ok
+test replica_follows_writer_off_and_window ... ok
+test replica_kill_matrix ... ok
+test replica_listener_rules ... ok
+test replica_missing_seq_waits ... ok
+test replica_paused_past_trim_grace_re_restores ... ok
+test replica_reader_held_across_seal ... ok
+test replica_refuses_mvcc ... ok
+test replica_refuses_writes_and_sends_zero_puts_and_deletes ... ok
+test replica_rolled_back_large_transaction ... ok
+test replica_skips_fenced_writers_late_record ... ok
+test replica_sync_spans_reach_clickhouse ... ok
+test replica_wakes_on_posted_notification_under_5s ... ok
+test replica_without_notification_setup_runs_on_slow_poll ... ok
+test replica_wrong_key_refused ... ok
+test takeover_from_a_replica_machine ... ok
+test two_replicas_each_with_own_listener ... ok
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 212.66s
+
+s3_list_after_start_after_and_paging (cargo test --locked -p buckwal --test s3_rustfs -- --ignored s3_list_after): ok, 1 passed
+Before the generation-move fix (tip 8ff1dc4): replica_follows_writer_off_and_window, replica_paused_past_trim_grace_re_restores, two_replicas_each_with_own_listener failed (coordinator's run); first was a product bug: a double seal between two polls made the head jump G=1 -> 3 and log/2 (101 records) was never read; the replica stayed at 501 of 600 rows.
