@@ -64,6 +64,7 @@ The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The
 - **HTTPS and encryption.** `https://` endpoints are checked against the platform's trust store, or against a list of certificate authorities you name in `BUCKWAL_CA_BUNDLE`. With a key file named in `BUCKWAL_ENCRYPTION_KEY_FILE`, the database is encrypted before it leaves the machine, so the bucket holds only scrambled bytes that only your key can read.
 - **A server for other languages.** `buckwal serve` serves the database over tursodb's SQL over HTTP v3, so apps in other languages and several processes can use it through tursodb's serverless drivers (see Server).
 - **Concurrent writers.** A database created new in a mode that lets several writes run at once (`BEGIN CONCURRENT`) is durable too, with limits. A section further down describes it.
+- **Read replicas.** A second machine can keep a read-only copy that follows the bucket alone, woken by the bucket's event notifications with a slower poll as the safety net (`buckwal follow`, `open_replica`; see Replicas). Its AWS notification route (SNS) was not tested on AWS.
 - **What it was tested on.** A laptop, against RustFS, over plain HTTP and over HTTPS with encryption. It was not tested on AWS S3 (see Not tested until real use).
 
 ## How it works
@@ -475,6 +476,8 @@ The error text is the `Display` of `Error::Unsupported`: the feature, then ` is 
 | `soak --dir DIR [--checkpoint passive\|full\|restart\|truncate\|reopen] [--every N] [--start ID] [--count N] [--page-put-delay-ms N] [--connections N] [--batching SPEC] [--batching-file PATH] [--stats-every N] [--journal-mode wal\|mvcc] [--concurrent [all\|mixed]]` | Commits one 1 KB row at a time into table `soak` and prints `ack <id>` after each acked commit. With `--checkpoint`, it checkpoints (or closes and reopens) every N commits (`--every`, default 100); without it, it never checkpoints itself. Ids start at 1 by default. It runs until killed unless `--count` is given. It retries on errors, printing `error <message>`. More below. |
 | `serve --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal\|mvcc]` | Serves the database over tursodb's SQL over HTTP v3 until SIGTERM or SIGINT, as the writer (the same `--claim` rule as `sql`). It reads `BUCKWAL_SERVE_*` too, and prints `serve listening …`, `serve ready …` and `serve stopped …` lines (see Server). |
 | `bench --dir DIR --commits N [--connections N] [--batching SPEC] [--journal-mode wal\|mvcc]` | Runs N single-row commits of 1 KB, shared by `--connections` threads (default 1), and prints `key=value` lines: commit p50/p95/p99/max, `busy_retries` (commits the engine refused as `database is busy`, each retried after 10 ms for up to 10 s, after which bench fails with the error; latency runs from the first attempt), commits/s, the `stats` keys for the run, `log_puts_per_commit`, `bucket_puts`, `page_puts`, each seal's ms and page count, then the maintenance checkpoint's `maintenance_runs` (runs started), `maintenance_sealed`, `maintenance_skipped`, `maintenance_gate_wait_max_ms` (the longest drain of a run that sealed), and `generation_log_objects_max` (the highest log seq seen before the close: the most log objects a generation held, which a restore of it reads). |
+| `follow --dir DIR [--poll-ms N]` | Runs a read replica of the bucket's database in `DIR` until SIGTERM or SIGINT, and prints a status line per event. It runs the notification listener when `BUCKWAL_REPLICA_NOTIFY_LISTEN` is set. It never writes to the bucket (see Replicas). |
+| `notify-setup --bucket B --replicas N [--region R] [--topic NAME]` | Prints the AWS CLI commands, the topic policy and the bucket notification JSON for N replicas, and the RustFS equivalents (untested). It runs nothing, reads no secret and makes no network call (see Replicas). |
 
 `--journal-mode` is the mode a new database is created in (see MVCC mode, Creating one). `soak --concurrent` (bare, or `all`) runs every write as `BEGIN CONCURRENT` … `COMMIT`, retrying a write conflict; `mixed` has even-numbered threads use a plain `BEGIN` and odd-numbered ones `BEGIN CONCURRENT`. `ack <id>` is printed only after the `COMMIT` returned `Ok`.
 
@@ -761,6 +764,76 @@ How the suite was run:
    ```
 6. Check that the tests really reached the server. **Both suites skip every test and still report ok when the variables are unset:** each Rust conformance test prints `skipping: set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN …` and returns (it needs both variables), and each Go test that reaches the server (24 of the 36) calls `t.Skip` when `TURSO_DATABASE_URL` is empty. So no line may contain `skipping` in the cargo output (with `--nocapture`), and no `--- SKIP` may appear in the `go test -v` output.
 
+## Replicas
+
+A *replica* is a local copy of the database on another machine that follows the bucket and only reads. It is fed from the bucket alone: no server, no Turso Cloud, and nothing is written to the bucket. The one writer keeps writing exactly as before. Seals, new generations, takeovers and GC on the writer's side do not break a replica. Decisions: [ADR 0006](docs/adr/0006-a-third-io-mode-for-replicas.md) (the replica IO mode) and [ADR 0007](docs/adr/0007-the-notification-listener-reuses-the-server-crates-listener.md) (the notification listener).
+
+**Using one.**
+- From Rust: `buckwal::open_replica(config)` returns a `Replica`. `Replica::connect()` gives a read-only `ReadConnection` (queries and read transactions; open one per thread), `Replica::stats()` a `ReplicaStats`, `Replica::waker()` a handle whose `wake()` starts a sync pass, and `Replica::close()` stops it (close the connections first). Apps read in the replica's own process: a second process cannot open the directory (D4, `durable.lock`). Serving a replica over the network is not built.
+- From the command line: `buckwal follow --dir DIR [--poll-ms N]` runs a replica until SIGTERM or SIGINT and prints one status line per event: `notify listening addr=… tls=… auth=…` (when the listener runs), `following generation=… seq=…`, `applied generation=… seq=…`, `notified received=…`, `checkpoint deferred count=…`, `skipped fenced_records=…`, `re-restored count=… reason=…` and `stopped reason=…` (the command then exits 1). `DIR` must be missing, empty or a replica's own directory; a directory that holds a writer's database is refused with `Config`.
+- The settings are the usual `BUCKWAL_*` ones (endpoint, bucket, prefix, keys) plus the table below. `Config::validate_replica` (run by `open_replica` and `follow`) refuses a poll interval of 0 and one at or above `trim_grace`.
+
+| Variable | `Config` field | Default | Notes |
+|---|---|---|---|
+| `BUCKWAL_REPLICA_POLL_MS` | `replica_poll_interval` | 60000 | The slow poll: how often a replica starts a sync pass when no notification came. Must be above 0 and below `trim_grace` (`--poll-ms` on `follow` is checked the same way). |
+| `BUCKWAL_REPLICA_NOTIFY_LISTEN` | (`buckwal_server::notify::NotifyConfig`) | unset | `IP:port` of the notification listener. Unset, `follow` runs no listener and the replica runs on the slow poll alone. |
+| `BUCKWAL_REPLICA_NOTIFY_TLS_CERT`, `BUCKWAL_REPLICA_NOTIFY_TLS_KEY` | | unset | PEM files. Both or neither. |
+| `BUCKWAL_REPLICA_NOTIFY_TOKEN_FILE` | | unset | A file holding the token. A non-loopback address is refused (exit 2) unless TLS and the token are both set. |
+
+**How it follows.** A replica starts with a restore (head, manifest, the current generation's log, pages fetched lazily), fetches every sealed page in the background, then runs one follower thread. Two things start a *sync pass*: a notification from the bucket, which is the main trigger, and the *slow poll* timer, a safety net. A pass lists `log/<G>/` after the last record it holds (`ListObjectsV2` with `start-after`, so it lists only new keys however long the generation's log is), fetches each new record in order, rebuilds the writer's WAL frames, applies only the *committed prefix* (up to the last commit frame, so a rolled-back transaction never shows), and checks the head once with a HEAD request. A commit becomes visible to the replica's readers at its commit frame. A notification is only a hint: the pass reads the log by seq, so a lost, late, duplicated or out-of-order notification cannot make a replica apply the wrong thing. A burst is coalesced into one pass after another. A pass that finds nothing costs one LIST and one HEAD.
+
+The replica keeps a *position file* `app.db-replica` (generation, stage, frame offset, a random replica id), written as a temp file, fsynced, renamed and the directory fsynced. After a restart the follower re-reads the current generation's log from seq 1 and skips what it already holds. A directory copied without its position file cannot resume and restores again. Two more files can appear: `app.db-replica-at`, which names the sibling directory that holds the current copy after a re-restore, and `app.db-replica-seen`, the time of the last successful pass.
+
+**Seals, takeovers and GC.**
+- At a seal the follower applies the rest of `log/<G>`, then runs a local TRUNCATE checkpoint and follows `log/<G+1>`. If readers hold the checkpoint (`Busy`) it retries for up to two slow-poll intervals, and then carries on without restarting its WAL and tries again on later passes. Readers are never refused. The cost is that the local WAL grows while a reader stays open, and that, until the checkpoint runs or the retry budget is spent, the replica does not read the next generation's log, so its lag grows by up to that budget.
+- A takeover can leave a late record from the fenced old writer in `log/<G>`. The follower applies the records the new writer took in, then, after the fence record, only records written by the fence's writer. A record from another writer is skipped, counted in `stats()` as `fenced_records_skipped` and logged (INFO `fenced writer's record skipped`). A takeover's first seal skips a generation number, and the follower moves from G to the generation the head names.
+- GC deletes a generation's log objects once a newer seal is older than `trim_grace`. A replica more than about `trim_grace` behind (a laptop asleep, a network loss) can find the objects it needs gone. It then logs one WARN (`replica fell behind, restoring again`, with how far behind it was and the reason), restores into a fresh directory beside the old one, swaps to it, removes the old one and resumes. The reason is `trimmed`, or `conflict` when the local WAL and the log disagree. A conflict also logs an ERROR `replica conflict` first; the replica then re-restores, so a conflict that heals this way never logs `replica stopped`. Readers see an error only if they hold an open transaction across the swap; new connections continue on the new copy. `stats()` shows `re_restores` up by one and `last_re_restore_at` with the reason.
+- A seq missing from the log (seq `n+1` listed but not `n`) stops the pass before `n+1`; the next pass tries again, and a hole still there after the head moved on is the trimmed case above.
+- `Replica::stats()` reports the applied generation and seq, the time of the last successful pass, the last pass's observed lag (now minus the newest applied object's `Last-Modified`, by the bucket's clock, at one-second resolution), passes by trigger (notification or slow poll), notifications received, notification passes that found nothing new, objects fetched, deferred checkpoints, `fenced_records_skipped`, `re_restores`, and `stopped` (set when the follower has stopped for good).
+
+**Where the notification comes from.** A replica is woken by the bucket's `s3:ObjectCreated:*` event for the keys under `log/`, `head` and `manifest` (not `pages/`, which are most of the bytes and not needed to follow). Every replica must get every event, so each replica has its own receiving point: a webhook listener (`POST /notify`) that `buckwal follow` runs when `BUCKWAL_REPLICA_NOTIFY_LISTEN` is set. An app that embeds the library either runs the same listener (`buckwal_server::notify::serve`) or calls `ReplicaWaker::wake()` from its own endpoint.
+
+- **On AWS:** S3 Event Notifications go to an **SNS topic** (one event can have only one destination, so the topic is what reaches N replicas), and the topic has **one HTTPS subscription per replica**, pointing at that replica's listener. **Every replica on AWS must be reachable over HTTPS from the internet**, on a public address with a certificate a public CA signed.
+- **Authentication.** The listener binds `127.0.0.1` by default. A non-loopback address is refused unless TLS and the token are both set. A request without the token, or with a wrong one, gets 401 and wakes nothing; the token is compared in constant time and never logged. SNS cannot send a bearer header, so the listener also accepts HTTP basic authentication with the user name `sns` and the same token file as the password, which is what SNS sends when the endpoint URL is `https://sns:<token>@host:port/notify`.
+- **Warning: the token lives in your AWS account.** SNS keeps the endpoint URL, credentials included, in the subscription. Anyone who can read the subscription (`aws sns get-subscription-attributes`, or the console) can read the token and wake the replica. A wake is harmless (a pass reads the log by seq and a wake applies nothing it carries), but use a token of its own, not one used elsewhere, and restrict who can read SNS subscriptions.
+- **Subscription confirmation.** SNS sends a confirmation request with the same credentials before it delivers anything. The listener confirms it by fetching the `SubscribeURL` only when that URL is on an `sns.<region>.amazonaws.com` host; any other host is refused (400, WARN `sns confirmation refused`). The replica must be running for the subscription to be confirmed.
+- **What you set up.** Creating the topic, the subscriptions, the topic policy and the bucket's notification configuration changes your cloud account, so buckwal does not do it. `buckwal notify-setup --bucket B --replicas N [--region R] [--topic NAME]` **prints** the AWS CLI commands, the topic policy, the bucket notification JSON (one rule per prefix: `log/`, `head`, `manifest`) and the RustFS equivalents (marked untested), with placeholders such as `ACCOUNT_ID`, `REPLICA_<n>_HOST` and `<token>`; it runs nothing, reads no secret and makes no network call. If the database lives under a prefix `P`, start each notification prefix with `P/`.
+- **Events sent while a replica is down are dropped, not queued.** SNS retries an HTTPS delivery for a limited time under its delivery policy and then gives up. Nothing depends on them: a replica's first pass after it starts reads the log from where it left off, and the slow poll catches anything dropped while it runs.
+- **Remove the SNS subscription of a stopped replica** (`aws sns unsubscribe --subscription-arn …`), or SNS keeps failing deliveries to it.
+- **At-least-once delivery.** AWS delivers events at least once, in no guaranteed order, usually within seconds and sometimes a minute or more. A notification can repeat, arrive late or out of order, or never arrive. The first three are harmless and the slow poll covers the last.
+- **Without notifications** a replica runs on the slow poll alone and is correct, with up to a minute of lag. If none has arrived by the first slow poll it logs a WARN once per start: `no notification received yet, running on the slow poll only`.
+- **RustFS** has webhook targets that should work the same way, but this is untested (see Not tested until real use). The tests post S3-format events to the listener themselves.
+
+**Lag.**
+- On the notification path: the bucket's delivery delay, plus one LIST and one GET round trip, plus the writer's own commit time. S3's delay is not guaranteed (usually seconds, sometimes a minute or more), so on AWS this path is usually slower than polling every second would be. For sub-second lag on AWS, lower `BUCKWAL_REPLICA_POLL_MS` and pay the polling cost below.
+- When a notification is lost: at most one slow-poll interval (60 s by default) plus one GET round trip.
+- At a seal while a reader is open: up to two slow-poll intervals more (2 minutes by default), the checkpoint's retry budget, as described above.
+- The bounds hold only while the replica polls faster than the writer's `trim_grace` (10 minutes by default). The slow poll is what keeps that bound, not the notifications, because every notification can be lost. Config validation refuses a poll interval at or above `trim_grace`. A replica stopped for longer than `trim_grace` re-restores, and for that time its lag is however long it was away plus the restore.
+- Why 60 s: it keeps the polling cost near zero (60 LISTs an hour) and puts a 60 s ceiling on the lag when a notification fails.
+- Diagnosis: the `replica fell behind` WARN and the `buckwal.replica.re_restore` span give the reason and how far behind it was; an ERROR `replica conflict` (naming the generation and frame in its `error` field) means the local WAL and the log disagreed and the replica is re-restoring; `no notification received yet` means the route is not delivering; `stats()` and the `buckwal.replica.sync` spans show the trigger, outcome and `buckwal.lag_ms` of each pass (see Telemetry).
+
+**Cost.** Each pass is 1 LIST, 1 HEAD of the head (priced as a GET) and 1 GET per new log object. Prices checked on 2026-10-24: [Amazon S3 pricing](https://aws.amazon.com/s3/pricing/) states S3 Standard GET requests at US$0.0004 per 1,000 (its US East (N. Virginia) example). The pricing pages did not return the rate tables for LIST (charged at the PUT/COPY/POST rate) or for SNS, so the LIST and SNS figures below are **the spec's estimate**, not looked up on the day: LIST about US$0.005 per 1,000, SNS publish about US$0.50 per million, SNS HTTPS delivery about US$0.60 per million. Check [S3](https://aws.amazon.com/s3/pricing/) and [SNS](https://aws.amazon.com/sns/pricing/) pricing for your region before you rely on them. As a guide at us-east-1 standard prices at the date of writing:
+
+| | Per replica per hour | About per month |
+|---|---|---|
+| Slow poll only, every 60 s (60 LISTs and head HEADs) | US$0.0003 | US$0.22 |
+| Each million writer commits seen (one notification, one pass: SNS publish and HTTPS delivery, LIST, 2 GETs) | about US$7 per million | depends on the commit rate |
+| For comparison, polling the bucket every 1 s instead | US$0.019 | US$14 |
+
+An idle replica costs about US$0.22 a month, against US$14 polling every second. Bursts are coalesced, so the per-million figure is an upper bound. N replicas multiply it by N. The writer's cost is unchanged, apart from SNS publishing the bucket's events. The initial restore and prefetch cost what a restore costs today. No figure here was measured: the tests run only against local RustFS.
+
+**Limits.**
+- `conn_raw_api` is not a public turso_core API. It is stable only because the repo pins `turso_core =0.8.3`, and the probes of `docs/read-replicas-recon.md` must be re-run on an upgrade.
+- A long-open reader keeps the replica's WAL from restarting, so the local WAL grows until it finishes. New data is held back only at a seal, for up to the checkpoint's retry budget (two slow-poll intervals).
+- The writer ships the frames of a large transaction it later rolls back. Replicas download them and drop them. There is no cap: it grows with the transaction.
+- A replica directory copied without its position file must re-restore.
+- MVCC databases are refused: `Unsupported("replica: MVCC")` at open when the head says `"journal_mode":"mvcc"`, and while following if a kind 3 record appears (then the follower stops: ERROR `replica stopped`, reason `mvcc`).
+- A replica reads in its own process only. It cannot write: every statement that writes, `PRAGMA` writes, `ATTACH`, checkpoints by the app and `buckwal_batching` are refused.
+- Encrypted databases have encrypted replicas: the same `BUCKWAL_ENCRYPTION_KEY_FILE` and `BUCKWAL_ENCRYPTION_CIPHER`; a wrong or missing key is refused at open with `Encryption`, before any follow. Each frame costs one decrypt (before insert) and one encrypt (the frame API encrypts on the way in); the replica's files hold ciphertext like the writer's. A failed integrity code (see Guarantees, Encryption) stops the replica with `Corrupt("integrity: <object key>")` and an ERROR; it applies nothing from that object.
+- Stopping for good happens for three reasons only: `mvcc`, `integrity` and `corrupt` (any other `Corrupt`, such as a malformed log record). `Replica::connect` still works on the last applied state.
+
+**Taking over from a replica's machine.** There is no separate "promote". Stop the replica and run `buckwal takeover --dir NEW` on that machine, into a fresh directory (a restore and a claim, as today), then open `NEW` as the writer. The old writer is fenced at its next commit, as today. An in-place takeover of a running replica is not built, and a replica's own directory is not turned into the writer's.
+
 ## Settings
 
 `Config::from_env(dir)` reads these variables. `Config::new(dir, endpoint, bucket, access_key, secret_key)` uses the same defaults, and every `Config` field is public.
@@ -789,6 +862,7 @@ How the suite was run:
 | `BUCKWAL_MAINTENANCE_GATE_WAIT_MS` | `maintenance_gate_wait` | 500 ms | The longest a maintenance run holds new statements back while it waits for those in flight (and open transactions) to end; then it reopens the gate and retries later. `Config` refuses 0 while maintenance is on. |
 | `BUCKWAL_ENCRYPTION_KEY_FILE` | `encryption_key_file` | unset (empty = unset) | A local file holding the database's encryption key as hex, either case, with whitespace around it ignored: 32 bytes (64 hex digits), or 16 bytes (32 digits) for `aes128gcm` and the `aegis128*` ciphers. Set, the database is encrypted (see Guarantees, Encryption). Read at open, never uploaded or logged. A file that cannot be read, or holds anything else, fails `open` with `Config`, which names the file and never its content. The setting must match the database: a key on an unencrypted one, or none on an encrypted one, fails `open` with `Encryption`. |
 | `BUCKWAL_ENCRYPTION_CIPHER` | `encryption_cipher` | `aegis256` (empty = default) | Any cipher name turso accepts: `aegis256`, `aegis256x2`, `aegis256x4`, `aegis128l`, `aegis128x2`, `aegis128x4`, `aes256gcm` or `aes128gcm`, any case, also with `-` or `_` (`aes-256-gcm`). Anything else fails with `Config`, and so does a value other than the default without a key file. It must be the cipher the database was created with (`Encryption` otherwise). |
+| `BUCKWAL_REPLICA_POLL_MS` | `replica_poll_interval` | 60000 (60 s) | A replica's slow poll (see Replicas). Above 0 and below `trim_grace`, checked by `open_replica` and `follow`, not by the writer's `open`. |
 
 `TelemetryConfig::from_env()` reads the telemetry variables (`Config::from_env` does not):
 
@@ -799,7 +873,7 @@ How the suite was run:
 | `BUCKWAL_OTEL_LEVEL` | `level` | `info` | The least severe log record exported: `trace`, `debug`, `info`, `warn` or `error`. Spans are always INFO. |
 | `BUCKWAL_TEST_RUN_ID` | `test_run_id` | unset | Added as the `test_run_id` attribute to every span and log record. An empty value counts as unset. |
 
-`serve` also reads the `BUCKWAL_SERVE_*` variables (see Server).
+`serve` also reads the `BUCKWAL_SERVE_*` variables (see Server). `follow` reads `BUCKWAL_REPLICA_NOTIFY_LISTEN`, `BUCKWAL_REPLICA_NOTIFY_TLS_CERT`, `BUCKWAL_REPLICA_NOTIFY_TLS_KEY` and `BUCKWAL_REPLICA_NOTIFY_TOKEN_FILE` (see Replicas).
 
 Where the defaults live:
 - `crates/buckwal/src/config.rs`, `mod defaults`, holds every default above.
@@ -832,6 +906,8 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `buckwal.fence` | the caller's span (`buckwal.takeover`, or the writer open that appends one) | One per fence record: `buckwal.generation`, `buckwal.seq`, `buckwal.epoch`, `buckwal.retries`, `s3.status` |
 | `buckwal.server.request` | none (one per pipeline or cursor request to `serve`) | `http.route`, `http.status`, `buckwal.stream` (the stream's numeric id, never the baton), `buckwal.statements` (one per `execute` or `sequence`, a batch's steps), `buckwal.outcome` (`ok`, `error`, `fenced`, `unauthorized`, `bad_request`, `stream_expired`, `not_ready`, `shutting_down` or `too_many_streams`). No SQL text, arguments, baton or token. The request's `buckwal.commit` spans are its children. |
 | `buckwal.gc` | the caller's span for `gc`; none on a writer's GC thread | One per GC pass: `buckwal.generation` (the head's), `buckwal.manifest` (the manifest trimmed against; absent otherwise), `buckwal.age_ms` (as `GcReport::age`), `buckwal.deleted`, `buckwal.outcome` (`trimmed`, `too_young`, `nothing`, `integrity` or `error`) |
+| `buckwal.replica.sync` | none (the follower thread) | One per sync pass: `buckwal.replica_id` (a random id kept in the position file), `buckwal.generation`, `buckwal.seq` (the last applied), `buckwal.trigger` (`notification`, `slow_poll` or `start`), `buckwal.lag_ms` (as in `stats()`), `buckwal.objects` (log objects fetched), `buckwal.lists`, `buckwal.gets`, `buckwal.found_new` (`true` or `false`), `buckwal.skipped` (fenced records skipped) and `buckwal.outcome` (`applied`, `nothing`, `checkpoint_deferred`, `re_restore` or `error`) |
+| `buckwal.replica.re_restore` | none | One per re-restore: `buckwal.replica_id`, `buckwal.generation` and `buckwal.seq` (before), `buckwal.generation_after` and `buckwal.seq_after` (after), `buckwal.behind_ms`, `buckwal.reason` (`trimmed` or `conflict`). Its restore has the existing `buckwal.restore` span as a child. |
 
 Every span and log record also carries `test_run_id` when one is set (`BUCKWAL_TEST_RUN_ID`).
 
@@ -840,6 +916,99 @@ Every span and log record also carries `test_run_id` when one is set (`BUCKWAL_T
 - **Alert: `integrity check failed`, severity `page`.** Fires on any such record outside a test run (no `test_run_id`) in 24 h. Expected rate: zero; any firing means tampering or damage in the bucket. Action: stop restoring and taking over from that bucket, find who has write access to it, and restore from a copy known to be good. A running writer that meets a tampered head is fenced and stops (safe) without a record, so the alert fires at the next restore, takeover or GC, not from a running writer.
 - Each record keeps its own time. Without one it gets its observed time, and without that the current time.
 - Log records carry no trace or span ids. Adding them would need an experimental OpenTelemetry feature.
+
+**Replica telemetry.** The library exports spans and logs only, no OTLP metrics (`stats()` stays in the process). Everything a replica's owner needs off the machine rides on the two replica spans above and these log records (target `buckwal`; ids and reasons only, never a token or row data):
+- `replica fell behind, restoring again` (WARN: `replica_id`, `generation`, `seq`, `behind_ms`, `reason`), and `replica: could not remove the old copy` (WARN);
+- `no notification received yet, running on the slow poll only` (WARN, once per start);
+- `notification rejected` (WARN, target `buckwal::notify`: remote address, reason `no credentials` or `wrong credentials`), `sns subscription confirmed` (INFO: topic ARN) and `sns confirmation refused` (WARN: reason, for a `SubscribeURL` off an `sns.<region>.amazonaws.com` host);
+- `fenced writer's record skipped` (INFO: generation, seq, writer id);
+- `replica conflict` (ERROR: generation and frame, in its `error` field), followed by the re-restore and its WARN with reason `conflict`;
+- `replica stopped` (ERROR: `generation`, `seq`, and `reason`: `mvcc` for an MVCC record, `integrity` for a failed integrity check, or `corrupt` for any other `Corrupt`, such as a malformed log record; with `key`, the object key, where there is one). A conflict is not a stop: it re-restores.
+
+The two WARNs for falling behind and for no notification are log lines, not alerts. The owner of a replica asks three things: is it current, did the notifications reach it, and is it costing too much. Each is a card (a read-only ClickHouse query on `otel.otel_traces`, `ServiceName = 'buckwal'`, `SpanName = 'buckwal.replica.sync'`), and the first two also an alert, built from the spans. You set the alerts up in your own stack. buckwal sends that stack only OTLP, and the queries below are SELECTs only. They use the column names `scripts/otel-check.sh` uses (`Timestamp`, `SpanAttributes`); they were written for this README and not run against a live stack by this change. Optimising: `buckwal.lag_ms` p50 and p95 per replica per day (to tune the slow poll), and the share of notification passes below.
+
+*Card 1: is my replica current?* Max lag per replica over 10 minutes:
+
+```sql
+SELECT SpanAttributes['buckwal.replica_id'] AS replica,
+       max(toUInt64OrZero(SpanAttributes['buckwal.lag_ms'])) AS max_lag_ms
+FROM otel.otel_traces
+WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND Timestamp > now() - INTERVAL 10 MINUTE
+GROUP BY replica ORDER BY max_lag_ms DESC
+```
+
+**Alert (warning): a replica is not current.** Fires when no `buckwal.replica.sync` span has arrived from a `buckwal.replica_id` for 3 slow-poll intervals (180 s with the default), or `buckwal.lag_ms` is above 5 minutes (300000) for 10 minutes. Expected firing rate: none while a replica runs, once per sleep or outage. Action: check the replica process and its network to the bucket.
+
+```sql
+-- silent replicas (3 x the slow poll; change 180 if you changed BUCKWAL_REPLICA_POLL_MS)
+SELECT SpanAttributes['buckwal.replica_id'] AS replica, max(Timestamp) AS last_pass
+FROM otel.otel_traces
+WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND Timestamp > now() - INTERVAL 1 DAY
+GROUP BY replica HAVING last_pass < now() - INTERVAL 180 SECOND;
+
+-- lagging replicas: every pass in the last 10 minutes was above 5 minutes behind
+SELECT SpanAttributes['buckwal.replica_id'] AS replica
+FROM otel.otel_traces
+WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND Timestamp > now() - INTERVAL 10 MINUTE
+GROUP BY replica
+HAVING min(toUInt64OrZero(SpanAttributes['buckwal.lag_ms'])) > 300000;
+```
+
+Diagnosis: the `buckwal.replica.sync` spans with generation, seq, trigger and outcome, the `replica fell behind` WARN, and the `buckwal.replica.re_restore` span with its reason.
+
+*Card 2: did notifications reach it?* The share of passes that found new data and were started by a notification rather than the slow poll, per replica per hour (near 100% when the route works):
+
+```sql
+SELECT SpanAttributes['buckwal.replica_id'] AS replica,
+       toStartOfHour(Timestamp) AS hour,
+       countIf(SpanAttributes['buckwal.found_new'] = 'true') AS new_passes,
+       countIf(SpanAttributes['buckwal.found_new'] = 'true'
+               AND SpanAttributes['buckwal.trigger'] = 'notification') / greatest(new_passes, 1) AS notified_share
+FROM otel.otel_traces
+WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND Timestamp > now() - INTERVAL 1 DAY
+GROUP BY replica, hour ORDER BY replica, hour
+```
+
+**Alert (warning): notifications are not arriving.** Fires when that share is below 50% over 1 hour with at least 10 passes that found new data. Expected firing rate: none once the route is set up. Action: check the bucket's notification setup, the SNS subscription, and that the listener is reachable (`notify-setup` prints what it should be). A replica run without notifications on purpose is left out by the query below, because none of its passes is ever started by a notification (here: none in 7 days).
+
+```sql
+SELECT replica, new_passes, notified_new / new_passes AS share
+FROM (
+  SELECT SpanAttributes['buckwal.replica_id'] AS replica,
+         countIf(SpanAttributes['buckwal.found_new'] = 'true'
+                 AND Timestamp > now() - INTERVAL 1 HOUR) AS new_passes,
+         countIf(SpanAttributes['buckwal.found_new'] = 'true'
+                 AND SpanAttributes['buckwal.trigger'] = 'notification'
+                 AND Timestamp > now() - INTERVAL 1 HOUR) AS notified_new,
+         countIf(SpanAttributes['buckwal.trigger'] = 'notification') AS ever_notified
+  FROM otel.otel_traces
+  WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+    AND Timestamp > now() - INTERVAL 7 DAY
+  GROUP BY replica
+)
+WHERE new_passes >= 10 AND ever_notified > 0 AND share < 0.5
+```
+
+Diagnosis: `buckwal.trigger` and `buckwal.found_new` per pass, and the `notification rejected` and `sns confirmation refused` WARNs.
+
+*Card 3: is it costing too much?* Requests per replica per hour (amber above 7,200, two a second). Coalescing shows as fewer passes than notifications. **No alert**: cost is read from the card, not paged.
+
+```sql
+SELECT SpanAttributes['buckwal.replica_id'] AS replica,
+       toStartOfHour(Timestamp) AS hour,
+       count() AS passes,
+       sum(toUInt64OrZero(SpanAttributes['buckwal.lists'])) + sum(toUInt64OrZero(SpanAttributes['buckwal.gets'])) AS requests
+FROM otel.otel_traces
+WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND Timestamp > now() - INTERVAL 1 DAY
+GROUP BY replica, hour ORDER BY replica, hour
+```
+
+Diagnosis: `buckwal.trigger` and `buckwal.objects` per pass.
 
 **What is exported.** Only targets that start with `buckwal`: spans at INFO and above, and log records at `level` and above. turso_core's own `tracing` output is never exported, and neither is the exporter's own stack (`opentelemetry*`, `tonic`, `h2`, `hyper`, `tower`, `reqwest`).
 
@@ -1015,6 +1184,7 @@ Stores known to support both conditional PUTs (`If-None-Match: *` and `If-Match`
 | `PRAGMA buckwal_batching` set to a Window, on an MVCC database | `Unsupported("MVCC: Window batching")` |
 | `PRAGMA synchronous` below FULL | `Unsupported("synchronous below FULL")` |
 | `ATTACH` | `Unsupported("ATTACH")`. Writes to an attached database would not be uploaded. |
+| Opening a replica on an MVCC database (the head says `"journal_mode":"mvcc"`) | `Unsupported("replica: MVCC")` (see Replicas) |
 | `PRAGMA hexkey` or `PRAGMA cipher` set to a value | `Unsupported("encryption PRAGMAs (use BUCKWAL_ENCRYPTION_KEY_FILE)")`. The engine would swap the connection's key or cipher (translate/pragma.rs:644-655). Reading them is allowed. |
 
 An existing WAL database is never switched to MVCC, and an MVCC database never back to WAL. Both are refused at open and restore, from the head's mode and the local state's format, and from bytes 18/19 of a local `app.db` or of the manifest's page 1, and from `Database::mvcc_enabled()` (see MVCC mode, Refusals). A WAL database refuses to open an MVCC log file (`*.db-log`) at the IO layer as a backstop; an MVCC database opens it only through its wrapper.
@@ -1139,6 +1309,12 @@ Stage-2 binaries must not run against a prefix a stage-3 writer has touched. A s
 - **Upgrade note.** Once a takeover has happened on a prefix, run only builds from this change on against it. A build from before it drops `next_generation_floor` from the heads it writes, so GC would fall back to the old rule while the fenced writer's leftover manifest is still there, which is the case the floor exists for.
 - The takeover quiet is unchanged by this fix (a skipped generation does not make A's late requests end sooner), so the cost below stays.
 
+**Replicas.** What a replica guarantees and what it does not (details under Replicas).
+- A replica reads the bucket and writes nothing to it: zero PUTs and zero DELETEs (a test counts them). It applies only the committed prefix of the writer's log, so it never shows a rolled-back transaction, and a commit becomes visible at its commit frame.
+- Its lag is bounded only while it polls faster than `trim_grace`: one slow-poll interval when a notification is lost, up to two more at a seal while a reader holds the local checkpoint. Past `trim_grace` it re-restores. These figures were not measured on AWS.
+- It is not a writer and not a standby that takes over by itself. Taking over from a replica's machine is a fresh `buckwal takeover --dir NEW`.
+- It refuses MVCC databases, and reads in its own process only.
+
 **Test and diagnostics hooks.** `Config::on_event`, `buckwal::Event` and `buckwal::EventHook` are `#[doc(hidden)]`. They exist for the tests and for the CLI's `soak` event lines, and are not part of the supported API: they may change without notice.
 
 **Known cost: the commit that crosses a generation boundary.**
@@ -1203,6 +1379,11 @@ The tests cannot show these. Treat each as unproven until it has run in real use
 - **Multi-process MVCC readers.** One process owns the directory (D4). Several processes reading an MVCC database stay out of scope.
 - **Peak object-store size on a small podman disk.** The MVCC tests held 66 to 84 MB in RustFS (targeted runs, each test deleting its prefix). The full `./scripts/test.sh` peak with the MVCC tests in it is 722 MB (plain) and 764 MB (https+encryption) (see Test command), and the podman disk is shared with another stack.
 - **VACUUM** is untested, as before.
+- **The AWS notification route.** S3 Event Notifications to an SNS topic, and each replica's SNS HTTPS subscription, including the subscription confirmation, the basic authentication SNS sends, and SNS dropping deliveries to a replica that is down, have never run. `buckwal notify-setup` and this README are their only cover.
+- **Real RustFS event delivery to the webhook.** RustFS 1.0.0 refuses a webhook target on the machine itself or a private network unless the container starts with `RUSTFS_OUTBOUND_ALLOW_ORIGINS` naming it, and a target on `host.containers.internal` failed to start (`docs/read-replicas-recon.md`, Question 8). The replica tests post the S3-format events to the listener themselves.
+- **Real S3's notification delay**, and the replica lag it gives, which are only estimated (Replicas, Lag), as are the replica cost figures.
+- **The fenced late-record skip path in an encrypted bucket (pass 2).** An encrypted late record of a fenced writer cannot be planted without a hook in production code, so the skip rule is exercised on plaintext buckets only.
+- **Paging of `start-after` on a real S3.** The paging of `ListObjectsV2` with `start-after` against real RustFS, beyond 1000 keys, is tested by `s3_list_after_start_after_and_paging`. Real S3 was not tried.
 
 ## Costs (measured)
 
@@ -1289,7 +1470,7 @@ Restoring the 5000-commit database (generation 12, 1673 pages, 6.9 MB):
 
 ## Decisions
 
-D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0.8.3 from crates.io, with paths relative to its crate root. D11–D14 are stage 3's, D15–D17 are stage 4's and D18–D29 are mvcc-durability's; their evidence is this repository's code (D18–D29 also cite `docs/mvcc-recon.md`, which cites turso_core 0.8.3 by path and line), except D15's, which is reqwest 0.13.2, hyper-rustls 0.27.10 and tokio-rustls 0.26.6 from crates.io, D16's, which is turso_core 0.8.3 as well, and D17's, which is RustFS 1.0.0's source (paths relative to its repository root).
+D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0.8.3 from crates.io, with paths relative to its crate root. D11–D14 are stage 3's, D15–D17 are stage 4's and D18–D29 are mvcc-durability's, D30–D31 are read-replicas'; their evidence is this repository's code (D18–D29 also cite `docs/mvcc-recon.md`, which cites turso_core 0.8.3 by path and line), except D15's, which is reqwest 0.13.2, hyper-rustls 0.27.10 and tokio-rustls 0.26.6 from crates.io, D16's, which is turso_core 0.8.3 as well, and D17's, which is RustFS 1.0.0's source (paths relative to its repository root).
 
 | # | Decision | Evidence |
 |---|---|---|
@@ -1322,10 +1503,12 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
 | D27 | Maintenance measures the `app.db-log` high-water mark (bytes) in MVCC mode, because the `-wal` stays near 0, and seals through the same TRUNCATE checkpoint. The log-object measure counts kind 1 and kind 3 records alike. | `io/log_file.rs` (`high_water`), `db.rs` (`maintenance_measures`), `maintenance.rs`; tests `maintenance_checkpoints_mvcc_when_log_bytes_exceed_threshold`, `pending_seal_does_not_starve_maintenance`, `open_begin_concurrent_makes_the_run_time_out_at_the_gate` |
 | D28 | `Connection::run`, `describe` and `is_autocommit` take the same guard, maintenance gate and ack path as `execute` and `query` in MVCC mode. `BEGIN CONCURRENT` goes through all of them. | `conn.rs`; tests `begin_concurrent_via_run_and_execute`, `run_waits_for_maintenance_gate`, `run_commit_failure_returns_err_and_is_autocommit_tracks_it` |
 | D29 | MVCC mode accepts the engine's limits and pins them in tests instead of hiding them: reads inside a transaction can see an unacked commit, a failed upload does not undo the commit (outcome unknown, shipped by the next commit), one upload at a time (use `BEGIN CONCURRENT`), a checkpoint stops every transaction. Four WAL promises about Off are rewritten for MVCC. | `crates/buckwal/tests/mvcc_limits.rs` (`speculative_read_inside_begin_sees_unacked_commit`, `autocommit_read_waits_out_the_upload`, `failed_upload_keeps_the_commit_locally_outcome_unknown`, `slow_upload_stalls_writers_and_begin_concurrent_waits`, `checkpoint_stops_readers_with_busy_after_timeout_on_slow_seal`); `docs/mvcc-recon.md` Limits in detail |
+| D30 | A replica is the library's third IO mode: local WAL and `app.db` writes for the follower only, lazy page reads until the prefetch has them, and no upload, seal, claim or GC. The follower lives inside `buckwal` (the engine type it needs is crate-private) and applies frames through turso_core's `conn_raw_api`, pinned by `=0.8.3`. See [ADR 0006](docs/adr/0006-a-third-io-mode-for-replicas.md). | `crates/buckwal/src/replica/`; tests `replica_refuses_writes_and_sends_zero_puts_and_deletes` and the unit tests under `replica/`. |
+| D31 | The notification listener lives in `buckwal-server` (`notify`) and reuses its listener, bind check and token; the library gains no server code and exposes `Replica::waker()`. A notification is only a hint: the pass reads the log by seq. See [ADR 0007](docs/adr/0007-the-notification-listener-reuses-the-server-crates-listener.md). | `crates/buckwal-server/src/notify.rs`, `tests/notify.rs`; test `replica_listener_rules`. |
 
 ## Test command
 
-- `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests. These include the in-memory takeover tests in `crates/buckwal/tests/fencing.rs`, each under Off and a Window setting, and the server's HTTP tests over an in-memory store (`crates/buckwal-server/tests/http.rs`: the endpoints, streams and batons, auth, health, a fenced server, the stream cap, TLS, SIGTERM with requests in flight and the shutdown bound). The MVCC work adds, all on in-memory or fault stores and with no RustFS: `crates/buckwal/tests/mvcc_fencing.rs` (fencing, takeover, the confirmed-sync property over 64 fault schedules, verify, restore, v1 stays v1), `tests/mvcc_limits.rs` (the five pinned limits, about 5.5 s) and the MVCC unit tests under `crates/buckwal/src/db/tests/mvcc/`. The unit step now runs 774 tests (561 in the library's own, 33 in the CLI's, 81 in the server's, 35 + 1 in its HTTP and span tests, 6 in the test client's, 33 + 5 + 5 + 8 + 5 + 1 in the library's integration tests, `tests/fresh_open.rs` among them).
+- `./scripts/test.sh unit`: fmt, clippy (`-D warnings`) and unit tests. These include the in-memory takeover tests in `crates/buckwal/tests/fencing.rs`, each under Off and a Window setting, and the server's HTTP tests over an in-memory store (`crates/buckwal-server/tests/http.rs`: the endpoints, streams and batons, auth, health, a fenced server, the stream cap, TLS, SIGTERM with requests in flight and the shutdown bound). The MVCC work adds, all on in-memory or fault stores and with no RustFS: `crates/buckwal/tests/mvcc_fencing.rs` (fencing, takeover, the confirmed-sync property over 64 fault schedules, verify, restore, v1 stays v1), `tests/mvcc_limits.rs` (the five pinned limits, about 5.5 s) and the MVCC unit tests under `crates/buckwal/src/db/tests/mvcc/`. The replica work adds the replica unit tests under `crates/buckwal/src/replica/` (in-memory and fault stores, no RustFS) and the listener's tests in `crates/buckwal-server/tests/notify.rs`. The unit step now runs 921 tests (677 in the library's own, 44 in the CLI's, 82 in the server's, 35 + 19 + 1 in its HTTP, notify and span tests, 6 in the test client's, 33 + 5 + 5 + 8 + 5 + 1 in the library's integration tests, `tests/fresh_open.rs` among them), counted from the output of `./scripts/test.sh unit` at the replica work's head (2026-10-24).
 - `./scripts/test.sh`: the above, then runs the RustFS-backed `--ignored` tests with `--test-threads=1` twice, each time on an emptied RustFS (`scripts/rustfs.sh reset`): pass 1 over plain HTTP without encryption (the `tls_*` tests skipped), pass 2 over HTTPS with encryption, every test. These include the CLI system tests (crash matrix, faults, restart, second process, trimming, the same under Window batching, batching stats, the maintenance checkpoint under sustained Window load and a crash in the middle of one, and collector-down runs). Stage 3 adds: a takeover of a running `soak` under Off and under a Window setting (`takeover_fences_a_running_soak`, `takeover_window_fences_a_running_soak`), an old writer paused with SIGSTOP across a takeover and GC (`paused_old_writer_is_fenced_after_resume`), `gc` after short-lived processes (`gc_cli_trims_after_short_lived_processes`), Window crash rows for PASSIVE, FULL and RESTART, and the S3 test `stat_reports_etag_and_age`. The server adds the `serve` system tests (`crates/buckwal-cli/tests/server.rs`), plain HTTP on loopback without a token in pass 1 and HTTPS with a token in pass 2: the test client's writes (libSQL's request shapes, which the protocol still accepts, and a `describe`) under Off, per-stream Window and per-transaction batching (`serve_client_writes_off_window_and_txn_batching`), SIGKILL under load and then the loss of the disk (`serve_sigkill_mid_load_restores_every_ack`), a takeover that fences the old server, which then stops with `fenced=true` and exit 1 (`serve_takeover_fences_the_old_server`), SIGTERM under load (`serve_sigterm_during_load_loses_no_ack`), and the bind rule and the token, which never reaches the server's output (`serve_security_bind_rules_and_token`). In the first four, every acked row must restore. The MVCC work adds system tests to both passes (`mvcc_*`, `verify_acked_on_plain_mvcc_restore` and `verify_acked_on_mid_checkpoint_restore` in `crates/buckwal-cli/tests/system.rs`: a kill at op boundaries of a commit, a group commit and a checkpoint, then the loss of the disk and a restore with `verify --acked`, 8 writer threads with `BEGIN CONCURRENT` and mixed, the refusals, a takeover, GC across generations, encryption), and `mvcc_serve_begin_concurrent` in `server.rs`. With them, each pass runs 6 `serve` tests and 56 system tests, and the full command took 14:34 at 9ab3403 (figures below).
   - It runs both passes with `BUCKWAL_OTEL=1` under one `BUCKWAL_TEST_RUN_ID` (`buckwal-<timestamp>-<pid>`, printed as `test run id: …`).
   - For pass 2, `scripts/tls-material.sh` makes a CA, RustFS's certificate and an encryption key in a `mktemp -d` directory (`buckwal-tls.*` under `$TMPDIR`), and the script exports `BUCKWAL_TLS_DIR` (RustFS serves HTTPS, and the system tests' own `rustfs.sh stop/start/pause/unpause` keep that mode) and `BUCKWAL_ENCRYPTION_KEY_FILE`. `scripts/rustfs.sh env` adds `BUCKWAL_CA_BUNDLE`. The tests pass `BUCKWAL_CA_BUNDLE`, `BUCKWAL_ENCRYPTION_KEY_FILE` and `BUCKWAL_ENCRYPTION_CIPHER` on to their CLI children and in-process databases; `BUCKWAL_TLS_DIR` is inherited by their `rustfs.sh` calls.
@@ -1335,16 +1518,17 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
   - On exit, pass or fail, it empties RustFS's storage again in plain mode (`scripts/rustfs.sh reset`) and removes the TLS material. A failed reset is reported on stderr and the exit code stays the tests'.
   - Every 15 s it samples the volume's size (`du -sm /data` in the container) and prints each pass's peak as `peak buckwal-objects: <MB> MB (plain)` and `(https+encryption)`. Measured in the final full run at 9ab3403 (2026-10-22, `results/mvcc-durability.txt`; laptop, RustFS), exit 0: 722 MB (plain) and 764 MB (https+encryption), a whole run 14:34 (874 s). Each pass ran 6 `serve` tests (`mvcc_serve_begin_concurrent` included), 52 system tests (the MVCC ones included) and the S3 tests (8 in pass 1, 12 in pass 2); the unit step ran 700 tests. Pass 1's scan found `CREATE TABLE` in 13240 objects; pass 2's found no plaintext, and the otel check passed. The baseline before the MVCC work, at 332b45f: 588 unit tests, 5 `serve` tests, 38 system tests, about 12 min, peaks 747 MB (plain) and 699 MB (https+encryption). Round 3's run at eda0d1d (`results/durable-server.txt`, superseded) peaked at 703 and 751 MB in 12:15, with 587 unit tests. The round-2 run at 4621d4e (superseded) peaked at 721 and 735 MB in 12:01.5, with 546 unit tests. Stage 4's canonical run at b4afb8f (`results/durable-transport.txt`): 684 and 708 MB, 11.7 min (11:43). With the prefixes kept, RustFS no longer fills its trash with deleted objects; Task 9's single-pass run peaked at 1010 MB.
   - Outside `test.sh`, each RustFS-backed test deletes its bucket prefix when it ends. `BUCKWAL_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
+  - The replica work adds a file of RustFS system tests, `crates/buckwal-cli/tests/replica.rs` (21 `--ignored` tests, none named `tls_`, so both passes run all 21: following under Off and Window, the posted notification, the dropped, duplicate and out-of-order ones, no notification set up, a seal, a new generation and a takeover by a third machine, a reader held across a seal, the kill matrix, a rolled-back large transaction, a replica that lagged past `trim_grace`, refused writes with zero PUTs and DELETEs, two replicas with their own listeners, takeover from a replica's machine, a fenced writer's late record, an encrypted bucket edited behind the replica's back, a missing seq, the MVCC refusal, a wrong key, the listener rules and the `buckwal.replica.sync` spans in ClickHouse), and one more S3 test, `s3_list_after_start_after_and_paging`. By `--ignored --list` the counts are now 6 `serve` tests, 56 system tests, 21 replica tests and 13 S3 tests (9 in pass 1, 13 in pass 2, which also runs the 4 `tls_` ones): 92 tests in pass 1 and 96 in pass 2. **Not yet measured:** the duration, the peak `buckwal-objects` size and the otel check of a full `./scripts/test.sh` run with the replica tests; the figures above are those of 9ab3403, before them. The posted notification tests post the S3-format event themselves (RustFS delivery was not seen; see Not tested until real use).
 - `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`buckwal-rustfs`, port 9290). `down` removes the container and its volume `buckwal-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `BUCKWAL_*` variables for it. With `BUCKWAL_TLS_DIR` set to a directory from `scripts/tls-material.sh DIR`, it runs RustFS over HTTPS (a container is plain or TLS for its whole life; `reset` switches).
 - tursodb's conformance suite and the Go driver are not part of `test.sh`. They were run by hand against `serve`, outside this repo (see Server, Clients run and not run).
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
 
 ## Layout
 
-- `crates/buckwal`: the library. MVCC mode adds `src/io/log_file.rs` (`LogShippingFile`), `src/io/log_storage.rs` (the `DurableStorage` wrapper that seals), `src/create.rs` (a new MVCC database) and the integration tests `tests/mvcc_fencing.rs` and `tests/mvcc_limits.rs`.
-- `crates/buckwal-server`: the server of tursodb's SQL over HTTP v3 behind `serve` (`ServeConfig`, `bind`, `Bound::serve`).
+- `crates/buckwal`: the library. Replicas add `src/replica/` (`open.rs`: `open_replica` and the follower thread; `sync.rs`: the sync pass; `image.rs`: the WAL image and committed prefix; `apply.rs`: the frame applier; `position.rs`: the position file; `fence.rs`; `connection.rs`: read connections; `waker.rs`; `stats.rs`), the replica IO mode (`src/io/`) and `ObjectStore::list_after` (`src/store/`). MVCC mode adds `src/io/log_file.rs` (`LogShippingFile`), `src/io/log_storage.rs` (the `DurableStorage` wrapper that seals), `src/create.rs` (a new MVCC database) and the integration tests `tests/mvcc_fencing.rs` and `tests/mvcc_limits.rs`.
+- `crates/buckwal-server`: the server of tursodb's SQL over HTTP v3 behind `serve` (`ServeConfig`, `bind`, `Bound::serve`), and the replica's notification listener (`src/notify.rs`, `notify::serve`) on the same listener.
 - `crates/buckwal-hrana-client`: a minimal SQL over HTTP v3 client for the tests only (`publish = false`). Most of its requests copy the shapes libSQL's clients send, which the protocol (it descends from libSQL's Hrana) still accepts, plus `describe`. Its name is historical: renaming the crate would change the audited `Cargo.lock`.
-- `crates/buckwal-cli`: the `buckwal` binary (with the test command's `scan`, `src/scan.rs`, the whole-bucket plaintext scan), the system tests and `examples/stage3_costs.rs` (the request counts of stages 3 and 4).
+- `crates/buckwal-cli`: the `buckwal` binary (with `follow` (`src/follow.rs`) and `notify-setup` (`src/notify_setup.rs`), the replica system tests `tests/replica.rs`, and, with the test command's `scan`, `src/scan.rs`, the whole-bucket plaintext scan), the system tests and `examples/stage3_costs.rs` (the request counts of stages 3 and 4).
 - `docs/`: `architecture.md` (components, interfaces, decisions), `glossary.md` (every term, with the words not to use), `adr/` (architecture decision records, with an index), `mvcc-recon.md` (the MVCC finding and design, with `mvcc-recon-probes/`) and `read-replicas-recon.md`.
 - `scripts/`: `test.sh`, `rustfs.sh` (local S3), `tls-material.sh` (test CA, certificate and key), `s3-gate.sh`, `otel-check.sh` (the ClickHouse check).
 - `results/`: `rustfs-gate.txt` (conditional-PUT gate), `rustfs-gate-tls.txt` (the same gate over HTTPS), `durable-core.txt` (stage 1 measurements), `batching-knob.txt` (stage 2 measurements), `writer-lease.txt` (stage 3 measurements) `durable-transport.txt` (stage 4 measurements) and `durable-server.txt` (the server's full test run, the canonical full run) and `mvcc-durability.txt` (the MVCC work's before and after logs).

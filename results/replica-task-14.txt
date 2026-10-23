@@ -1,0 +1,54 @@
+# Task 14 verification (2026-10-24)
+## unit run: ./scripts/test.sh unit (log of the run)
+test result: ok. 677 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.55s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.17s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.73s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.83s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.53s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+test result: ok. 0 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 0 passed; 0 failed; 21 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 56 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.27s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+TOTAL passed: 921
+## ignored counts: cargo test --locked -p <crate> --test <t> -- --ignored --list
+s3_rustfs 13 (tls_ 4); replica 21 (tls_ 0); server 6; system 56; all 96 (cargo test --workspace --locked -- --ignored --list)
+## first screen: git diff 392b908 HEAD -- README.md hunks
+## banned-word greps (excluding glossary Not: lines, ADRs, recon docs)
+README.md:835:**Taking over from a replica's machine.** There is no separate "promote". Stop the replica and run `buckwal takeover --dir NEW` on that machine, i
+-- reconcile in replica context:
+-- 'promote' grep done
+## mermaid
+/Users/kahgeh/.local/state/nvm/versions/node/v24.0.1/bin/mmdc
+mermaid not found
+## links
+   2 ok README.md -> LICENSES/turso-MIT.md
+   2 ok README.md -> docs/adr/0007-the-notification-listener-reuses-the-server-crates-listener.md
+   2 ok README.md -> docs/adr/0006-a-third-io-mode-for-replicas.md
+   2 ok docs/architecture.md -> adr/0007-the-notification-listener-reuses-the-server-crates-listener.md
+   2 ok docs/architecture.md -> adr/0006-a-third-io-mode-for-replicas.md
+   2 ok docs/architecture.md -> adr/0005-takeover-generation-floor-quiet-and-integrity-codes.md
+   1 ok README.md -> LICENSE
+   1 ok docs/architecture.md -> adr/0004-new-mvcc-database-starts-at-generation-2.md
+   1 ok docs/architecture.md -> adr/0003-bucket-format-v2-for-mvcc-buckets-only.md
+   1 ok docs/architecture.md -> adr/0002-mvcc-seal-runs-in-the-durable-storage-truncate.md
+   1 ok docs/architecture.md -> adr/0001-mvcc-commit-point-is-the-db-log-sync.md
+   1 ok docs/adr/README.md -> 0007-the-notification-listener-reuses-the-server-crates-listener.md
+   1 ok docs/adr/README.md -> 0006-a-third-io-mode-for-replicas.md
+   1 ok docs/adr/README.md -> 0005-takeover-generation-floor-quiet-and-integrity-codes.md
+   1 ok docs/adr/README.md -> 0004-new-mvcc-database-starts-at-generation-2.md
+   1 ok docs/adr/README.md -> 0003-bucket-format-v2-for-mvcc-buckets-only.md
+   1 ok docs/adr/README.md -> 0002-mvcc-seal-runs-in-the-durable-storage-truncate.md
+   1 ok docs/adr/README.md -> 0001-mvcc-commit-point-is-the-db-log-sync.md
+## mermaid: mmdc (existing install) rendered both docs/architecture.md blocks to SVG without error (mmdc -i m0.mmd / m1.mmd)
+## price lookups 2026-10-24: WebFetch aws.amazon.com/s3/pricing: GET US$0.0004/1000 confirmed; LIST rate and SNS rates not returned (tables absent) -> README labels them the spec's estimate
