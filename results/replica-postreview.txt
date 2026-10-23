@@ -26,3 +26,19 @@ RED (before the fix):
    left: Position { generation: 2, stage: Applying, offset: -3, new_offset: -3, .. }
   right: Position { generation: 2, stage: CkptPending, offset: 2, new_offset: -2, .. }
 GREEN (after the fix): replica:: module: 109 passed; 0 failed
+
+== Generation moves: the replica follows intermediate generations (head past G+1) ==
+RED (new tests, old sync.rs): cargo test --locked -p buckwal --lib replica::sync
+test replica::sync::tests::head_skipping_a_generation_lists_the_skipped_one_once_and_jumps ... FAILED
+test replica::sync::tests::ordinary_then_skipped_generation_in_one_jump ... FAILED
+test replica::sync::tests::trimmed_intermediate_generation_re_restores ... FAILED
+test replica::sync::tests::three_seals_between_passes_follow_every_generation ... FAILED
+test replica::sync::tests::two_seals_between_passes_follow_the_intermediate_generation ... FAILED
+thread 'replica::sync::tests::head_skipping_a_generation_lists_the_skipped_one_once_and_jumps' (184558930) panicked at crates/buckwal/src/replica/sync/tests.rs:830:5:
+thread 'replica::sync::tests::ordinary_then_skipped_generation_in_one_jump' (184558950) panicked at crates/buckwal/src/replica/sync/tests.rs:26:46:
+thread 'replica::sync::tests::trimmed_intermediate_generation_re_restores' (184559009) panicked at crates/buckwal/src/replica/sync/tests.rs:891:5:
+thread 'replica::sync::tests::three_seals_between_passes_follow_every_generation' (184559008) panicked at crates/buckwal/src/replica/sync/tests.rs:26:46:
+thread 'replica::sync::tests::two_seals_between_passes_follow_the_intermediate_generation' (184559012) panicked at crates/buckwal/src/replica/sync/tests.rs:26:46:
+test result: FAILED. 37 passed; 5 failed; 0 ignored; 0 measured; 644 filtered out; finished in 0.94s
+GREEN (new sync.rs): cargo test --locked -p buckwal --lib replica::
+test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 572 filtered out; finished in 6.78s

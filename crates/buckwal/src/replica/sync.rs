@@ -175,6 +175,9 @@ struct HeadView {
     mvcc: bool,
 }
 
+/// The head as cached between passes: generation, MVCC, `next_generation_floor`.
+type HeadSeen = (u64, bool, Option<u64>);
+
 enum Flow {
     Go,
     Done(Outcome),
@@ -196,7 +199,7 @@ pub(crate) struct Follower {
     /// Frames of the generation already applied (or already in `app.db`).
     applied: u64,
     head_etag: Option<String>,
-    head_view: Option<(u64, bool)>,
+    head_view: Option<HeadSeen>,
     fence: FenceRule,
     /// The last admitted record of the generation was a seal-start (an empty Extents record).
     sealed: bool,
@@ -523,6 +526,10 @@ impl Follower {
             ));
             return Some(Outcome::ReRestore(Reason::Trimmed));
         }
+        let next = match self.next_generation(head_generation, t) {
+            Ok(n) => n,
+            Err(o) => return Some(o),
+        };
         let last = match self.applier.local_last_frame() {
             Ok(l) => l as i64,
             Err(e) => return Some(failed(t, e)),
@@ -531,14 +538,14 @@ impl Follower {
         if let Err(m) = self.step(Step::BeforeCkptPending) {
             return Some(failed_msg(t, m));
         }
-        if let Err(e) = self.write_pos(head_generation, Stage::CkptPending, last, 0) {
+        if let Err(e) = self.write_pos(next, Stage::CkptPending, last, 0) {
             return Some(failed(t, e));
         }
         #[cfg(test)]
         if let Err(m) = self.step(Step::AfterCkptPending) {
             return Some(failed_msg(t, m));
         }
-        self.reset(head_generation, last);
+        self.reset(next, last);
         self.last_pending_k = None;
         self.ckpt = Some(CkptTask {
             new_offset: 0,
@@ -547,6 +554,46 @@ impl Follower {
             deferred: false,
         });
         self.run_ckpt_task(t)
+    }
+
+    /// The generation after ours that the log continues in. The head only tells where the writer
+    /// is now: a writer that sealed twice between two passes left the head at G+2 with an
+    /// ordinary generation G+1 in between, whose log must be followed. So when the head is past
+    /// G+1, LIST `log/<G+1>/`: any record means an ordinary generation (a seal always writes its
+    /// seal-start record first), and we follow it. An empty listing is a takeover's skipped
+    /// generation (no log is ever written under it) only when it is the generation just below
+    /// the head's `next_generation_floor`; otherwise it is an ordinary generation whose log was
+    /// trimmed, which needs a re-restore.
+    fn next_generation(
+        &mut self,
+        head_generation: u64,
+        t: &mut Tally,
+    ) -> std::result::Result<u64, Outcome> {
+        let next = self.generation + 1;
+        if head_generation <= next {
+            return Ok(head_generation);
+        }
+        let prefix = self.keys.log_prefix(next);
+        t.lists += 1;
+        let listed = with_retry(&self.retry, &prefix, |_| {
+            self.store.list_after(&prefix, &prefix)
+        })
+        .map_err(|e| failed(t, e))?;
+        if listed
+            .iter()
+            .any(|k| matches!(self.keys.parse_log(k), Some((g, _)) if g == next))
+        {
+            return Ok(next);
+        }
+        let floor = self.head_view.and_then(|v| v.2);
+        if floor.is_some_and(|f| f == next + 1) {
+            // The skipped generation: the seal that wrote the floor moved the head past it.
+            return Ok(next + 1);
+        }
+        t.detail = Some(format!(
+            "log/{next} is empty (trimmed) and the head is at generation {head_generation}"
+        ));
+        Err(Outcome::ReRestore(Reason::Trimmed))
     }
 
     /// Run the pending checkpoint. `Some` ends the pass (Busy within the budget, or an error).
@@ -892,7 +939,7 @@ impl Follower {
     fn check_head(&mut self, t: &mut Tally) -> std::result::Result<HeadView, Outcome> {
         let key = self.keys.head();
         t.gets += 1;
-        if let (Some(etag), Some((generation, mvcc))) = (&self.head_etag, self.head_view) {
+        if let (Some(etag), Some((generation, mvcc, _))) = (&self.head_etag, self.head_view) {
             match with_retry(&self.retry, &key, |_| self.store.stat(&key)) {
                 Ok(Some(s)) if &s.etag == etag => return Ok(HeadView { generation, mvcc }),
                 Ok(_) => t.gets += 1,
@@ -913,7 +960,11 @@ impl Follower {
                 return Err(decode_failure(&e, &key));
             }
         };
-        let view = (head.generation, head.journal_mode == JournalMode::Mvcc);
+        let view = (
+            head.generation,
+            head.journal_mode == JournalMode::Mvcc,
+            head.next_generation_floor,
+        );
         self.head_etag = Some(obj.etag);
         self.head_view = Some(view);
         Ok(HeadView {

@@ -130,9 +130,14 @@ impl Fx {
 
     /// Run one insert on the writer; the ops for the WAL bytes it added.
     fn commit(&mut self, id: i64) -> Vec<Op> {
+        self.commit_sized(id, 100)
+    }
+
+    /// `commit` with a row of `size` bytes (a big row takes a page of its own).
+    fn commit_sized(&mut self, id: i64, size: usize) -> Vec<Op> {
         sql(
             &self.writer,
-            &format!("INSERT INTO t VALUES ({id}, zeroblob(100))"),
+            &format!("INSERT INTO t VALUES ({id}, zeroblob({size}))"),
         );
         let b = std::fs::read(&self.wal).unwrap();
         let ops = vec![Op::Write {
@@ -155,7 +160,13 @@ impl Fx {
     }
 
     fn set_head(&self, generation: u64) {
-        let h = head(&self.keys, generation, JournalMode::Wal);
+        self.set_head_floor(generation, None);
+    }
+
+    /// A head after a takeover's skip seal carries the floor (`next_generation_floor`).
+    fn set_head_floor(&self, generation: u64, floor: Option<u64>) {
+        let mut h = head(&self.keys, generation, JournalMode::Wal);
+        h.next_generation_floor = floor;
         self.mem
             .put(&self.keys.head(), &self.keys.encode_head(&h))
             .unwrap();
@@ -202,6 +213,12 @@ impl Fx {
     /// Commit on the writer and ship it as the next record of the current generation.
     fn ship(&mut self, id: i64) {
         let ops = self.commit(id);
+        self.put_next(&ext("w1", ops));
+    }
+
+    /// `ship` of a row that takes a page of its own, so a lost record loses a row.
+    fn ship_big(&mut self, id: i64) {
+        let ops = self.commit_sized(id, 3000);
         self.put_next(&ext("w1", ops));
     }
 
@@ -795,10 +812,11 @@ fn deferred_checkpoint_runs_after_reader_commits() {
 }
 
 #[test]
-fn head_skipping_a_generation_never_lists_the_skipped_one() {
+fn head_skipping_a_generation_lists_the_skipped_one_once_and_jumps() {
     let mut f = Fx::new().positioned(BUDGET);
     f.ship(2);
-    f.seal_to(3); // the head goes 1 -> 3; log/2 never exists
+    f.seal_to(3); // the head goes 1 -> 3 with the floor 3 of a takeover; log/2 never exists
+    f.set_head_floor(3, Some(3));
     f.ship(4);
     let start = f.fault.events().len();
     let r = f.pass();
@@ -807,17 +825,108 @@ fn head_skipping_a_generation_never_lists_the_skipped_one() {
     assert_eq!(f.follower.generation(), 3);
     assert_eq!(f.rows(), 3);
     let ev = f.fault.events()[start..].to_vec();
-    assert!(
-        ev.iter().all(|e| !e.contains(&f.keys.log_prefix(2))),
-        "{}",
-        names(&ev)
-    );
+    let p2 = f.keys.log_prefix(2);
+    let on2: Vec<_> = ev.iter().filter(|e| e.contains(&p2)).collect();
+    assert_eq!(on2.len(), 1, "{}", names(&ev));
+    assert!(on2[0].starts_with("list_after "), "{}", names(&ev));
     assert!(
         ev.iter().any(|e| e.contains(&f.keys.log_prefix(3))),
         "{}",
         names(&ev)
     );
     assert_eq!(f.position().generation, 3);
+}
+
+#[test]
+fn two_seals_between_passes_follow_the_intermediate_generation() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship_big(2);
+    f.seal_to(2);
+    f.ship_big(3);
+    f.ship_big(4);
+    f.seal_to(3);
+    f.ship_big(5);
+    let r = f.pass();
+    assert!(!matches!(r.outcome, Outcome::ReRestore(_)), "{r:?}");
+    f.pass();
+    assert_eq!(f.follower.generation(), 3);
+    assert_eq!(f.rows(), f.writer_rows());
+    assert_eq!(f.rows(), 5);
+    assert_eq!(f.position().generation, 3);
+    f.integrity_ok();
+}
+
+#[test]
+fn three_seals_between_passes_follow_every_generation() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship_big(2);
+    f.seal_to(2);
+    f.ship_big(3);
+    f.seal_to(3);
+    f.ship_big(4);
+    f.ship_big(5);
+    f.seal_to(4);
+    f.ship_big(6);
+    let r = f.pass();
+    assert!(!matches!(r.outcome, Outcome::ReRestore(_)), "{r:?}");
+    f.pass();
+    assert_eq!(f.follower.generation(), 4);
+    assert_eq!(f.rows(), f.writer_rows());
+    assert_eq!(f.rows(), 6);
+    f.integrity_ok();
+}
+
+#[test]
+fn trimmed_intermediate_generation_re_restores() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship_big(2);
+    f.seal_to(2);
+    f.ship_big(3);
+    f.seal_to(3);
+    f.ship_big(4);
+    // GC deleted log/2 (the replica was long gone); the head carries no floor
+    f.mem.delete(&f.keys.log(2, 1)).unwrap();
+    f.mem.delete(&f.keys.log(2, 2)).unwrap();
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    // also when an older takeover left a floor, but log/2 is not the generation below it
+    let mut g = Fx::new().positioned(BUDGET);
+    g.ship_big(2);
+    g.seal_to(2);
+    g.ship_big(3);
+    g.seal_to(3);
+    g.mem.delete(&g.keys.log(2, 1)).unwrap();
+    g.mem.delete(&g.keys.log(2, 2)).unwrap();
+    g.set_head_floor(3, Some(2));
+    let r = g.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+}
+
+#[test]
+fn ordinary_then_skipped_generation_in_one_jump() {
+    // The bucket state a writer leaves (simulated; the follower fixture has no real Bucket):
+    // gen 1 sealed to 2 (ordinary), a takeover, gen 2 sealed past the skipped 3 to 4.
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship_big(2);
+    f.seal_to(2);
+    f.ship_big(3);
+    f.seal_to(4);
+    f.set_head_floor(4, Some(4));
+    f.ship_big(4);
+    let start = f.fault.events().len();
+    let r = f.pass();
+    assert!(!matches!(r.outcome, Outcome::ReRestore(_)), "{r:?}");
+    f.pass();
+    assert_eq!(f.follower.generation(), 4);
+    assert_eq!(f.rows(), f.writer_rows());
+    let ev = f.fault.events()[start..].to_vec();
+    let p3 = f.keys.log_prefix(3);
+    assert_eq!(
+        ev.iter().filter(|e| e.contains(&p3)).count(),
+        1,
+        "{}",
+        names(&ev)
+    );
 }
 
 #[test]
