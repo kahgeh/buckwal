@@ -15,6 +15,7 @@ pub mod config;
 pub mod exec;
 mod http;
 mod listener;
+pub mod notify;
 mod proto;
 pub mod streams;
 

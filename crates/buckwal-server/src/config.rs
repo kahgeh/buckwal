@@ -100,15 +100,32 @@ impl ServeConfig {
     /// A non-loopback address exposes the server to the network, so it needs both TLS and
     /// a token; a loopback one needs neither.
     pub fn check_bind(&self) -> Result<(), String> {
-        if self.listen.ip().is_loopback() || (self.tls.is_some() && self.token_file.is_some()) {
-            return Ok(());
-        }
-        Err(format!(
-            "listening on {} (not loopback) needs TLS (BUCKWAL_SERVE_TLS_CERT and \
-             BUCKWAL_SERVE_TLS_KEY) and a token (BUCKWAL_SERVE_TOKEN_FILE)",
-            self.listen
-        ))
+        check_bind_rule(
+            self.listen,
+            self.tls.is_some(),
+            self.token_file.is_some(),
+            ("BUCKWAL_SERVE_TLS_CERT", "BUCKWAL_SERVE_TLS_KEY"),
+            "BUCKWAL_SERVE_TOKEN_FILE",
+        )
     }
+}
+
+/// The bind rule both listeners follow: a non-loopback `listen` needs TLS and a token. The
+/// error names the variables of the listener that failed.
+pub(crate) fn check_bind_rule(
+    listen: SocketAddr,
+    tls: bool,
+    token: bool,
+    tls_vars: (&str, &str),
+    token_var: &str,
+) -> Result<(), String> {
+    if listen.ip().is_loopback() || (tls && token) {
+        return Ok(());
+    }
+    Err(format!(
+        "listening on {listen} (not loopback) needs TLS ({} and {}) and a token ({token_var})",
+        tls_vars.0, tls_vars.1
+    ))
 }
 
 /// A variable holding an integer of at least 1, or `default` when unset.
@@ -129,35 +146,33 @@ impl Token {
     /// Read the token from `path`: surrounding ASCII whitespace is trimmed, and what remains must
     /// be at least 16 bytes of visible ASCII (0x21 to 0x7E, so no whitespace inside). Errors name the path, never the content.
     pub fn load(path: &Path) -> Result<Token, String> {
+        Token::load_named(path, "BUCKWAL_SERVE_TOKEN_FILE")
+    }
+
+    /// [`Token::load`] with the variable name its errors give (the notify listener has its own).
+    pub(crate) fn load_named(path: &Path, var: &str) -> Result<Token, String> {
         let shown = path.display();
-        let bytes = std::fs::read(path).map_err(|e| {
-            format!(
-                "BUCKWAL_SERVE_TOKEN_FILE {shown}: cannot read: {}",
-                e.kind()
-            )
-        })?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("{var} {shown}: cannot read: {}", e.kind()))?;
         let text = bytes.trim_ascii();
         if text.is_empty() {
-            return Err(format!("BUCKWAL_SERVE_TOKEN_FILE {shown}: file is empty"));
+            return Err(format!("{var} {shown}: file is empty"));
         }
         if text.len() < MIN_TOKEN_LEN {
             return Err(format!(
-                "BUCKWAL_SERVE_TOKEN_FILE {shown}: token is shorter than {MIN_TOKEN_LEN} bytes"
+                "{var} {shown}: token is shorter than {MIN_TOKEN_LEN} bytes"
             ));
         }
         if text.iter().any(u8::is_ascii_whitespace) {
-            return Err(format!(
-                "BUCKWAL_SERVE_TOKEN_FILE {shown}: token contains whitespace"
-            ));
+            return Err(format!("{var} {shown}: token contains whitespace"));
         }
         if !text.iter().all(|b| (0x21..=0x7e).contains(b)) {
             return Err(format!(
-                "BUCKWAL_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)"
+                "{var} {shown}: token must be visible ASCII (0x21 to 0x7E)"
             ));
         }
-        let text = std::str::from_utf8(text).map_err(|_| {
-            format!("BUCKWAL_SERVE_TOKEN_FILE {shown}: token must be visible ASCII (0x21 to 0x7E)")
-        })?;
+        let text = std::str::from_utf8(text)
+            .map_err(|_| format!("{var} {shown}: token must be visible ASCII (0x21 to 0x7E)"))?;
         Ok(Token::from_text(text))
     }
 

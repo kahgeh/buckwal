@@ -68,13 +68,22 @@ fn pem_problem(e: &pem::Error) -> String {
 /// acceptor: rustls with ring, TLS 1.3 and 1.2, ALPN `http/1.1`. Errors name the file at
 /// fault and never hold key material.
 pub(crate) fn tls_acceptor(files: &TlsFiles) -> Result<TlsAcceptor, String> {
+    tls_acceptor_named(files, "BUCKWAL_SERVE_TLS_CERT", "BUCKWAL_SERVE_TLS_KEY")
+}
+
+/// [`tls_acceptor`] with the variable names its errors give (the notify listener has its own).
+pub(crate) fn tls_acceptor_named(
+    files: &TlsFiles,
+    cert_var: &str,
+    key_var: &str,
+) -> Result<TlsAcceptor, String> {
     let (cert_path, key_path) = (files.cert.display(), files.key.display());
-    let certs = load_certs(&files.cert)?;
+    let certs = load_certs(&files.cert, cert_var)?;
     let key = PrivateKeyDer::from_pem_file(&files.key).map_err(|e| match e {
         pem::Error::NoItemsFound => {
-            format!("BUCKWAL_SERVE_TLS_KEY {key_path}: no PEM private key in the file")
+            format!("{key_var} {key_path}: no PEM private key in the file")
         }
-        e => format!("BUCKWAL_SERVE_TLS_KEY {key_path}: {}", pem_problem(&e)),
+        e => format!("{key_var} {key_path}: {}", pem_problem(&e)),
     })?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -84,26 +93,24 @@ pub(crate) fn tls_acceptor(files: &TlsFiles) -> Result<TlsAcceptor, String> {
         .with_single_cert(certs, key)
         .map_err(|e| match e {
             rustls::Error::InconsistentKeys(_) => format!(
-                "BUCKWAL_SERVE_TLS_KEY {key_path}: does not match the certificate in \
-                 BUCKWAL_SERVE_TLS_CERT {cert_path}"
+                "{key_var} {key_path}: does not match the certificate in \
+                 {cert_var} {cert_path}"
             ),
             // rustls errors describe the key's kind, never its bytes.
-            e => format!(
-                "BUCKWAL_SERVE_TLS_CERT {cert_path} and BUCKWAL_SERVE_TLS_KEY {key_path}: {e}"
-            ),
+            e => format!("{cert_var} {cert_path} and {key_var} {key_path}: {e}"),
         })?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+fn load_certs(path: &Path, cert_var: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let shown = path.display();
     let certs = CertificateDer::pem_file_iter(path)
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| format!("BUCKWAL_SERVE_TLS_CERT {shown}: {}", pem_problem(&e)))?;
+        .map_err(|e| format!("{cert_var} {shown}: {}", pem_problem(&e)))?;
     if certs.is_empty() {
         return Err(format!(
-            "BUCKWAL_SERVE_TLS_CERT {shown}: no PEM certificate in the file"
+            "{cert_var} {shown}: no PEM certificate in the file"
         ));
     }
     Ok(certs)
@@ -159,8 +166,8 @@ pub(crate) async fn accept_loop(
             Either::Left(a) => a,
             Either::Right(_) => break,
         };
-        let tcp = match accepted {
-            Ok((tcp, _peer)) => tcp,
+        let (tcp, peer) = match accepted {
+            Ok((tcp, peer)) => (tcp, peer),
             Err(e) => {
                 // Usually out of file descriptors; back off instead of spinning.
                 tracing::warn!(target: "buckwal::server", error = %e, "accept failed");
@@ -170,7 +177,8 @@ pub(crate) async fn accept_loop(
         };
         let conn = serve_tcp(
             tcp,
-            app.clone(),
+            // The peer is there for handlers that log it; the SQL routes never read it.
+            app.clone().layer(axum::Extension(peer)),
             tls.clone(),
             graceful.watcher(),
             stop.clone(),

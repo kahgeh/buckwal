@@ -1,0 +1,34 @@
+Task 11: buckwal_server::notify
+
+RED (tests written first, module absent):
+$ cargo test --locked -p buckwal-server --test notify
+error[E0432]: unresolved import `buckwal_server::notify`
+ --> crates/buckwal-server/tests/notify.rs:6:21
+  |     use buckwal_server::notify::{serve_with, Fetch, NotifyBound, NotifyConfig};
+  |                     ^^^^^^ could not find `notify` in `buckwal_server`
+error: could not compile `buckwal-server` (test "notify") due to 1 previous error
+
+GREEN:
+$ cargo test --locked -p buckwal-server --test notify
+test config_from_lookup_rules ... ok
+test non_loopback_without_tls_and_token_refused_at_bind ... ok
+test loopback_without_token_accepted ... ok
+test sns_confirmation_fetch_failure_is_502_not_a_panic ... ok
+test s3_event_body_wakes_once ... ok
+test sns_basic_auth_wakes ... ok
+test http_fetch_checks_status_and_does_not_follow_redirects ... ok
+test missing_token_401_and_no_wake ... ok
+test bearer_token_wakes ... ok
+test sns_confirmation_on_host_fetches ... ok
+test token_never_in_logs ... ok
+test wrong_token_401_and_no_wake ... ok
+test malformed_body_400_no_wake ... ok
+test sns_confirmation_off_host_refused ... ok
+test oversize_body_413_no_wake ... ok
+test https_with_token_wakes ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+serve unchanged: results/replica-task-11-server-before.txt vs -after.txt (cargo test --locked -p buckwal-server,
+sorted per-test lines). The diff holds only added lines (new notify tests and the extra test binary's summary).
+$ ./scripts/test.sh unit   -> fmt, clippy -D warnings, all tests pass (rc=0)
+Cargo.lock: unchanged (reqwest moved from dev-dependencies to dependencies of buckwal-server; already locked).
