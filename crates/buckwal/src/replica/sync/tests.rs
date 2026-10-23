@@ -1014,6 +1014,26 @@ fn kill_inside_a_deferred_checkpoint_resumes_to_the_writers_rows() {
 }
 
 #[test]
+fn a_hole_in_the_log_holds_back_the_deferred_checkpoint() {
+    let (mut f, r2) = deferred_fixture();
+    let before = f.position();
+    sql(&r2, "COMMIT");
+    // Record N is applied, N+1 is missing, N+2 is there: the log read ends on a hole.
+    f.ship(6);
+    let _lost = f.commit(7);
+    f.next_seq += 1;
+    f.ship(8);
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::Applied, "{r:?}");
+    assert_eq!(
+        f.position(),
+        before,
+        "the position file was rewritten past a hole"
+    );
+    assert!(f.follower.offset > 0);
+}
+
+#[test]
 fn busy_deferral_more_frames_applied_then_killed_does_not_reuse_a_stale_offset() {
     let (mut f, r2) = deferred_fixture();
     // more frames are applied while the file still says ckpt_pending(-k); then the pass dies

@@ -158,6 +158,8 @@ struct Tally {
     applied_tx: u64,
     moved: bool,
     deferred: bool,
+    /// The last log read of the pass ended on a hole.
+    hole: bool,
     detail: Option<String>,
 }
 
@@ -480,7 +482,8 @@ impl Follower {
         if !matches!(outcome, Outcome::Applied | Outcome::Nothing) {
             return outcome;
         }
-        if !t.deferred {
+        // Not past a hole: the frames after it are not applied yet.
+        if !t.deferred && !t.hole {
             if let Some(o) = self.try_deferred(t) {
                 return o;
             }
@@ -651,6 +654,7 @@ impl Follower {
             Ok(h) => h,
             Err(o) => return o,
         };
+        t.hole = hole;
         let head = match self.check_head(t) {
             Ok(h) => h,
             Err(o) => return o,

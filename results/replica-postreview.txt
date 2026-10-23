@@ -18,3 +18,11 @@ GREEN (after the fix):
   test result: ok. 2 passed; 0 failed   (replica:: module: 108 passed)
 Also: the re-restore swap asks the old copy's prefetch to stop (Engine::stop_prefetch);
 Engine's drop still joins the thread before the copy's files are released.
+
+== Fix 4: no deferred checkpoint attempt when the log read ended on a hole ==
+cargo test --locked -p buckwal --lib a_hole_in_the_log_holds
+RED (before the fix):
+  assertion `left == right` failed: the position file was rewritten past a hole
+   left: Position { generation: 2, stage: Applying, offset: -3, new_offset: -3, .. }
+  right: Position { generation: 2, stage: CkptPending, offset: 2, new_offset: -2, .. }
+GREEN (after the fix): replica:: module: 109 passed; 0 failed
