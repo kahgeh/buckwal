@@ -460,7 +460,11 @@ fn removal_order(dir: &Path, with_pointer: bool) -> Result<Vec<PathBuf>> {
     for e in fs::read_dir(dir).map_err(|e| io_err("list replica dir", e))? {
         let e = e.map_err(|e| io_err("list replica dir", e))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        if name == LOCK_FILE
+        // Only a replica's own regular files: whatever else a user keeps there stays.
+        let regular = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if !regular
+            || !is_replica_file(&name)
+            || name == LOCK_FILE
             || (matches!(name.as_str(), REPLICA_AT_FILE | REPLICA_SEEN_FILE) && !with_pointer)
         {
             continue;

@@ -1211,6 +1211,43 @@ fn leftovers_of_the_old_copy_after_the_pointer_write_are_removed_at_open() {
 }
 
 #[test]
+fn unrelated_files_and_directories_survive_the_old_copy_removal_after_a_re_restore() {
+    let l = lag();
+    let dir = l.dir.clone();
+    // A user's file and subdirectory beside the replica's files.
+    std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("x"), b"x").unwrap();
+    l.fall_behind();
+    l.wait_re_restore();
+    let rc = l.replica.connect().unwrap();
+    wait_rows(&rc, 8);
+    rc.close().unwrap();
+    // remove_old_copy removed the old copy's files only.
+    assert!(!dir.join("app.db").exists());
+    assert!(dir.join("notes.txt").exists() && dir.join("sub").join("x").exists());
+    let copy = pointed_copy(&dir).unwrap();
+    let spy = l.spy.clone();
+    l.replica.close().unwrap();
+    // settle_layout at the next open, with leftovers of the old copy to remove.
+    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-replica"] {
+        if copy.join(f).exists() {
+            std::fs::copy(copy.join(f), dir.join(f)).unwrap();
+        }
+    }
+    let again = open_replica_with_store(rconfig(&dir), spy).unwrap();
+    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-replica"] {
+        assert!(!dir.join(f).exists(), "{f} left over");
+    }
+    assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"mine");
+    assert!(dir.join("sub").join("x").exists());
+    let rc = again.connect().unwrap();
+    wait_rows(&rc, 8);
+    rc.close().unwrap();
+    again.close().unwrap();
+}
+
+#[test]
 fn only_directories_shaped_like_copies_are_swept() {
     let store = Arc::new(MemStore::new());
     let (_w, _wdb, _wc) = writer(&store, 1);

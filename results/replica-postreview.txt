@@ -1,0 +1,9 @@
+Post-review fixes (read-replicas branch)
+
+== Fix 1: removal_order removes only a replica's regular files ==
+cargo test --locked -p buckwal --lib unrelated_files_and_directories
+RED (before the fix):
+  assertion failed: dir.join("notes.txt").exists() && dir.join("sub").join("x").exists()
+  test result: FAILED. 0 passed; 1 failed
+GREEN (after the fix): cargo test --locked -p buckwal --lib replica::
+  test result: ok. 106 passed; 0 failed
