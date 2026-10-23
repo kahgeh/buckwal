@@ -1,3 +1,86 @@
+# Durable hardening: before and after
+
+Sections in fix order: item 9 (S3Store::new), the head fields (Task 2), item 2 (takeover quiet), item 1 (skipped generation, floor, GC floor check), the HKDF vectors (Task 4), then Task 5, 5b, 6 and 5c. Each section is copied from the implementer report in `.superpowers/sdd/durable-hardening/`; where a report has no RED or GREEN block for a fix, the section says so.
+
+## Item 9: S3Store::new refuses a CA bundle with an http endpoint (Task 1)
+
+RED: `cargo test --locked -p buckwal s3_new_`
+
+```
+s3_new_accepts_ca_bundle_with_https_endpoint ... ok
+s3_new_refuses_ca_bundle_with_http_endpoint ... FAILED
+  assertion failed: "HTTP://x"
+  left: "CA bundle /ca.pem: No such file or directory (os error 2)"
+  right: "BUCKWAL_CA_BUNDLE is set but the endpoint is http://"
+```
+
+GREEN: same command: 2 passed; 0 failed. config tests: 29 passed (incl. `ca_bundle_with_http_endpoint_is_refused`). `./scripts/test.sh unit`: rc=0.
+
+The accepts test passes before the fix too (it guards against over-refusal).
+
+## Head fields lease_ms, request_timeout_ms, next_generation_floor (Task 2)
+
+RED: with head.rs and mod.rs at HEAD and the new tests in place, `cargo test --locked -p buckwal --lib format::` fails to compile: `cannot find value FORMAT_V3`, `Head has no field lease_ms / request_timeout_ms / next_generation_floor` (27 each), `LocalState has no field next_generation_floor` (9+1). The report notes the literal fixes were applied before this run, so the RED is the missing fields and constant; the implementation had been written first and was reverted temporarily to capture it. This is a compile failure, not a failing assertion.
+
+GREEN: `./scripts/test.sh unit` passes (fmt, clippy -D warnings, 502 buckwal lib tests plus the other crates' unit tests).
+
+Review fix: `previous_build_reads_heads_carrying_the_new_fields` (format/tests.rs) decodes a format 1 head and a format 2 mvcc head carrying the three fields through `decode_accepting(&[FORMAT])` and `(&[FORMAT, FORMAT_V2])`, with the other fields intact; the json Obj parser ignores unknown keys. The report shows no RED block for this test (it covers behaviour the code already had). `cargo test --locked -p buckwal --lib format::tests::previous_build`: 1 passed.
+
+## Item 2: the takeover quiet uses both writers' timeouts (Task 3, commit a)
+
+RED (`cargo test --locked -p buckwal --lib -- quiet_is_larger quiet_of_a_head quiet_over_max every_head_carries`):
+
+```
+db::tests::every_head_carries_the_writers_timeouts: assertion failed: create
+  left: (None, None)  right: (Some(300), Some(500))
+db::tests::quiet_is_larger_of_both_writers: left: (None, None) right: (Some(400), Some(600))
+test result: FAILED. 2 passed; 2 failed
+```
+
+`quiet_of_a_head_without_the_fields_is_the_own_sum` and `quiet_over_max_is_corrupt` pass on the old code too: the head decoder already refused a sum over a day (Task 1), and absent fields already meant own values. They pin that behaviour at takeover level.
+
+GREEN: the same four tests: 4 passed. `./scripts/test.sh unit`: all ok (507 lib tests plus the CLI, server and integration binaries; ignored RustFS tests only compiled).
+
+## Item 1: a takeover skips a generation; the floor; the GC floor check (Task 3, spec revision 6)
+
+RED (code at bc66c12, new tests only; `cargo test --locked -p buckwal --lib -- <names>`):
+
+```
+mvcc_takeover_seal_lands_on_g_plus_2: left: Ok(3) right: Ok(4)
+mvcc_seal_with_lost_head_reply_adopts_g_plus_2: the head PUT stored: left (3, Some(2)) right (4, Some(3))
+restart_between_takeover_and_first_seal_keeps_floor: after the takeover: left 0 right 3
+skipped_generation_restore_verify_gc_maintenance_reconcile_second_takeover: the takeover's head: left None right Some(3)
+two_takeovers_before_first_seal_skip_both: left None right Some(3)
+previous_build_restores_from_new_head: left (2, Some(1)) right (3, Some(2))
+gc_pause_between_takeover_and_skip_seal_ends: left (2, Some(1), None) right (2, Some(1), Some(4))
+gc_ignores_fenced_writers_leftover_manifest: Head { generation: 3, manifest: Some(2), .. } left (3, Some(2)) right (4, Some(3))
+late_put_cannot_replace_new_writers_page: the head skips 2: left Ok(2) right Ok(3)
+test result: FAILED. 0 passed; 8 failed (+ the late_put test run alone: 1 failed)
+```
+
+The late_put test originally hung on old code, because a failed assertion inside the thread scope left A's PUT held; its assertions now run after A is released.
+
+RED with the GC floor check alone removed (everything else in place), `gc_ignores_fenced_writers_leftover_manifest` and `gc_pause_between_takeover_and_skip_seal_ends`:
+
+```
+GcPass { generation: 4, trimmed_against: Some(2), age: Some(642.1s), deleted: 98, outcome: Trimmed }
+  left: Trimmed right: TooYoung   (GC trimmed against A's leftover manifest/2: 98 objects, incl. pages B maps)
+GcPass { generation: 2, trimmed_against: Some(1), deleted: 63, outcome: Trimmed }
+  left: (Trimmed, 63) right: (Nothing, 0)   (GC trimmed between the takeover and the skip seal)
+```
+
+GREEN: the nine new tests: 9 passed, with the floor check back. `./scripts/test.sh unit`: all ok (522 lib tests, then the CLI, server and integration binaries; RustFS tests only compiled).
+
+Tests covered: bucket/tests.rs `late_put_cannot_replace_new_writers_page`; db/tests.rs `skipped_generation_restore_verify_gc_maintenance_reconcile_second_takeover`, `two_takeovers_before_first_seal_skip_both`, `restart_between_takeover_and_first_seal_keeps_floor`, `previous_build_restores_from_new_head`; gc/tests.rs `gc_ignores_fenced_writers_leftover_manifest`, `gc_pause_between_takeover_and_skip_seal_ends`; io/log_file.rs MVCC tests `mvcc_takeover_seal_lands_on_g_plus_2` and `mvcc_seal_with_lost_head_reply_adopts_g_plus_2` (kind 3 records in `log/<G+2>`, none in `log/<G+1>`); system.rs (`#[ignore]`, compiled only) `late_put_from_fenced_writer_lands_on_unreferenced_key`. The report records no separate RED output for `maintenance_skips_during_takeover_quiet`, which was changed to assert the maintenance seal lands on G+2.
+
+The report notes `db::tests::close_stops_prefetch_before_releasing_the_dir` failed once on the final run (timing based) and also fails alone at bc66c12, so it is unrelated.
+
+## HKDF-SHA256 and the integrity key (Task 4)
+
+RED: tests written first (RFC 5869 cases 1-3, key differs from page key, newline-insensitive, Debug redacted, verify), `cargo test --locked -p buckwal --lib encryption`: compile errors (`hkdf_sha256`, `integrity_key` not found). The report gives no assertion output; the RED is a compile failure.
+
+GREEN: same command: 17 passed, 0 failed. `./scripts/test.sh unit`: fmt, clippy -D warnings, all unit tests pass.
+
 
 ## Task 5: integrity codes on pages, records, manifests and the head (format 3)
 

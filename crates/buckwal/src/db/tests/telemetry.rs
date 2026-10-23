@@ -34,7 +34,7 @@ fn takeover_span_carries_the_quiet_and_the_next_generation_floor() {
 }
 
 #[test]
-fn the_larger_writer_sets_the_quiet_and_a_head_without_timeouts_has_no_old_value() {
+fn a_head_without_timeouts_has_no_quiet_old_ms() {
     let store = mem();
     let _a = writer_left_in_a_seal(&store, 5);
     // The head of a build without the timeouts.

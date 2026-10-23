@@ -1276,8 +1276,9 @@ impl Bucket {
     /// lands later than `lease` + `retry_deadline` counts only after a head GET
     /// (`confirm_landed`).
     /// Against another process this holds only if that process's trim grace exceeds this
-    /// writer's sum too (README, Settings): nothing in the bucket records another process's
-    /// settings.
+    /// writer's sum too (README, Settings): the head records each writer's `lease` and
+    /// `request_timeout` (the takeover quiet uses the larger of both), but not `retry_deadline`
+    /// or `trim_grace`.
     fn check_lease(&mut self, start: Instant) -> Result<()> {
         if self.last_confirmed.age() < self.lease {
             return Ok(());
@@ -1517,8 +1518,9 @@ impl Bucket {
     }
 
     /// Publish generation G: an empty seal-start record and a head check (`seal_start`), then
-    /// its dirty pages, its manifest, then move the head to G+1 with a conditional write.
-    /// Returns G+1.
+    /// its dirty pages, its manifest, then move the head to `seal_target()` = T with a
+    /// conditional write. Pages and manifest are written under T-1 (T-1 = G in the normal
+    /// case; after a takeover T can be G+2). Returns T.
     ///
     /// A seal of a generation under a takeover quiet (`set_seal_not_before`) first waits it
     /// out (`wait_quiet`); its retry deadline starts after the wait. That includes the
