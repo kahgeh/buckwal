@@ -1024,10 +1024,13 @@ fn encrypted_swapped_page_objects_fail_read() {
     swapped_page_objects_fail_read("encrypted_swapped_page_objects_fail_read", &[]);
 }
 
-/// Pass 2 (an encryption key): after a good open, a plaintext format 1 head put back over the
-/// encrypted bucket's head is a downgrade. The running writer's next head read (its seal)
-/// fails with `integrity: <prefix>/head format downgraded` and the writer stops with an error;
-/// nothing is accepted. Pass 1 has no key, so the test only returns there.
+/// Pass 2 (an encryption key): a plaintext format 1 head put over the encrypted bucket's head
+/// while a writer runs. The running writer's head reads compare the head's bytes and fence
+/// (`the head was changed by another writer`), with no `integrity check failed` record: it
+/// stops non-zero. A fresh restore is an open, and a format 1 head under a key is the
+/// `Encryption` "no integrity codes" error there, again with no record. (The post-open
+/// `Corrupt("... format downgraded")` is pinned by the unit tests: only GC's reads reach it.)
+/// Pass 1 has no key, so the test returns there.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn encrypted_downgraded_head_after_open_is_tampering() {
@@ -1046,31 +1049,52 @@ fn encrypted_downgraded_head_after_open_is_tampering() {
     let key = format!("{}/head", ctx.prefix());
     let real = String::from_utf8(store.get(&key).unwrap().expect("head").body).unwrap();
     assert!(real.contains("\"format\":3"), "{real}");
-    // Format 1: no journal_mode, key_check or integrity field.
-    let mut old = real.replace("\"format\":3", "\"format\":1");
-    for field in ["journal_mode", "key_check", "integrity"] {
-        if let Some(at) = old.find(&format!(",\"{field}\":\"")) {
-            let end = old[at + 1..].find('"').unwrap() + at + 1; // the field name's end
-            let end = old[end + 1..].find('"').unwrap() + end + 1; // its closing quote
-            let end = old[end + 1..].find('"').unwrap() + end + 1; // the value's opening quote
-            let end = old[end + 1..].find('"').unwrap() + end + 2; // the value's closing quote
-            old.replace_range(at..end, "");
-        }
-    }
+    let old = format_1_head(&real);
     store.put(&key, old.as_bytes()).unwrap();
     soak.drain();
     let status = soak.child.wait().expect("wait soak");
-    assert!(!status.success(), "the writer accepted a downgraded head");
-    let want = format!("integrity: {key} format downgraded");
+    assert!(!status.success(), "the writer accepted a swapped head");
+    let err = soak.stderr();
     assert!(
-        soak.stderr().contains(&want),
-        "stderr names the downgrade: {}",
-        soak.stderr()
+        err.contains("the head was changed by another writer"),
+        "the running writer is fenced: {err}"
+    );
+    assert!(
+        !err.contains("integrity check failed"),
+        "a fenced writer logs no integrity record: {err}"
     );
     fs::remove_dir_all(&dir).ok();
     let r = ctx.dir("restored");
     let out = ctx.run(&["restore", "--dir", r.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr
+            .contains("the bucket has no integrity codes: it is plaintext, or was encrypted"),
+        "restore (an open) refuses a format 1 head under a key: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("integrity check failed"),
+        "no record at open: {}",
+        out.stderr
+    );
+}
+
+/// A format 3 head's JSON as a format 1 head: `format` 1, without `journal_mode`, `key_check`
+/// and `integrity` (each a `"name":"value"` pair, whatever its place in the object).
+fn format_1_head(real: &str) -> String {
+    let mut pairs: Vec<String> = Vec::new();
+    let inner = real.trim().trim_start_matches('{').trim_end_matches('}');
+    // Values are numbers, hex or plain identifiers: no commas or quotes inside a value.
+    for pair in inner.split(',') {
+        let name = pair.split(':').next().unwrap().trim().trim_matches('"');
+        match name {
+            "journal_mode" | "key_check" | "integrity" => {}
+            "format" => pairs.push("\"format\":1".to_string()),
+            _ => pairs.push(pair.to_string()),
+        }
+    }
+    format!("{{{}}}", pairs.join(","))
 }
 
 /// The coordinator's ruling: a read-only verify of the same bucket while the writer runs
