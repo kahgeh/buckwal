@@ -77,14 +77,17 @@ impl IntegrityKey {
     fn mac(&self, parts: &[&[u8]]) -> Hmac<Sha256> {
         let mut m =
             <Hmac<Sha256> as KeyInit>::new_from_slice(&self.0).expect("hmac takes any key length");
+        // Each part is length-prefixed, so re-splitting the same bytes gives another code.
         for p in parts {
+            m.update(&(p.len() as u64).to_be_bytes());
             m.update(p);
         }
         m
     }
 
-    /// The integrity code over `parts` in order (they are hashed as one concatenation, so
-    /// callers use fixed-width fields).
+    /// The integrity code over `parts` in order, each fed as its length (u64, big-endian) and
+    /// then its bytes. A call site's first part is its kind (`page`, `record`, `manifest`,
+    /// `head`), so a code of one kind never verifies as another.
     pub(crate) fn code(&self, parts: &[&[u8]]) -> [u8; 32] {
         self.mac(parts).finalize().into_bytes().into()
     }
@@ -396,7 +399,9 @@ mod tests {
         let ik = load(&c).unwrap().unwrap().integrity_key();
         let code = ik.code(&[&b"ab"[..], &b"c"[..]]);
         assert!(ik.verify(&[&b"ab"[..], &b"c"[..]], &code));
-        assert!(ik.verify(&[&b"a"[..], &b"bc"[..]], &code)); // concatenation: callers fix field widths
+        // Parts are length-prefixed: the same bytes split elsewhere are another message.
+        assert!(!ik.verify(&[&b"a"[..], &b"bc"[..]], &code));
+        assert!(!ik.verify(&[&b"abc"[..]], &code));
         assert!(!ik.verify(&[b"abd"], &code));
         assert!(!ik.verify(&[b"abc"], &code[..31]));
         assert!(!ik.verify(&[b"abc"], &[]));
