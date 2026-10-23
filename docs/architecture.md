@@ -227,7 +227,7 @@ flowchart LR
 | `durable.lock` | The exclusive lock of the process that has the directory open. |
 | `app.db-replica`, `app.db-replica-at`, `app.db-replica-seen` | A replica's position file, the pointer to its current copy after a re-restore, and the time of its last successful pass (see Replicas). |
 
-**Settings and telemetry.** `BUCKWAL_*` environment variables (README, Settings), `BUCKWAL_OTEL*` and the span names (README, Telemetry, a contract the HyperDX searches depend on), including the replica spans `buckwal.replica.sync` and `buckwal.replica.re_restore`.
+**Settings and telemetry.** `BUCKWAL_*` environment variables (README, Settings), `BUCKWAL_OTEL*` and the span names (README, Telemetry, a contract the HyperDX searches depend on), including the replica spans `buckwal.replica.sync` and `buckwal.replica.re_restore`. Also `buckwal.prefetch`, the resource attributes (`host.name`, `service.instance.id`, and `deployment.environment.name = test` for a test run) and the rule that a span whose `buckwal.outcome` is `error`, `integrity` or `fenced` ends with status Error (README, Telemetry).
 
 ## Takeover, generations and integrity codes
 

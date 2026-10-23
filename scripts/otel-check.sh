@@ -12,6 +12,9 @@
 # at least one ERROR record `integrity check failed` with no data or code field, and, when
 # replica tests ran under the run id (any `buckwal.replica.sync` span), those spans carry
 # `buckwal.lag_ms` and `buckwal.trigger`.
+# Also checked: the run's spans carry the marking (`deployment.environment.name = test`,
+# `host.name`, `service.instance.id` as resource attributes), and at least one span of the run
+# has status Error (a failed commit, restore or takeover of the fault tests).
 # The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
@@ -103,7 +106,18 @@ while :; do
   query "SELECT count() $TRACES AND SpanName = 'buckwal.replica.sync' AND Timestamp > now() - INTERVAL 1 DAY AND SpanAttributes['buckwal.lag_ms'] != '' AND SpanAttributes['buckwal.trigger'] IN ('notification', 'slow_poll', 'start')"
   replica_sync="$OUT"
 
+  # The marking: every span of the run is a test span from a named machine and process.
+  query "SELECT count() $TRACES AND Timestamp > now() - INTERVAL 1 DAY AND ResourceAttributes['deployment.environment.name'] = 'test' AND ResourceAttributes['host.name'] != '' AND ResourceAttributes['service.instance.id'] != ''"
+  marked="$OUT"
+  query "SELECT count() $TRACES AND Timestamp > now() - INTERVAL 1 DAY AND NOT (ResourceAttributes['deployment.environment.name'] = 'test' AND ResourceAttributes['host.name'] != '' AND ResourceAttributes['service.instance.id'] != '')"
+  unmarked="$OUT"
+  query "SELECT count() $TRACES AND Timestamp > now() - INTERVAL 1 DAY AND StatusCode = 'Error'"
+  errors="$OUT"
+
   missing=""
+  [[ "$marked" -gt 0 ]] || missing="$missing resource-marking(deployment.environment.name,host.name,service.instance.id)"
+  [[ "$unmarked" -eq 0 ]] || missing="$missing every-span-marked(unmarked $unmarked)"
+  [[ "$errors" -gt 0 ]] || missing="$missing span-with-status-Error"
   [[ "$replica_all" -eq 0 || "$replica_sync" -gt 0 ]] || missing="$missing buckwal.replica.sync(buckwal.lag_ms,buckwal.trigger)(of $replica_all)"
   for s in $SPANS; do
     awk -F'\t' -v s="$s" '$1 == s && $2 > 0 { found = 1 } END { exit !found }' <<<"$spans" \
@@ -114,7 +128,7 @@ while :; do
   [[ "$integrity" -gt 0 ]] || missing="$missing log:integrity-check-failed"
   [[ "$integrity_data" -eq 0 ]] || missing="$missing no-data-in-integrity-records(found $integrity_data)"
   if [[ -z "$missing" && "$logs" -gt 0 && "$untimed" -eq 0 ]]; then
-    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity replica_sync_spans=$replica_sync"
+    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity replica_sync_spans=$replica_sync marked_spans=$marked error_spans=$errors"
     exit 0
   fi
   if (( SECONDS - start >= DEADLINE )); then

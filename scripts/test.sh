@@ -101,6 +101,7 @@ TLS_DIR="$(mktemp -d "$TMP/buckwal-tls.XXXXXX")"
 (while sleep 15; do sample; done) &
 SAMPLER=$!
 
+# Only this run exports; the run id marks every record `deployment.environment.name = test`.
 export BUCKWAL_OTEL=1
 export BUCKWAL_TEST_RUN_ID="buckwal-$(date +%Y%m%d%H%M%S)-$$"
 echo "test run id: $BUCKWAL_TEST_RUN_ID"
