@@ -18,7 +18,8 @@ use crate::encryption::{self, check_page_one, file_page_one};
 use crate::engine::{engine_error, open_engine};
 use crate::error::{Error, Result};
 use crate::files::{
-    io_err, DB_FILE, LOCK_FILE, LOG_FILE, REPLICA_AT_FILE, REPLICA_FILE, STATE_FILE, WAL_FILE,
+    io_err, DB_FILE, LOCK_FILE, LOG_FILE, REPLICA_AT_FILE, REPLICA_FILE, REPLICA_SEEN_FILE,
+    STATE_FILE, WAL_FILE,
 };
 use crate::format::Head;
 use crate::format::{Keys, LocalState, Manifest};
@@ -26,7 +27,7 @@ use crate::io::IoMode;
 use crate::reconcile::replace_file;
 use crate::replica::{
     apply::{Applier, PageDecrypt},
-    connection::ReadConnection,
+    connection::{Current, ReadConnection},
     position::{Position, Stage},
     stats::ReplicaStats,
     sync::{reason, Follower, Outcome, PassResult, Reason, StopReason, Trigger},
@@ -57,12 +58,13 @@ pub fn open_replica(config: Config) -> Result<Replica> {
 /// replaced under a mutex; a connection opened before keeps the old engine alive (on its
 /// unlinked files) until it is closed.
 pub struct Replica {
-    current: Arc<Mutex<Database>>,
+    current: Arc<Current>,
     wake: Arc<WakeState>,
     stats: Arc<Mutex<ReplicaStats>>,
     thread: Option<JoinHandle<()>>,
-    /// Dropped last: the lock outlives every file of every copy.
-    _guard: DirGuard,
+    /// The directory lock; every copy's `Database` holds it too, so it is released only when
+    /// the replica and the last connection of any copy are gone.
+    _guard: Arc<DirGuard>,
 }
 
 impl std::fmt::Debug for Replica {
@@ -83,8 +85,7 @@ impl Replica {
     /// opened before keep reading the copy they were opened on (an open transaction may get
     /// an error).
     pub fn connect(&self) -> Result<ReadConnection> {
-        let db = lock(&self.current).clone();
-        db.connect().map(ReadConnection::new)
+        ReadConnection::new(self.current.clone())
     }
 
     /// Progress and cost so far; readable after the follower has stopped.
@@ -103,7 +104,7 @@ impl Replica {
     /// first (`Config` otherwise).
     pub fn close(mut self) -> Result<()> {
         self.stop_follower();
-        let db = lock(&self.current).clone();
+        let (_, db) = self.current.get();
         db.close()
     }
 
@@ -134,6 +135,7 @@ struct Env {
     encryption: Option<Arc<Encryption>>,
     /// A seal's checkpoint may stay Busy for two slow-poll intervals.
     busy_budget: Duration,
+    guard: Arc<DirGuard>,
 }
 
 impl Env {
@@ -185,7 +187,7 @@ impl Env {
             manifest,
         );
         let engine = open_engine(data, bucket, state, &self.cfg, None)?;
-        let db = replica_database(self.store.clone(), engine, &self.cfg);
+        let db = replica_database(self.store.clone(), engine, &self.cfg, self.guard.clone());
         // The follower's own connection: never handed out, and it never checkpoints by itself.
         let core = db
             .shared
@@ -231,7 +233,7 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
     // The lock is taken first, as the writer's open does (it creates the directory and
     // `durable.lock`, nothing else). Every refusal below happens before any other file is
     // touched.
-    let guard = DirGuard::acquire(&config.dir)?;
+    let guard = Arc::new(DirGuard::acquire(&config.dir)?);
     let dir = guard.dir().to_path_buf();
     let keys = config.keys_for(encryption.as_deref());
     let mut cfg = config.engine(IoMode::Replica);
@@ -245,6 +247,7 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
         encryption,
         // A seal's checkpoint may stay Busy for two slow-poll intervals.
         busy_budget: config.replica_poll_interval * 2,
+        guard: guard.clone(),
     };
 
     // The head first: an MVCC bucket or a wrong key is refused before anything is fetched.
@@ -265,13 +268,14 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
     };
 
     let (db, follower) = env.open_copy(&data, &state, head, head_etag)?;
+    let caught_up = restart_caught_up(&dir, &data);
     let stats = Arc::new(Mutex::new(ReplicaStats {
         generation: follower.generation(),
         seq: follower.last_seq(),
         ..ReplicaStats::default()
     }));
     let wake = Arc::new(WakeState::default());
-    let current = Arc::new(Mutex::new(db));
+    let current = Arc::new(Current::new(db));
     let runner = Runner {
         follower,
         env,
@@ -281,7 +285,8 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
         stats: stats.clone(),
         wake: wake.clone(),
         interval: config.replica_poll_interval,
-        caught_up: Instant::now(),
+        caught_up,
+        episode: None,
     };
     // The thread reports to the subscriber of the thread that opened the replica.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -336,6 +341,18 @@ fn copy_prefix(dir: &Path) -> Option<String> {
         .map(|n| format!(".{}.data-", n.to_string_lossy()))
 }
 
+/// Whether `name` is `<prefix><pid>-<nanos>` (digits only): a copy directory's name.
+fn is_copy_name(name: &str, prefix: &str) -> bool {
+    let Some((pid, nanos)) = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(nanos)
+}
+
 /// A new, empty copy directory beside `dir`.
 fn new_copy_dir(dir: &Path) -> Result<PathBuf> {
     let (Some(parent), Some(prefix)) = (dir.parent(), copy_prefix(dir)) else {
@@ -349,6 +366,7 @@ fn new_copy_dir(dir: &Path) -> Result<PathBuf> {
         .map_or(0, |d| d.as_nanos());
     let copy = parent.join(format!("{prefix}{}-{nanos}", std::process::id()));
     fs::create_dir(&copy).map_err(|e| io_err(&format!("create {}", copy.display()), e))?;
+    fsync_dir(parent)?;
     Ok(copy)
 }
 
@@ -358,7 +376,7 @@ fn pointed_copy(dir: &Path) -> Option<PathBuf> {
     let name = fs::read_to_string(dir.join(REPLICA_AT_FILE)).ok()?;
     let name = name.trim();
     let prefix = copy_prefix(dir)?;
-    if !name.starts_with(&prefix) || name.contains(['/', '\\']) {
+    if !is_copy_name(name, &prefix) {
         return None;
     }
     let copy = dir.parent()?.join(name);
@@ -370,7 +388,11 @@ fn write_pointer(dir: &Path, copy: &Path) -> Result<()> {
         .file_name()
         .ok_or_else(|| Error::Config("a copy directory without a name".into()))?
         .to_string_lossy();
-    replace_file(dir, REPLICA_AT_FILE, name.as_bytes())
+    replace_file(dir, REPLICA_AT_FILE, name.as_bytes())?;
+    if let Some(parent) = dir.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
 }
 
 /// Remove a copy directory and the staging directories a restore into it left.
@@ -385,12 +407,17 @@ fn sweep_copies(dir: &Path, keep: Option<&Path>) -> Result<()> {
     let (Some(parent), Some(prefix)) = (dir.parent(), copy_prefix(dir)) else {
         return Ok(());
     };
-    let staged_prefix = format!(".{prefix}");
     let entries = fs::read_dir(parent).map_err(|e| io_err("list parent dir", e))?;
     for e in entries {
         let e = e.map_err(|e| io_err("list parent dir", e))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with(&prefix) || name.starts_with(&staged_prefix)) {
+        let is_copy = is_copy_name(&name, &prefix);
+        // A restore into a copy stages beside it: `.<copy name>.restore-<pid>-<nanos>`.
+        let is_staging = name
+            .strip_prefix('.')
+            .and_then(|n| n.split_once(".restore-"))
+            .is_some_and(|(copy, _)| is_copy_name(copy, &prefix));
+        if !(is_copy || is_staging) {
             continue;
         }
         if keep.is_some_and(|k| k == e.path()) {
@@ -409,7 +436,7 @@ fn settle_layout(dir: &Path) -> Result<PathBuf> {
     sweep_copies(dir, pointed.as_deref())?;
     match pointed {
         Some(copy) => {
-            remove_own_files(dir, false, None)?;
+            remove_own_files(dir, false, &mut Budget(None))?;
             Ok(copy)
         }
         None => {
@@ -433,7 +460,9 @@ fn removal_order(dir: &Path, with_pointer: bool) -> Result<Vec<PathBuf>> {
     for e in fs::read_dir(dir).map_err(|e| io_err("list replica dir", e))? {
         let e = e.map_err(|e| io_err("list replica dir", e))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        if name == LOCK_FILE || (name == REPLICA_AT_FILE && !with_pointer) {
+        if name == LOCK_FILE
+            || (matches!(name.as_str(), REPLICA_AT_FILE | REPLICA_SEEN_FILE) && !with_pointer)
+        {
             continue;
         }
         let rank = match name.as_str() {
@@ -448,12 +477,28 @@ fn removal_order(dir: &Path, with_pointer: bool) -> Result<Vec<PathBuf>> {
     Ok(files.into_iter().map(|(_, _, p)| p).collect())
 }
 
-/// Remove the replica files of `dir` in `removal_order`, then fsync it. `limit` stops after
-/// that many removals (tests: a crash).
-fn remove_own_files(dir: &Path, with_pointer: bool, limit: Option<usize>) -> Result<()> {
+/// How many more removals a clear may do (tests stop it early to emulate a crash).
+struct Budget(Option<usize>);
+
+impl Budget {
+    /// Take one removal; false when none is left.
+    fn take(&mut self) -> bool {
+        match &mut self.0 {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    }
+}
+
+/// Remove the replica files of `dir` in `removal_order`, then fsync it.
+fn remove_own_files(dir: &Path, with_pointer: bool, budget: &mut Budget) -> Result<()> {
     let state = dir.join(STATE_FILE);
-    for (i, f) in removal_order(dir, with_pointer)?.into_iter().enumerate() {
-        if limit.is_some_and(|l| i >= l) {
+    for f in removal_order(dir, with_pointer)? {
+        if !budget.take() {
             return Ok(());
         }
         if f == state {
@@ -520,10 +565,24 @@ fn clear_replica_dir_n(dir: &Path, limit: Option<usize>) -> Result<()> {
             )));
         }
     }
+    let mut budget = Budget(limit);
     if let Some(copy) = copy {
+        // The pointer goes first: from then on the copy is an orphan, swept at the next open
+        // however far its removal got. Then its files in order (state last), then the
+        // directory.
+        if !budget.take() {
+            return Ok(());
+        }
+        fs::remove_file(dir.join(REPLICA_AT_FILE))
+            .map_err(|e| io_err("remove replica pointer", e))?;
+        fsync_dir(dir)?;
+        remove_own_files(&copy, true, &mut budget)?;
+        if budget.0 == Some(0) {
+            return Ok(());
+        }
         remove_copy(&copy);
     }
-    remove_own_files(dir, true, limit)
+    remove_own_files(dir, true, &mut budget)
 }
 
 /// The manifest the replica's lazy page fetches use: the newest one below the generation its
@@ -586,13 +645,23 @@ struct Runner {
     /// Where the current copy's files are: `dir` or a sibling copy directory.
     data: PathBuf,
     /// The `Database` `Replica::connect` uses; replaced by a re-restore.
-    current: Arc<Mutex<Database>>,
+    current: Arc<Current>,
     stats: Arc<Mutex<ReplicaStats>>,
     wake: Arc<WakeState>,
     interval: Duration,
     /// When a pass last succeeded (start of the thread before any): how long the replica has
     /// been behind when it must restore again.
     caught_up: Instant,
+    /// The re-restore in progress, while one is failing and being retried.
+    episode: Option<Episode>,
+}
+
+/// A run of failed re-restore attempts: one WARN for falling behind, one for the failure, and
+/// a growing wait between attempts.
+struct Episode {
+    failures: u32,
+    next_attempt: Instant,
+    failure_logged: bool,
 }
 
 impl Runner {
@@ -662,6 +731,8 @@ impl Runner {
         }
         if ok {
             self.caught_up = Instant::now();
+            self.episode = None;
+            note_seen(&self.dir);
         }
         self.handle(r)
     }
@@ -717,19 +788,44 @@ impl Runner {
         };
         let (generation, seq) = (self.follower.generation(), self.follower.last_seq());
         let behind = self.caught_up.elapsed();
-        tracing::warn!(
-            target: "buckwal",
-            replica_id = self.follower.replica_id(),
-            generation,
-            seq,
-            behind_ms = behind.as_millis() as u64,
-            reason,
-            "replica fell behind, restoring again"
-        );
+        match &self.episode {
+            // A failed attempt is backed off: no restore until its wait is over.
+            Some(ep) if Instant::now() < ep.next_attempt => return Next::Wait,
+            Some(_) => {}
+            None => {
+                tracing::warn!(
+                    target: "buckwal",
+                    replica_id = self.follower.replica_id(),
+                    generation,
+                    seq,
+                    behind_ms = behind.as_millis() as u64,
+                    reason,
+                    "replica fell behind, restoring again"
+                );
+                self.episode = Some(Episode {
+                    failures: 0,
+                    next_attempt: Instant::now(),
+                    failure_logged: false,
+                });
+            }
+        }
         if let Err(e) = self.restore_again() {
-            tracing::warn!(target: "buckwal", error = %e, "replica: restoring again failed, trying again later");
+            let wait = self.backoff();
+            let ep = self.episode.get_or_insert(Episode {
+                failures: 0,
+                next_attempt: Instant::now(),
+                failure_logged: false,
+            });
+            ep.failures += 1;
+            let shift = (ep.failures - 1).min(16);
+            ep.next_attempt = Instant::now() + (wait * (1u32 << shift)).min(self.interval);
+            if !ep.failure_logged {
+                ep.failure_logged = true;
+                tracing::warn!(target: "buckwal", error = %e, "replica: restoring again failed, trying again later");
+            }
             return Next::Wait;
         }
+        self.episode = None;
         let mut s = lock(&self.stats);
         s.re_restores += 1;
         s.last_re_restore_at = Some((
@@ -748,6 +844,12 @@ impl Runner {
         Next::Now
     }
 
+    /// The first wait after a failed attempt: a quarter of the slow-poll interval, at most
+    /// 1 s; it doubles per failure up to the interval.
+    fn backoff(&self) -> Duration {
+        (self.interval / 4).min(Duration::from_secs(1))
+    }
+
     fn restore_again(&mut self) -> Result<()> {
         let copy = new_copy_dir(&self.dir)?;
         match self.build_copy(&copy) {
@@ -763,7 +865,7 @@ impl Runner {
                     return Err(e);
                 }
                 let old = std::mem::replace(&mut self.data, copy);
-                let old_db = std::mem::replace(&mut *lock(&self.current), db);
+                let old_db = self.current.swap(db);
                 // The old apply connection goes first, then the handle; readers still on the
                 // old copy keep its engine (and its unlinked files) until they close.
                 self.follower = follower;
@@ -784,7 +886,7 @@ impl Runner {
 
     fn remove_old_copy(&self, old: &Path) {
         if old == self.dir {
-            if let Err(e) = remove_own_files(&self.dir, false, None) {
+            if let Err(e) = remove_own_files(&self.dir, false, &mut Budget(None)) {
                 tracing::warn!(target: "buckwal", error = %e, "replica: could not remove the old copy");
             }
         } else {
@@ -804,6 +906,30 @@ impl Runner {
             "replica stopped"
         );
     }
+}
+
+/// Record that a pass finished now (best effort, no fsync).
+fn note_seen(dir: &Path) {
+    let ms = std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis());
+    let _ = fs::write(dir.join(REPLICA_SEEN_FILE), ms.to_string());
+}
+
+/// When the replica was last caught up, as an `Instant`, at start: the last pass a previous
+/// run recorded, else the position file's modification time, else now.
+fn restart_caught_up(dir: &Path, data: &Path) -> Instant {
+    let seen = fs::read_to_string(dir.join(REPLICA_SEEN_FILE))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms))
+        .or_else(|| {
+            fs::metadata(data.join(REPLICA_FILE))
+                .and_then(|m| m.modified())
+                .ok()
+        });
+    let ago = seen
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or_default();
+    Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
 }
 
 /// `14m`, `2h5m`, `37s`, `120ms`.

@@ -98,9 +98,7 @@ impl Drop for DirGuard {
 struct Open {
     engine: Engine,
     trimmer: Option<JoinHandle<()>>,
-    /// Dropped last: the lock outlives every file of the engine. A replica's database has
-    /// none: its `Replica` holds the directory lock for its whole life, across the swaps of
-    /// the copy it follows.
+    /// Dropped last: the lock outlives every file of the engine.
     guard: Option<DirGuard>,
 }
 
@@ -129,6 +127,10 @@ pub(crate) struct Shared {
     /// What the open's reconcile found (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) reconciled: Option<Reconciled>,
+    /// A replica's directory lock, shared by the `Replica` and by every copy's `Shared`, so it
+    /// is held until the last connection of any copy is gone (`Open::guard` is the writer's).
+    #[allow(dead_code)]
+    dir_guard: Option<Arc<DirGuard>>,
 }
 
 impl Shared {
@@ -384,6 +386,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             journal_mode: config.journal_mode,
             events: cfg.events.clone(),
             reconciled,
+            dir_guard: None,
         }),
     };
     if !read_only {
@@ -398,6 +401,7 @@ pub(crate) fn replica_database(
     store: Arc<dyn ObjectStore>,
     engine: Engine,
     cfg: &EngineConfig,
+    guard: Arc<DirGuard>,
 ) -> Database {
     let uploader = engine.uploader.clone();
     let wal_bytes = engine.wal_bytes.clone();
@@ -420,6 +424,7 @@ pub(crate) fn replica_database(
             journal_mode: JournalMode::Wal,
             events: cfg.events.clone(),
             reconciled: None,
+            dir_guard: Some(guard),
         }),
     }
 }

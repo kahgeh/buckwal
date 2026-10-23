@@ -994,48 +994,229 @@ fn stats_after_re_restore_shows_count_reason_and_jumped_position() {
 }
 
 #[test]
-fn old_connection_outside_a_transaction_keeps_working_new_connections_see_new_copy() {
+fn old_connection_outside_a_transaction_is_rebound_to_the_new_copy() {
     let l = lag();
     let old = l.replica.connect().unwrap();
     assert_eq!(count(&old), 3);
     l.fall_behind();
     l.wait_re_restore();
-    let new = l.replica.connect().unwrap();
-    wait_rows(&new, 8);
-    // The old connection still answers (from the copy it was opened on, which is gone from
-    // the directory); it is not an error and not a crash.
-    let n = count(&old);
-    assert!(n == 3 || n == 8, "{n}");
+    // The same connection, no transaction open: its next statement runs on the new copy.
+    assert_eq!(count(&old), 8);
+    add(&l.wc, 9);
+    wait_rows(&old, 9);
     old.close().unwrap();
-    new.close().unwrap();
     l.replica.close().unwrap();
 }
 
+/// Implemented: a connection inside a transaction keeps its old snapshot (the old engine
+/// serves it from its own files) until the transaction ends; it may instead get an error if the
+/// old engine can no longer serve it. After the transaction the connection is rebound.
 #[test]
-fn a_reader_holding_a_transaction_across_the_swap_gets_an_error_or_its_snapshot_and_nothing_worse()
-{
+fn a_transaction_across_the_swap_keeps_its_snapshot_or_errors_then_the_connection_rebinds() {
     let l = lag();
     let rc = l.replica.connect().unwrap();
     let r = rc.transaction(|tx| {
-        let first = tx.query("SELECT count(*) FROM t", &[])?[0][0].as_int();
-        assert_eq!(first, Some(3));
+        assert_eq!(
+            tx.query("SELECT count(*) FROM t", &[])?[0][0].as_int(),
+            Some(3)
+        );
         l.fall_behind();
         l.wait_re_restore();
         Ok(tx
             .query("SELECT count(*) FROM t", &[])
             .map(|r| r[0][0].as_int()))
     });
-    if let Ok(Ok(n)) = r {
-        assert!(n == Some(3) || n == Some(8), "{n:?}");
+    match r {
+        Ok(Ok(Some(3))) => {}
+        Ok(Err(_)) | Err(_) => {}
+        other => panic!("neither the old snapshot nor an error: {other:?}"),
     }
-    // Others are unaffected, the replica goes on, and the connection can be closed.
-    let _ = rc.close();
-    let new = l.replica.connect().unwrap();
-    wait_rows(&new, 8);
-    add(&l.wc, 9);
-    wait_rows(&new, 9);
-    new.close().unwrap();
+    assert!(rc.is_autocommit());
+    assert_eq!(count(&rc), 8, "rebound once the transaction is over");
+    rc.close().unwrap();
     l.replica.close().unwrap();
+}
+
+#[test]
+fn a_dropped_replica_keeps_the_directory_locked_while_a_connection_lives() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, _wc) = writer(&store, 2);
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    let replica = open_replica_with_store(rconfig(&dir), store.clone()).unwrap();
+    let rc = replica.connect().unwrap();
+    wait_rows(&rc, 2);
+    drop(replica);
+    assert!(matches!(
+        open_replica_with_store(rconfig(&dir), store.clone()),
+        Err(Error::AlreadyOpen(_) | Error::Locked(_))
+    ));
+    assert_eq!(count(&rc), 2, "the connection still reads");
+    drop(rc);
+    open_replica_with_store(rconfig(&dir), store.clone())
+        .unwrap()
+        .close()
+        .unwrap();
+}
+
+#[test]
+fn behind_ms_after_a_restart_comes_from_the_last_pass_before_it() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, wc) = writer(&store, 3);
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    let replica = open_replica_with_store(rconfig(&dir), store.clone()).unwrap();
+    let rc = replica.connect().unwrap();
+    wait_rows(&rc, 3);
+    until("a pass", || replica.stats().last_pass_at.is_some());
+    let applied = replica.stats().seq;
+    rc.close().unwrap();
+    replica.close().unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    for i in 4..=5 {
+        add(&wc, i);
+    }
+    wc.checkpoint(CheckpointMode::Truncate).unwrap();
+    add(&wc, 6);
+    let keys = Keys::new(PREFIX);
+    for k in ObjectStore::list(&*store, &keys.log_prefix(1)).unwrap() {
+        if k > keys.log(1, applied) {
+            ObjectStore::delete(&*store, &k).unwrap();
+        }
+    }
+    let cap = Capture::new();
+    let (spans, why) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let replica = open_replica_with_store(rconfig(&dir), store.clone()).unwrap();
+        until("a re-restore", || replica.stats().re_restores >= 1);
+        let why = replica.stats().last_re_restore_at.unwrap().1;
+        replica.close().unwrap();
+        (cap.spans(), why)
+    });
+    let w = fell_behind_events(&spans)[0];
+    let behind: u64 = w.field("behind_ms").unwrap().parse().unwrap();
+    assert!(
+        behind >= 550,
+        "behind_ms {behind} counts the time the replica was down"
+    );
+    assert!(
+        why.contains("replica was ") && !why.contains("was 0ms"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_failing_re_restore_backs_off_and_logs_once_per_episode() {
+    let cap = Capture::new();
+    let (spans, attempts, passes) = tracing::subscriber::with_default(cap.subscriber(), || {
+        let l = lag();
+        l.spy.fail_gets_under("manifest/");
+        l.fall_behind();
+        until("a failed attempt", || l.spy.page_gets_failed() > 0);
+        let waker = l.replica.waker();
+        let before = l.spy.page_gets_failed();
+        let passes0 = l.replica.stats().passes_notification;
+        for _ in 0..40 {
+            waker.wake();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let attempts = l.spy.page_gets_failed() - before;
+        let passes = l.replica.stats().passes_notification - passes0;
+        l.spy.heal();
+        l.wait_re_restore();
+        let rc = l.replica.connect().unwrap();
+        wait_rows(&rc, 8);
+        rc.close().unwrap();
+        l.replica.close().unwrap();
+        (cap.spans(), attempts, passes)
+    });
+    assert!(passes >= 5, "{passes} passes");
+    assert!(
+        attempts <= 6 && attempts < passes,
+        "{attempts} attempts in {passes} passes"
+    );
+    assert_eq!(fell_behind_events(&spans).len(), 1, "one WARN per episode");
+    let failed: Vec<_> = spans
+        .events
+        .iter()
+        .filter(|e| {
+            e.field("message") == Some("replica: restoring again failed, trying again later")
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "the failure is logged once per episode");
+    assert!(failed[0]
+        .field("error")
+        .is_some_and(|e| e.contains("injected")));
+}
+
+#[test]
+fn a_crash_while_the_pointed_copy_is_cleared_still_re_restores_at_the_next_open() {
+    // Clear steps: the pointer, then each file of the copy, then the directory's own files.
+    for k in 1..=8 {
+        let l = lag();
+        l.fall_behind();
+        l.wait_re_restore();
+        let rc = l.replica.connect().unwrap();
+        wait_rows(&rc, 8);
+        rc.close().unwrap();
+        l.replica.close().unwrap();
+        clear_replica_dir_n(&l.dir, Some(k)).unwrap();
+        let again = open_replica_with_store(rconfig(&l.dir), l.spy.clone())
+            .unwrap_or_else(|e| panic!("open after {k} removals: {e}"));
+        let rc = again.connect().unwrap();
+        wait_rows(&rc, 8);
+        rc.close().unwrap();
+        again.close().unwrap();
+        let names: Vec<_> = std::fs::read_dir(l.dir.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.len() <= 2, "after {k}: no orphan copy: {names:?}");
+    }
+}
+
+#[test]
+fn leftovers_of_the_old_copy_after_the_pointer_write_are_removed_at_open() {
+    let l = lag();
+    l.fall_behind();
+    l.wait_re_restore();
+    let rc = l.replica.connect().unwrap();
+    wait_rows(&rc, 8);
+    rc.close().unwrap();
+    let dir = l.dir.clone();
+    let spy = l.spy.clone();
+    let copy = pointed_copy(&dir).unwrap();
+    l.replica.close().unwrap();
+    // A crash between the pointer write and the old copy's removal.
+    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-replica"] {
+        if copy.join(f).exists() {
+            std::fs::copy(copy.join(f), dir.join(f)).unwrap();
+        }
+    }
+    let again = open_replica_with_store(rconfig(&dir), spy).unwrap();
+    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-replica"] {
+        assert!(!dir.join(f).exists(), "{f} left over");
+    }
+    let rc = again.connect().unwrap();
+    wait_rows(&rc, 8);
+    rc.close().unwrap();
+    again.close().unwrap();
+}
+
+#[test]
+fn only_directories_shaped_like_copies_are_swept() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, _wc) = writer(&store, 1);
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    let mine = r.path().join(".r.data-notes");
+    std::fs::create_dir(&mine).unwrap();
+    let orphan = r.path().join(".r.data-12-345");
+    std::fs::create_dir(&orphan).unwrap();
+    open_replica_with_store(rconfig(&dir), store.clone())
+        .unwrap()
+        .close()
+        .unwrap();
+    assert!(mine.exists() && !orphan.exists());
 }
 
 #[test]

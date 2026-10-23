@@ -86,3 +86,24 @@ test replica::open::tests::files_without_a_local_state_are_refused_and_left_alon
 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 633 filtered out; finished in 3.02s
 
 ./scripts/test.sh unit: exit 0 (fmt, clippy -D warnings, 663 buckwal lib tests + the other suites)
+
+# FIX ROUND 1 RED
+$ cargo test --locked -p buckwal --lib replica::open
+test replica::open::tests::a_dropped_replica_keeps_the_directory_locked_while_a_connection_lives ... FAILED
+test replica::open::tests::a_transaction_across_the_swap_keeps_its_snapshot_or_errors_then_the_connection_rebinds ... FAILED
+test replica::open::tests::a_failing_re_restore_backs_off_and_logs_once_per_episode ... FAILED
+test replica::open::tests::behind_ms_after_a_restart_comes_from_the_last_pass_before_it ... FAILED
+test replica::open::tests::only_directories_shaped_like_copies_are_swept ... FAILED
+test replica::open::tests::old_connection_outside_a_transaction_is_rebound_to_the_new_copy ... FAILED
+assertion `left == right` failed: rebound once the transaction is over
+13 attempts in 14 passes
+behind_ms 0 counts the time the replica was down
+---- replica::open::tests::old_connection_outside_a_transaction_is_rebound_to_the_new_copy stdout ----
+thread 'replica::open::tests::old_connection_outside_a_transaction_is_rebound_to_the_new_copy' (180255363) panicked at crates/buckwal/src/replica/open/tests.rs:1004:5:
+    replica::open::tests::old_connection_outside_a_transaction_is_rebound_to_the_new_copy
+test result: FAILED. 30 passed; 6 failed; 0 ignored; 0 measured; 633 filtered out; finished in 4.26s
+
+# FIX ROUND 1 GREEN
+$ cargo test --locked -p buckwal --lib replica::open  (3 runs)
+test result: ok. 36 passed; 0 failed (x3)
+./scripts/test.sh unit: exit 0 (669 buckwal lib tests, fmt, clippy -D warnings)
