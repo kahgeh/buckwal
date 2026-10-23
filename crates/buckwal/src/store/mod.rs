@@ -95,6 +95,18 @@ pub trait ObjectStore: Send + Sync {
     fn stat(&self, key: &str) -> std::result::Result<Option<ObjectStat>, StoreError>;
     /// Every key under `prefix`, sorted ascending.
     fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError>;
+    /// The keys under `prefix` strictly greater than `start_after`, sorted ascending. The
+    /// default lists the whole prefix and filters; a store that can ask its server (S3's
+    /// `start-after`) overrides it so a long listing is not read again.
+    fn list_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> std::result::Result<Vec<String>, StoreError> {
+        let mut keys = self.list(prefix)?;
+        keys.retain(|k| k.as_str() > start_after);
+        Ok(keys)
+    }
     fn delete(&self, key: &str) -> std::result::Result<(), StoreError>;
     fn stats(&self) -> StatsSnap;
 }

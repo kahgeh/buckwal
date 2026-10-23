@@ -190,6 +190,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_list_after_is_strictly_greater_sorted_and_prefix_bound() {
+        let s = MemStore::new();
+        for k in ["a/3", "a/1", "a/2", "a/4", "b/9", "a"] {
+            s.put(k, b"x").unwrap();
+        }
+        assert_eq!(s.list_after("a/", "a/2").unwrap(), ["a/3", "a/4"]);
+        assert_eq!(
+            s.list_after("a/", "a/").unwrap(),
+            ["a/1", "a/2", "a/3", "a/4"]
+        );
+        assert!(s.list_after("a/", "a/4").unwrap().is_empty());
+        assert!(s.list_after("a/", "b/9").unwrap().is_empty());
+    }
+
+    #[test]
     fn mem_conditional_semantics() {
         let s = MemStore::new();
         let CondPut::Created { etag: e1 } = s.put_if_absent("k", b"one").unwrap() else {

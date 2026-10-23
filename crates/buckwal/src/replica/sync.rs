@@ -629,8 +629,17 @@ impl Follower {
         }
         'reread: loop {
             let prefix = self.keys.log_prefix(self.generation);
+            // Log keys are zero-padded, so key order is seq order: list only after the last
+            // record seen (from seq 1, after the prefix itself).
+            let start_after = if self.last_seq == 0 {
+                prefix.clone()
+            } else {
+                self.keys.log(self.generation, self.last_seq)
+            };
             t.lists += 1;
-            let listed = match with_retry(&self.retry, &prefix, |_| self.store.list(&prefix)) {
+            let listed = match with_retry(&self.retry, &prefix, |_| {
+                self.store.list_after(&prefix, &start_after)
+            }) {
                 Ok(l) => l,
                 Err(e) => return Err(failed(t, e)),
             };

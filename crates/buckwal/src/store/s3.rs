@@ -416,16 +416,7 @@ impl S3Store {
         extra: &[(&str, &str)],
     ) -> Result<Reply, StoreError> {
         let (url, host, uri) = object_url(&self.cfg, key);
-        let mut q: Vec<(String, String)> = query
-            .iter()
-            .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
-            .collect();
-        q.sort();
-        let cq = q
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
+        let cq = canonical_query(query);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| StoreError::Permanent(format!("clock before epoch: {e}")))?
@@ -623,6 +614,68 @@ fn if_match_reply(what: &str, bucket: &str, r: &Reply) -> Result<CondPut, StoreE
     }
 }
 
+/// The ListObjectsV2 query. `start_after` applies to the first page only: a later page's
+/// continuation token already encodes where the listing stands.
+fn list_query(
+    prefix: &str,
+    start_after: Option<&str>,
+    token: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut q = vec![
+        ("list-type", "2".to_string()),
+        ("prefix", prefix.to_string()),
+    ];
+    match (token, start_after) {
+        (Some(t), _) => q.push(("continuation-token", t.to_string())),
+        (None, Some(a)) => q.push(("start-after", a.to_string())),
+        (None, None) => {}
+    }
+    q
+}
+
+/// The canonical query string: names and values encoded, then sorted.
+fn canonical_query(query: &[(&str, String)]) -> String {
+    let mut q: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+        .collect();
+    q.sort();
+    q.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+impl S3Store {
+    fn list_from(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let q = list_query(prefix, start_after, token.as_deref());
+            let r = self.send("GET", "", &q, &[], &[])?;
+            self.lists.fetch_add(1, Relaxed);
+            if r.status != 200 {
+                return Err(status_error(&format!("LIST {prefix}"), &r));
+            }
+            let page = parse_list(&String::from_utf8_lossy(&r.body));
+            keys.extend(page.keys);
+            match page.next {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        if let Some(a) = start_after {
+            keys.retain(|k| k.as_str() > a);
+        }
+        keys.sort();
+        Ok(keys)
+    }
+}
+
 impl ObjectStore for S3Store {
     fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
         let r = self.put_with(key, body, &[])?;
@@ -671,30 +724,11 @@ impl ObjectStore for S3Store {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
-        let mut keys = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut q = vec![
-                ("list-type", "2".to_string()),
-                ("prefix", prefix.to_string()),
-            ];
-            if let Some(t) = &token {
-                q.push(("continuation-token", t.clone()));
-            }
-            let r = self.send("GET", "", &q, &[], &[])?;
-            self.lists.fetch_add(1, Relaxed);
-            if r.status != 200 {
-                return Err(status_error(&format!("LIST {prefix}"), &r));
-            }
-            let page = parse_list(&String::from_utf8_lossy(&r.body));
-            keys.extend(page.keys);
-            match page.next {
-                Some(t) => token = Some(t),
-                None => break,
-            }
-        }
-        keys.sort();
-        Ok(keys)
+        self.list_from(prefix, None)
+    }
+
+    fn list_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>, StoreError> {
+        self.list_from(prefix, Some(start_after))
     }
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
@@ -730,6 +764,32 @@ mod tests {
             date: None,
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn list_after_query_has_start_after_and_signs_sorted() {
+        let q = list_query(
+            "db/log/0000000001/",
+            Some("db/log/0000000001/00000000000000000002"),
+            None,
+        );
+        assert!(q.contains(&(
+            "start-after",
+            "db/log/0000000001/00000000000000000002".to_string()
+        )));
+        assert_eq!(
+            canonical_query(&q),
+            "list-type=2&prefix=db%2Flog%2F0000000001%2F&start-after=db%2Flog%2F0000000001%2F00000000000000000002"
+        );
+        // later pages carry the token alone: it already encodes where the listing stands
+        let q = list_query("p/", Some("p/1"), Some("tok+/="));
+        assert_eq!(
+            canonical_query(&q),
+            "continuation-token=tok%2B%2F%3D&list-type=2&prefix=p%2F"
+        );
+        // plain list sends no start-after
+        let q = list_query("p/", None, None);
+        assert_eq!(canonical_query(&q), "list-type=2&prefix=p%2F");
     }
 
     #[test]

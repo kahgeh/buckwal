@@ -1,0 +1,44 @@
+## RED (sync.rs still uses list())
+test store::s3::tests::list_after_query_has_start_after_and_signs_sorted ... ok
+test store::mem::tests::default_list_after_is_strictly_greater_sorted_and_prefix_bound ... ok
+test replica::sync::tests::first_pass_and_restart_list_from_the_prefix ... FAILED
+test replica::sync::tests::pass_with_nothing_new_costs_one_list_and_one_head_get ... FAILED
+test replica::sync::tests::pass_after_n_records_lists_only_after_seq_n ... FAILED
+test replica::sync::tests::long_generation_is_followed_in_order_and_idle_pass_lists_after_last ... FAILED
+thread 'replica::sync::tests::first_pass_and_restart_list_from_the_prefix' (175190722) panicked at crates/buckwal/src/replica/sync/tests.rs:1053:5:
+assertion `left == right` failed: ["list db/log/0000000001/", "get db/log/0000000001/00000000000000000001", "get db/head"]
+  left: "list db/log/0000000001/"
+ right: "list_after db/log/0000000001/ db/log/0000000001/"
+thread 'replica::sync::tests::pass_with_nothing_new_costs_one_list_and_one_head_get' (175190725) panicked at crates/buckwal/src/replica/sync/tests.rs:295:5:
+thread 'replica::sync::tests::pass_after_n_records_lists_only_after_seq_n' (175190724) panicked at crates/buckwal/src/replica/sync/tests.rs:1040:5:
+assertion `left == right` failed: ["list db/log/0000000001/", "get db/log/0000000001/00000000000000000003", "stat db/head"]
+  left: "list db/log/0000000001/"
+ right: "list_after db/log/0000000001/ db/log/0000000001/00000000000000000002"
+thread 'replica::sync::tests::long_generation_is_followed_in_order_and_idle_pass_lists_after_last' (175190723) panicked at crates/buckwal/src/replica/sync/tests.rs:140:21:
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 627 filtered out; finished in 0.29s
+
+## GREEN: ./scripts/test.sh unit
+test exec::tests::mixed_args_and_named_args_are_sql_input_error ... ok
+test proto::tests::bad_values_are_proto_errors ... ok
+test proto::tests::error_codes ... ok
+test exec::tests::unknown_request_type_is_unsupported_and_malformed_is_proto_error ... ok
+test http::tests::protocol_error_keeps_the_code ... ok
+test tests::a_fenced_close_error_trips_the_latch_and_unsets_clean ... ok
+test tests::another_close_error_unsets_clean_only ... ok
+test exec::tests::fenced_library_error_sets_the_fence_and_later_requests_skip_the_library ... ok
+test streams::tests::close_all_without_faults_has_no_error ... ok
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+test cursor_error_condition_is_true_for_a_skipped_step ... ok
+test open_error_is_returned_and_the_port_closes ... ok
+test malformed_body_is_400_proto_error ... ok
+test unknown_request_type_errors_alone ... ok
+test unknown_table_named_busy_is_sqlite_error ... ok
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.50s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## GREEN: ./scripts/test.sh unit (lib result, fmt+clippy clean)
+test result: ok. 633 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 68.17s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.07s

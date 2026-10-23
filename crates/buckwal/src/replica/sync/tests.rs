@@ -293,7 +293,7 @@ fn pass_with_nothing_new_costs_one_list_and_one_head_get() {
     let ev = f.fault.events()[before..].to_vec();
     assert_eq!(ev.len(), 2, "{ev:?}");
     assert!(
-        ev[0].starts_with("list ") && ev[1] == "stat db/head",
+        ev[0].starts_with("list_after ") && ev[1] == "stat db/head",
         "{ev:?}"
     );
 }
@@ -605,8 +605,9 @@ fn replica_issues_no_puts_or_deletes() {
     assert!(!ev.is_empty());
     // the test's own head write above is a put on the MemStore directly, not the follower's
     assert!(
-        ev.iter()
-            .all(|e| e.starts_with("get ") || e.starts_with("list ") || e.starts_with("stat ")),
+        ev.iter().all(|e| e.starts_with("get ")
+            || e.starts_with("list_after ")
+            || e.starts_with("stat ")),
         "{ev:?}"
     );
     let d = f.mem.stats().since(&s0);
@@ -1020,4 +1021,77 @@ fn busy_deferral_more_frames_applied_then_killed_does_not_reuse_a_stale_offset()
     assert!(stale.new_offset < 0 && -stale.new_offset < f.follower.applied_frames() as i64);
     sql(&r2, "COMMIT");
     recover_and_check(&f, "stale deferred offset");
+}
+
+#[test]
+fn pass_after_n_records_lists_only_after_seq_n() {
+    let mut f = Fx::new();
+    let a = f.commit(2);
+    let b = f.commit(3);
+    f.put(1, &ext("w1", a));
+    f.put(2, &ext("w1", b));
+    f.pass();
+    let c = f.commit(4);
+    f.put(3, &ext("w1", c));
+    let before = f.fault.events().len();
+    let r = f.pass();
+    assert_eq!(
+        (r.outcome.clone(), r.objects, r.lists),
+        (Outcome::Applied, 1, 1),
+        "{r:?}"
+    );
+    let ev = f.fault.events()[before..].to_vec();
+    let want = format!("list_after {} {}", f.keys.log_prefix(1), f.keys.log(1, 2));
+    assert_eq!(ev[0], want, "{ev:?}");
+    assert_eq!(ev[1], format!("get {}", f.keys.log(1, 3)), "{ev:?}");
+    assert_eq!(f.rows(), 4);
+}
+
+#[test]
+fn first_pass_and_restart_list_from_the_prefix() {
+    let mut f = Fx::new();
+    let a = f.commit(2);
+    f.put(1, &ext("w1", a));
+    f.pass();
+    let ev = f.fault.events();
+    let p = f.keys.log_prefix(1);
+    assert_eq!(ev[0], format!("list_after {p} {p}"), "{ev:?}");
+}
+
+#[test]
+fn long_generation_is_followed_in_order_and_idle_pass_lists_after_last() {
+    let mut f = Fx::new();
+    // One real commit, then 2,499 fence records (cheap, each read and decoded in order).
+    let a = f.commit(2);
+    f.put(1, &ext("w1", a));
+    for i in 1..2500u64 {
+        f.put(i + 1, &fence("w1", i));
+    }
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::Applied, "{r:?}");
+    assert_eq!((r.objects, r.lists), (2500, 1), "{r:?}");
+    assert_eq!(f.follower.last_seq(), 2500);
+    assert_eq!(f.rows(), 2);
+    let gets: Vec<String> = f
+        .fault
+        .events()
+        .into_iter()
+        .filter(|e| e.starts_with("get ") && e.contains("/log/"))
+        .collect();
+    let want: Vec<String> = (1..=2500)
+        .map(|s| format!("get {}", f.keys.log(1, s)))
+        .collect();
+    assert_eq!(gets, want);
+    let before = f.fault.events().len();
+    let r = f.pass();
+    assert_eq!((r.outcome, r.objects), (Outcome::Nothing, 0));
+    let ev = f.fault.events()[before..].to_vec();
+    assert_eq!(
+        ev[0],
+        format!(
+            "list_after {} {}",
+            f.keys.log_prefix(1),
+            f.keys.log(1, 2500)
+        )
+    );
 }

@@ -167,6 +167,10 @@ impl ObjectStore for FaultStore {
         self.record("list", prefix);
         self.inner.list(prefix)
     }
+    fn list_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>, StoreError> {
+        self.record("list_after", &format!("{prefix} {start_after}"));
+        self.inner.list_after(prefix, start_after)
+    }
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.record("delete", key);
         self.inner.delete(key)
