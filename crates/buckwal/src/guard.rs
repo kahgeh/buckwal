@@ -37,10 +37,6 @@ pub(crate) fn check_sql_split(sql: &str, mode: JournalMode) -> Result<()> {
     check(sql, true, mode)
 }
 
-/// Refusal of the former name of `PRAGMA buckwal_batching`.
-const OLD_BATCHING_PRAGMA: &str =
-    "PRAGMA durable_batching is no longer read, use PRAGMA buckwal_batching instead";
-
 fn check(sql: &str, split: bool, mode: JournalMode) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
     if !lower.contains("pragma") && !lower.contains("attach") {
@@ -61,10 +57,6 @@ fn check(sql: &str, split: bool, mode: JournalMode) -> Result<()> {
             Cmd::ExplainQueryPlan { stmt, .. } => stmt,
         };
         if let Stmt::Pragma { name, body } = &stmt {
-            // The former name, in any schema, form or case, explained or not.
-            if name.name.as_str().eq_ignore_ascii_case("durable_batching") {
-                return Err(Error::Config(OLD_BATCHING_PRAGMA.into()));
-            }
             if name.name.as_str().eq_ignore_ascii_case("buckwal_batching") {
                 check_batching(name, body.as_ref(), explain, mode)?;
                 batching = true;
@@ -414,30 +406,6 @@ mod tests {
         ] {
             assert_eq!(batching_pragma(sql), None, "{sql}");
         }
-    }
-
-    #[test]
-    fn guard_refuses_the_old_batching_name_in_every_form() {
-        for mode in [JournalMode::Wal, JournalMode::Mvcc] {
-            for sql in [
-                "PRAGMA durable_batching",
-                "pragma DURABLE_BATCHING = off",
-                "PRAGMA main.durable_batching('off')",
-                "PRAGMA temp.durable_batching = off",
-                "EXPLAIN PRAGMA durable_batching",
-                "EXPLAIN QUERY PLAN PRAGMA durable_batching",
-                "SELECT 1; PRAGMA durable_batching = 'window 1ms 1 1'",
-            ] {
-                for split in [false, true] {
-                    assert_eq!(
-                        check(sql, split, mode),
-                        Err(Error::Config(OLD_BATCHING_PRAGMA.into())),
-                        "{sql}"
-                    );
-                }
-            }
-        }
-        assert_eq!(check_sql("SELECT 'pragma durable_batching'"), Ok(()));
     }
 
     #[test]

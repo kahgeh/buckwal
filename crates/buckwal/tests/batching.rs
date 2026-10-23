@@ -4,7 +4,7 @@
 use buckwal::store::{FaultStore, MemStore, ObjectStore};
 use buckwal::{
     open_read_only_with_store, open_with_store, restore_with_store, Batching, CheckpointMode,
-    Config, Connection, Database, Error, Event, EventHook, JournalMode, UploadStats, Value,
+    Config, Connection, Database, Error, Event, EventHook, UploadStats, Value,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -906,70 +906,6 @@ fn buckwal_batching_pragma_outside_transaction_or_malformed_is_refused() {
     );
     assert_eq!(r, Err(Error::Unsupported("synchronous below FULL")));
     assert_eq!(count(&conn), 0);
-}
-
-const OLD_REFUSAL: &str =
-    "PRAGMA durable_batching is no longer read, use PRAGMA buckwal_batching instead";
-
-fn assert_old_refused<T: std::fmt::Debug>(what: &str, r: Result<T, Error>) {
-    assert!(
-        matches!(&r, Err(Error::Config(m)) if m == OLD_REFUSAL),
-        "{what}: {r:?}"
-    );
-}
-
-#[test]
-fn old_durable_batching_pragma_is_refused() {
-    let (_d, db) = open(mem(), Recorder::default());
-    let conn = db.connect().unwrap();
-    create(&conn);
-    for sql in [
-        "PRAGMA durable_batching = off",
-        "PRAGMA durable_batching",
-        "PRAGMA durable_batching('off')",
-        "PRAGMA temp.durable_batching = off",
-        "PRAGMA main.durable_batching = off",
-        "PRAGMA DURABLE_BATCHING",
-        "EXPLAIN PRAGMA durable_batching",
-        "EXPLAIN QUERY PLAN PRAGMA durable_batching",
-    ] {
-        assert_old_refused(sql, conn.execute(sql, &[]));
-        assert_old_refused(sql, conn.query(sql, &[]));
-        assert_old_refused(sql, conn.describe(sql));
-    }
-    // Refused before any statement of the batch runs.
-    assert_old_refused(
-        "batch",
-        conn.execute_batch("INSERT INTO t VALUES (77); PRAGMA durable_batching = off"),
-    );
-    assert_old_refused(
-        "batch",
-        conn.execute_batch("SELECT 1; PRAGMA durable_batching = off"),
-    );
-    assert_eq!(count(&conn), 0, "a statement of the refused batch ran");
-    // A string, not a PRAGMA.
-    conn.execute("SELECT 'durable_batching'", &[]).unwrap();
-    // The new name still works.
-    conn.execute("BEGIN", &[]).unwrap();
-    conn.execute("PRAGMA buckwal_batching = off", &[]).unwrap();
-    conn.execute("ROLLBACK", &[]).unwrap();
-
-    // MVCC: the same refusal, not Unsupported("MVCC: Window batching").
-    let (_d2, mvcc) = open_with(mem(), Recorder::default(), |c| {
-        c.journal_mode = JournalMode::Mvcc
-    });
-    let conn = mvcc.connect().unwrap();
-    for sql in [
-        "PRAGMA durable_batching = 'window 10ms 4 1KiB'",
-        "PRAGMA durable_batching",
-    ] {
-        assert_old_refused(sql, conn.execute(sql, &[]));
-    }
-    conn.execute("BEGIN", &[]).unwrap();
-    assert_old_refused(
-        "in txn",
-        conn.execute("PRAGMA durable_batching = 'window 10ms 4 1KiB'", &[]),
-    );
 }
 
 #[test]

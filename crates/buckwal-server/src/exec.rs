@@ -1092,27 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn old_durable_batching_pragma_is_refused_over_serve() {
-        let mut f = fx();
-        let want = "PRAGMA durable_batching is no longer read, use PRAGMA buckwal_batching instead";
-        for req in [
-            json!({"type":"execute","stmt":{"sql":"PRAGMA durable_batching = off"}}),
-            json!({"type":"execute","stmt":{"sql":"PRAGMA durable_batching"}}),
-            json!({"type":"describe","sql":"PRAGMA durable_batching"}),
-        ] {
-            match f.req(Version::V3, req.clone()) {
-                StreamResult::Error { error } => {
-                    assert_eq!(error.message, format!("config error: {want}"), "{req}");
-                    assert_eq!(error.code.as_deref(), Some("SQL_INPUT_ERROR"), "{req}");
-                }
-                StreamResult::Ok { response } => panic!("{req}: {response:?}"),
-            }
-        }
-        // Nothing was applied, and the new name still reads.
-        assert_eq!(setting(&mut f), "off");
-    }
-
-    #[test]
     fn fenced_inside_a_batch_sets_the_fence_and_later_steps_answer_fenced() {
         let mem = Arc::new(MemStore::new());
         let dir_a = tempfile::tempdir().unwrap();

@@ -469,33 +469,6 @@ fn unknown_table_named_busy_is_sqlite_error() {
     s.stop().unwrap();
 }
 
-/// The former `PRAGMA durable_batching` is refused with the library's `Config` message,
-/// over HTTP, for execute and describe.
-#[test]
-fn old_durable_batching_pragma_is_refused_over_http() {
-    let s = start(Opts::default());
-    let c = s.client(None);
-    let mut st = c.stream(Proto::V3);
-    let want = "PRAGMA durable_batching is no longer read, use PRAGMA buckwal_batching instead";
-    let r = st
-        .pipeline(vec![
-            execute("PRAGMA durable_batching = off", &[]),
-            describe("PRAGMA durable_batching"),
-            close(),
-        ])
-        .unwrap();
-    assert_eq!(r.status, 200, "{}", r.body);
-    for i in 0..2 {
-        assert_eq!(r.body["results"][i]["type"], "error", "{i}: {}", r.body);
-        assert_eq!(
-            r.body["results"][i]["error"]["message"],
-            format!("config error: {want}"),
-            "{i}"
-        );
-    }
-    s.stop().unwrap();
-}
-
 /// A non-finite float is `{"type":"float","value":null}` and a blob is unpadded base64
 /// (PROTOCOL.md 8.2), in pipeline results and in cursor rows. Padded input is still read.
 #[test]
