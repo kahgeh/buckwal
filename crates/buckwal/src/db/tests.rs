@@ -1424,6 +1424,111 @@ fn close_stops_prefetch_before_releasing_the_dir() {
     assert_eq!(ids(&db.connect().unwrap()), (1..=300).collect::<Vec<_>>());
 }
 
+/// A store that delays every page GET the prefetch thread makes.
+struct SlowPrefetchStore {
+    inner: Arc<dyn ObjectStore>,
+    delay: Duration,
+}
+
+impl ObjectStore for SlowPrefetchStore {
+    fn put(&self, k: &str, b: &[u8]) -> std::result::Result<String, crate::store::StoreError> {
+        self.inner.put(k, b)
+    }
+    fn put_if_absent(
+        &self,
+        k: &str,
+        b: &[u8],
+    ) -> std::result::Result<CondPut, crate::store::StoreError> {
+        self.inner.put_if_absent(k, b)
+    }
+    fn put_if_match(
+        &self,
+        k: &str,
+        b: &[u8],
+        etag: &str,
+    ) -> std::result::Result<CondPut, crate::store::StoreError> {
+        self.inner.put_if_match(k, b, etag)
+    }
+    fn get(
+        &self,
+        k: &str,
+    ) -> std::result::Result<Option<crate::store::Object>, crate::store::StoreError> {
+        if std::thread::current().name() == Some("buckwal-prefetch") && k.contains("/pages/") {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.get(k)
+    }
+    fn stat(
+        &self,
+        k: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(k)
+    }
+    fn list(&self, p: &str) -> std::result::Result<Vec<String>, crate::store::StoreError> {
+        self.inner.list(p)
+    }
+    fn delete(&self, k: &str) -> std::result::Result<(), crate::store::StoreError> {
+        self.inner.delete(k)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.inner.stats()
+    }
+}
+
+/// A writer's open of a restored database does not wait for the prefetch: the page-1 set-up
+/// (`allocate_page_one`) would read page 1 under the page-cache lock the prefetch holds
+/// across each GET, so it is skipped when the open knows the database is not fresh.
+#[test]
+fn writer_open_after_restore_does_not_wait_for_prefetch() {
+    let store = mem();
+    {
+        let a = tempdir();
+        let db = open_mem(&store, a.path());
+        let c = db.connect().unwrap();
+        create(&c);
+        for id in 1..=300 {
+            c.execute(
+                "INSERT INTO t(id, v) VALUES (?, zeroblob(2000))",
+                &[Value::from_i64(id)],
+            )
+            .unwrap();
+        }
+        c.close().unwrap();
+        db.close().unwrap();
+    }
+    let pages = crate::engine::tests::manifest(&*store).1.pages.len();
+    assert!(pages >= 150, "{pages} pages");
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let delay = Duration::from_millis(3);
+    let slow = Arc::new(SlowPrefetchStore {
+        inner: store.clone(),
+        delay,
+    });
+    let mut cfg = config(r.path());
+    cfg.prefetch = true;
+    let t = Instant::now();
+    let db = open_with_store(cfg, slow).unwrap();
+    let opened = t.elapsed();
+    let (storage, done) = {
+        let open = db.shared.open.lock().unwrap();
+        let e = &open.as_ref().unwrap().engine;
+        (e.storage.clone(), e.prefetch.as_ref().unwrap().done.clone())
+    };
+    let fetched = storage.lazy_gets();
+    let still_running = !done.load(std::sync::atomic::Ordering::SeqCst);
+    eprintln!(
+        "writer open: {pages} pages, {delay:?} per GET, open took {opened:?}, \
+         {fetched} pages fetched when it returned"
+    );
+    drop(storage);
+    db.close().unwrap();
+    assert!(
+        still_running && fetched < pages as u64 / 2,
+        "the open waited for the prefetch ({fetched} of {pages} pages, {opened:?})"
+    );
+}
+
 /// A finished prefetch is recorded in the local state at once, not at the next seal: a later
 /// process of the directory fetches nothing, even when no seal ever ran in between.
 #[test]

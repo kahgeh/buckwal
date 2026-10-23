@@ -350,6 +350,12 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         let (tx, rx) = mpsc::channel();
         (Some(tx), Some(rx))
     };
+    // Known before the engine opens: a restored or attached copy that is incomplete (pages
+    // still to prefetch) or has a non-empty `app.db` is not fresh, so `allocate_page_one`
+    // has nothing to do and would only wait on the prefetch's page-cache lock. A crashed
+    // fresh create (complete, empty `app.db`) still gets page 1.
+    let known_not_fresh = reconciled.is_some()
+        && (!state.complete || fs::metadata(dir.join(DB_FILE)).is_ok_and(|m| m.len() > 0));
     let engine = open_engine(&dir, bucket, &state, &cfg, trim_tx)?;
     // open_engine sent the open's wake: the trimmer's pass at start.
     let trimmer = trim_rx.map(|rx| {
@@ -396,7 +402,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             dir_guard: None,
         }),
     };
-    if !read_only {
+    if !read_only && !known_not_fresh {
         allocate_page_one(&db)?;
     }
     Ok(db)
@@ -445,8 +451,11 @@ pub(crate) fn replica_database(
 /// and starts no seal of its own (its automatic WAL actions are off, below). The connection
 /// is dropped before this returns, and is the only one then, so its close would be the last
 /// and checkpoint the WAL, which commits a log record: its automatic WAL actions are
-/// disabled, and the open commits nothing for it. Only a writer's open calls it: a read-only
-/// open refuses `BEGIN IMMEDIATE`, and every other write, so it has nothing to race.
+/// disabled, and the open commits nothing for it. The open skips it for a database it knows
+/// is not fresh (restored or attached, with pages to fetch or an `app.db` not empty): the
+/// prefetch holds the page-cache lock across each page GET, so the read would wait for about
+/// the whole prefetch. Only a writer's open calls it: a read-only open refuses `BEGIN
+/// IMMEDIATE`, and every other write, so it has nothing to race.
 fn allocate_page_one(db: &Database) -> Result<()> {
     let conn = db.connect_with(|core| core.wal_auto_actions_disable())?;
     let rows = conn.query("PRAGMA page_count", &[])?;

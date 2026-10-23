@@ -4,7 +4,7 @@ Rust library `buckwal` (crates/buckwal) plus CLI `buckwal` (crates/buckwal-cli) 
 
 ## Tests
 
-- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (933 at 9992398, 2026-10-24: the server's HTTP and notify tests, the MVCC fencing and limits tests and the replica unit tests included). Fast.
+- `./scripts/test.sh unit`: fmt, clippy (-D warnings), unit tests (934 on open-skips-prefetch-wait, 2026-10-24; 933 at 9992398: the server's HTTP and notify tests, the MVCC fencing and limits tests and the replica unit tests included). Fast.
 - `./scripts/test.sh`: the above, then starts RustFS and runs `--ignored` tests with `--test-threads=1` in two passes: plain HTTP (`--skip tls_`), then HTTPS with encryption (all). By `--ignored --list` each pass now runs 6 `serve` tests (`mvcc_serve_begin_concurrent` included), 56 system tests (the MVCC ones included), 21 replica tests (crates/buckwal-cli/tests/replica.rs, `follow` and the posted notifications) and the S3 tests (9, then 13: `s3_list_after_start_after_and_paging` is new). Timing and peaks: 14:34 (874 s) at 9ab3403 on 2026-10-22, before the replica tests; the replica additions are not yet measured. Before the MVCC work: 5 `serve` tests, 38 system tests, about 12 min (baseline at 332b45f).
 - The `serve` system tests (crates/buckwal-cli/tests/server.rs, `mvcc_serve_begin_concurrent` included) join both passes: plain HTTP without a token in pass 1, HTTPS with a token in pass 2. `serve` defaults to `127.0.0.1:9295`; tests always use port 0 and read the port from the `serve listening` line.
 - Pass 2's TLS material and key are made in a `mktemp -d` dir (`buckwal-tls.*`) and removed on exit; it exports `BUCKWAL_TLS_DIR` and `BUCKWAL_ENCRYPTION_KEY_FILE`.
