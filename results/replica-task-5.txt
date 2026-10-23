@@ -1,0 +1,23 @@
+$ cargo test --locked -p buckwal --lib replica::apply   # RED: apply_commit stubbed to return Gap
+test replica::apply::tests::gap_is_reported_not_applied ... ok
+test replica::apply::tests::uncommitted_tail_is_rolled_back ... FAILED
+test replica::apply::tests::reapplying_same_frames_is_ok ... FAILED
+test replica::apply::tests::applies_committed_frames_and_reader_sees_rows_at_commit_frame ... FAILED
+test replica::apply::tests::negative_numbering_skips_frames_already_in_app_db ... FAILED
+test replica::apply::tests::checkpoint_truncate_empties_the_local_wal ... FAILED
+test replica::apply::tests::different_content_at_same_frame_is_conflict ... FAILED
+test replica::apply::tests::encrypted_frames_are_decrypted_before_insert ... FAILED
+test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 579 filtered out; finished in 0.03s
+
+$ cargo test --locked -p buckwal --lib replica::apply   # GREEN
+test replica::apply::tests::negative_numbering_skips_frames_already_in_app_db ... ok
+test replica::apply::tests::gap_is_reported_not_applied ... ok
+test replica::apply::tests::reapplying_same_frames_is_ok ... ok
+test replica::apply::tests::checkpoint_truncate_empties_the_local_wal ... ok
+test replica::apply::tests::different_content_at_same_frame_is_conflict ... ok
+test replica::apply::tests::applies_committed_frames_and_reader_sees_rows_at_commit_frame ... ok
+test replica::apply::tests::uncommitted_tail_is_rolled_back ... ok
+test replica::apply::tests::encrypted_frames_are_decrypted_before_insert ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 579 filtered out; finished in 0.04s
+
+$ ./scripts/test.sh unit  # fmt, clippy -D warnings, tests: pass

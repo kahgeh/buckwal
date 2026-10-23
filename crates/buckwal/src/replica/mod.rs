@@ -2,5 +2,6 @@
 // Nothing calls this yet; the allow goes when the replica loop uses it.
 #![allow(dead_code)]
 
+pub(crate) mod apply;
 pub(crate) mod image;
 pub(crate) mod position;
