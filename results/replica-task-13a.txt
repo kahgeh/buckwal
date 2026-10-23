@@ -5,9 +5,9 @@
   Executable tests/server.rs (target/debug/deps/server-6698d7f07c00e00c)
   Executable tests/system.rs (target/debug/deps/system-870ae001a34e2bac)
 == clippy
-    Checking buckwal v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal)
-    Checking buckwal-server v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-server)
-    Checking buckwal-cli v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-cli)
+    Checking buckwal v0.1.0 (<repo>/crates/buckwal)
+    Checking buckwal-server v0.1.0 (<repo>/crates/buckwal-server)
+    Checking buckwal-cli v0.1.0 (<repo>/crates/buckwal-cli)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.46s
 == ./scripts/test.sh unit
 test telemetry::tests::takeover_exports_takeover_and_fence_spans ... ok
@@ -61,8 +61,8 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
   Executable tests/server.rs (target/debug/deps/server-6698d7f07c00e00c)
   Executable tests/system.rs (target/debug/deps/system-870ae001a34e2bac)
 == clippy
-    Checking buckwal-server v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-server)
-    Checking buckwal-cli v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-cli)
+    Checking buckwal-server v0.1.0 (<repo>/crates/buckwal-server)
+    Checking buckwal-cli v0.1.0 (<repo>/crates/buckwal-cli)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.21s
 == unit (fix round 1)
 test trim::tests::trimmer_waits_for_the_bucket_clock_and_exits_on_disconnect ... ok

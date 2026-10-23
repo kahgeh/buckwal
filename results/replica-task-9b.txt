@@ -34,7 +34,7 @@ thread 'replica::open::tests::a_refused_directory_says_what_to_delete' (17951170
 thread 'replica::open::tests::a_crash_mid_restore_leaves_nothing_visible_at_the_next_open' (179511700) panicked at crates/buckwal/src/replica/open/tests.rs:1114:5:
 thread 'replica::open::tests::conflict_re_restores_after_error_log' (179511708) panicked at crates/buckwal/src/replica/open/tests.rs:893:10:
 thread 'replica::open::tests::a_crash_after_any_removal_of_the_clear_still_re_restores_at_the_next_open' (179511699) panicked at crates/buckwal/src/replica/open/tests.rs:1139:33:
-open after 3 removals: config error: /private/var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T/.tmpkqduqw/r holds app.db-wal without a replica's local state; it is not cleared for a replica
+open after 3 removals: config error: <tmp>/.tmpkqduqw/r holds app.db-wal without a replica's local state; it is not cleared for a replica
 thread 'replica::open::tests::a_reader_holding_a_transaction_across_the_swap_gets_an_error_or_its_snapshot_and_nothing_worse' (179511703) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
 timed out waiting for: a re-restore
 thread 'replica::open::tests::a_failed_re_restore_leaves_no_half_directory_and_the_replica_goes_on' (179511702) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:

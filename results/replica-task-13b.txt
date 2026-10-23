@@ -1,6 +1,6 @@
 $ cargo test --workspace --locked --no-run   (ok, see below)
 $ cargo clippy --workspace --all-targets --locked -- -D warnings
-    Checking buckwal-cli v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-cli)
+    Checking buckwal-cli v0.1.0 (<repo>/crates/buckwal-cli)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.47s
 $ cargo fmt --all --check
 fmt ok

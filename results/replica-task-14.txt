@@ -29,7 +29,7 @@ README.md:835:**Taking over from a replica's machine.** There is no separate "pr
 -- reconcile in replica context:
 -- 'promote' grep done
 ## mermaid
-/Users/kahgeh/.local/state/nvm/versions/node/v24.0.1/bin/mmdc
+<node bin>/mmdc
 mermaid not found
 ## links
    2 ok README.md -> LICENSES/turso-MIT.md
