@@ -890,7 +890,11 @@ fn replica_paused_past_trim_grace_re_restores() {
     let line = f.wait_line(from, "re-restored", Duration::from_secs(90), |l| {
         l.starts_with("re-restored ")
     });
-    assert_eq!(line, "re-restored count=1 reason=trimmed");
+    // the reason is the full text, for example "log/1/13 trimmed: replica was 12s behind"
+    assert!(
+        line.starts_with("re-restored count=1 reason=") && line.contains("trimmed"),
+        "{line}"
+    );
     let head = ctx.head();
     let n = ctx.assert_log_contiguous(head.generation);
     f.wait_applied(from, head.generation, n, Duration::from_secs(60));
