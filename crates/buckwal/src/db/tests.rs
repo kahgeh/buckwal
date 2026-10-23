@@ -1998,7 +1998,17 @@ fn changed_keys(a: &BTreeMap<String, Vec<u8>>, b: &BTreeMap<String, Vec<u8>>) ->
 /// record of its writer id) at the next seq of the head's generation: as if its next seal had
 /// started and its process were gone with the page PUTs in flight.
 fn writer_left_in_a_seal(store: &Arc<MemStore>, n: i64) -> TempDir {
-    let a = closed_writer(store, n);
+    // With `quiet_config`'s timeouts (its head carries them): a takeover's quiet is the larger
+    // of both writers' sums, and the takeovers here use `quiet_config` too.
+    let a = tempdir();
+    let db = open_with_store(quiet_config(a.path(), None), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=n {
+        insert(&c, id).unwrap();
+    }
+    c.close().unwrap();
+    db.close().unwrap();
     let gen = head(&**store).generation;
     let next = log_seqs(&**store, gen).last().map_or(1, |s| s + 1);
     let rec = LogRecord::Extents {
@@ -4016,3 +4026,130 @@ fn create_mvcc_encrypted_has_no_plaintext() {
 }
 
 mod mvcc;
+
+/// `quiet_config` with the lease and request timeout (ms) given.
+fn timeouts_config(dir: &Path, lease_ms: u64, request_timeout_ms: u64) -> Config {
+    let mut c = quiet_config(dir, None);
+    c.lease = Duration::from_millis(lease_ms);
+    c.request_timeout = Duration::from_millis(request_timeout_ms);
+    c
+}
+
+/// A writer with the given lease and request timeout that committed 1..=5 and closed, then
+/// its seal-start record (`writer_left_in_a_seal`).
+fn left_in_a_seal_with(store: &Arc<MemStore>, lease_ms: u64, request_timeout_ms: u64) -> TempDir {
+    let a = tempdir();
+    let db = open_with_store(
+        timeouts_config(a.path(), lease_ms, request_timeout_ms),
+        store.clone(),
+    )
+    .unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=5 {
+        insert(&c, id).unwrap();
+    }
+    c.close().unwrap();
+    db.close().unwrap();
+    let gen = head(&**store).generation;
+    let next = log_seqs(&**store, gen).last().map_or(1, |s| s + 1);
+    let rec = LogRecord::Extents {
+        file: LogFile::Wal,
+        writer_id: state(a.path()).writer_id,
+        syncs: Vec::new(),
+    };
+    let r = store
+        .put_if_absent(&keys().log(gen, next), &crate::format::encode_record(&rec))
+        .unwrap();
+    assert!(matches!(r, CondPut::Created { .. }), "{r:?}");
+    a
+}
+
+/// Item 2: `TakeoverReport::quiet` is the larger of the replaced writer's `lease + request
+/// timeout` (from its head) and the new writer's own, and `seal_quiet_ms` holds it.
+#[test]
+fn quiet_is_larger_of_both_writers() {
+    // (old lease, old request timeout, own lease, own request timeout, quiet used), in ms.
+    let cases = [
+        (400, 600, 300, 500, 1000), // the old writer's sum is longer
+        (300, 500, 400, 700, 1100), // the new writer's is longer
+    ];
+    for (al, ar, bl, br, want) in cases {
+        let store = mem();
+        let _a = left_in_a_seal_with(&store, al, ar);
+        let old = head(&*store);
+        assert_eq!((old.lease_ms, old.request_timeout_ms), (Some(al), Some(ar)));
+        let bt = tempdir();
+        let b_dir = fresh(&bt);
+        let rep =
+            crate::takeover_with_store(timeouts_config(&b_dir, bl, br), store.clone()).unwrap();
+        let want = Duration::from_millis(want);
+        assert_eq!(rep.quiet, want, "old {al}+{ar}, own {bl}+{br}: {rep:?}");
+        assert_eq!(state(&b_dir).seal_quiet_ms, want.as_millis() as u64);
+        let h = head(&*store);
+        assert_eq!(
+            (h.lease_ms, h.request_timeout_ms),
+            (Some(bl), Some(br)),
+            "{h:?}"
+        );
+    }
+}
+
+/// A head without the fields (written before this change) leaves the quiet at the new
+/// writer's own values.
+#[test]
+fn quiet_of_a_head_without_the_fields_is_the_own_sum() {
+    let store = mem();
+    let _a = left_in_a_seal_with(&store, 1000, 2000);
+    let h = Head {
+        lease_ms: None,
+        request_timeout_ms: None,
+        ..head(&*store)
+    };
+    store.put(&keys().head(), &h.encode()).unwrap();
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    let rep = crate::takeover_with_store(timeouts_config(&b_dir, 300, 500), store.clone()).unwrap();
+    assert_eq!(rep.quiet, QUIET, "{rep:?}");
+}
+
+/// A head whose `lease_ms + request_timeout_ms` is over a day is `Corrupt` at the takeover,
+/// not a day-long wait.
+#[test]
+fn quiet_over_max_is_corrupt() {
+    let store = mem();
+    let _a = left_in_a_seal_with(&store, 300, 500);
+    let huge = Head {
+        lease_ms: Some(86_400_000),
+        request_timeout_ms: Some(1),
+        ..head(&*store)
+    };
+    store.put(&keys().head(), &huge.encode()).unwrap();
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    match crate::takeover_with_store(timeouts_config(&b_dir, 300, 500), store.clone()) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("head"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Every head a writer writes carries its own lease and request timeout: the create, a seal
+/// and an open's epoch raise (the takeover's head is checked in `quiet_is_larger_of_both_writers`).
+#[test]
+fn every_head_carries_the_writers_timeouts() {
+    let store = mem();
+    let a = tempdir();
+    let own = |h: &Head| (h.lease_ms, h.request_timeout_ms);
+    let db = open_with_store(timeouts_config(a.path(), 300, 500), store.clone()).unwrap();
+    assert_eq!(own(&head(&*store)), (Some(300), Some(500)), "create");
+    let c = db.connect().unwrap();
+    create(&c);
+    insert(&c, 1).unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    assert_eq!(own(&head(&*store)), (Some(300), Some(500)), "seal");
+    c.close().unwrap();
+    db.close().unwrap();
+    let db = open_with_store(timeouts_config(a.path(), 350, 550), store.clone()).unwrap();
+    assert_eq!(own(&head(&*store)), (Some(350), Some(550)), "raise at open");
+    db.close().unwrap();
+}

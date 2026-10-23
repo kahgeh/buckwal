@@ -180,6 +180,56 @@ enum HeadCheck {
     Published(String),
 }
 
+/// A writer's own lease and request timeout: every head it writes carries them (`lease_ms`,
+/// `request_timeout_ms`), so a later takeover sizes its quiet from both writers' settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Timeouts {
+    pub lease: Duration,
+    pub request_timeout: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            lease: crate::config::defaults::LEASE,
+            request_timeout: crate::config::defaults::REQUEST_TIMEOUT,
+        }
+    }
+}
+
+impl Timeouts {
+    /// `lease + request_timeout`: how long after its last head check a writer's request can
+    /// still be in flight.
+    pub(crate) fn sum(&self) -> Duration {
+        self.lease.saturating_add(self.request_timeout)
+    }
+
+    fn ms(d: Duration) -> u64 {
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// `head` with these as its `lease_ms` and `request_timeout_ms`.
+    fn stamp(&self, head: Head) -> Head {
+        Head {
+            lease_ms: Some(Self::ms(self.lease)),
+            request_timeout_ms: Some(Self::ms(self.request_timeout)),
+            ..head
+        }
+    }
+
+    /// The takeover quiet: the larger of the replaced writer's sum (when its head carries both
+    /// fields) and this writer's own. The head decoder already refuses a sum over
+    /// `MAX_SEAL_QUIET`.
+    pub(crate) fn quiet_for(&self, old: Option<&Head>) -> Duration {
+        let old = old
+            .and_then(|h| Some((h.lease_ms?, h.request_timeout_ms?)))
+            .map_or(Duration::ZERO, |(l, r)| {
+                Duration::from_millis(l).saturating_add(Duration::from_millis(r))
+            });
+        self.sum().max(old)
+    }
+}
+
 pub(crate) struct Bucket {
     store: Arc<dyn ObjectStore>,
     keys: Keys,
@@ -210,6 +260,8 @@ pub(crate) struct Bucket {
     seal_etags: Mutex<HashMap<String, Known>>,
     /// See `set_lease`.
     lease: Duration,
+    /// This writer's own timeouts, written into every head (`Timeouts`).
+    timeouts: Timeouts,
     /// See `set_seal_not_before`.
     quiet: Option<SealQuiet>,
     counters: Arc<Counters>,
@@ -283,7 +335,9 @@ pub(crate) const RESTORE_AGAIN: &str =
 /// The first half of a takeover (the claim of a restored copy) as `writer_id`: the head is
 /// written again with the new writer id and its epoch raised by one, same generation and
 /// manifest. The second half is the fence record (`Bucket::append_fence`), which the caller
-/// appends once attached (`db::attach_existing`). Returns the new head and its ETag.
+/// appends once attached (`db::attach_existing`). Returns the new head (carrying `own`), its
+/// ETag and the head it replaced (`None` for a claim that already landed), whose timeouts size
+/// the takeover quiet (`Timeouts::quiet_for`).
 ///
 /// It GETs the head. One that already names `writer_id` is returned as is: a claim whose head
 /// write landed before its process crashed resumes under the same id (the caller persisted it
@@ -324,8 +378,9 @@ pub(crate) fn take_over_counted(
     retry: &RetryPolicy,
     expect_generation: u64,
     writer_id: &str,
+    own: Timeouts,
     retries: &AtomicU64,
-) -> Result<(Head, String)> {
+) -> Result<(Head, String, Option<Head>)> {
     if !writer_id.is_ascii() || writer_id.len() > u8::MAX as usize {
         return Err(Error::Config(
             "writer id must be ASCII and at most 255 bytes".into(),
@@ -340,23 +395,23 @@ pub(crate) fn take_over_counted(
         };
         let head = Head::decode(&current.body)?;
         if head.writer_id == writer_id {
-            return Ok((head, current.etag));
+            return Ok((head, current.etag, None));
         }
         if head.generation != expect_generation {
             return Err(restore_again());
         }
-        let new = Head {
+        let new = own.stamp(Head {
             writer_id: writer_id.to_string(),
             epoch: head.epoch + 1,
-            ..head
-        };
+            ..head.clone()
+        });
         let body = new.encode();
         let put = retry_rest(retry, start, retries, &key, || {
             store.put_if_match(&key, &body, &current.etag)
         })
         .map_err(upload_error)?;
         if let CondPut::Created { etag } = put {
-            return Ok((new, etag));
+            return Ok((new, etag, Some(head)));
         }
         // The head moved since the GET: read it again, within the same deadline.
         let elapsed = start.elapsed();
@@ -383,8 +438,10 @@ pub(crate) fn take_over(
         retry,
         expect_generation,
         writer_id,
+        Timeouts::default(),
         &AtomicU64::new(0),
     )
+    .map(|(h, etag, _)| (h, etag))
 }
 
 /// What `Bucket::append_fence` landed.
@@ -441,6 +498,7 @@ impl Bucket {
             last_confirmed: Stamp::now(),
             seal_etags: Mutex::default(),
             lease: crate::config::defaults::LEASE,
+            timeouts: Timeouts::default(),
             quiet: None,
             store,
             keys,
@@ -464,15 +522,16 @@ impl Bucket {
     /// A create that times out may still have stored its head. A later `create` then finds a
     /// head and returns `Config` (its first attempt gets a 412, which is never compared);
     /// the caller should `attach` with the same writer id instead.
-    pub(crate) fn create(
+    pub(crate) fn create_with(
         store: Arc<dyn ObjectStore>,
         keys: Keys,
         retry: RetryPolicy,
         concurrency: usize,
         writer_id: String,
+        own: Timeouts,
     ) -> Result<Bucket> {
         check_writer_id(&writer_id)?;
-        let head = Head {
+        let head = own.stamp(Head {
             format: FORMAT,
             generation: 1,
             manifest: None,
@@ -482,8 +541,10 @@ impl Bucket {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
-        };
-        Bucket::create_head(store, keys, retry, concurrency, head)
+        });
+        let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
+        b.timeouts = own;
+        Ok(b)
     }
 
     /// Start a new MVCC database as a seal of generation 1 holding its empty image
@@ -502,13 +563,14 @@ impl Bucket {
     /// crashed attempt may hold). Two racing creators: the head decides, and the loser
     /// returns `Config` as `create` does; its pages may have overwritten the winner's (the
     /// same empty database).
-    pub(crate) fn create_sealed(
+    pub(crate) fn create_sealed_with(
         store: Arc<dyn ObjectStore>,
         keys: Keys,
         retry: RetryPolicy,
         concurrency: usize,
         writer_id: String,
         image: Image,
+        own: Timeouts,
     ) -> Result<Bucket> {
         check_writer_id(&writer_id)?;
         let gen = 1;
@@ -531,7 +593,7 @@ impl Bucket {
         retrying(&counters, &retry, &key, || {
             store.put(&key, &manifest.encode())
         })?;
-        let head = Head {
+        let head = own.stamp(Head {
             format: FORMAT_V2,
             generation: gen + 1,
             manifest: Some(gen),
@@ -541,8 +603,9 @@ impl Bucket {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
-        };
+        });
         let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
+        b.timeouts = own;
         b.manifest = Some(manifest);
         b.counters
             .retries
@@ -551,6 +614,46 @@ impl Bucket {
             .page_puts
             .store(counters.page_puts.load(Relaxed), Relaxed);
         Ok(b)
+    }
+
+    /// `create_with` and the default timeouts.
+    #[cfg(test)]
+    pub(crate) fn create(
+        store: Arc<dyn ObjectStore>,
+        keys: Keys,
+        retry: RetryPolicy,
+        concurrency: usize,
+        writer_id: String,
+    ) -> Result<Bucket> {
+        Bucket::create_with(
+            store,
+            keys,
+            retry,
+            concurrency,
+            writer_id,
+            Timeouts::default(),
+        )
+    }
+
+    /// `create_sealed_with` and the default timeouts.
+    #[cfg(test)]
+    pub(crate) fn create_sealed(
+        store: Arc<dyn ObjectStore>,
+        keys: Keys,
+        retry: RetryPolicy,
+        concurrency: usize,
+        writer_id: String,
+        image: Image,
+    ) -> Result<Bucket> {
+        Bucket::create_sealed_with(
+            store,
+            keys,
+            retry,
+            concurrency,
+            writer_id,
+            image,
+            Timeouts::default(),
+        )
     }
 
     /// `put_if_absent(head)`: the commit point of a new database.
@@ -687,6 +790,12 @@ impl Bucket {
     /// every append and every round of page PUTs.
     pub(crate) fn set_lease(&mut self, lease: Duration) {
         self.lease = lease;
+        self.timeouts.lease = lease;
+    }
+
+    /// The request timeout written into every head this writer writes (`Timeouts`).
+    pub(crate) fn set_request_timeout(&mut self, request_timeout: Duration) {
+        self.timeouts.request_timeout = request_timeout;
     }
 
     /// The takeover quiet: no seal of `generation` starts before `until` (monotonic).
@@ -704,9 +813,10 @@ impl Bucket {
     /// head write, and a request ends within `request_timeout`: after the quiet, none of its
     /// stats can see an object of this writer's. The same holds when that writer is several
     /// takeovers back (`[A seal-start, F(B), B's commits, F(C)]`): its last head check came
-    /// before the first of them. This holds when the old writer's lease and
-    /// request timeout are at most this writer's: nothing in the bucket records another
-    /// process's settings.
+    /// before the first of them. The quiet is the larger of the replaced writer's `lease +
+    /// request_timeout` (its head carries both) and this writer's own (`Timeouts::quiet_for`); a
+    /// head without the fields counts as this writer's own. A writer several takeovers back is
+    /// sized by the head each takeover replaced, not by its own settings (README, takeover quiet).
     ///
     /// It does not cover equal ETags for equal bytes (S3 and RustFS: the MD5 of the body): if
     /// the old writer was paused for longer than the quiet, between its lease check and the
@@ -1220,10 +1330,10 @@ impl Bucket {
 
     /// The current head with its epoch raised by one: same writer, generation and manifest.
     fn raised_head(&self) -> Head {
-        Head {
+        self.timeouts.stamp(Head {
             epoch: self.head.epoch + 1,
             ..self.head.clone()
-        }
+        })
     }
 
     /// `head` is published with `etag`, by a request sent at `sent`: adopt it, renewing the
@@ -1282,7 +1392,7 @@ impl Bucket {
 
     /// The head a seal of the current generation publishes.
     fn sealed_head(&self) -> Head {
-        Head {
+        self.timeouts.stamp(Head {
             format: self.head.format,
             generation: self.head.generation + 1,
             manifest: Some(self.head.generation),
@@ -1292,7 +1402,7 @@ impl Bucket {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
-        }
+        })
     }
 
     /// Re-put the in-doubt record, if any, at the position it was meant for.

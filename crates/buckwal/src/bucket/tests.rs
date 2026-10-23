@@ -122,8 +122,8 @@ fn create_then_attach_round_trip() {
         manifest: None,
         writer_id: "w1".into(),
         epoch: 1,
-        lease_ms: None,
-        request_timeout_ms: None,
+        lease_ms: Some(30_000),
+        request_timeout_ms: Some(10_000),
         next_generation_floor: None,
     };
     assert_eq!(b.head(), &want);
@@ -383,8 +383,8 @@ fn seal_start_accepts_our_own_late_head() {
         manifest: Some(1),
         writer_id: "w1".into(),
         epoch: 1,
-        lease_ms: None,
-        request_timeout_ms: None,
+        lease_ms: Some(30_000),
+        request_timeout_ms: Some(10_000),
         next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
@@ -938,8 +938,9 @@ fn lapsed_append_with_our_head_proceeds() {
         manifest: Some(2),
         writer_id: "w1".into(),
         epoch: 1,
-        lease_ms: None,
-        request_timeout_ms: None,
+        lease_ms: Some(0), // the writer's `set_lease(ZERO)` above
+
+        request_timeout_ms: Some(10_000),
         next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();

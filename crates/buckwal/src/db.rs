@@ -1,6 +1,6 @@
 //! [`open`] and [`Database`]: the directory locks (D4), the order of an open, and shutdown.
 use crate::batching::Batching;
-use crate::bucket::{self, Bucket, FenceOutcome};
+use crate::bucket::{self, Bucket, FenceOutcome, Timeouts};
 use crate::config::{Config, EngineConfig, Event, EventHook, JournalMode};
 use crate::conn::Connection;
 use crate::create::{self, clear_interrupted_create};
@@ -534,12 +534,13 @@ fn create_new(
     cfg: &EngineConfig,
 ) -> Result<(Bucket, LocalState)> {
     let writer_id = new_writer_id()?;
-    let mut bucket = Bucket::create(
+    let mut bucket = Bucket::create_with(
         store.clone(),
         keys.clone(),
         cfg.retry.clone(),
         cfg.upload_concurrency,
         writer_id.clone(),
+        timeouts_of(cfg),
     )?;
     bucket.set_lease(cfg.lease);
     let state = LocalState {
@@ -575,13 +576,14 @@ fn create_new_mvcc(
     let staging = create::staging_dir(dir);
     let image = create::build_mvcc_image(&staging, cfg.encryption.as_deref())?;
     let writer_id = new_writer_id()?;
-    let mut bucket = Bucket::create_sealed(
+    let mut bucket = Bucket::create_sealed_with(
         store.clone(),
         keys.clone(),
         cfg.retry.clone(),
         cfg.upload_concurrency,
         writer_id.clone(),
         image,
+        timeouts_of(cfg),
     )?;
     bucket.set_lease(cfg.lease);
     let state = LocalState {
@@ -658,7 +660,7 @@ pub(crate) fn attach_existing(
             state.epoch = raise_at_open(store, keys, cfg, &state, &mut bucket)?;
             state.write_atomic(dir)?;
             if last_record_is_foreign(&bucket, &state.writer_id, cfg)? {
-                set_provisional_quiet(cfg, &mut state);
+                set_provisional_quiet(cfg, None, &mut state);
                 state.write_atomic(dir)?;
                 fence = Some(resume_takeover(cfg, &state.writer_id, &mut bucket)?);
             }
@@ -687,19 +689,46 @@ pub(crate) fn attach_existing(
     })
 }
 
-/// The takeover quiet: how long a writer whose fence may follow another writer's seal still in
-/// flight must not seal that generation (`Bucket::set_seal_not_before`).
+/// This writer's own timeouts, written into every head it writes.
+fn timeouts_of(cfg: &EngineConfig) -> Timeouts {
+    Timeouts {
+        lease: cfg.lease,
+        request_timeout: cfg.request_timeout,
+    }
+}
+
+/// This writer's own takeover quiet: how long a writer whose fence may follow another writer's
+/// seal still in flight must not seal that generation (`Bucket::set_seal_not_before`), when
+/// nothing is known of the replaced writer's timeouts.
 fn quiet_of(cfg: &EngineConfig) -> Duration {
-    cfg.lease.saturating_add(cfg.request_timeout)
+    timeouts_of(cfg).sum()
 }
 
 /// The takeover quiet persisted before a fence is appended, in case the open crashes between
 /// the fence and `set_quiet`: the next open then finds its own fence as the last record (no
 /// fence again) and waits the persisted length (`set_quiet`). `set_quiet` replaces it.
-fn set_provisional_quiet(cfg: &EngineConfig, state: &mut LocalState) {
-    let quiet = quiet_of(cfg);
+///
+/// It is the larger of both writers' `lease + request_timeout`: the replaced head's
+/// (`replaced`, from the takeover's head write) and this writer's own. Where the replaced head
+/// is not known (a resumed claim, a takeover whose fence never landed) a pending quiet already
+/// persisted counts too, so a restart does not shorten it.
+fn set_provisional_quiet(cfg: &EngineConfig, replaced: Option<&Head>, state: &mut LocalState) {
+    let pending = if state.seal_not_before_ms != 0 {
+        Duration::from_millis(state.seal_quiet_ms)
+    } else {
+        Duration::ZERO
+    };
+    let quiet = timeouts_of(cfg).quiet_for(replaced).max(pending);
     state.seal_not_before_ms = bucket::unix_ms(SystemTime::now() + quiet);
     state.seal_quiet_ms = duration_ms(quiet);
+}
+
+/// The persisted takeover quiet length (`seal_quiet_ms`), this writer's own sum when absent.
+fn pending_quiet(cfg: &EngineConfig, state: &LocalState) -> Duration {
+    match state.seal_quiet_ms {
+        0 => quiet_of(cfg),
+        ms => Duration::from_millis(ms),
+    }
 }
 
 /// `d` in whole ms, at least 1 for a nonzero `d`, so a pending quiet's length is never read
@@ -742,10 +771,7 @@ fn set_quiet(
             state.seal_quiet_ms = 0;
             return Ok(Duration::ZERO);
         }
-        let length = match state.seal_quiet_ms {
-            0 => quiet_of(cfg),
-            ms => Duration::from_millis(ms),
-        };
+        let length = pending_quiet(cfg, state);
         let until = Instant::now() + length;
         state.seal_not_before_ms = bucket::unix_ms(SystemTime::now() + length);
         state.seal_quiet_ms = duration_ms(length);
@@ -760,7 +786,8 @@ fn set_quiet(
         return Ok(Duration::ZERO);
     };
     let quiet = if fence.seal_may_be_in_flight {
-        quiet_of(cfg)
+        // The provisional quiet persisted before the fence: both writers' larger sum.
+        pending_quiet(cfg, state)
     } else {
         Duration::ZERO
     };
@@ -801,6 +828,7 @@ fn attach(
         state.epoch,
     )?;
     bucket.set_lease(cfg.lease);
+    bucket.set_request_timeout(cfg.request_timeout);
     Ok(bucket)
 }
 
@@ -940,12 +968,13 @@ fn claim_in_span(
         state.claim_id = new_writer_id()?;
         state.write_atomic(dir)?;
     }
-    let (head, etag) = bucket::take_over_counted(
+    let (head, etag, replaced) = bucket::take_over_counted(
         &**store,
         keys,
         &cfg.retry,
         state.generation,
         &state.claim_id,
+        timeouts_of(cfg),
         retries,
     )?;
     span.record("buckwal.epoch", head.epoch);
@@ -959,7 +988,7 @@ fn claim_in_span(
     state.claimed = true;
     state.head_etag = etag;
     state.epoch = head.epoch;
-    set_provisional_quiet(cfg, state);
+    set_provisional_quiet(cfg, replaced.as_ref(), state);
     state.write_atomic(dir)?;
     let mut bucket = attach(store, keys, cfg, state)?;
     let fence = bucket.append_fence();

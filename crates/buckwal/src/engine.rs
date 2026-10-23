@@ -100,6 +100,7 @@ pub(crate) fn open_engine(
     // `db` sets it right after create or attach, before any append; this covers every other
     // caller (`Bucket::check_lease`).
     bucket.set_lease(cfg.lease);
+    bucket.set_request_timeout(cfg.request_timeout);
     let db_path = dir
         .join(DB_FILE)
         .to_str()

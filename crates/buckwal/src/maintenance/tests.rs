@@ -399,7 +399,10 @@ fn maintenance_skips_during_takeover_quiet() {
     // The old writer: rows, closed, then its seal-start record at the next seq, as if its
     // next seal had started and its process were gone with the page PUTs in flight.
     let a = tempfile::tempdir().unwrap();
-    let ca = Config::new(a.path(), "http://127.0.0.1:1", "b", "k", "s");
+    let mut ca = Config::new(a.path(), "http://127.0.0.1:1", "b", "k", "s");
+    // Its head carries these: the takeover quiet is the larger of both writers' sums.
+    ca.lease = Duration::from_secs(1);
+    ca.request_timeout = Duration::from_millis(500);
     let db = crate::open_with_store(ca.clone(), store.clone()).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("CREATE TABLE t(x)", &[]).unwrap();
