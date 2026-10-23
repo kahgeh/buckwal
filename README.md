@@ -46,13 +46,13 @@ rm -rf shop
 
 # A new machine rebuilds the database from the bucket and becomes its writer.
 buckwal takeover --dir shop2
-# took over generation=2 epoch=2 fence_seq=2 writer_id=… quiet_ms=0 ms=87
+# prints one line that starts "took over" and gives the new writer's numbers
 
 buckwal sql --dir shop2 "SELECT id, item FROM orders"
 # 1	book
 ```
 
-The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The `takeover` line reports the new writer's numbers (see CLI). Use a new `BUCKWAL_PREFIX` to start another database; settings are listed under Settings.
+The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The numbers on the `takeover` line are explained under CLI. Use a new `BUCKWAL_PREFIX` to start another database; settings are listed under Settings.
 
 ## What it covers
 
@@ -63,7 +63,7 @@ The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The
 - **Telemetry.** buckwal can send traces and metrics in the OpenTelemetry format, a standard one for monitoring tools (see Telemetry).
 - **HTTPS and encryption.** `https://` endpoints are checked against the platform's trust store, or against a list of certificate authorities you name in `BUCKWAL_CA_BUNDLE`. With a key file named in `BUCKWAL_ENCRYPTION_KEY_FILE`, the database is encrypted before it leaves the machine, so the bucket holds only ciphertext.
 - **A server for other languages.** `buckwal serve` serves the database over tursodb's SQL over HTTP v3, so apps in other languages and several processes can use it through tursodb's serverless drivers (see Server).
-- **Concurrent writers.** A database created new in a mode that lets several writes run at once (`BEGIN CONCURRENT`, called MVCC mode) is durable too, with limits (see MVCC mode).
+- **Concurrent writers.** A database created new in a mode that lets several writes run at once (`BEGIN CONCURRENT`) is durable too, with limits. A section further down describes it.
 - **What it was tested on.** A laptop, against RustFS, over plain HTTP and over HTTPS with encryption. It was not tested on AWS S3 (see Not tested until real use).
 
 ## How it works
