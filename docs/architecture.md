@@ -2,7 +2,7 @@
 
 What this product is made of and how its parts talk. Kept true by the product's pod. This
 file was started by the `mvcc-durability` work (2026-10-22), so "new", "changed" and "existing"
-in the diagram mean: new, changed or unchanged by that work. `durable-hardening` (2026-10-23) changed the head, the takeover and the seal, and added integrity codes: see "Takeover, generations and integrity codes" below. The README is the full contract
+in the diagram mean: new, changed or unchanged by that work. `durable-hardening` (2026-10-23) changed the head, the takeover and the seal, and added integrity codes: see "Takeover, generations and integrity codes" below. `read-replicas` (2026-10-23) added the replica IO mode, the follower and the notification listener: see "Replicas" below, whose diagram marks new, changed and existing by that work. The README is the full contract
 and `docs/glossary.md` defines the terms.
 
 ## Purpose
@@ -13,7 +13,7 @@ restore every acknowledged commit from the bucket alone. One writer process owns
 a time (fenced by an epoch and a lease, with manual takeover), either embedded as a Rust library
 or behind `buckwal serve`, which speaks tursodb's SQL over HTTP v3 to any language. A
 database is either a WAL database (the default) or, since `mvcc-durability`, one created new in
-MVCC mode with concurrent writers (`BEGIN CONCURRENT`).
+MVCC mode with concurrent writers (`BEGIN CONCURRENT`). A second machine can keep a read-only **replica** of a WAL database, fed from the bucket alone (`open_replica`, `buckwal follow`).
 
 ## Components
 
@@ -95,25 +95,117 @@ flowchart LR
 | LogDurableStorage | The `DurableStorage` wrapper given to the engine: delegates to the engine's own `Storage`, seals in `truncate`, poisons on a checkpoint failure after a seal | `crates/buckwal/src/io/log_storage.rs` |
 | Uploader and Bucket | The one upload at a time per database: log records, in-doubt settling, the seal (seal-start, pages, manifest, head), the lease and the fence checks | `crates/buckwal/src/uploader.rs`, `uploader/batch.rs`, `bucket.rs`, `clock.rs` |
 | Format codec | Bytes of the head (its fields, format 3 with `key_check` and the integrity code), local state, log records (kinds 1 to 3), manifests and keys, and the integrity codes of an encrypted bucket's objects | `crates/buckwal/src/format/` |
-| Object store | The S3 client (SigV4, conditional PUTs, HTTPS), retry, and the in-memory and fault stores the tests use | `crates/buckwal/src/store/` |
+| Object store | The S3 client (SigV4, conditional PUTs, HTTPS), retry, and the in-memory and fault stores the tests use. `ObjectStore::list_after(prefix, start_after)` lists the keys strictly after a key: S3 sends `start-after` on `ListObjectsV2`, the in-memory and fault stores use a default method that filters the sorted list. The replica's sync pass uses it | `crates/buckwal/src/store/` (`mod.rs`, `s3.rs`, `mem.rs`, `fault.rs`) |
 | Encryption and telemetry | The key file, the integrity key and page-1 checks, and OTLP export through `tracing` | `crates/buckwal/src/encryption.rs`, `telemetry/` |
-| CLI | The `buckwal` binary, its argument parsing, `soak`, `bench`, `serve` and the whole-bucket `scan` | `crates/buckwal-cli/src/main.rs`, `args.rs`, `soak.rs`, `bench.rs`, `serve.rs`, `scan.rs` |
-| CLI tests | The system tests against RustFS, including the crash matrix and the MVCC tests | `crates/buckwal-cli/tests/system.rs`, `server.rs` |
-| Server | SQL over HTTP v3 (pipeline, cursor, describe, batons), health, TLS and token, streams, shutdown | `crates/buckwal-server/src/lib.rs`, `http.rs`, `proto.rs`, `exec.rs`, `streams.rs`, `listener.rs`, `config.rs` |
+| CLI | The `buckwal` binary, its argument parsing, `soak`, `bench`, `serve`, the whole-bucket `scan`, `follow` (a replica with status lines and the notification listener) and `notify-setup` (prints the AWS commands, runs nothing) | `crates/buckwal-cli/src/main.rs`, `args.rs`, `soak.rs`, `bench.rs`, `serve.rs`, `scan.rs`, `follow.rs`, `notify_setup.rs` |
+| CLI tests | The system tests against RustFS, including the crash matrix and the MVCC tests, and the replica system tests | `crates/buckwal-cli/tests/system.rs`, `server.rs`, `replica.rs` |
+| Server | SQL over HTTP v3 (pipeline, cursor, describe, batons), health, TLS and token, streams, shutdown | `crates/buckwal-server/src/lib.rs`, `http.rs`, `proto.rs`, `exec.rs`, `streams.rs`, `listener.rs`, `config.rs`, `notify.rs` (the replica's webhook) |
+| Replica (open and follower) | `open_replica`, the `Replica` handle (`connect`, `stats`, `waker`, `close`), the follower thread with its two wake-ups, and the re-restore into a fresh sibling copy | `crates/buckwal/src/replica/open.rs`, `waker.rs`, `stats.rs` |
+| Replica sync pass | One pass: `list_after` on the generation's log, fetch, rebuild frames, apply the committed prefix, check the head, handle seals and the fence rule | `crates/buckwal/src/replica/sync.rs`, `image.rs`, `fence.rs` |
+| Replica frame applier and position file | `wal_insert_begin`, `wal_insert_frame`, `wal_insert_end` through turso_core's `conn_raw_api`, decrypting encrypted frames first; the position file and its steps | `crates/buckwal/src/replica/apply.rs`, `position.rs` |
+| Replica read connections | Read-only connections over the current copy, which refuse every write | `crates/buckwal/src/replica/connection.rs` |
+| Notification listener | `POST /notify`: a bucket event (or an SNS message) wakes the follower. It reuses the server's listener, bind check and token and adds basic authentication for SNS | `crates/buckwal-server/src/notify.rs` |
 | Test client | A minimal SQL over HTTP v3 client for the tests (`publish = false`, name is historical) | `crates/buckwal-hrana-client/src/lib.rs` |
 | Scripts | `test.sh` (two passes plus the plaintext scan and the telemetry check), `rustfs.sh` (local S3), `tls-material.sh`, `s3-gate.sh`, `otel-check.sh` | `scripts/` |
 | Bucket | One prefix per database: `head`, `log/…`, `pages/…`, `manifest/…` | formats in README, Bucket format v1 and v2 |
+
+## Replicas
+
+Added by `read-replicas` ([ADR 0006](adr/0006-a-third-io-mode-for-replicas.md), [ADR 0007](adr/0007-the-notification-listener-reuses-the-server-crates-listener.md)); the README, Replicas, is the contract.
+
+Green is new, amber is changed, grey is existing and unchanged.
+
+```mermaid
+flowchart LR
+  subgraph writer["Writer machine (unchanged)"]
+    wapp["App"]:::existing
+    wlib["buckwal writer<br/>commits, seals, takeover, GC"]:::existing
+  end
+  subgraph store["Object store"]
+    bucket[("Bucket, format v1<br/>head, log/G/seq, pages, manifest")]:::existing
+    notif["Bucket event notification<br/>ObjectCreated on log/, head, manifest"]:::existing
+  end
+  subgraph route["Notification route (set up by the user)"]
+    sns["AWS: SNS topic<br/>one HTTPS subscription per replica"]:::existing
+    hook["RustFS: webhook target per replica"]:::existing
+  end
+  subgraph replica["Replica machine, one process"]
+    rapp["App (reads only)"]:::existing
+    subgraph rlib["buckwal in replica mode"]
+      ropen["open_replica<br/>read-only connections"]:::new
+      follow["Follower thread<br/>sync pass, frame rebuild, committed prefix"]:::new
+      pos["Position file app.db-replica"]:::new
+      timer["Slow poll, 60 s"]:::new
+      rio["IO layer, replica mode<br/>local writes, no upload"]:::changed
+      rest["Restore and prefetch<br/>also the re-restore after a gap"]:::changed
+      enc["Frame decrypt<br/>encrypted databases"]:::new
+      stats["Replica stats and sync span"]:::new
+    end
+    subgraph srv["buckwal-server crate"]
+      lis["Listener, TLS and token<br/>shared with serve"]:::changed
+      nmod["notify module<br/>webhook to wake"]:::new
+    end
+    core["turso_core 0.8.3<br/>wal_insert_frame (conn_raw_api)"]:::existing
+    cli["CLI follow and notify-setup"]:::new
+  end
+  wapp --> wlib --> bucket
+  bucket --> notif
+  notif --> sns
+  notif --> hook
+  sns -- "HTTPS POST, basic auth" --> lis
+  hook -- "HTTP POST with token" --> lis --> nmod
+  nmod -- "wake" --> follow
+  timer -- "wake" --> follow
+  bucket -- "LIST log/G, GET objects and head" --> follow
+  follow --> enc
+  follow -- "frames" --> core
+  follow --> pos
+  core --> rio
+  rest --> rio
+  follow --> rest
+  rapp --> ropen --> core
+  follow --> stats
+  cli --> follow
+  cli --> nmod
+  subgraph legend["Legend"]
+    l1["new"]:::new
+    l2["changed"]:::changed
+    l3["existing"]:::existing
+  end
+  classDef new fill:#d9f2e3,stroke:#1f7a4a,color:#10301f
+  classDef changed fill:#fdebc8,stroke:#a86b00,color:#3d2700
+  classDef existing fill:#e6e9ec,stroke:#6b7480,color:#22272e
+```
+
+**The replica IO mode.** A third mode of the library's IO layer, beside writer and read-only. Local WAL and `app.db` writes are allowed (the follower's frame inserts and checkpoints), pages are read lazily from the bucket until the prefetch has them, and nothing is uploaded, sealed, claimed or deleted. A replica sends GET, HEAD and LIST requests only. Neither existing mode is relaxed.
+
+**The follower.** One thread per replica, woken by a notification (through `Replica::waker()`) or by the slow poll (`BUCKWAL_REPLICA_POLL_MS`, 60 s). Either starts the same sync pass, which treats a notification as a hint only and reads the log by seq: `list_after` on `log/<G>/` after the last record seen, then each new record in order, rebuilt into WAL frames, cut to the committed prefix, decrypted first when the database is encrypted, and inserted one committed transaction at a time. A seal or a takeover moves it to the generation the head names, with a local checkpoint that readers can hold off (then it numbers on and retries). A log object the follower needs being gone makes it re-restore into a fresh sibling copy.
+
+**The shared notify listener.** `buckwal_server::notify::serve` runs in `buckwal-server`, on the crate's own listener, bind check and token, so the library gains no async runtime and no server code. `buckwal follow` runs it when `BUCKWAL_REPLICA_NOTIFY_LISTEN` is set.
+
+**The object store's start-after list.** `ObjectStore::list_after(prefix, start_after)` is new. Its default method (used by the in-memory and fault stores) filters the sorted `list`; the S3 store sends `start-after` on `ListObjectsV2`. A pass thus lists only the new keys however long the generation's log is. (It is part of this change, not a decision of its own, so it has no ADR.)
+
+**Local files of a replica**, beside the usual `app.db`, `app.db-wal`, `app.db-durable` and `durable.lock`:
+
+| File | What it is |
+|---|---|
+| `app.db-replica` | The position file: generation, stage (`applying` or `ckpt_pending`), frame offset and the replica's random id. Written as a temp file, fsynced, renamed, then the directory is fsynced. |
+| `app.db-replica-at` | Present only after a re-restore: names the sibling directory that holds the current copy. Written atomically after the new copy is open, so it is the durable switch; a reopen follows it and removes what an earlier copy or an interrupted re-restore left. |
+| `app.db-replica-seen` | When the follower last finished a successful pass (unix milliseconds, as text). A restarted replica reads it to tell how far behind it is. |
 
 ## Interfaces
 
 **Library (Rust).** `buckwal::{open, takeover, restore, gc, is_claimed, Config, JournalMode, Database, Connection, Transaction, Batching, CheckpointMode, StmtOutput, Column, Description, UploadStats, GcReport, RestoreReport, TakeoverReport, Error, Value}`.
 - `Connection::execute`, `execute_batch`, `query`, `run` (columns, rows, changes, last rowid), `describe`, `is_autocommit`, `transaction`, `transaction_with`, `set_batching`, `checkpoint`, `close`.
 - `Config.journal_mode` (`JournalMode::Wal` by default, `Mvcc`) creates a new database in that mode and must name the mode of an existing one. `BUCKWAL_JOURNAL_MODE` sets it from the environment.
-- Contract: README, Use (the API table) and Errors, and MVCC mode.
+- Replicas: `open_replica(Config) -> Replica`, with `Replica::connect() -> ReadConnection`, `stats() -> ReplicaStats`, `waker() -> ReplicaWaker` and `close()`; `Config.replica_poll_interval` (`BUCKWAL_REPLICA_POLL_MS`); the error `Unsupported("replica: MVCC")`. `buckwal_server::notify::serve` is the listener.
+- Contract: README, Use (the API table) and Errors, MVCC mode, and Replicas.
 
-**CLI.** `buckwal restore | takeover | gc | verify | sql | stats | soak | bench | serve | scan`. `--journal-mode wal|mvcc` on `sql`, `stats`, `soak`, `bench`, `serve` and `takeover` (without it, an existing database's own mode), `soak --concurrent [all|mixed]`. `restore` and `verify` follow the bucket head. Exit codes 0, 1 and 2. Contract: README, CLI, and the usage text in `crates/buckwal-cli/src/args.rs`.
+**CLI.** `buckwal restore | takeover | gc | verify | sql | stats | soak | bench | serve | scan | follow | notify-setup`. `--journal-mode wal|mvcc` on `sql`, `stats`, `soak`, `bench`, `serve` and `takeover` (without it, an existing database's own mode), `soak --concurrent [all|mixed]`. `restore` and `verify` follow the bucket head. Exit codes 0, 1 and 2. Contract: README, CLI, and the usage text in `crates/buckwal-cli/src/args.rs`.
 
 **Server (HTTP).** `buckwal serve` speaks tursodb's SQL over HTTP v3 (`serverless/PROTOCOL.md` in the turso repository at 0b2bec917, not in this repository): `GET /health`, `GET /v2`, `GET /v3`, `POST /v3/pipeline`, `POST /v3/cursor`, `POST /v2/pipeline`. Requests `execute`, `batch`, `sequence`, `describe`, `store_sql`, `close_sql`, `close`, `get_autocommit`. Settings `BUCKWAL_SERVE_*`. Contract: README, Server, and the protocol file above.
+
+**Notification webhook.** `POST /notify` on the replica's listener (`BUCKWAL_REPLICA_NOTIFY_*`): an S3 event or an SNS message, with the token as a bearer header or as basic authentication (user `sns`). Contract: README, Replicas.
 
 **Bucket.** Everything under `<prefix>/`.
 - Format v1 (WAL databases): `head` (`format` 1, generation, manifest, writer id, epoch), `log/<generation:010>/<seq:020>` (kind 1 WAL extents, kind 2 fence), `pages/<generation:010>/<page:010>`, `manifest/<generation:010>`.
@@ -133,8 +225,9 @@ flowchart LR
 | `app.db-dirty` | Page numbers checkpointed since the last seal. |
 | `app.db-restoring` | Present only while a restore moves its files in. |
 | `durable.lock` | The exclusive lock of the process that has the directory open. |
+| `app.db-replica`, `app.db-replica-at`, `app.db-replica-seen` | A replica's position file, the pointer to its current copy after a re-restore, and the time of its last successful pass (see Replicas). |
 
-**Settings and telemetry.** `BUCKWAL_*` environment variables (README, Settings), `BUCKWAL_OTEL*` and the span names (README, Telemetry, a contract the HyperDX searches depend on).
+**Settings and telemetry.** `BUCKWAL_*` environment variables (README, Settings), `BUCKWAL_OTEL*` and the span names (README, Telemetry, a contract the HyperDX searches depend on), including the replica spans `buckwal.replica.sync` and `buckwal.replica.re_restore`.
 
 ## Takeover, generations and integrity codes
 
@@ -152,7 +245,7 @@ Added by `durable-hardening` ([ADR 0005](adr/0005-takeover-generation-floor-quie
 
 ## Decisions
 
-Newest last. "Spec" is the id of the work that made it: `durable-library` stages 1 to 4, `durable-server`, `mvcc-durability`, `durable-hardening`. The earlier stages' spec files are not in this repository, so they are named by id. Evidence for D1 to D29 is in README, Decisions. ADRs 0001 to 0004 in `docs/adr/` (index: `docs/adr/README.md`) record the four decisions of `mvcc-durability` that most shape the design, in Nygard's form; the earlier stages' decisions are not back-filled.
+Newest last. "Spec" is the id of the work that made it: `durable-library` stages 1 to 4, `durable-server`, `mvcc-durability`, `durable-hardening`, `read-replicas`. The earlier stages' spec files are not in this repository, so they are named by id. Evidence for D1 to D29 is in README, Decisions. ADRs 0001 to 0007 in `docs/adr/` (index: `docs/adr/README.md`) record the decisions of `mvcc-durability`, `durable-hardening` and `read-replicas` that most shape the design, in Nygard's form; the earlier stages' decisions are not back-filled.
 
 - 2026-10-16, `durable-library` stage 1: use turso_core `=0.8.3` through its public APIs only (an `IO`/`File` wrapper and `DatabaseStorage`), no fork, so the engine upgrades by version bump (D1, D2).
 - 2026-10-16, `durable-library` stage 1: the commit point is the WAL's fsync, and a failed upload fails the commit synchronously, so the engine rolls it back and never reaches the fsync panic (D3).
@@ -172,13 +265,15 @@ Newest last. "Spec" is the id of the work that made it: `durable-library` stages
 - 2026-10-22, `mvcc-durability`: restore and reconcile work on two images (D23), a read-only open lets recovery writes through locally (D24), and a checkpoint failure after a seal poisons the database until reopen (D25).
 - 2026-10-22, `mvcc-durability`: the CLI follows the head's journal mode and the library does not (D26), maintenance measures the `.db-log` (D27), `run` and `is_autocommit` share the guard, gate and ack path (D28), and the engine's MVCC limits are accepted and pinned in tests (D29).
 - 2026-10-23, `durable-hardening`: a takeover's first seal skips a generation number and the head keeps a next generation floor that GC honours, the takeover quiet is the larger of both writers' timeouts, and an encrypted bucket carries integrity codes in a format 3 head ([ADR 0005](adr/0005-takeover-generation-floor-quiet-and-integrity-codes.md)). Why: a late PUT from the fenced writer could replace a key the new writer relies on, and an encrypted page was bound to neither its number nor its version.
+- 2026-10-23, `read-replicas`: a third IO mode for replicas (local writes for the follower only, nothing to the bucket), with the follower inside `buckwal` and the frame calls of turso_core's `conn_raw_api` ([ADR 0006](adr/0006-a-third-io-mode-for-replicas.md)). Why: a replica must apply frames and checkpoint locally but never write to the bucket.
+- 2026-10-23, `read-replicas`: the notification listener lives in `buckwal-server` and reuses its listener, bind check and token ([ADR 0007](adr/0007-the-notification-listener-reuses-the-server-crates-listener.md)). Why: one listener and one set of security rules, and no async runtime in the library.
 
 ## Departures from the standards
 
 None found. The organisation's standards file is kept outside this repository. Section by section:
 
 - **Glossary.** Followed. `docs/glossary.md` gives every term a one-line meaning and the words not to use, and lists the older text that still uses such a word under "Not yet consistent". The `mvcc-durability` work added its new terms in the same change.
-- **Architecture decisions.** Followed from this work on. `docs/adr/` holds ADRs 0001 to 0005 in Nygard's form (see Decisions). The earlier stages' decisions stay in the README, Decisions (D1 to D29), and are not back-filled. `docs/architecture.md` stays alongside the ADRs, as the standard says.
+- **Architecture decisions.** Followed from this work on. `docs/adr/` holds ADRs 0001 to 0007 in Nygard's form (see Decisions). The earlier stages' decisions stay in the README, Decisions (D1 to D29), and are not back-filled. `docs/architecture.md` stays alongside the ADRs, as the standard says.
 - **Telemetry.** Followed. Spans and logs leave over OTLP/gRPC, to `http://localhost:4317` by default (`Config::OTEL_ENDPOINT`, `crates/buckwal/src/config.rs`). `service.name` is set in code (`telemetry/pipeline.rs`, and the test `spans_carry_service_name_and_run_id_and_engine_spans_are_dropped`). No SQL text, row data or secret goes in a span or a log line. The MVCC path adds no span names: it reuses `buckwal.commit`, `buckwal.upload`, `buckwal.ack_wait` and `buckwal.local_fsync`, with their existing attributes (counts, bytes, generation, seq, retries, status, outcome). `git diff 332b45f..HEAD -- crates` adds two log lines: `log upload failed` (warn, the bucket error) and `database poisoned` (error, a text naming the failed checkpoint step). Neither carries SQL text. The stage's fixes show their logged problem and the passing lines in `results/mvcc-durability.txt`. Observability for the work is in the README, Telemetry.
 - **APIs and messaging.** Nothing to follow. The product has no gRPC interface and no web app; its HTTP server speaks tursodb's SQL over HTTP v3, a protocol set by turso, not a REST API behind pages.
 - **Stacks.** Followed: Rust. It is not a web app, so the axum, askama and Datastar stack does not apply.
