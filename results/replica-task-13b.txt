@@ -67,3 +67,5 @@ ok
    1 test result: ok. 0 passed; 0 failed; 21 ignored; 0 measured; 0 filtered out; finished in 0.00s
    1 test result: ok. 0 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 0.00s
 NOTE: buckwal lib unit test db::tests::close_stops_prefetch_before_releasing_the_dir fails deterministically here ('prefetch finished before close'); no src/ file changed by this task.
+
+Fix round 1: ./scripts/test.sh unit green (20 test binaries ok, 0 failed); clippy -D warnings, fmt clean.

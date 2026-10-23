@@ -1153,6 +1153,9 @@ struct GateState {
     armed: bool,
     released: bool,
     held: Option<(String, Vec<u8>)>,
+    /// Every key held so far: a retry of the same append blocks too, so it cannot win the
+    /// seq before the other machine's fence.
+    held_keys: Vec<String>,
 }
 
 impl GateStore {
@@ -1197,9 +1200,13 @@ impl ObjectStore for GateStore {
         body: &[u8],
     ) -> Result<buckwal::store::CondPut, buckwal::store::StoreError> {
         let mut g = self.state.lock().unwrap();
-        if g.armed && key.contains("/log/") {
+        let again = g.held_keys.iter().any(|k| k == key);
+        if (g.armed && key.contains("/log/")) || again {
             g.armed = false;
-            g.held = Some((key.to_string(), body.to_vec()));
+            if !again {
+                g.held = Some((key.to_string(), body.to_vec()));
+                g.held_keys.push(key.to_string());
+            }
             // Bounded, so a test that failed before `release` does not leave this thread forever.
             let deadline = Instant::now() + Duration::from_secs(120);
             while !g.released && Instant::now() < deadline {

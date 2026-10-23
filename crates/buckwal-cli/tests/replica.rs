@@ -816,6 +816,14 @@ fn next_log_key(key: &str) -> String {
     format!("{dir}/{:020}", seq.parse::<u64>().expect("a seq") + 1)
 }
 
+/// Wait for the replica's first pass (the `start` pass after open) to have finished, so a
+/// later edit of the bucket cannot be overtaken by it.
+fn wait_first_pass(rep: &Rep) {
+    wait_until("the first sync pass", Duration::from_secs(60), || {
+        rep.stats().last_pass_at.map(|_| ())
+    });
+}
+
 /// Pause until the sync pass that a `wake` started has ended: wake again and wait for the
 /// second notification pass to begin (passes run one after another).
 fn wake_and_settle(rep: &Rep) {
@@ -998,6 +1006,11 @@ fn two_replicas_each_with_own_listener() {
         };
         pf.post_ok(&key, Auth::Bearer);
         first.wait_applied(ffrom, g, n, Duration::from_secs(5));
+        first.wait_line(ffrom, "notified", Duration::from_secs(5), |l| {
+            l.starts_with("notified ")
+        });
+        // Settle: the other replica had the same time to react to an event it never got.
+        std::thread::sleep(Duration::from_secs(1));
         assert_eq!(
             second.count_lines(sfrom, applied),
             0,
@@ -1006,10 +1019,9 @@ fn two_replicas_each_with_own_listener() {
         );
         ps.post_ok(&key, Auth::Basic);
         second.wait_applied(sfrom, g, n, Duration::from_secs(5));
-        for (f, from) in [(first, ffrom), (second, sfrom)] {
-            let woken = f.count_lines(from, |l| l.starts_with("notified "));
-            assert!(woken >= 1, "woken by its own event: {:?}", f.lines);
-        }
+        second.wait_line(sfrom, "notified", Duration::from_secs(5), |l| {
+            l.starts_with("notified ")
+        });
     }
     assert!(f1.sigterm().success(), "{}", f1.tail());
     assert!(f2.sigterm().success(), "{}", f2.tail());
@@ -1105,6 +1117,7 @@ fn fenced_late_record(name: &str, seal_first: bool) {
     a.insert_range(1..=20);
     let rep = Rep::open(&ctx, &ctx.dir("r"), Duration::from_secs(60));
     rep.wait_equal(&a, BOUND);
+    wait_first_pass(&rep);
     let g = ctx.head().generation;
 
     gate.arm();
@@ -1130,18 +1143,12 @@ fn fenced_late_record(name: &str, seal_first: bool) {
 
     let head = ctx.head();
     if seal_first {
-        assert!(
-            head.generation > g,
-            "B sealed A's generation: {g} then {head:?}"
-        );
-        eprintln!(
-            "{name}: head generation {g} -> {} ({})",
+        // As in `late_put_from_fenced_writer_lands_on_unreferenced_key` (system.rs): the
+        // first seal after a takeover skips a generation.
+        assert_eq!(
             head.generation,
-            if head.generation == g + 2 {
-                "skips a generation"
-            } else {
-                "next generation"
-            }
+            g + 2,
+            "B's first seal skips a generation: {g} then {head:?}"
         );
     } else {
         assert_eq!(head.generation, g, "no seal yet: {head:?}");
@@ -1229,6 +1236,7 @@ fn replica_encrypted_bucket_edited_behind_back_stops_with_integrity() {
     let r = ctx.dir("r");
     let rep = Rep::open(&ctx, &r, Duration::from_secs(60));
     rep.wait_equal(&w, BOUND);
+    wait_first_pass(&rep);
     w.insert_range(6..=7);
     let g = ctx.head().generation;
     let keys = log_keys(&ctx, g);
@@ -1282,6 +1290,7 @@ fn replica_missing_seq_waits() {
     w.insert_range(1..=5);
     let rep = Rep::open(&ctx, &ctx.dir("r"), Duration::from_secs(60));
     rep.wait_equal(&w, BOUND);
+    wait_first_pass(&rep);
     w.insert_range(6..=7);
     let g = ctx.head().generation;
     let keys = log_keys(&ctx, g);
@@ -1417,7 +1426,7 @@ fn replica_refuses_mvcc() {
 /// `notify listening` line, its directory never created) with no TLS and no token, with a
 /// token only and (pass 2, where the material exists) with TLS only. A loopback address with
 /// neither is accepted (`tls=false auth=false`). With a token (pass 2: over TLS as well): a
-/// post with a wrong token, a missing token and a bad scheme answers 401 and wakes nothing
+/// post with a wrong token, a missing token and an empty JSON body without a token answer 401 and wakes nothing
 /// (the one `notified received=1` line comes only after the valid post), the valid post wakes
 /// the replica and applies the commit, and the token appears nowhere in the child's stdout or
 /// stderr.
@@ -1559,6 +1568,8 @@ fn replica_sync_spans_reach_clickhouse() {
         f.wait_applied(from, g, n, Duration::from_secs(15));
     }
     assert!(f.sigterm().success(), "{}", f.tail());
+    let applied = f.count_lines(0, |l| l.starts_with("applied "));
+    assert!(applied >= 6, "one applied line per commit: {:?}", f.lines);
     eprintln!(
         "replica_sync_spans_reach_clickhouse: BUCKWAL_OTEL={:?}, run id {:?}",
         std::env::var("BUCKWAL_OTEL").ok(),

@@ -245,7 +245,10 @@ fn s3_list_after_start_after_and_paging() {
         }
     });
     let dir = format!("{p}k/");
+    let l0 = s.stats().lists;
     let all = s.list(&dir).unwrap();
+    let full = s.stats().lists - l0;
+    assert!(full >= 2, "1,100 keys took {full} LIST request(s)");
     assert_eq!(
         all,
         (0..N).map(key).collect::<Vec<_>>(),
@@ -264,10 +267,16 @@ fn s3_list_after_start_after_and_paging() {
     assert_eq!(between, (10..N).map(key).collect::<Vec<_>>());
     assert!(s.list_after(&dir, &key(N - 1)).unwrap().is_empty());
     assert_eq!(s.list_after(&dir, "").unwrap(), all);
-    // Beyond the first page's last key.
+    // Past the first page's last key: the server skips them, so one LIST holds the rest.
+    let l1 = s.stats().lists;
     assert_eq!(
         s.list_after(&dir, &key(1049)).unwrap(),
         (1050..N).map(key).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        s.stats().lists - l1,
+        1,
+        "start-after left 50 keys: one LIST"
     );
     // A neighbouring prefix is not listed.
     s.put(&format!("{p}kk"), b"x").unwrap();
