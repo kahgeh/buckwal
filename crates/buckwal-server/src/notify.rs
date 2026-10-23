@@ -225,6 +225,11 @@ pub fn serve_with(
         .build()
         .map_err(|e| format!("cannot start the notification runtime: {e}"))?;
     let (is_tls, auth) = (tls.is_some(), token.is_some());
+    // Registered with the runtime here, so a failure is returned to the caller.
+    let listener = {
+        let _in_runtime = rt.enter();
+        tokio::net::TcpListener::from_std(listener).map_err(fail)?
+    };
     let state = Arc::new(State_ {
         token,
         wake: Box::new(wake),
@@ -247,18 +252,11 @@ pub fn serve_with(
 }
 
 async fn run(
-    listener: std::net::TcpListener,
+    listener: tokio::net::TcpListener,
     app: Router,
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
 ) {
-    let listener = match tokio::net::TcpListener::from_std(listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "buckwal::notify", error = %e, "notification listener failed");
-            return;
-        }
-    };
     let (stop_tx, stop_rx) = watch::channel(false);
     let accept = tokio::spawn(accept_loop(listener, app, tls, MAX_CONNECTIONS, stop_rx));
     shutdown.await;
@@ -340,6 +338,17 @@ fn reply(status: StatusCode, text: &'static str) -> Response {
     (status, text).into_response()
 }
 
+/// A 400. The reason (never the body) goes to the debug log, so a topic or bucket set up
+/// wrong can be diagnosed.
+fn bad_request(why: &'static str) -> Response {
+    tracing::debug!(
+        target: "buckwal::notify",
+        reason = why.trim_end(),
+        "notification request refused with 400"
+    );
+    reply(StatusCode::BAD_REQUEST, why)
+}
+
 fn unauthorized() -> Response {
     let mut r = reply(StatusCode::UNAUTHORIZED, "credentials required\n");
     let h = r.headers_mut();
@@ -383,35 +392,49 @@ async fn notify(
     }
     let bytes = match tokio::time::timeout(BODY_READ_TIMEOUT, read_body(body)).await {
         Ok(Ok(b)) => b,
+        Ok(Err(StatusCode::BAD_REQUEST)) => return bad_request("cannot read the body\n"),
         Ok(Err(status)) => return reply(status, "cannot read the body\n"),
         Err(_) => return reply(StatusCode::REQUEST_TIMEOUT, "body read timed out\n"),
     };
     match classify(&bytes) {
-        Err(why) => reply(StatusCode::BAD_REQUEST, why),
+        Err(why) => bad_request(why),
         Ok(Action::Wake) => {
             (st.wake)();
             reply(StatusCode::OK, "ok\n")
         }
+        Ok(Action::Ack) => reply(StatusCode::OK, "ok\n"),
         Ok(Action::Confirm { url, topic }) => confirm(&st, url, topic).await,
     }
 }
 
 async fn read_body(body: Body) -> Result<axum::body::Bytes, StatusCode> {
-    to_bytes(body, BODY_LIMIT).await.map_err(|e| {
-        // The limit error is the only one with a source of the limit's type; a client that
-        // dropped its connection mid-body is not worth telling apart.
-        let limited = std::error::Error::source(&e).is_some();
-        if limited {
-            StatusCode::PAYLOAD_TOO_LARGE
-        } else {
-            StatusCode::BAD_REQUEST
+    to_bytes(body, BODY_LIMIT)
+        .await
+        .map_err(|e| read_error_status(&e))
+}
+
+/// 413 for the body limit's own error, 400 for any other read error (a client that went away
+/// mid-body). The limit error is a boxed `http_body_util::LengthLimitError`, a type this
+/// crate does not depend on, so it is recognised by its text anywhere in the error chain.
+fn read_error_status(e: &(dyn std::error::Error + 'static)) -> StatusCode {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.to_string() == "length limit exceeded" {
+            return StatusCode::PAYLOAD_TOO_LARGE;
         }
-    })
+        cur = err.source();
+    }
+    StatusCode::BAD_REQUEST
 }
 
 enum Action {
     Wake,
-    Confirm { url: String, topic: String },
+    /// S3's `s3:TestEvent`: acknowledged, nothing to wake for.
+    Ack,
+    Confirm {
+        url: String,
+        topic: String,
+    },
 }
 
 /// Sort a body into a wake, a confirmation or a refusal (the text is the 400's body).
@@ -421,6 +444,8 @@ fn classify(body: &[u8]) -> Result<Action, &'static str> {
     let Some(kind) = obj.get("Type") else {
         return if is_object_created(&v) {
             Ok(Action::Wake)
+        } else if is_test_event(&v) {
+            Ok(Action::Ack)
         } else {
             Err("not an S3 ObjectCreated event\n")
         };
@@ -434,6 +459,8 @@ fn classify(body: &[u8]) -> Result<Action, &'static str> {
             let inner: Value = serde_json::from_str(msg).map_err(|_| "Message is not JSON\n")?;
             if is_object_created(&inner) {
                 Ok(Action::Wake)
+            } else if is_test_event(&inner) {
+                Ok(Action::Ack)
             } else {
                 Err("Message is not an S3 ObjectCreated event\n")
             }
@@ -453,6 +480,12 @@ fn classify(body: &[u8]) -> Result<Action, &'static str> {
     }
 }
 
+/// S3 sends `{"Event":"s3:TestEvent",...}` once when a notification is configured. Answering
+/// 400 would make SNS retry it.
+fn is_test_event(v: &Value) -> bool {
+    v.get("Event").and_then(Value::as_str) == Some("s3:TestEvent")
+}
+
 /// Whether `v` is an S3 event with at least one ObjectCreated record (`eventName` is
 /// `ObjectCreated:Put` in a delivered event; `s3:` before it is accepted too).
 fn is_object_created(v: &Value) -> bool {
@@ -470,7 +503,7 @@ fn is_object_created(v: &Value) -> bool {
 async fn confirm(st: &State_, url: String, topic: String) -> Response {
     if let Err(reason) = check_subscribe_url(&url) {
         tracing::warn!(target: "buckwal::notify", reason, "sns confirmation refused");
-        return reply(StatusCode::BAD_REQUEST, "SubscribeURL refused\n");
+        return bad_request("SubscribeURL refused\n");
     }
     let fetch = st.fetch.clone();
     let done = tokio::task::spawn_blocking(move || fetch.get(&url)).await;
@@ -528,5 +561,35 @@ fn check_subscribe_url(url: &str) -> Result<(), &'static str> {
         Ok(())
     } else {
         Err("the URL parser reads another host")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Boxed(&'static str, Option<Box<Boxed>>);
+    impl std::fmt::Display for Boxed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Boxed {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    #[test]
+    fn only_the_limit_error_is_413() {
+        let limit = Boxed("length limit exceeded", None);
+        assert_eq!(read_error_status(&limit), StatusCode::PAYLOAD_TOO_LARGE);
+        let wrapped = Boxed("body error", Some(Box::new(limit)));
+        assert_eq!(read_error_status(&wrapped), StatusCode::PAYLOAD_TOO_LARGE);
+        let gone = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert_eq!(read_error_status(&gone), StatusCode::BAD_REQUEST);
+        let other = Boxed("body error", Some(Box::new(Boxed("closed", None))));
+        assert_eq!(read_error_status(&other), StatusCode::BAD_REQUEST);
     }
 }

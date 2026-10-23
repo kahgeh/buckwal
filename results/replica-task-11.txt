@@ -32,3 +32,29 @@ serve unchanged: results/replica-task-11-server-before.txt vs -after.txt (cargo 
 sorted per-test lines). The diff holds only added lines (new notify tests and the extra test binary's summary).
 $ ./scripts/test.sh unit   -> fmt, clippy -D warnings, all tests pass (rc=0)
 Cargo.lock: unchanged (reqwest moved from dev-dependencies to dependencies of buckwal-server; already locked).
+
+Review fixes (round 2): read_body 413 only for the limit error (else 400), s3:TestEvent acknowledged (200, no wake),
+400s logged at DEBUG with reason, from_std failure returned by serve. New tests written together with the fixes (no separate RED run).
+$ cargo test --locked -p buckwal-server --test notify
+test config_from_lookup_rules ... ok
+test non_loopback_without_tls_and_token_refused_at_bind ... ok
+test loopback_without_token_accepted ... ok
+test a_400_is_logged_at_debug_with_its_reason_and_not_the_body ... ok
+test sns_basic_auth_wakes ... ok
+test missing_token_401_and_no_wake ... ok
+test bearer_token_wakes ... ok
+test s3_event_body_wakes_once ... ok
+test sns_confirmation_fetch_failure_is_502_not_a_panic ... ok
+test s3_test_event_is_acknowledged_without_a_wake ... ok
+test sns_confirmation_on_host_fetches ... ok
+test token_never_in_logs ... ok
+test http_fetch_checks_status_and_does_not_follow_redirects ... ok
+test wrong_token_401_and_no_wake ... ok
+test malformed_body_400_no_wake ... ok
+test sns_confirmation_off_host_refused ... ok
+test oversize_body_413_no_wake ... ok
+test a_client_that_leaves_mid_body_wakes_nothing_and_changes_nothing ... ok
+test https_with_token_wakes ... ok
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ ./scripts/test.sh unit -> exit 0 (fmt, clippy -D warnings, all tests)
+Test list diff before/after: additions only, plus the lib unit-test count 81 -> 82 on the summary line (one new unit test).

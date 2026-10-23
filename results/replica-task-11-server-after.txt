@@ -1,3 +1,5 @@
+test a_400_is_logged_at_debug_with_its_reason_and_not_the_body ... ok
+test a_client_that_leaves_mid_body_wakes_nothing_and_changes_nothing ... ok
 test auth_required_when_token_set ... ok
 test auth_scheme_is_case_insensitive_and_basic_is_refused ... ok
 test bearer_token_wakes ... ok
@@ -75,6 +77,7 @@ test malformed_body_is_400_proto_error ... ok
 test missing_token_401_and_no_wake ... ok
 test non_finite_floats_are_null_and_blobs_unpadded ... ok
 test non_loopback_without_tls_and_token_refused_at_bind ... ok
+test notify::tests::only_the_limit_error_is_413 ... ok
 test open_error_is_returned_and_the_port_closes ... ok
 test oversize_body_413_no_wake ... ok
 test oversized_body_is_413 ... ok
@@ -96,10 +99,11 @@ test replayed_baton_is_refused_and_does_not_run ... ok
 test request_span_has_no_sql_or_token ... ok
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test s3_event_body_wakes_once ... ok
+test s3_test_event_is_acknowledged_without_a_wake ... ok
 test shutdown_bound_fails_in_flight_rather_than_ack ... ok
 test shutdown_while_opening_waits_for_open_then_closes ... ok
 test sigterm_finishes_in_flight_then_closes ... ok

@@ -701,3 +701,56 @@ fn http_fetch_checks_status_and_does_not_follow_redirects() {
     let e = get("http://127.0.0.1:1/confirm?Token=SECRET-TOKEN-ABC".to_string()).unwrap_err();
     assert!(!e.contains("SECRET-TOKEN-ABC"), "{e}");
 }
+
+#[test]
+fn s3_test_event_is_acknowledged_without_a_wake() {
+    let s = start(Opts::default());
+    let test = json!({"Service":"Amazon S3","Event":"s3:TestEvent","Bucket":"b","RequestId":"r"});
+    assert_eq!(s.post(None, &test), 200);
+    assert_eq!(s.post(None, &sns_notification(&test)), 200);
+    assert_eq!(s.wakes(), 0);
+    // Other events that are not ObjectCreated stay refused.
+    let other = json!({"Event":"s3:Other"});
+    assert_eq!(s.post(None, &other), 400);
+    s.stop();
+}
+
+#[test]
+fn a_400_is_logged_at_debug_with_its_reason_and_not_the_body() {
+    let s = start(Opts::default());
+    let secret = "BODY-SECRET-77aa";
+    let (status, _, _) = s.raw(
+        "/notify",
+        None,
+        format!("{{\"x\":\"{secret}\"}}").as_bytes(),
+    );
+    assert_eq!(status, 400);
+    let all = capture().0.lock().unwrap().clone();
+    let mine: Vec<&Rec> = all
+        .iter()
+        .filter(|r| {
+            r.get("message").map(String::as_str) == Some("notification request refused with 400")
+        })
+        .collect();
+    assert!(
+        mine.iter()
+            .any(|r| r["reason"] == "not an S3 ObjectCreated event"),
+        "{mine:?}"
+    );
+    assert!(!format!("{all:?}").contains(secret));
+    s.stop();
+}
+
+#[test]
+fn a_client_that_leaves_mid_body_wakes_nothing_and_changes_nothing() {
+    let s = start(Opts::default());
+    let mut c = TcpStream::connect(s.addr).unwrap();
+    let _ = c.write_all(
+        b"POST /notify HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n{\"Records\":",
+    );
+    drop(c);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(s.wakes(), 0);
+    assert_eq!(s.post(None, &s3_event(&["head"])), 200, "still serving");
+    s.stop();
+}
