@@ -1634,6 +1634,9 @@ fn take_over_raises_the_epoch_with_the_new_writer_in_the_same_generation() {
     let want = Head {
         writer_id: "w2".into(),
         epoch: old.epoch + 1,
+        // One above the highest generation the old writer could seal into (2): its first seal
+        // moves the head to 3.
+        next_generation_floor: Some(3),
         ..old.clone()
     };
     assert_eq!(h, want);
@@ -2324,10 +2327,11 @@ fn object_events(events: &[String]) -> Vec<String> {
 /// Old writer A (lease 200 ms, one PUT at a time) seals generation 1, and its next PUT of a
 /// key containing `held` is held after its lease check, as if A were paused (SIGSTOP) right
 /// before the send. Meanwhile B takes over (`take_over`, then `append_fence`, which lands
-/// right after A's seal-start record), waits out its quiet and seals generation 1 itself,
-/// with other page bodies and page count, publishing its head. Then A's PUT goes on. It must
-/// fail its condition and leave B's `pages/1/*` and `manifest/1` byte-identical; A's seal
-/// ends `Fenced`.
+/// right after A's seal-start record), waits out its quiet and seals itself, with other page
+/// bodies and page count, publishing its head. B's first seal skips a generation: head 3,
+/// objects under generation 2, none under A's generation 1. Then A's PUT goes on: it can only
+/// land on a key under generation 1, which nothing references, and leaves B's `pages/2/*` and
+/// `manifest/2` byte-identical; A's seal ends `Fenced`.
 fn stale_writers_late_put_is_refused(held: &str) {
     let f = Fixture::new();
     let hold = Arc::new(HoldStore::new(f.mem.clone()));
@@ -2335,7 +2339,8 @@ fn stale_writers_late_put_is_refused(held: &str) {
     a.set_lease(Duration::from_millis(200));
     a.append_log(LogFile::Wal, syncs(1)).unwrap();
     let (held_rx, go) = hold.hold_next_put(held);
-    std::thread::scope(|s| {
+    // Nothing is asserted inside the scope: a failure would leave A's PUT held for ever.
+    let (a_result, a, key, published, after, sealed_b, fence_in_flight) = std::thread::scope(|s| {
         let a_seal = s.spawn(move || {
             let r = a.seal_generation(pages_of(2, 0xA), 4096, 2);
             (r, a)
@@ -2346,38 +2351,53 @@ fn stale_writers_late_put_is_refused(held: &str) {
         take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
         let mut b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
         let fo = b.append_fence().unwrap();
-        assert!(
-            fo.seal_may_be_in_flight,
-            "B's fence follows A's seal-start record"
-        );
         let quiet = Duration::from_millis(300);
         b.set_seal_not_before(1, Instant::now() + quiet);
         b.append_log(LogFile::Wal, syncs(2)).unwrap();
-        assert_eq!(b.seal_generation(pages_of(3, 0xB), 4096, 3), Ok(2));
-        let published = sealed(&f.mem, 1);
+        let sealed_b = b.seal_generation(pages_of(3, 0xB), 4096, 3);
+        let published = sealed(&f.mem, 2);
         go.send(()).unwrap();
         let (r, a) = a_seal.join().unwrap();
-        let after = sealed(&f.mem, 1);
-        assert!(
-            after == published,
-            "A's late PUT of {key} overwrote B's seal of generation 1: {:?}",
-            hold.outcomes()
-        );
-        let outcomes = hold.outcomes();
-        assert!(
-            matches!(&outcomes[..], [o] if o.ends_with(": 412")),
-            "A's held PUT must fail its condition: {outcomes:?}"
-        );
-        assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
-        assert!(a.degraded(), "A is fenced for good");
+        let after = sealed(&f.mem, 2);
+        (
+            r,
+            a,
+            key,
+            published,
+            after,
+            sealed_b,
+            fo.seal_may_be_in_flight,
+        )
     });
+    assert!(fence_in_flight, "B's fence follows A's seal-start record");
+    assert_eq!(sealed_b, Ok(3), "the head goes to 3");
+    assert!(
+        after == published,
+        "A's late PUT of {key} overwrote B's seal of generation 2: {:?}",
+        hold.outcomes()
+    );
+    let outcomes = hold.outcomes();
+    assert!(
+        matches!(&outcomes[..], [o] if o.contains(": stored")),
+        "A's held PUT lands on its own, unreferenced key: {outcomes:?}"
+    );
+    assert!(key.contains("/1/") || key.contains("0000000001"), "{key}");
+    assert!(matches!(a_result, Err(Error::Fenced(_))), "{a_result:?}");
+    assert!(a.degraded(), "A is fenced for good");
     for p in 1..=3 {
-        assert_eq!(f.body(&keys().page(1, p)), Some(vec![0xB; 16]), "page {p}");
+        assert_eq!(f.body(&keys().page(2, p)), Some(vec![0xB; 16]), "page {p}");
     }
-    let m = Manifest::decode(&f.body(&keys().manifest(1)).unwrap()).unwrap();
+    let m = Manifest::decode(&f.body(&keys().manifest(2)).unwrap()).unwrap();
     assert_eq!(m.page_count, 3);
+    assert_eq!(
+        m.pages.values().collect::<BTreeSet<_>>(),
+        BTreeSet::from([&2])
+    );
     let head = f.stored_head();
-    assert_eq!((head.writer_id.as_str(), head.generation), ("w2", 2));
+    assert_eq!(
+        (head.writer_id.as_str(), head.generation, head.manifest),
+        ("w2", 3, Some(2))
+    );
 }
 
 /// A stale writer's page PUT, held between its lease check and its send until a new writer
@@ -2554,17 +2574,20 @@ fn a_seal_finding_its_own_page_overwritten_checks_the_head_first() {
     }
 }
 
-/// Pins a known, documented limit, not desired behaviour (the residual at
-/// `Bucket::seal_put_step`). On a store whose ETags depend only on the body, as a single-part
-/// PUT's MD5 ETag does on S3 and RustFS, old writer A's late `put_if_match` lands over new
-/// writer B's published page when A was paused longer than the takeover quiet between its
-/// lease check and the send, and B's page is byte-identical to the one A conditioned on.
+/// The residual at `Bucket::seal_put_step`, closed by the skipped generation. On a store whose
+/// ETags depend only on the body, as a single-part PUT's MD5 ETag does on S3 and RustFS, old
+/// writer A's late `put_if_match` lands over whatever sits at its key when A was paused longer
+/// than the takeover quiet between its lease check and the send, and the object there is
+/// byte-identical to the one A conditioned on.
 ///
 /// A's first seal attempt uploads page 1 as bytes X and fails at its manifest, so A holds X's
 /// ETag. A's second attempt, with other bytes, sends `put_if_match` on it and is held. B takes
-/// over and seals generation 1 with page 1 = X (the same ETag). Released, A's PUT succeeds.
+/// over and seals with page 1 = X. B's seal moves the head to generation 3 and writes under
+/// generation 2, not under A's generation 1, so A's late PUT, released, lands on a key nothing
+/// references: B's objects are untouched, and the manifest B published maps its pages to
+/// generation 2, so a restore holds B's rows.
 #[test]
-fn residual_content_equal_etag_lets_a_stale_put_through() {
+fn late_put_cannot_replace_new_writers_page() {
     let mem = Arc::new(MemStore::with_content_etags());
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let f = Fixture { mem, fault };
@@ -2589,23 +2612,45 @@ fn residual_content_equal_etag_lets_a_stale_put_through() {
         b.set_seal_not_before(1, Instant::now() + quiet);
         b.append_log(LogFile::Wal, syncs(2)).unwrap();
         let b_pages = vec![(1, vec![0xA; 16]), (2, vec![0xB; 16])];
-        assert_eq!(b.seal_generation(b_pages, 4096, 2), Ok(2));
-        assert_eq!(f.body(&k.page(1, 1)), Some(vec![0xA; 16]), "B's page 1");
+        // Nothing is asserted until A's PUT is released (a failure would leave it held).
+        let sealed = b.seal_generation(b_pages, 4096, 2);
         go.send(()).unwrap();
         let r = a_seal.join().unwrap();
         assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+        assert_eq!(sealed, Ok(3), "the head skips 2");
     });
     assert_eq!(
         hold.outcomes(),
         [format!("put_if_match {}: stored", k.page(1, 1))],
-        "the residual: A's late PUT matched B's content-equal ETag"
+        "A's late PUT matched its own content-equal ETag, on its own key"
     );
     assert_eq!(
         f.body(&k.page(1, 1)),
         Some(vec![0xC; 16]),
-        "A's bytes now sit under B's published seal"
+        "A's key, unreferenced"
     );
-    assert_eq!(f.stored_head().writer_id, "w2");
+    assert_eq!(
+        f.body(&k.page(2, 1)),
+        Some(vec![0xA; 16]),
+        "B's page 1 untouched"
+    );
+    assert_eq!(
+        f.body(&k.page(2, 2)),
+        Some(vec![0xB; 16]),
+        "B's page 2 untouched"
+    );
+    let h = f.stored_head();
+    assert_eq!(
+        (h.writer_id.as_str(), h.generation, h.manifest),
+        ("w2", 3, Some(2))
+    );
+    assert_eq!(h.next_generation_floor, Some(3), "the head keeps the floor");
+    let m = Manifest::decode(&f.body(&k.manifest(2)).unwrap()).unwrap();
+    assert_eq!(
+        m.pages,
+        BTreeMap::from([(1, 2), (2, 2)]),
+        "B's manifest maps B's pages"
+    );
 }
 
 /// A store over a `MemStore` that answers every PUT of `key` with a 412 and changes that key's

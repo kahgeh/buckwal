@@ -1360,13 +1360,15 @@ fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
     let sealed = ctx.head();
     assert_eq!(
         (sealed.generation, sealed.manifest.is_some()),
-        (gen + 1, true),
-        "B sealed generation {gen}: {sealed:?}"
+        (gen + 2, true),
+        "B's first seal after the takeover skips a generation: {sealed:?}"
     );
+    // B's seal wrote its objects under G+1, not under A's generation G.
+    let key_gen = gen + 1;
     let store = ctx.store();
     let sealed_objects = || {
-        let mut keys = ctx.list(&format!("pages/{gen:010}/"));
-        keys.push(format!("{}/manifest/{gen:010}", ctx.prefix()));
+        let mut keys = ctx.list(&format!("pages/{key_gen:010}/"));
+        keys.push(format!("{}/manifest/{key_gen:010}", ctx.prefix()));
         keys.push(format!("{}/head", ctx.prefix()));
         keys.into_iter()
             .map(|k| {
@@ -1401,6 +1403,78 @@ fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
         "idle_old_writer_closing_after_claim_and_seal_loses_nothing: A's close {closed:?}; \
          acked={} {}",
         v.acked, v.restored
+    );
+}
+
+/// Item 1 end to end: old writer A is stopped (SIGSTOP) in the middle of a seal, its page PUTs
+/// slowed; B takes over and seals, which moves the head two generations (B's pages and manifest
+/// go under G+1, never under A's G). Resumed (SIGCONT), A's late PUTs can only land on keys under
+/// G, which nothing references: every object B's seal wrote is byte-identical afterwards, and
+/// the restore holds every row either writer acked.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn late_put_from_fenced_writer_lands_on_unreferenced_key() {
+    let ctx = short_lease_ctx("late_put_from_fenced_writer_lands_on_unreferenced_key");
+    let a = ctx.dir("a");
+    let mut soak = Soak::spawn(
+        &ctx,
+        &a,
+        &[
+            "--checkpoint",
+            "passive",
+            "--every",
+            "160",
+            "--page-put-delay-ms",
+            "2000",
+        ],
+    );
+    soak.wait_line("event seal-started");
+    soak.signal("STOP");
+    let before = ctx.head();
+    let b = ctx.dir("b");
+    takeover(&ctx, &b, &before);
+    let rows = insert_rows(
+        &ctx,
+        &b,
+        100001..=100010,
+        &["PRAGMA wal_checkpoint(TRUNCATE)"],
+    );
+    let head = ctx.head();
+    assert_eq!(
+        head.generation,
+        before.generation + 2,
+        "B's first seal skips a generation: {before:?} then {head:?}"
+    );
+    let key_gen = before.generation + 1;
+    let store = ctx.store();
+    let sealed_objects = || {
+        let mut keys = ctx.list(&format!("pages/{key_gen:010}/"));
+        keys.push(format!("{}/manifest/{key_gen:010}", ctx.prefix()));
+        keys.push(format!("{}/head", ctx.prefix()));
+        keys.into_iter()
+            .map(|k| {
+                let body = store.get(&k).expect("get").map(|o| o.body);
+                (k, body)
+            })
+            .collect::<Vec<_>>()
+    };
+    let sealed = sealed_objects();
+    assert!(sealed.len() > 2, "B's seal wrote pages: {sealed:?}");
+    soak.signal("CONT");
+    std::thread::sleep(Duration::from_secs(6));
+    soak.kill();
+    assert_eq!(
+        sealed_objects(),
+        sealed,
+        "A's late PUTs changed B's seal (generation {key_gen})"
+    );
+    let mut lines = soak.lines.clone();
+    lines.extend(rows);
+    let v = restore_verify(&ctx, &lines);
+    eprintln!(
+        "late_put_from_fenced_writer_lands_on_unreferenced_key: generation {} then {}; \
+         acked={} {}",
+        before.generation, head.generation, v.acked, v.restored
     );
 }
 

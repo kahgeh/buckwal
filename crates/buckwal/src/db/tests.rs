@@ -953,9 +953,10 @@ fn old_writer_after_claim_and_seal(
     cb.close().unwrap();
     db_b.close().unwrap();
     let h = head(&*store);
+    // B took G over, so its first seal skips a generation: head G+2, objects under G+1.
     assert_eq!(
         (h.generation, h.manifest),
-        (gen + 1, Some(gen)),
+        (gen + 2, Some(gen + 1)),
         "B sealed G"
     );
     if trim {
@@ -964,7 +965,11 @@ fn old_writer_after_claim_and_seal(
         assert!(log_seqs(&*store, gen).is_empty(), "log/G trimmed");
     }
     let before = bucket_objects(&store);
-    assert!(!sealed_objects(&before, gen).is_empty());
+    assert!(!sealed_objects(&before, gen + 1).is_empty());
+    assert!(
+        sealed_objects(&before, gen).is_empty(),
+        "B wrote nothing under G"
+    );
 
     let r = old_writer(db_a, ca);
     assert!(
@@ -985,10 +990,13 @@ fn old_writer_after_claim_and_seal(
             .cloned()
             .collect::<Vec<_>>()
     };
-    let g_changed = changed(&sealed_objects(&before, gen), &sealed_objects(&after, gen));
+    let g_changed = changed(
+        &sealed_objects(&before, gen + 1),
+        &sealed_objects(&after, gen + 1),
+    );
     assert!(
         g_changed.is_empty(),
-        "pages/G/* and manifest/G differ from B's seal: {g_changed:?}"
+        "pages/G+1/* and manifest/G+1 differ from B's seal: {g_changed:?}"
     );
     let mut all_changed = changed(&before, &after);
     if trim {
@@ -1069,8 +1077,8 @@ fn idle_old_writer_appending_into_trimmed_log_is_fenced() {
     let h = head(&*store);
     assert_eq!(
         (h.generation, h.manifest),
-        (gen + 1, Some(gen)),
-        "B sealed G"
+        (gen + 2, Some(gen + 1)),
+        "B sealed G, skipping a generation"
     );
     let (_, m) = crate::engine::tests::manifest(&*store);
     crate::trim::trim_once(&*store, &keys(), &h, Some(&m)).unwrap();
@@ -2084,13 +2092,17 @@ fn old_writer_page_puts_in_flight_cannot_overwrite_the_new_seal() {
     }
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
     let sealed_after = took.elapsed();
-    assert_eq!(head(&*store).generation, gen + 1, "B sealed G");
-    let first = sealed_objects(&bucket_objects(&store), gen);
+    assert_eq!(
+        head(&*store).generation,
+        gen + 2,
+        "B sealed G, skipping a generation"
+    );
+    let first = sealed_objects(&bucket_objects(&store), gen + 1);
     assert!(!first.is_empty());
 
     let (a_result, ca, db_a) = a_seal.join().unwrap();
     std::thread::sleep(Duration::from_millis(600));
-    let second = sealed_objects(&bucket_objects(&store), gen);
+    let second = sealed_objects(&bucket_objects(&store), gen + 1);
     let changed = changed_keys(&first, &second);
     assert!(
         changed.is_empty(),
@@ -2138,7 +2150,8 @@ fn takeover_after_a_commit_has_no_quiet() {
     let cb = db_b.connect().unwrap();
     insert(&cb, 1001).unwrap();
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
-    assert_eq!(head(&*store).generation, rep.generation + 1);
+    // B took the generation over, so its first seal skips one.
+    assert_eq!(head(&*store).generation, rep.generation + 2);
     assert_eq!(seal_quiets(&seen), vec![]);
     crash(db_a, vec![ca]);
     cb.close().unwrap();
@@ -2219,7 +2232,8 @@ fn crash_after_the_fence_keeps_the_quiet() {
     insert(&c, 1001).unwrap();
     c.checkpoint(CheckpointMode::Truncate).unwrap();
     let sealed = now_ms();
-    let gen = head(&*store).generation - 1;
+    // The takeover's first seal moves the head two generations: it sealed G, the head's - 2.
+    let gen = head(&*store).generation - 2;
     assert!(
         sealed >= deadline,
         "the seal of {gen} ended at {sealed}, before the quiet's end {deadline}"
@@ -2273,13 +2287,17 @@ fn stale_writers_late_put_after_the_new_seal(batching: crate::Batching, held: &s
         insert_kb(&cb, id);
     }
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
-    assert_eq!(head(&*store).generation, gen + 1, "B sealed G");
-    let published = sealed_objects(&bucket_objects(&store), gen);
+    assert_eq!(
+        head(&*store).generation,
+        gen + 2,
+        "B sealed G, skipping a generation"
+    );
+    let published = sealed_objects(&bucket_objects(&store), gen + 1);
     assert!(!published.is_empty());
 
     go.send(()).unwrap();
     let (a_result, ca, db_a) = a_seal.join().unwrap();
-    let after = sealed_objects(&bucket_objects(&store), gen);
+    let after = sealed_objects(&bucket_objects(&store), gen + 1);
     let changed = changed_keys(&published, &after);
     assert!(
         changed.is_empty(),
@@ -2289,8 +2307,9 @@ fn stale_writers_late_put_after_the_new_seal(batching: crate::Batching, held: &s
     );
     let outcomes = hold.outcomes();
     assert!(
-        matches!(&outcomes[..], [o] if o.ends_with(": 412")),
-        "{batching:?}: A's held PUT must fail its condition: {outcomes:?}"
+        matches!(&outcomes[..], [o] if o.ends_with(": stored")),
+        "{batching:?}: A's held PUT lands on its own key under G, which nothing references: \
+         {outcomes:?}"
     );
     assert!(
         matches!(a_result, Err(Error::Fenced(_))),
@@ -2343,9 +2362,13 @@ fn a_crash_of_the_new_writer_mid_seal_resumes_over_its_own_leftovers() {
     let r = cb.checkpoint(CheckpointMode::Truncate);
     assert!(r.is_err(), "{r:?}");
     let k = keys();
-    let leftovers = store.list(&format!("{}{gen:010}/", k.page_root())).unwrap();
-    assert!(!leftovers.is_empty(), "B's pages of {gen} landed");
-    assert!(store.get(&k.manifest(gen)).unwrap().is_none());
+    // B took G over, so its seal's objects go under G+1.
+    let key_gen = gen + 1;
+    let leftovers = store
+        .list(&format!("{}{key_gen:010}/", k.page_root()))
+        .unwrap();
+    assert!(!leftovers.is_empty(), "B's pages of {key_gen} landed");
+    assert!(store.get(&k.manifest(key_gen)).unwrap().is_none());
     assert_eq!(head(&*store).generation, gen);
     crash(db_b, vec![cb]);
 
@@ -2461,13 +2484,15 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
     }
     cc.checkpoint(CheckpointMode::Truncate).unwrap();
     let sealed_after = took.elapsed();
-    assert_eq!(head(&*store).generation, gen + 1, "C sealed G");
-    let published = sealed_objects(&bucket_objects(&store), gen);
+    // Two takeovers before the first seal: the floor is G+3, so the seal's objects are
+    // under G+2.
+    assert_eq!(head(&*store).generation, gen + 3, "C sealed G");
+    let published = sealed_objects(&bucket_objects(&store), gen + 2);
     assert!(!published.is_empty());
 
     go.send(()).unwrap();
     let (a_result, ca, db_a) = a_seal.join().unwrap();
-    let after = sealed_objects(&bucket_objects(&store), gen);
+    let after = sealed_objects(&bucket_objects(&store), gen + 2);
     let changed = changed_keys(&published, &after);
     let tag = format!("{batching:?}, B commits: {b_commits}");
     assert!(
@@ -2480,8 +2505,8 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
     );
     let outcomes = hold.outcomes();
     assert!(
-        matches!(&outcomes[..], [o] if o.ends_with(": 412")),
-        "{tag}: A's held PUT must fail its condition: {outcomes:?}"
+        matches!(&outcomes[..], [o] if o.ends_with(": stored")),
+        "{tag}: A's held PUT lands on its own key under G, which nothing references: {outcomes:?}"
     );
     assert!(
         matches!(a_result, Err(Error::Fenced(_))),
@@ -2650,13 +2675,17 @@ fn forward_wall_step_between_takeover_and_open(batching: crate::Batching) {
     }
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
     let sealed_after = took.elapsed();
-    assert_eq!(head(&*store).generation, gen + 1, "B sealed G");
-    let published = sealed_objects(&bucket_objects(&store), gen);
+    assert_eq!(
+        head(&*store).generation,
+        gen + 2,
+        "B sealed G, skipping a generation"
+    );
+    let published = sealed_objects(&bucket_objects(&store), gen + 1);
     assert!(!published.is_empty());
 
     go.send(()).unwrap();
     let (a_result, ca, db_a) = a_seal.join().unwrap();
-    let after = sealed_objects(&bucket_objects(&store), gen);
+    let after = sealed_objects(&bucket_objects(&store), gen + 1);
     let changed = changed_keys(&published, &after);
     let outcomes = hold.outcomes();
     eprintln!(
@@ -2673,8 +2702,9 @@ fn forward_wall_step_between_takeover_and_open(batching: crate::Batching) {
         "{batching:?}: A's late PUT of {key} overwrote B's seal of generation {gen}: {changed:?}"
     );
     assert!(
-        matches!(&outcomes[..], [o] if o.ends_with(": 412")),
-        "{batching:?}: A's held PUT must fail its condition: {outcomes:?}"
+        matches!(&outcomes[..], [o] if o.ends_with(": stored")),
+        "{batching:?}: A's held PUT lands on its own key under G, which nothing references: \
+         {outcomes:?}"
     );
     assert!(
         matches!(a_result, Err(Error::Fenced(_))),
@@ -4152,4 +4182,293 @@ fn every_head_carries_the_writers_timeouts() {
     let db = open_with_store(timeouts_config(a.path(), 350, 550), store.clone()).unwrap();
     assert_eq!(own(&head(&*store)), (Some(350), Some(550)), "raise at open");
     db.close().unwrap();
+}
+
+// ---- Item 1: a takeover's first seal skips a generation ----
+
+/// A copy of `from`'s files (not its lock) in a new directory: the disk of a crashed process.
+fn copy_disk(from: &Path) -> TempDir {
+    let to = tempdir();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() && e.file_name() != "durable.lock" {
+            std::fs::copy(e.path(), to.path().join(e.file_name())).unwrap();
+        }
+    }
+    to
+}
+
+/// Writer A creates `t`, commits `1..=n` and crashes.
+fn crashed_writer_a(store: &Arc<MemStore>, n: i64) -> TempDir {
+    let a = tempdir();
+    let db = open_mem(store, a.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=n {
+        insert(&c, id).unwrap();
+    }
+    crash(db, vec![c]);
+    a
+}
+
+/// `takeover_with_store` into `<holder>/db`, then a writer open of it.
+fn takeover_and_open(
+    store: &Arc<MemStore>,
+    holder: &TempDir,
+) -> (Database, Connection, crate::TakeoverReport) {
+    let dir = fresh(holder);
+    let rep = crate::takeover_with_store(config(&dir), store.clone()).unwrap();
+    let db = open_with_store(config(&dir), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    (db, c, rep)
+}
+
+fn log_gens(store: &MemStore) -> BTreeSet<u64> {
+    store
+        .list(&keys().log_root())
+        .unwrap()
+        .iter()
+        .filter_map(|k| keys().parse_log(k))
+        .map(|(g, _)| g)
+        .collect()
+}
+
+/// The generations holding page and manifest objects.
+fn sealed_gens(store: &MemStore) -> BTreeSet<u64> {
+    let k = keys();
+    let mut gens = BTreeSet::new();
+    for key in store.list(&k.page_root()).unwrap() {
+        gens.extend(k.parse_page(&key).map(|(g, _)| g));
+    }
+    for key in store.list(&k.manifest_root()).unwrap() {
+        gens.extend(k.parse_manifest(&key));
+    }
+    gens
+}
+
+/// A commits 1..=5 and crashes; B takes over, commits 1001..=1005 and seals (the skip seal),
+/// then crashes. Returns the generation A left, B's directory holder, and its rows.
+fn skip_sealed(store: &Arc<MemStore>) -> (u64, TempDir, Vec<i64>) {
+    let _a = crashed_writer_a(store, 5);
+    let g = head(&**store).generation;
+    let tb = tempdir();
+    let (db, c, _) = takeover_and_open(store, &tb);
+    for id in 1001..=1005 {
+        insert(&c, id).unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let mut want: Vec<i64> = (1..=5).collect();
+    want.extend(1001..=1005);
+    crash(db, vec![c]);
+    (g, tb, want)
+}
+
+/// The skipped generation across everything that reads a bucket: B's takeover head carries the
+/// floor (G+2) and so does the local state; B's first seal writes `pages/G+1`, `manifest/G+1` and
+/// moves the head to G+2 (no `log/G+1` ever); the log of G+2 starts after it. Then a restore, a
+/// verify (read-only open), GC (A's leftovers under G go), a reconcile of a disk one seal behind,
+/// and a second takeover all work across the head that went up by 2.
+#[test]
+fn skipped_generation_restore_verify_gc_maintenance_reconcile_second_takeover() {
+    let store = mem();
+    let _a = crashed_writer_a(&store, 5);
+    let g = head(&*store).generation;
+    let tb = tempdir();
+    let (db_b, cb, rep) = takeover_and_open(&store, &tb);
+    assert_eq!(rep.generation, g);
+    let b_dir = fresh(&tb);
+    let h = head(&*store);
+    assert_eq!((h.generation, h.manifest), (g, None), "{h:?}");
+    assert_eq!(h.next_generation_floor, Some(g + 2), "the takeover's head");
+    assert_eq!(
+        state(&b_dir).next_generation_floor,
+        g + 2,
+        "the local state"
+    );
+    for id in 1001..=1005 {
+        insert(&cb, id).unwrap();
+    }
+    // What A's seal of G leaves if it got as far as pages and a manifest.
+    let k = keys();
+    store.put(&k.page(g, 1), b"A's page").unwrap();
+    let leftover = crate::format::Manifest {
+        page_size: 4096,
+        page_count: 1,
+        pages: BTreeMap::from([(1, g)]),
+    };
+    store.put(&k.manifest(g), &leftover.encode()).unwrap();
+    let disk = copy_disk(&b_dir);
+
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    let h = head(&*store);
+    assert_eq!(
+        (h.generation, h.manifest, h.next_generation_floor),
+        (g + 2, Some(g + 1), Some(g + 2)),
+        "{h:?}"
+    );
+    assert_eq!(state(&b_dir).generation, g + 2);
+    assert!(log_seqs(&*store, g + 1).is_empty(), "no log/G+1 ever");
+    let all = bucket_objects(&store);
+    assert!(
+        !sealed_objects(&all, g + 1).is_empty(),
+        "B's seal is under G+1"
+    );
+    assert_eq!(
+        store.get(&k.page(g, 1)).unwrap().unwrap().body,
+        b"A's page",
+        "B wrote nothing under G"
+    );
+    insert(&cb, 1006).unwrap();
+    assert!(
+        !log_seqs(&*store, g + 2).is_empty(),
+        "the log goes on at G+2"
+    );
+    let mut want: Vec<i64> = (1..=5).collect();
+    want.extend(1001..=1006);
+
+    // GC trims against B's manifest and removes A's leftovers under G.
+    let pass = crate::gc::gc_once(&*store, &k, Duration::ZERO, None).unwrap();
+    assert_eq!(pass.trimmed_against, Some(g + 1), "{pass:?}");
+    assert!(store.get(&k.page(g, 1)).unwrap().is_none(), "A's page");
+    assert!(store.get(&k.manifest(g)).unwrap().is_none(), "A's manifest");
+    assert!(log_seqs(&*store, g).is_empty(), "log/G");
+    // Restore, and verify (a read-only open).
+    assert_eq!(restored_ids(&store), want);
+
+    // A disk one seal behind (the crash between the seal's head and the local state):
+    // its generation is G, the head is G+2 naming manifest G+1.
+    let db_c = open_with_store(config(disk.path()), store.clone()).unwrap();
+    assert_eq!(
+        db_c.shared.reconciled,
+        Some(Reconciled::NewGeneration),
+        "reconcile accepts the skip seal's head"
+    );
+    let cc = db_c.connect().unwrap();
+    assert_eq!(ids(&cc), want);
+    crash(db_c, vec![cc]);
+    crash(db_b, vec![cb]);
+
+    // A second takeover over the skipped head: the floor goes up again, and its seal skips.
+    let tc = tempdir();
+    let (db_d, cd, rep) = takeover_and_open(&store, &tc);
+    assert_eq!(rep.generation, g + 2);
+    assert_eq!(head(&*store).next_generation_floor, Some(g + 4));
+    insert(&cd, 2001).unwrap();
+    cd.checkpoint(CheckpointMode::Truncate).unwrap();
+    let h = head(&*store);
+    assert_eq!((h.generation, h.manifest), (g + 4, Some(g + 3)), "{h:?}");
+    assert!(log_seqs(&*store, g + 3).is_empty());
+    want.push(2001);
+    assert_eq!(restored_ids(&store), want);
+    crash(db_d, vec![cd]);
+}
+
+/// Two takeovers before the first seal: the second raises the floor past the first's, so the
+/// seal skips both earlier writers' generations.
+#[test]
+fn two_takeovers_before_first_seal_skip_both() {
+    let store = mem();
+    let _a = crashed_writer_a(&store, 5);
+    let g = head(&*store).generation;
+    let tb = tempdir();
+    let (db_b, cb, _) = takeover_and_open(&store, &tb);
+    assert_eq!(head(&*store).next_generation_floor, Some(g + 2));
+    insert(&cb, 500).unwrap();
+    crash(db_b, vec![cb]);
+    let tc = tempdir();
+    let (db_c, cc, rep) = takeover_and_open(&store, &tc);
+    assert_eq!(rep.generation, g);
+    assert_eq!(head(&*store).next_generation_floor, Some(g + 3));
+    insert(&cc, 600).unwrap();
+    cc.checkpoint(CheckpointMode::Truncate).unwrap();
+    let h = head(&*store);
+    assert_eq!((h.generation, h.manifest), (g + 3, Some(g + 2)), "{h:?}");
+    assert_eq!(
+        sealed_gens(&store),
+        BTreeSet::from([g + 2]),
+        "nothing under G or G+1"
+    );
+    assert!(!log_gens(&store).contains(&(g + 1)) && !log_gens(&store).contains(&(g + 2)));
+    let mut want: Vec<i64> = (1..=5).collect();
+    want.extend([500, 600]);
+    assert_eq!(restored_ids(&store), want);
+    crash(db_c, vec![cc]);
+}
+
+/// A restart between the takeover and the first seal keeps the floor: in the local state, and
+/// the first seal after the restart still skips.
+#[test]
+fn restart_between_takeover_and_first_seal_keeps_floor() {
+    let store = mem();
+    let _a = crashed_writer_a(&store, 5);
+    let g = head(&*store).generation;
+    let tb = tempdir();
+    let dir = fresh(&tb);
+    crate::takeover_with_store(config(&dir), store.clone()).unwrap();
+    assert_eq!(
+        state(&dir).next_generation_floor,
+        g + 2,
+        "after the takeover"
+    );
+    let db = open_with_store(config(&dir), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    insert(&c, 1001).unwrap();
+    let disk = copy_disk(&dir);
+    crash(db, vec![c]);
+
+    let db = open_with_store(config(disk.path()), store.clone()).unwrap();
+    assert_eq!(
+        state(disk.path()).next_generation_floor,
+        g + 2,
+        "after the restart"
+    );
+    let c = db.connect().unwrap();
+    insert(&c, 1002).unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let h = head(&*store);
+    assert_eq!((h.generation, h.manifest), (g + 2, Some(g + 1)), "{h:?}");
+    assert_eq!(sealed_gens(&store), BTreeSet::from([g + 1]));
+    let mut want: Vec<i64> = (1..=5).collect();
+    want.extend([1001, 1002]);
+    assert_eq!(restored_ids(&store), want);
+    crash(db, vec![c]);
+}
+
+/// A previous build (formats 1 and 2 only, unaware of the new head fields) reads the skip
+/// seal's head, and its restore (head's manifest, then `log/<head generation>`) follows G+2 to
+/// manifest G+1. It keeps writing too: with the new fields gone from the head, a writer's next
+/// seal is an ordinary one.
+#[test]
+fn previous_build_restores_from_new_head() {
+    use crate::format::{FORMAT, FORMAT_V2};
+    let store = mem();
+    let (g, tb, want) = skip_sealed(&store);
+    let k = keys();
+    let body = store.get(&k.head()).unwrap().unwrap().body;
+    let h = Head::decode_accepting(&body, &[FORMAT, FORMAT_V2]).unwrap();
+    assert_eq!((h.generation, h.manifest), (g + 2, Some(g + 1)), "{h:?}");
+    assert!(store.get(&k.manifest(g + 1)).unwrap().is_some());
+    assert!(log_seqs(&*store, g + 1).is_empty());
+    assert_eq!(restored_ids(&store), want);
+
+    // What the previous build's decode and encode leave: the same head without the fields.
+    let old = Head {
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
+        ..h
+    };
+    store.put(&k.head(), &old.encode()).unwrap();
+    let disk = copy_disk(&fresh(&tb));
+    let db = open_with_store(config(disk.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert_eq!(ids(&c), want);
+    insert(&c, 3001).unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let h = head(&*store);
+    assert_eq!((h.generation, h.manifest), (g + 3, Some(g + 2)), "{h:?}");
+    let mut want = want;
+    want.push(3001);
+    assert_eq!(restored_ids(&store), want);
+    crash(db, vec![c]);
 }

@@ -535,6 +535,16 @@ mod tests {
     }
 
     fn rig_with(deadline_ms: u64, lease: Option<Duration>) -> Rig {
+        rig_build(deadline_ms, lease, false)
+    }
+
+    /// `rig`, after a takeover: writer w2 took the head over from the creating writer w1 and
+    /// appended its fence record, so its first seal skips a generation.
+    fn rig_taken_over() -> Rig {
+        rig_build(2_000, None, true)
+    }
+
+    fn rig_build(deadline_ms: u64, lease: Option<Duration>, taken_over: bool) -> Rig {
         let mem = Arc::new(MemStore::new());
         let gate = Arc::new(GetGate {
             inner: mem.clone(),
@@ -557,6 +567,11 @@ mod tests {
             image,
         )
         .unwrap();
+        if taken_over {
+            crate::bucket::take_over(&*hold, &keys(), &retry(deadline_ms), 2, "w2").unwrap();
+            b = Bucket::attach(hold.clone(), keys(), retry(deadline_ms), 4, "w2", 2).unwrap();
+            b.append_fence().unwrap();
+        }
         if let Some(l) = lease {
             b.set_lease(l);
         }
@@ -1154,6 +1169,91 @@ mod tests {
             "the next append lands after it"
         );
         assert_eq!(r.image(3), r.local_bytes());
+    }
+
+    /// A takeover's seal moves the head to G+2 with its objects under G+1 (`create_sealed`
+    /// leaves G = 2): nothing is written under G, no `log/<G+1>` exists, and the kind-3 records
+    /// of the new generation start in `log/<G+2>`.
+    #[test]
+    fn mvcc_takeover_seal_lands_on_g_plus_2() {
+        let r = rig_taken_over();
+        let f = r.file();
+        write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(kinds(&r.records(2)), [2, 3], "the fence, then the record");
+        assert_eq!(
+            r.up.seal_generation(vec![(1, vec![5u8; 4096])], 4096, 1),
+            Ok(4)
+        );
+        let head =
+            crate::format::Head::decode(&r.mem.get(&keys().head()).unwrap().unwrap().body).unwrap();
+        assert_eq!(
+            (head.generation, head.manifest, head.next_generation_floor),
+            (4, Some(3), Some(4))
+        );
+        assert!(r.mem.get(&keys().page(3, 1)).unwrap().is_some());
+        assert!(r.mem.get(&keys().manifest(3)).unwrap().is_some());
+        assert!(
+            r.mem.get(&keys().page(2, 1)).unwrap().is_none(),
+            "nothing under G"
+        );
+        assert!(
+            r.mem.get(&keys().manifest(2)).unwrap().is_none(),
+            "nothing under G"
+        );
+        assert!(
+            r.records(3).is_empty(),
+            "no log under the skipped generation"
+        );
+        assert_eq!(r.up.generation(), 4);
+        write(&f, &*r.io, (HEADER + 55) as u64, frame(2, 49)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(
+            kinds(&r.records(4)),
+            [3],
+            "kind 3 records start in log/<G+2>"
+        );
+        assert_eq!(r.image(4), r.local_bytes());
+    }
+
+    /// The same with the seal's head reply lost: G+2 is published, and the next sync adopts it
+    /// (it names this writer) before it appends, shipping the whole local log into `log/<G+2>`.
+    #[test]
+    fn mvcc_seal_with_lost_head_reply_adopts_g_plus_2() {
+        let r = rig_taken_over();
+        let f = r.file();
+        write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        write(&f, &*r.io, (HEADER + 55) as u64, frame(2, 49)).unwrap();
+
+        r.fault.only_keys_containing("/head");
+        r.fault.store_then_fail_next_puts(1);
+        r.fault.fail_puts_after(0);
+        assert!(r
+            .up
+            .seal_generation(vec![(1, vec![5u8; 4096])], 4096, 1)
+            .is_err());
+        let head =
+            crate::format::Head::decode(&r.mem.get(&keys().head()).unwrap().unwrap().body).unwrap();
+        assert_eq!(
+            (head.generation, head.manifest),
+            (4, Some(3)),
+            "the head PUT stored"
+        );
+        assert_eq!(r.up.generation(), 2, "its reply was lost");
+        r.heal();
+
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert_eq!(r.up.generation(), 4, "adopted");
+        assert!(
+            r.records(3).is_empty(),
+            "no log under the skipped generation"
+        );
+        let recs = r.records(4);
+        assert_eq!(kinds(&recs), [3]);
+        assert_eq!(r.image(4), r.local_bytes(), "the whole local log");
     }
 
     fn trunc(f: &dyn File, io: &dyn IO, len: u64) {

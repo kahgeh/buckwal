@@ -403,6 +403,7 @@ pub(crate) fn take_over_counted(
         let new = own.stamp(Head {
             writer_id: writer_id.to_string(),
             epoch: head.epoch + 1,
+            next_generation_floor: Some(next_floor(&head)),
             ..head.clone()
         });
         let body = new.encode();
@@ -421,6 +422,13 @@ pub(crate) fn take_over_counted(
             )));
         }
     }
+}
+
+/// The floor a takeover of `replaced` writes: one above the highest generation any earlier
+/// writer could seal into, `max(G + 1, the replaced head's floor) + 1`. The new writer's first
+/// seal moves the head to it and writes its objects under the generation before it.
+pub(crate) fn next_floor(replaced: &Head) -> u64 {
+    (replaced.generation + 1).max(replaced.next_generation_floor.unwrap_or(0)) + 1
 }
 
 /// `take_over_counted`, its extra attempts not counted anywhere.
@@ -818,11 +826,9 @@ impl Bucket {
     /// head without the fields counts as this writer's own. A writer several takeovers back is
     /// sized by the head each takeover replaced, not by its own settings (README, takeover quiet).
     ///
-    /// It does not cover equal ETags for equal bytes (S3 and RustFS: the MD5 of the body): if
-    /// the old writer was paused for longer than the quiet, between its lease check and the
-    /// send of a `put_if_match` on an ETag it already held, and this writer's page (or
-    /// manifest) at that key is byte-identical to what it conditioned on, the PUT lands. That
-    /// is the known residual described at `seal_put_step`, with its possible future fix.
+    /// Equal ETags for equal bytes (S3 and RustFS: the MD5 of the body) are covered by the
+    /// skipped generation instead (`seal_put_step`, `seal_target`): this writer's seal keys are
+    /// never keys the old writer writes.
     pub(crate) fn set_seal_not_before(&mut self, generation: u64, until: Instant) {
         self.quiet = Some(SealQuiet { generation, until });
     }
@@ -1390,18 +1396,28 @@ impl Bucket {
         }
     }
 
+    /// The generation the next seal moves the head to: `max(G + 1, floor)`, where the floor is
+    /// the head's `next_generation_floor` (a takeover's skipped generation). Its objects go
+    /// under `seal_target() - 1`.
+    pub(crate) fn seal_target(&self) -> u64 {
+        (self.head.generation + 1).max(self.head.next_generation_floor.unwrap_or(0))
+    }
+
     /// The head a seal of the current generation publishes.
     fn sealed_head(&self) -> Head {
+        let target = self.seal_target();
         self.timeouts.stamp(Head {
             format: self.head.format,
-            generation: self.head.generation + 1,
-            manifest: Some(self.head.generation),
+            generation: target,
+            manifest: Some(target - 1),
             writer_id: self.head.writer_id.clone(),
             epoch: self.head.epoch,
             journal_mode: self.head.journal_mode,
             lease_ms: None,
             request_timeout_ms: None,
-            next_generation_floor: None,
+            // Every head after a takeover carries the floor (GC keeps off manifests below
+            // `floor - 1`), the skip seal's included.
+            next_generation_floor: self.head.next_generation_floor,
         })
     }
 
@@ -1573,9 +1589,12 @@ impl Bucket {
         self.settle(start)?;
         Span::current().record("buckwal.seq", self.seq);
         self.seal_start(start)?;
-        let gen = self.head.generation;
+        // The seal that moves the head to T writes its objects under T-1 (G after no takeover,
+        // G+1 after one: the skipped generation); the log and the seal-start record stay on
+        // `head.generation`.
+        let key_gen = self.seal_target() - 1;
         self.emit(Event::SealStarted {
-            generation: gen,
+            generation: self.head.generation,
             pages: pages.len() as u64,
         });
         // Pages and the manifest are unreferenced until the head moves. A failed seal whose
@@ -1596,7 +1615,7 @@ impl Bucket {
             rest,
             stored,
             answered,
-        } = self.put_pages_until_lapse(start, gen, &pages, &todo)?
+        } = self.put_pages_until_lapse(start, key_gen, &pages, &todo)?
         {
             self.renew_lease(start, round_progressed(stored, answered, &mut answer_only))?;
             todo = rest;
@@ -1612,8 +1631,8 @@ impl Bucket {
             .manifest
             .as_ref()
             .unwrap_or(&empty)
-            .sealed(gen, &dirty, page_size, page_count);
-        let key = self.keys.manifest(gen);
+            .sealed(key_gen, &dirty, page_size, page_count);
+        let key = self.keys.manifest(key_gen);
         let body = manifest.encode();
         // The page PUTs, not a head check, came just before: no free attempt (a zero lease
         // checks the head first). The first lapse here always renews: the PUTs before it
@@ -1740,19 +1759,16 @@ impl Bucket {
     /// the new writer's head write; its lease check before that stat then lapses, and the head
     /// GET that follows fences it.
     ///
-    /// The residual (known, accepted): "no longer current" assumes every write gets a new
-    /// ETag. On S3 and RustFS a single-part PUT's ETag is the MD5 of its body, so equal bytes
-    /// get equal ETags. A late PUT of old writer A lands over new writer B's object when A was
-    /// paused for longer than the takeover quiet, between its lease check and the send of a
-    /// `put_if_match` on an ETag it already held (from its own earlier PUT of the key in this
-    /// generation, or a stat of a leftover), and B's page (or manifest) at that key is
-    /// byte-identical to what A conditioned on (ETag = MD5 of the bytes). A is fenced at its
-    /// next request, but the object it overwrote stays. MemStore's ETags (a hash plus a
-    /// version) hide this; `residual_content_equal_etag_lets_a_stale_put_through` pins it.
-    /// A possible future fix: a takeover could seal into a generation number the old writer
-    /// never used, so B never writes keys under A's generation G, and A's late conditional
-    /// PUTs cannot touch anything B references. That needs a change to how generations are
-    /// numbered at takeover, which is not in this stage.
+    /// The residual, closed by the skipped generation: "no longer current" assumes every write
+    /// gets a new ETag, but on S3 and RustFS a single-part PUT's ETag is the MD5 of its body, so
+    /// equal bytes get equal ETags. A late PUT of old writer A could land over new writer B's
+    /// object when A was paused longer than the takeover quiet, between its lease check and the
+    /// send of a `put_if_match` on an ETag it already held, and B's object at that key was
+    /// byte-identical. So B's first seal after a takeover moves the head to
+    /// `seal_target()` (G+2) and writes its pages and manifest under G+1: A only ever writes
+    /// seal keys under G, so none of B's keys is one A writes or conditions on, and A's late
+    /// PUTs land on keys nothing references (GC trims them once it trusts B's manifest).
+    /// `late_put_cannot_replace_new_writers_page` pins it.
     fn seal_put_step(
         &self,
         start: Instant,

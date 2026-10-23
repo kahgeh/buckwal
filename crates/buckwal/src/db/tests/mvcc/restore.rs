@@ -410,7 +410,8 @@ fn restore_of_created_mvcc_bucket_opens() {
     // A seal on the restored (empty-log) directory, then a commit after it, then another
     // restore: every row, and the sealed generation's log image starts with the commit's header.
     truncate_checkpoint(&c).unwrap();
-    assert_eq!(db.generation(), 3);
+    // The restore claimed the head (a takeover at generation 2): its first seal skips to 4.
+    assert_eq!(db.generation(), 4);
     insert_c(&c, 4).unwrap();
     assert_eq!(ids(&c), vec![1, 2, 3, 4]);
     assert_eq!(integrity_of(&c), "ok");

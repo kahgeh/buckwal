@@ -413,3 +413,139 @@ fn gc_and_trim_across_mvcc_generations_keep_only_sealed_manifest_pages_and_log()
     std::mem::forget(c);
     std::mem::forget(db);
 }
+
+// ---- GC and the skipped generation (item 1) ----
+
+fn insert_kb(c: &Connection, id: i64) {
+    c.execute(
+        "INSERT INTO t(id, v) VALUES (?, ?)",
+        &[Value::from_i64(id), Value::build_text("x".repeat(1024))],
+    )
+    .unwrap();
+}
+
+/// Writer A creates `t` with 1..=60 rows of 1 KB and seals (generation 1 into manifest 1, head
+/// 2), commits 61..=65 in generation 2 and crashes. Returns the writer's directory.
+fn crashed_after_one_seal(store: &Arc<MemStore>) -> TempDir {
+    let a = tempdir();
+    let db = open_with_store(config(a.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    for id in 1..=60 {
+        insert_kb(&c, id);
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    for id in 61..=65 {
+        insert_kb(&c, id);
+    }
+    std::mem::forget(c);
+    std::mem::forget(db);
+    a
+}
+
+/// B takes A's directory's bucket over and opens (no GC of its own).
+fn takeover_and_open(store: &Arc<MemStore>, holder: &TempDir) -> (crate::db::Database, Connection) {
+    let dir = holder.path().join("db");
+    crate::takeover_with_store(config(&dir), store.clone()).unwrap();
+    let db = open_with_store(config(&dir), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    (db, c)
+}
+
+fn rows_of(store: &Arc<MemStore>) -> Vec<i64> {
+    let v = tempdir();
+    let db = open_read_only_with_store(config(v.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    c.query("SELECT id FROM t ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect()
+}
+
+/// A's seal of generation 2 got as far as its manifest and crashed (`manifest/2`, mapping every
+/// page to generation 2, old enough to trim against). B takes over, and its skip seal's
+/// `manifest/4`... is younger than the trim grace. GC must not trim against A's manifest: it
+/// would delete `pages/1/*` that B's manifest still maps. It trims nothing, and a restore from
+/// B's head still works.
+#[test]
+fn gc_ignores_fenced_writers_leftover_manifest() {
+    let store = mem();
+    let _a = crashed_after_one_seal(&store);
+    let k = keys();
+    let m1 = Manifest::decode(&store.get(&k.manifest(1)).unwrap().unwrap().body).unwrap();
+    assert!(m1.pages.len() > 3, "a database of several pages: {m1:?}");
+    let leftover = Manifest {
+        pages: m1.pages.keys().map(|p| (*p, 2)).collect(),
+        ..m1.clone()
+    };
+    store.put(&k.manifest(2), &leftover.encode()).unwrap();
+    store.advance_clock(min_age() + Duration::from_secs(1));
+
+    let tb = tempdir();
+    let (db, c) = takeover_and_open(&store, &tb);
+    for id in 1001..=1003 {
+        insert_kb(&c, id);
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let h = head(&*store);
+    assert_eq!((h.generation, h.manifest), (4, Some(3)), "{h:?}");
+    let before = all_keys(&store);
+
+    let pass = gc_once(&*store, &k, min_age(), None).unwrap();
+    assert_eq!(pass.outcome, GcOutcome::TooYoung, "{pass:?}");
+    assert_eq!((pass.deleted, pass.trimmed_against), (0, None), "{pass:?}");
+    assert_eq!(all_keys(&store), before, "GC deleted something");
+    let mut want: Vec<i64> = (1..=65).collect();
+    want.extend(1001..=1003);
+    assert_eq!(rows_of(&store), want);
+    std::mem::forget(c);
+    std::mem::forget(db);
+}
+
+/// Between a takeover and its skip seal the head carries a floor above its manifest, so GC
+/// has no manifest it may trust and trims nothing, however old they are. Once the skip seal
+/// lands and its manifest is old enough, GC trims against it and removes A's leftover.
+#[test]
+fn gc_pause_between_takeover_and_skip_seal_ends() {
+    let store = mem();
+    let _a = crashed_after_one_seal(&store);
+    let k = keys();
+    store.put(&k.page(2, 1), b"A's page").unwrap();
+    store.advance_clock(min_age() + Duration::from_secs(1));
+    let tb = tempdir();
+    let (db, c) = takeover_and_open(&store, &tb);
+    let h = head(&*store);
+    assert_eq!(
+        (h.generation, h.manifest, h.next_generation_floor),
+        (2, Some(1), Some(4))
+    );
+    let before = all_keys(&store);
+    let pass = gc_once(&*store, &k, min_age(), None).unwrap();
+    assert_eq!(
+        (pass.outcome, pass.deleted),
+        (GcOutcome::Nothing, 0),
+        "{pass:?}"
+    );
+    assert_eq!(all_keys(&store), before, "paused: nothing trimmed");
+
+    for id in 1001..=1003 {
+        insert_kb(&c, id);
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    store.advance_clock(min_age() + Duration::from_secs(1));
+    let pass = gc_once(&*store, &k, min_age(), None).unwrap();
+    assert_eq!(pass.outcome, GcOutcome::Trimmed, "{pass:?}");
+    assert_eq!(pass.trimmed_against, Some(3), "{pass:?}");
+    assert!(
+        store.get(&k.page(2, 1)).unwrap().is_none(),
+        "A's leftover is gone"
+    );
+    assert!(store.get(&k.manifest(1)).unwrap().is_none(), "manifest/1");
+    let mut want: Vec<i64> = (1..=65).collect();
+    want.extend(1001..=1003);
+    assert_eq!(rows_of(&store), want);
+    std::mem::forget(c);
+    std::mem::forget(db);
+}

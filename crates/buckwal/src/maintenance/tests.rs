@@ -460,7 +460,8 @@ fn maintenance_skips_during_takeover_quiet() {
     }
     // After the quiet, maintenance seals (the generation is still due).
     wait_event(&seen, |e| matches!(e, Event::MaintenanceFinished { .. }));
-    assert_eq!(db.generation(), gen + 1);
+    // Maintenance's seal is a takeover's first: the head skips a generation.
+    assert_eq!(db.generation(), gen + 2);
     other.close().unwrap();
     conn.close().unwrap();
     db.close().unwrap();

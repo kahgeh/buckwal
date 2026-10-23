@@ -105,7 +105,8 @@ fn bucket_err(what: &str, e: impl std::fmt::Display) -> Error {
 /// `nothing` or `error`):
 ///
 /// 1. GET the head; none, or no manifest yet: `Nothing`.
-/// 2. LIST `manifest/`; the candidates are the manifests up to the head's, newest first.
+/// 2. LIST `manifest/`; the candidates are the manifests up to the head's, newest first, and (a
+///    head carrying `next_generation_floor`) not below `floor - 1`: none left is `Nothing`.
 /// 3. Stat each until one is at least `min_age` old: the chosen one. Each younger one
 ///    brings `next_due` forward to when it comes of age; an unknown age (`stat` gave none)
 ///    is never taken as old.
@@ -182,6 +183,20 @@ fn pass(
         .filter_map(|k| keys.parse_manifest(k))
         .filter(|&m| m <= head_manifest)
         .collect();
+    // After a takeover the head carries its next generation floor, and the manifests below
+    // `floor - 1` may be a fenced writer's unpublished leftovers (its seal's `manifest/G`
+    // under the skipped generation): trimming against one could delete pages the head's
+    // manifest still maps. They are ignored while the field is present, so GC trims nothing
+    // between a takeover and its skip seal (the head's manifest is below the floor then).
+    // A head without the field keeps the rule above only.
+    let trusted_from = head
+        .next_generation_floor
+        .map_or(0, |f| f.saturating_sub(1));
+    let before = candidates.len();
+    candidates.retain(|&m| m >= trusted_from);
+    if candidates.is_empty() && before > 0 {
+        return Ok(out);
+    }
     candidates.sort_unstable_by(|a, b| b.cmp(a));
     let mut chosen = None;
     for m in candidates {

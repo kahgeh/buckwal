@@ -96,10 +96,13 @@ pub(crate) fn reconcile_files(
             state.generation, head.generation
         )));
     }
-    // One seal behind: that seal's manifest covers the local WAL. Anything else (more than one
-    // generation, or a head whose manifest is not the local generation's) cannot be leveled.
+    // One seal behind: that seal's manifest covers the local WAL. The seal moved the head to
+    // `max(local generation + 1, the floor)` (a takeover's first seal skips a generation) and
+    // names the manifest before it. Anything else (a head further on, or one whose manifest is
+    // not the one before it) cannot be leveled.
+    let expected = (state.generation + 1).max(state.next_generation_floor);
     if state.generation < head.generation
-        && (head.generation != state.generation + 1 || head.manifest != Some(state.generation))
+        && (head.generation != expected || head.manifest != Some(expected - 1))
     {
         return Err(Error::Corrupt(format!(
             "{} is stale: its local state is at generation {}, but the head is at generation \

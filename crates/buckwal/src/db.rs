@@ -988,6 +988,9 @@ fn claim_in_span(
     state.claimed = true;
     state.head_etag = etag;
     state.epoch = head.epoch;
+    // Kept locally too: a restart before the first seal keeps it, and reconcile tells the
+    // skip seal's head from a stale directory by it.
+    state.next_generation_floor = head.next_generation_floor.unwrap_or(0);
     set_provisional_quiet(cfg, replaced.as_ref(), state);
     state.write_atomic(dir)?;
     let mut bucket = attach(store, keys, cfg, state)?;
