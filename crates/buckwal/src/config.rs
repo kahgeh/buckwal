@@ -64,6 +64,9 @@ pub mod defaults {
     /// (`BUCKWAL_MAINTENANCE_GATE_WAIT_MS`). It bounds the stall a maintenance run adds to
     /// a commit.
     pub const MAINTENANCE_GATE_WAIT: Duration = Duration::from_millis(500);
+    /// How often a read replica looks for a newer manifest or log tail
+    /// (`BUCKWAL_REPLICA_POLL_MS`).
+    pub const REPLICA_POLL_INTERVAL: Duration = Duration::from_secs(60);
     /// After a skipped or failed maintenance run, the next one waits at least this long.
     /// Repeated gate timeouts and busy refusals double it, up to `MAINTENANCE_RETRY_MAX`; a
     /// failed run is retried sooner only once the generation grows by another threshold.
@@ -173,6 +176,9 @@ pub struct Config {
     /// How long a maintenance run holds new calls back while it waits for the ones in flight
     /// (and open transactions) to end; then it gives up and retries later.
     pub maintenance_gate_wait: Duration,
+    /// How often a read replica polls the bucket for new data (`BUCKWAL_REPLICA_POLL_MS`).
+    /// Must be above 0 and below `trim_grace` (`validate_replica`).
+    pub replica_poll_interval: Duration,
     /// A local file holding the database's encryption key as hex (D16); `None` stores the
     /// database unencrypted. Read at open, never uploaded. An existing database must match
     /// it: a key on an unencrypted database, or none on an encrypted one, is refused with
@@ -211,6 +217,7 @@ impl fmt::Debug for Config {
             .field("maintenance_log_objects", &self.maintenance_log_objects)
             .field("maintenance_wal_bytes", &self.maintenance_wal_bytes)
             .field("maintenance_gate_wait", &self.maintenance_gate_wait)
+            .field("replica_poll_interval", &self.replica_poll_interval)
             .field("encryption_key_file", &self.encryption_key_file)
             .field("encryption_cipher", &self.encryption_cipher)
             .field("journal_mode", &self.journal_mode)
@@ -220,7 +227,7 @@ impl fmt::Debug for Config {
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 22] = [
+const ENV_VARS: [&str; 23] = [
     "BUCKWAL_ENDPOINT",
     "BUCKWAL_CA_BUNDLE",
     "BUCKWAL_REGION",
@@ -243,6 +250,7 @@ const ENV_VARS: [&str; 22] = [
     "BUCKWAL_ENCRYPTION_KEY_FILE",
     "BUCKWAL_ENCRYPTION_CIPHER",
     "BUCKWAL_JOURNAL_MODE",
+    "BUCKWAL_REPLICA_POLL_MS",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -320,6 +328,7 @@ impl Config {
             maintenance_log_objects: defaults::MAINTENANCE_LOG_OBJECTS,
             maintenance_wal_bytes: defaults::MAINTENANCE_WAL_BYTES,
             maintenance_gate_wait: defaults::MAINTENANCE_GATE_WAIT,
+            replica_poll_interval: defaults::REPLICA_POLL_INTERVAL,
             encryption_key_file: None,
             encryption_cipher: defaults::ENCRYPTION_CIPHER.to_string(),
             journal_mode: JournalMode::default(),
@@ -404,6 +413,10 @@ impl Config {
             c.maintenance_gate_wait =
                 Duration::from_millis(parse_num("BUCKWAL_MAINTENANCE_GATE_WAIT_MS", &v)?);
         }
+        if let Some(v) = get("BUCKWAL_REPLICA_POLL_MS") {
+            c.replica_poll_interval =
+                Duration::from_millis(parse_num("BUCKWAL_REPLICA_POLL_MS", &v)?);
+        }
         if let Some(v) = get("BUCKWAL_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
             c.encryption_key_file = Some(PathBuf::from(v));
         }
@@ -418,6 +431,23 @@ impl Config {
             })?;
         }
         Ok(c)
+    }
+
+    /// The checks a read replica makes at open: the poll interval is above 0 and below
+    /// `trim_grace`, so a replica looks again before GC may delete what it last read.
+    pub fn validate_replica(&self) -> Result<()> {
+        if self.replica_poll_interval.is_zero() {
+            return Err(Error::Config(
+                "BUCKWAL_REPLICA_POLL_MS must be above 0".to_string(),
+            ));
+        }
+        if self.replica_poll_interval >= self.trim_grace {
+            return Err(Error::Config(format!(
+                "BUCKWAL_REPLICA_POLL_MS ({:?}) must be below trim_grace ({:?})",
+                self.replica_poll_interval, self.trim_grace
+            )));
+        }
+        Ok(())
     }
 
     /// The checks `open` and `restore` make before touching anything.
@@ -664,6 +694,44 @@ mod tests {
     }
 
     #[test]
+    fn replica_poll_defaults_to_60s() {
+        let c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert_eq!(c.replica_poll_interval, Duration::from_secs(60));
+        assert_eq!(c.validate_replica(), Ok(()));
+    }
+
+    #[test]
+    fn replica_poll_env_overrides() {
+        let mut env = required();
+        env.insert("BUCKWAL_REPLICA_POLL_MS", "1500");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(c.replica_poll_interval, Duration::from_millis(1500));
+        env.insert("BUCKWAL_REPLICA_POLL_MS", "soon");
+        match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_REPLICA_POLL_MS"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn replica_poll_at_trim_grace_is_refused() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.replica_poll_interval = c.trim_grace;
+        assert!(matches!(c.validate_replica(), Err(Error::Config(m)) if m.contains("trim_grace")));
+        c.replica_poll_interval = c.trim_grace - Duration::from_millis(1);
+        assert_eq!(c.validate_replica(), Ok(()));
+    }
+
+    #[test]
+    fn replica_poll_zero_is_refused() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.replica_poll_interval = Duration::ZERO;
+        assert!(
+            matches!(c.validate_replica(), Err(Error::Config(m)) if m.contains("BUCKWAL_REPLICA_POLL_MS"))
+        );
+    }
+
+    #[test]
     fn gc_min_age_adds_the_request_budget_and_a_second() {
         let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
         assert_eq!(
@@ -831,6 +899,7 @@ mod tests {
             ("BUCKWAL_ENCRYPTION_KEY_FILE", "/etc/db.key"),
             ("BUCKWAL_ENCRYPTION_CIPHER", "aes256gcm"),
             ("BUCKWAL_JOURNAL_MODE", "mvcc"),
+            ("BUCKWAL_REPLICA_POLL_MS", "4000"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads BUCKWAL_* variables.
@@ -868,6 +937,7 @@ mod tests {
         assert_eq!(c.maintenance_log_objects, 250);
         assert_eq!(c.maintenance_wal_bytes, 3 << 20);
         assert_eq!(c.maintenance_gate_wait, Duration::from_millis(75));
+        assert_eq!(c.replica_poll_interval, Duration::from_millis(4000));
         assert_eq!(c.lease, Duration::from_millis(2500));
         assert!(!c.gc_after_seal);
         assert_eq!(c.encryption_key_file, Some(PathBuf::from("/etc/db.key")));

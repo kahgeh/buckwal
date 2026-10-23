@@ -1,0 +1,10 @@
+RED: cargo test -p buckwal --locked --lib replica_poll
+error[E0609]: no field `replica_poll_interval` on type `config::Config`
+error[E0599]: no method named `validate_replica` found for struct `config::Config` in the current scope
+GREEN: cargo test -p buckwal --locked --lib replica_poll
+test config::tests::replica_poll_at_trim_grace_is_refused ... ok
+test config::tests::replica_poll_defaults_to_60s ... ok
+test config::tests::replica_poll_zero_is_refused ... ok
+test config::tests::replica_poll_env_overrides ... ok
+test result: ok. 4 passed
+./scripts/test.sh unit: exit 0 (fmt, clippy -D warnings, 566 lib tests + others pass)
