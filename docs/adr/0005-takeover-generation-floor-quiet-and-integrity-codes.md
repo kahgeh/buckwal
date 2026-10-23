@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-23
 - Spec: `durable-hardening`
-- Decision record in the README: the residual paragraph in Guarantees and limits, the takeover quiet, Encryption (D16) and Bucket format v3
+- Decision record in the README: "A late PUT from the fenced writer" in Guarantees and limits, the takeover quiet, Encryption (D16) and Bucket format v3
 
 ## Context
 
