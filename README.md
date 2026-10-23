@@ -68,12 +68,14 @@ The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The
 
 ## How it works
 
-- **Commits.** Each commit writes WAL frames. With batching `Off` (the default), the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`) before the WAL's fsync. With a `Window`, the commit is queued for the uploader, fsynced locally, and the call then waits while the commit shares one log object with other commits (see Batching). Either way, the commit returns `Ok` only when a log object holding it is in the bucket. In MVCC mode the commit point is the sync of the engine's logical log, `app.db-log`, not the WAL's (see MVCC mode).
-- **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it. It first appends an empty *seal-start* log record and checks that `head` has not moved, so a writer that was taken over stops before it uploads anything. Then it uploads every page that changed in that generation (`pages/…`), then a manifest that maps each page to the generation holding its latest copy, then moves `head` to the next generation.
+Each term below is explained where it first appears, and `docs/glossary.md` lists them all in one place.
+
+- **Commits.** Each commit writes WAL frames (the WAL, the write-ahead log, is the file where the engine first records every change before it reaches the main database file). With batching `Off` (the default), the library uploads the bytes written since the last fsync as one log object (`log/<generation>/<seq>`, a *generation* being one stretch of the log between two seals, explained next) before the WAL's fsync. With a `Window`, the commit is queued for the uploader, fsynced locally, and the call then waits while the commit shares one log object with other commits (see Batching). Either way, the commit returns `Ok` only when a log object holding it is in the bucket. In MVCC mode the commit point is the sync of the engine's logical log, `app.db-log`, not the WAL's (see MVCC mode).
+- **Generations.** When the engine restarts its WAL after a checkpoint, the old WAL becomes a finished *generation*. The library then *seals* it: it uploads the generation's changed pages and a summary, then records in the bucket that the next generation has begun. It first appends an empty *seal-start* log record and checks that `head` (a small file in the bucket that says where the database is now) has not moved, so a writer that was taken over stops before it uploads anything. Then it uploads every page that changed in that generation (`pages/…`), then a *manifest* (a list that maps each page to the generation holding its latest copy), then moves `head` to the next generation.
 - **Transport and encryption.** `https://` endpoints use rustls (ring), verified against the platform's trust store or only against `BUCKWAL_CA_BUNDLE`; `http://` still works. With `BUCKWAL_ENCRYPTION_KEY_FILE`, turso's own page codec encrypts every page and WAL frame body before it reaches the files the library uploads, so seals, log records and lazy fetches carry ciphertext. The key stays on the machine (see Guarantees, Encryption).
 - **Restore.** Restore reads `head`, the newest manifest and the current generation's log. It rebuilds the WAL from the log and fetches pages from the bucket only when the engine first reads them.
-- **Takeover.** Another machine takes the database over by restoring it and writing the head with a new writer id at the next epoch, then a fence record in the log (`takeover`, see Guarantees). The old writer, if it still runs, is fenced: its next append, seal or lease check fails `Fenced`.
-- **The lease.** A writer trusts its last look at the head for `lease` (30 s). Past it, the next append, and each page or manifest PUT of a seal, reads the head first.
+- **Takeover.** Another machine takes the database over by restoring it and writing the head with a new writer id at the next *epoch* (a counter in the head that goes up at every takeover), then a *fence* record in the log (a marker that any older writer collides with) (`takeover`, see Guarantees). The old writer, if it still runs, is fenced: its next append, seal or lease check fails `Fenced`.
+- **The lease.** A writer trusts its last look at the head for `lease` (30 s), a *lease* being how long it may go without looking again. Past it, the next append, and each page or manifest PUT of a seal, reads the head first.
 - **GC.** Log objects, manifests and pages that the head no longer needs are deleted once the bucket's own clock says they have been unreferenced for longer than the trim grace (10 min). A writer runs GC on a background thread at open and after each seal; `gc` runs it from anywhere.
 
 ## Use
@@ -1142,7 +1144,7 @@ The tests cannot show these. Treat each as unproven until it has run in real use
 
 ## Costs (measured)
 
-### Stage 4: HTTPS and encryption
+### HTTPS and encryption
 
 Source: `results/durable-transport.txt`. These are laptop figures (Apple M4 Max, RustFS in podman on the same Mac over loopback, release build), not S3 and not production numbers, with telemetry off. Each row is one `bench --commits 1000` run on one connection (one run per row, so small differences are noise), on an emptied RustFS: (a) plain HTTP, (b) HTTPS with a test CA, (c) HTTPS and encryption (aegis256).
 
@@ -1161,7 +1163,7 @@ Source: `results/durable-transport.txt`. These are laptop figures (Apple M4 Max,
 - The first writer open of a directory restored by `restore` or `takeover` is where stage 4 added requests: the encryption check needs page 1, and a directory that holds none GETs the head, the manifest and page 1 first (this happens without a key too). Opening the restored 1000-commit directory made 2 PUTs, 11 GETs and 3 LISTs (37-73 ms), the same with and without a key. The stage-3 row below, re-measured with its request lines, shows the same 3 extra GETs on the first open after a takeover.
 - The full test command (see Test command) is the largest cost: a whole run (both passes, the scans and the telemetry check) took 11.7 min (`real 703.27` s, 11:43), and the larger pass held 708 MB in RustFS at its peak (the canonical final run, at b4afb8f; the earlier run at 5215309 took 11.5 min and peaked at 711 MB). With the server's tests it took 12.3 min (12:15, round 3's run at eda0d1d) and peaked at 751 MB (`results/durable-server.txt`). With the MVCC tests, the run at 9ab3403 took 14:34 (874 s) and peaked at 764 MB (see Test command).
 
-### Stage 3: takeover, lease and GC
+### Takeover, lease and GC
 
 Source: `results/writer-lease.txt`. These are laptop figures (Apple M4 Max, RustFS in podman on the same Mac, release build), not production numbers, with telemetry off. The file holds two runs of the same code: this table quotes run 2, and run 1 (an earlier round) is kept raw beside it; each measure ran once per run. The database is the 5000-commit bench database of stage 1's workload (generation 13 at the takeover). Request counts come from `crates/buckwal-cli/examples/stage3_costs.rs`, which wraps the S3 store in a counter.
 
@@ -1178,7 +1180,7 @@ Source: `results/writer-lease.txt`. These are laptop figures (Apple M4 Max, Rust
 - The takeover quiet was not exercised here. When it applies (the old writer's last record is a seal-start record), it holds the new writer's first seal of that generation back for `lease` + `request_timeout`, 40 s with the defaults.
 - GC's request count grows with the bucket: per pass one head GET, one LIST of `manifest/`, one HEAD per manifest it ages, then the manifest GET, the LISTs of `log/`, `manifest/` and `pages/`, and one DELETE per object.
 
-### Stage 2: batching
+### Batching
 
 The maintenance checkpoint's costs are under Batching, "Maintenance checkpoint".
 
@@ -1203,7 +1205,7 @@ Source: `results/batching-knob.txt`. These are laptop figures (Apple M4 Max, Rus
 - Checkpoint uploads: with one connection, each in-run seal took 41–45 ms (Off) and 43–75 ms (Window) for 170 pages. With 8 Window connections, no WAL restart happened during the run, so the run's 696–728 pages were sealed once, at close, in 177–186 ms. These runs predate the maintenance checkpoint, which now seals such a generation during the run (see "Maintenance checkpoint").
 - Restore of the 1-connection Off database (generation 6): 24 ms, 4 GETs (`3 + 1` log object), 1 LIST, 4.4 KB downloaded. A full `verify` of the fresh restore took 0.23 s of wall time.
 
-### Stage 1
+### Commits and restore
 
 Source: `results/durable-core.txt`. These are laptop figures (Apple M4 Max, macOS, RustFS 1.0.0 in podman on the same Mac, release build), not production numbers. The workload was one connection running `INSERT OR REPLACE` of a 1 KB blob per commit.
 
