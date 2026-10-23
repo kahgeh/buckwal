@@ -1026,8 +1026,9 @@ fn encrypted_swapped_page_objects_fail_read() {
 
 /// Pass 2 (an encryption key): a plaintext format 1 head put over the encrypted bucket's head
 /// while a writer runs. The running writer's head reads compare the head's bytes and fence
-/// (`the head was changed by another writer`), with no `integrity check failed` record: it
-/// stops non-zero. A fresh restore is an open, and a format 1 head under a key is the
+/// (`the head was changed by another writer`) at its next seal, with no
+/// `integrity check failed` record: the soak prints a fenced `error` line and keeps retrying,
+/// so the test waits for that line, then kills it. A fresh restore is an open, and a format 1 head under a key is the
 /// `Encryption` "no integrity codes" error there, again with no record. (The post-open
 /// `Corrupt("... format downgraded")` is pinned by the unit tests: only GC's reads reach it.)
 /// Pass 1 has no key, so the test returns there.
@@ -1051,18 +1052,22 @@ fn encrypted_downgraded_head_after_open_is_tampering() {
     assert!(real.contains("\"format\":3"), "{real}");
     let old = format_1_head(&real);
     store.put(&key, old.as_bytes()).unwrap();
-    soak.drain();
-    let status = soak.child.wait().expect("wait soak");
-    assert!(!status.success(), "the writer accepted a swapped head");
+    // The soak does not exit when fenced: it prints `error ... fenced ...` and retries. Its
+    // next seal (a truncate checkpoint every 50 acks) reads the head and fences.
+    let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
+    soak.kill();
+    let first = soak.lines[fenced].clone();
+    assert!(
+        first.contains("the head was changed by another writer"),
+        "the running writer is fenced by the swapped head: {first}"
+    );
     let err = soak.stderr();
-    assert!(
-        err.contains("the head was changed by another writer"),
-        "the running writer is fenced: {err}"
-    );
-    assert!(
-        !err.contains("integrity check failed"),
-        "a fenced writer logs no integrity record: {err}"
-    );
+    for (where_, text) in [("stdout", soak.lines.join("\n")), ("stderr", err)] {
+        assert!(
+            !text.contains("integrity check failed"),
+            "a fenced writer logs no integrity record on {where_}: {text}"
+        );
+    }
     fs::remove_dir_all(&dir).ok();
     let r = ctx.dir("restored");
     let out = ctx.run(&["restore", "--dir", r.to_str().unwrap()]);
