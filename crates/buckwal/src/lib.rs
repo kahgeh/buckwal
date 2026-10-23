@@ -17,6 +17,7 @@ pub(crate) mod guard;
 pub(crate) mod io;
 pub(crate) mod maintenance;
 pub(crate) mod reconcile;
+pub(crate) mod replica;
 pub(crate) mod restore;
 pub mod stats;
 pub mod store;

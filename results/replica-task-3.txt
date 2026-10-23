@@ -1,0 +1,18 @@
+RED: cargo test --locked -p buckwal --lib replica::image (committed_count stubbed todo!)
+test replica::image::tests::zero_fill_past_end ... FAILED
+test replica::image::tests::truncate_to_below_committed_prefix_shrinks_committed_len ... FAILED
+test replica::image::tests::empty_image_has_no_frames ... FAILED
+test replica::image::tests::partial_frame_is_not_counted ... FAILED
+test replica::image::tests::rewind_below_held_back_frames_drops_them ... FAILED
+test replica::image::tests::frames_after_last_commit_are_held_back ... FAILED
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.00s
+
+GREEN: cargo test --locked -p buckwal --lib replica::image
+test replica::image::tests::truncate_to_below_committed_prefix_shrinks_committed_len ... ok
+test replica::image::tests::partial_frame_is_not_counted ... ok
+test replica::image::tests::empty_image_has_no_frames ... ok
+test replica::image::tests::rewind_below_held_back_frames_drops_them ... ok
+test replica::image::tests::zero_fill_past_end ... ok
+test replica::image::tests::frames_after_last_commit_are_held_back ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.00s
+./scripts/test.sh unit: exit 0 (fmt, clippy -D warnings, tests pass)
