@@ -501,7 +501,7 @@ Exit codes: 0 on success, 1 on an error (one `error: …` line on stderr), 2 on 
 
 `buckwal serve` runs one process that owns the database: it is the single writer, holds the lease and talks to the bucket. Apps in other languages, or several app processes on the machine, connect to it with one of tursodb's serverless drivers instead of embedding the library. The server sends a result only after the library call returned, so a client hears success only once the commit is in the bucket, as with the library.
 
-**Protocol.** The server speaks tursodb's "SQL over HTTP v3": `serverless/PROTOCOL.md` in the turso repo at commit `0b2bec917`. Its clients are tursodb's serverless drivers: `@tursodatabase/serverless` (TypeScript), `turso_serverless` (Rust), `tursogo-serverless` (Go) and `turso_serverless` (Python). `/v2/pipeline` is still accepted, as PROTOCOL.md section 2 allows. tursodb's own conformance suite and the Go driver passed against it at eb101d9, and again at 10e62fb, the final code; the TypeScript and Python drivers were not run (see Clients run and not run below). The protocol descends from libSQL's Hrana, and the server still parses the request shapes libSQL's clients send, but no libSQL client library was run against it.
+**Protocol.** The server speaks tursodb's "SQL over HTTP v3": `serverless/PROTOCOL.md` in the turso repo at commit `0b2bec917`. Its clients are tursodb's serverless drivers: `@tursodatabase/serverless` (TypeScript), `turso_serverless` (Rust), `tursogo-serverless` (Go) and `turso_serverless` (Python). `/v2/pipeline` is still accepted, as PROTOCOL.md section 2 allows. tursodb's own conformance suite and the Go driver passed against it at eb101d9, and again at 10e62fb, the final code; the TypeScript and Python drivers passed too, over plain HTTP and over HTTPS with a token (see Clients run and not run below). The protocol descends from libSQL's Hrana, and the server still parses the request shapes libSQL's clients send, but no libSQL client library was run against it.
 
 ```sh
 eval "$(scripts/rustfs.sh env)"     # or your own BUCKWAL_* settings (see Settings)
@@ -729,10 +729,19 @@ Run against `buckwal serve` at commit eb101d9, and again at c5ad4c5 and at 10e62
 
 The repo's own test client (`crates/buckwal-hrana-client`) still runs in both passes of `./scripts/test.sh` (plain HTTP, then HTTPS with a token and encryption).
 
+The TypeScript and Python drivers were run on 2026-10-24 (buckwal 902a6a1, RustFS, a WAL database, upstream's `serverless/` tree at 0b2bec917), each on its own prefix, with a bearer token, both over plain HTTP on 127.0.0.1 and over HTTPS on `localhost` with a test CA from `scripts/tls-material.sh` and certificate checks on:
+
+| Client | Plain HTTP | HTTPS with a token |
+|---|---|---|
+| `@tursodatabase/serverless` 1.4.1 (TypeScript, Node v24.0.1): its 48 ava tests in `integration-tests/` (`serverless`, `compat`, `protocol`) | 48 pass, 0 fail, 0 skip | 48 pass, 0 fail, 0 skip (CA through `NODE_EXTRA_CA_CERTS`) |
+| `turso_serverless` 0.1.0 (Python 3.13.7, stdlib only): its 84 pytest tests in `tests/` | 84 pass, 0 fail, 0 skip | 84 pass, 0 fail, 0 skip (CA through `SSL_CERT_FILE`) |
+
+No protocol gap was found and the server was not changed. The summary lines, the commands and the negative checks are in `results/serve-clients.txt`.
+
 Not run:
-- `@tursodatabase/serverless` (TypeScript) and the Python `turso_serverless`.
 - Upstream's differential suites: they need the embedded drivers and Turso Cloud.
-- No real driver was run over HTTPS. The Rust conformance build has no TLS stack, and the Go run used plain HTTP.
+- No Rust or Go driver was run over HTTPS. The Rust conformance build has no TLS stack, and the Go run used plain HTTP (the TypeScript and Python drivers did run over HTTPS, above).
+- The TypeScript and Python drivers were run against a WAL database only, not an MVCC one.
 - No real libSQL client library was run: not `@libsql/client`, the `libsql` Rust crate or Python package, and not `libsql-client-go`. The server still parses the request shapes those clients send (unit fixtures copy them), because the protocol descends from libSQL's Hrana, but that is unproven against the real libraries.
 
 How the suite was run:
@@ -741,6 +750,7 @@ How the suite was run:
 - It has two crates that this repo's audited lock does not: futures 0.3.34, and wasm-streams 0.5.0 (wasm-only, never compiled).
 - The audit's conditions: plain HTTP on loopback, a dummy token, no proxy, `--locked`, and never in this repo's lock.
 - The Go driver needed no download (stdlib only; `GOTOOLCHAIN=local GOPROXY=off`).
+- The TypeScript tests were installed with `npm ci --ignore-scripts` from upstream's own `package-lock.json` (sha256 `88798a7eaf02f12063e3764dbcafbb8abe46812a0b4d8010e75c5105b1bec7d6`: ava 6.4.1, tsup 8.5.1, typescript 5.9.3, @types/node 24.12.2, esbuild 0.28.2), approved by the javascript-supply-chain-auditor, in a scratch directory outside this repo. The Python tests need pytest 9.1.1 and hypothesis 6.161.0 with five small dependencies (hashes from upstream's `uv.lock`, sha256 `f0ae3661519f1877e465bbe6a01252afd7dfafd2fd4d312ae61a0c799e64c574`), installed with `--require-hashes --only-binary :all: --no-deps` into a venv, approved by the python-supply-chain-auditor. The Python driver imports nothing outside the standard library. No lock file from these runs is kept here.
 
 ### Reproducing the conformance run
 
@@ -762,7 +772,22 @@ How the suite was run:
    (cd "$SCRATCH/ws" && cargo test --locked -p turso_serverless_conformance -- --nocapture)   # and again with --test-threads=1
    (cd "$SCRATCH/serverless/go" && GOTOOLCHAIN=local GOPROXY=off go test -v ./...)
    ```
-6. Check that the tests really reached the server. **Both suites skip every test and still report ok when the variables are unset:** each Rust conformance test prints `skipping: set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN …` and returns (it needs both variables), and each Go test that reaches the server (24 of the 36) calls `t.Skip` when `TURSO_DATABASE_URL` is empty. So no line may contain `skipping` in the cargo output (with `--nocapture`), and no `--- SKIP` may appear in the `go test -v` output.
+6. Check that the tests really reached the server. **The Rust and Go suites skip every test and still report ok when the variables are unset:** each Rust conformance test prints `skipping: set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN …` and returns (it needs both variables), and each Go test that reaches the server (24 of the 36) calls `t.Skip` when `TURSO_DATABASE_URL` is empty. So no line may contain `skipping` in the cargo output (with `--nocapture`), and no `--- SKIP` may appear in the `go test -v` output.
+7. The TypeScript and Python drivers (same `serverless/` export; every download only after the auditors approve the exact versions, in scratch folders outside this repo):
+   ```sh
+   # TypeScript: a copy of serverless/javascript, then
+   npm ci --ignore-scripts && npm run build
+   # Python: a venv from python3 -I -m venv, then pinned, hashed, wheel-only installs of the packages in results/serve-clients.txt
+   pip install --require-hashes --only-binary :all: --no-deps -r req.txt
+   # the driver source goes on the path with a .pth file in the venv (python -I ignores PYTHONPATH)
+   ```
+8. Start `serve` as in step 4 for each run, on its own prefix. For HTTPS, make the CA with `scripts/tls-material.sh <fresh dir>`, start `serve` with `BUCKWAL_SERVE_TLS_CERT=<dir>/server/rustfs_cert.pem`, `BUCKWAL_SERVE_TLS_KEY=<dir>/server/rustfs_key.pem` and the token file, and use `https://localhost:<port>`. Run each driver with only PATH, HOME and its variables set (`env -i`):
+   ```sh
+   TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token> npx ava --verbose integration-tests/*.test.mjs
+   TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token> python -I -m pytest -p no:cacheprovider -rs -v <scratch>/py-src/tests
+   # HTTPS: https://localhost:<port> plus NODE_EXTRA_CA_CERTS=<dir>/ca.pem (TypeScript) or SSL_CERT_FILE=<dir>/ca.pem (Python)
+   ```
+9. Check that the drivers really reached the server and verified the certificate. The Python suite skips its 45 server tests (`SKIPPED … TURSO_DATABASE_URL is not set`, 39 passed) when the URL is unset, so `-rs` must show no `SKIPPED`; the TypeScript suite fails rather than skips without the URL, and its ava output must show 48 passed. Run each driver once over HTTPS with `ca.pem` swapped for `other-ca.pem`: the TypeScript tests must fail with a certificate error (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) and the Python ones with `CERTIFICATE_VERIFY_FAILED`. Never set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
 
 ## Replicas
 
@@ -1380,7 +1405,7 @@ The tests cannot show these. Treat each as unproven until it has run in real use
 - **Real AWS S3, and its latency.** Every test runs against local RustFS (plain HTTP and HTTPS), on one laptop. S3's conditional PUTs are documented but not exercised here. In MVCC mode one upload at a time stalls every writer and a checkpoint's seal stops every transaction, so S3 latency matters more than for WAL, and no MVCC throughput or latency figure exists on S3 (or in Costs).
 - **Kills exactly between the seal, the log truncate and the `-wal` truncate.** The system tests kill at `seal-started` and `seal-finished`, which lands near those boundaries, not on them. The exact points are reached only by library tests that copy the directory inside the engine's calls (`crash_between_seal_and_log_truncate_reconciles_new_generation`, `crash_between_log_truncate_and_wal_truncate_opens`) and by the fault-schedule tests in `crates/buckwal/tests/mvcc_fencing.rs`. A failed put under group commit, a put that stores then fails before a takeover, and a seal failure then retry then crash have no CLI test: the CLI cannot inject faults.
 - **Takeover of a writer committing flat out.** It hits the 64 fence-probe limit (4 of 5 runs, the fifth took over; `results/mvcc-durability.txt`) and needs a retry or a pause (see MVCC mode, Takeover). No takeover has been tried against a real busy writer on another machine.
-- **Drivers and clients against an MVCC server.** Only the repo's own test client has run against `serve` on an MVCC database. The TypeScript and Python drivers and every libSQL client were never run, as for WAL, and tursodb's conformance suite and the Go driver were not re-run against an MVCC database.
+- **Drivers and clients against an MVCC server.** Only the repo's own test client has run against `serve` on an MVCC database. The TypeScript and Python drivers ran against a WAL database only, and every libSQL client was never run. tursodb's conformance suite, the Go driver and the TypeScript and Python drivers were not re-run against an MVCC database.
 - **Long-running use.** The tests run for seconds to minutes. A multi-day soak, the growth of `app.db-log` when maintenance is off or slow, GC over many MVCC generations beyond the 10 the tests make (`mvcc_gc_across_generations`), and more than 8 concurrent writers are untried.
 - **The whole-log ship's memory.** The first commit after an open or a generation change reads the whole local `app.db-log` into one buffer, about 2 to 3 times its size. With the default 64 MiB maintenance threshold that is bounded, but a log that grew past it (maintenance off or failing) was not measured.
 - **Async IO backends.** The wrappers return a failed upload as a synchronous error and read the local file right after the engine's writes at a generation change. Tests ran only the platform IO on macOS. Linux, and an asynchronous backend such as io_uring, may complete writes later and were not tried.
@@ -1529,7 +1554,7 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
   - Outside `test.sh`, each RustFS-backed test deletes its bucket prefix when it ends. `BUCKWAL_KEEP_FAILED=1` keeps a failed test's prefix and prints its name on stderr (until the next `test.sh` run resets the storage).
   - The replica work adds a file of RustFS system tests, `crates/buckwal-cli/tests/replica.rs` (21 `--ignored` tests, none named `tls_`, so both passes run all 21: following under Off and Window, the posted notification, the dropped, duplicate and out-of-order ones, no notification set up, a seal, a new generation and a takeover by a third machine, a reader held across a seal, the kill matrix, a rolled-back large transaction, a replica that lagged past `trim_grace`, refused writes with zero PUTs and DELETEs, two replicas with their own listeners, takeover from a replica's machine, a fenced writer's late record, an encrypted bucket edited behind the replica's back, a missing seq, the MVCC refusal, a wrong key, the listener rules and the `buckwal.replica.sync` spans in ClickHouse), and one more S3 test, `s3_list_after_start_after_and_paging`. By `--ignored --list` the counts are now 6 `serve` tests, 56 system tests, 21 replica tests and 13 S3 tests (9 in pass 1, 13 in pass 2, which also runs the 4 `tls_` ones): 92 tests in pass 1 and 96 in pass 2. **Not yet measured:** the duration, the peak `buckwal-objects` size and the otel check of a full `./scripts/test.sh` run with the replica tests; the figures above are those of 9ab3403, before them. The posted notification tests post the S3-format event themselves (RustFS delivery was not seen; see Not tested until real use).
 - `scripts/rustfs.sh up|down|reset|stop|start|pause|unpause|env` manages the local RustFS container (`buckwal-rustfs`, port 9290). `down` removes the container and its volume `buckwal-objects`; `reset` is `down` then `up`, an empty bucket. `eval "$(scripts/rustfs.sh env)"` sets the `BUCKWAL_*` variables for it. With `BUCKWAL_TLS_DIR` set to a directory from `scripts/tls-material.sh DIR`, it runs RustFS over HTTPS (a container is plain or TLS for its whole life; `reset` switches).
-- tursodb's conformance suite and the Go driver are not part of `test.sh`. They were run by hand against `serve`, outside this repo (see Server, Clients run and not run).
+- tursodb's conformance suite and the Go, TypeScript and Python drivers are not part of `test.sh`. They were run by hand against `serve`, outside this repo (see Server, Clients run and not run).
 - Always pass `--locked` to cargo. On macOS the script sets `SDKROOT`, and it sets `SOURCE_DATE_EPOCH`.
 
 ## Layout

@@ -1,0 +1,44 @@
+serve-client-coverage: tursodb's TypeScript and Python serverless drivers against `buckwal serve`
+Run 2026-10-24 by hand, on RustFS (scripts/rustfs.sh), WAL (default) database, one fresh prefix per run.
+buckwal: built at 902a6a1 (the branch was later rebased onto main; no server code changed). Upstream: turso 0b2bec917e3300a302ad782357b57407e6c2a5d3,
+`serverless/` tree exported with `git archive` into <scratch>/src.
+
+Driver                                            Transport                     pass  fail  skip
+@tursodatabase/serverless 1.4.1 (ava, 3 files)    plain HTTP 127.0.0.1, token     48     0     0
+@tursodatabase/serverless 1.4.1 (ava, 3 files)    HTTPS localhost, token, test CA 48     0     0
+turso_serverless 0.1.0 (pytest, tests/)           plain HTTP 127.0.0.1, token     84     0     0
+turso_serverless 0.1.0 (pytest, tests/)           HTTPS localhost, token, test CA 84     0     0
+
+No protocol gap found; no server change.
+
+Skip check (the suites skip silently without a server):
+- Python with TURSO_DATABASE_URL unset: 39 passed, 45 skipped (`SKIPPED ... TURSO_DATABASE_URL is not set`).
+  With the URL set: 84 passed, 0 skipped, in both transports (`-rs -v` shows no SKIPPED line).
+- TypeScript with the URL unset: the suite fails (3 tests failed, 1 uncaught exception), it does not skip.
+  With the URL set: 48 passed, none failed, none skipped, in both transports.
+
+Certificate checks are on (no NODE_TLS_REJECT_UNAUTHORIZED, no verify=False):
+- TypeScript trusts the CA through NODE_EXTRA_CA_CERTS=<scratch>/tls/ca.pem; Python through SSL_CERT_FILE=<scratch>/tls/ca.pem.
+- Negative check with the unrelated CA (other-ca.pem) over HTTPS:
+  TypeScript: fetch fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE (serverless.test.mjs: 15 failed);
+  Python: 43 failed, 41 passed (offline tests), `[SSL: CERTIFICATE_VERIFY_FAILED]`.
+- Server log of each run: `serve listening addr=127.0.0.1:<port> tls=<false|true> auth=true`, then
+  `serve stopped clean=true fenced=false in_flight_failed=0`.
+
+Dependencies (scratch folders outside the repo; javascript- and python-supply-chain-auditor approved the exact versions):
+- npm: `npm ci --ignore-scripts` from upstream's package-lock.json, sha256 88798a7eaf02f12063e3764dbcafbb8abe46812a0b4d8010e75c5105b1bec7d6
+  (275 packages; ava 6.4.1, tsup 8.5.1, typescript 5.9.3, @types/node 24.12.2, esbuild 0.28.2 as locked). Node v24.0.1.
+- pip: python3 -I -m venv; `pip install --require-hashes --only-binary :all: --no-deps -r req.txt` with pytest 9.1.1, hypothesis 6.161.0,
+  iniconfig 2.3.0, packaging 26.2, pluggy 1.6.0, pygments 2.20.0, sortedcontainers 2.4.0, hashes from upstream's uv.lock
+  (sha256 f0ae3661519f1877e465bbe6a01252afd7dfafd2fd4d312ae61a0c799e64c574). req.txt sha256 2b9574789918d53d2e7dd1da8c3e991c959ddb91b5226a6b27f11b88d0e1f345. Python 3.13.7.
+  The driver itself is the exported source (stdlib only), put on the path with a .pth file because -I ignores PYTHONPATH.
+
+Commands (<scratch> is a fresh directory outside the repo, <port> from the `serve listening` line, <token> a 32-byte token file):
+  eval "$(scripts/rustfs.sh env)"; scripts/tls-material.sh <scratch>/tls
+  BUCKWAL_PREFIX=<run>-$(date +%s) BUCKWAL_SERVE_TOKEN_FILE=<scratch>/token [BUCKWAL_SERVE_TLS_CERT=<scratch>/tls/server/rustfs_cert.pem BUCKWAL_SERVE_TLS_KEY=<scratch>/tls/server/rustfs_key.pem] \
+    target/debug/buckwal serve --dir <scratch>/db --listen 127.0.0.1:0 --claim
+  (cd <scratch>/ts && TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token> npx ava --verbose integration-tests/*.test.mjs)
+  (cd <scratch>/ts && NODE_EXTRA_CA_CERTS=<scratch>/tls/ca.pem TURSO_DATABASE_URL=https://localhost:<port> TURSO_AUTH_TOKEN=<token> npx ava --verbose integration-tests/*.test.mjs)
+  (cd <scratch>/run && TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token> <scratch>/pyvenv/bin/python -I -m pytest -p no:cacheprovider -rs -v <scratch>/py-src/tests)
+  (same with SSL_CERT_FILE=<scratch>/tls/ca.pem TURSO_DATABASE_URL=https://localhost:<port>)
+  Each run used `env -i` with only PATH and HOME plus the variables shown.
