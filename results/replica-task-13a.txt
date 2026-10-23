@@ -1,0 +1,58 @@
+== cargo test -p buckwal-cli --locked --no-run
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+  Executable unittests src/main.rs (target/debug/deps/buckwal-b712a5fbc52b1559)
+  Executable tests/replica.rs (target/debug/deps/replica-c1003181611bec56)
+  Executable tests/server.rs (target/debug/deps/server-6698d7f07c00e00c)
+  Executable tests/system.rs (target/debug/deps/system-870ae001a34e2bac)
+== clippy
+    Checking buckwal v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal)
+    Checking buckwal-server v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-server)
+    Checking buckwal-cli v0.1.0 (/Users/kahgeh/Dev/p/buckwal/read-replicas/crates/buckwal-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.46s
+== ./scripts/test.sh unit
+test telemetry::tests::takeover_exports_takeover_and_fence_spans ... ok
+test telemetry::tests::takeover_failing_at_the_fence_exports_its_epoch ... ok
+test telemetry::tests::restore_span_counts_its_retries_and_an_empty_log_is_seq_0 ... ok
+test engine::tests::every_ack_restores_across_checkpoints_and_pages_are_lazy ... ok
+test uploader::tests::a_failed_seal_on_an_idle_bucket_clears_only_after_a_head_get ... ok
+test uploader::tests::owed_retries_are_not_held_back_by_a_long_window ... ok
+test uploader::tests::last_failed_is_probed_until_the_bucket_answers ... ok
+test uploader::tests::uploader_is_degraded_while_window_syncs_are_owed ... ok
+test db::tests::seal_keeps_the_epoch_and_claim_keys_in_the_local_state ... ok
+
+failures:
+
+---- db::tests::close_stops_prefetch_before_releasing_the_dir stdout ----
+prefetch: 152 of 152 pages before close; close took 164.833µs
+
+thread 'db::tests::close_stops_prefetch_before_releasing_the_dir' (183286267) panicked at crates/buckwal/src/db/tests.rs:1315:5:
+prefetch finished before close; the test proves nothing
+
+
+failures:
+    db::tests::close_stops_prefetch_before_releasing_the_dir
+
+test result: FAILED. 676 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 66.21s
+
+error: test failed, to rerun pass `-p buckwal --lib`
+== ./scripts/test.sh unit (rerun; first run had 1 timing flake db::tests::close_stops_prefetch_before_releasing_the_dir, untouched code)
+test result: ok. 677 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.59s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.35s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.93s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.32s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.65s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.53s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+test result: ok. 0 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 0 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 56 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.36s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
