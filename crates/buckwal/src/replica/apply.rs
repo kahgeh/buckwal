@@ -45,8 +45,14 @@ impl PageDecrypt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApplyOutcome {
-    Applied { frames: u64 },
+    /// The transaction is committed; `frames` counts frames appended or matched (frames at
+    /// local number 0 or below are skipped and not counted).
+    Applied {
+        frames: u64,
+    },
     Gap,
+    /// The frames do not end on a commit frame. Nothing was inserted.
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,20 +89,37 @@ impl Applier {
         Ok(self.conn.wal_state().map_err(engine)?.max_frame)
     }
 
-    pub(crate) fn local_wal_empty(&self) -> bool {
-        self.last_frame().map(|n| n == 0).unwrap_or(false)
+    pub(crate) fn local_wal_empty(&self) -> Result<bool> {
+        Ok(self.last_frame()? == 0)
     }
 
-    /// Insert the frames of one or more whole transactions; `frames` must end on a commit
-    /// frame, else the tail is rolled back. Local number is `frame.no + offset`.
+    /// Insert exactly one committed transaction: `frames` must end on a commit frame (header
+    /// `db_size != 0`) and hold no commit frame before the last. Local number is
+    /// `frame.no + offset`. Frames that do not end on a commit frame give `Incomplete` and
+    /// nothing is inserted; a commit frame before the last is an error (the caller passes one
+    /// transaction at a time). On any failure the session is rolled back.
     pub(crate) fn apply_commit(&self, frames: &[Frame], offset: i64) -> Result<ApplyOutcome> {
+        let is_commit = |f: &Frame| f.header[4..8] != [0; 4];
+        match frames.split_last() {
+            Some((last, rest)) if is_commit(last) => {
+                if rest.iter().any(is_commit) {
+                    return Err(Error::Corrupt(
+                        "replica apply: a commit frame before the last frame".into(),
+                    ));
+                }
+            }
+            _ => return Ok(ApplyOutcome::Incomplete),
+        }
         let mut last = self.last_frame()?;
         self.conn.wal_insert_begin().map_err(engine)?;
         match self.insert_all(frames, offset, &mut last) {
-            Ok(Some(applied)) => {
-                self.conn.wal_insert_end(true).map_err(engine)?;
-                Ok(ApplyOutcome::Applied { frames: applied })
-            }
+            Ok(Some(applied)) => match self.conn.wal_insert_end(true) {
+                Ok(()) => Ok(ApplyOutcome::Applied { frames: applied }),
+                Err(e) => {
+                    let _ = self.conn.wal_insert_end(false);
+                    Err(engine(e))
+                }
+            },
             Ok(None) => {
                 self.conn.wal_insert_end(false).map_err(engine)?;
                 Ok(ApplyOutcome::Gap)
@@ -272,6 +295,20 @@ mod tests {
         frames
     }
 
+    /// Split frames into transactions, each ending on a commit frame.
+    fn txs(frames: &[Frame]) -> Vec<Vec<Frame>> {
+        let mut out = vec![];
+        let mut cur = vec![];
+        for f in frames {
+            cur.push(f.clone());
+            if f.header[4..8] != [0; 4] {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        assert!(cur.is_empty());
+        out
+    }
+
     #[test]
     fn applies_committed_frames_and_reader_sees_rows_at_commit_frame() {
         let f = fixture(false);
@@ -279,15 +316,19 @@ mod tests {
         sql(&f.writer, "INSERT INTO t VALUES (3, zeroblob(100))");
         let frames = commit_frames(&f);
         assert_eq!(count(&f.reader), 1);
-        let out = f.applier.apply_commit(&frames, 0).unwrap();
+        let t = txs(&frames);
+        assert_eq!(t.len(), 2);
+        let out = f.applier.apply_commit(&t[0], 0).unwrap();
         assert_eq!(
             out,
             ApplyOutcome::Applied {
-                frames: frames.len() as u64
+                frames: t[0].len() as u64
             }
         );
+        assert_eq!(count(&f.reader), 2);
+        f.applier.apply_commit(&t[1], 0).unwrap();
         assert_eq!(count(&f.reader), 3);
-        assert!(!f.applier.local_wal_empty());
+        assert!(!f.applier.local_wal_empty().unwrap());
     }
 
     #[test]
@@ -331,12 +372,21 @@ mod tests {
         sql(&f.writer, "INSERT INTO t VALUES (2, zeroblob(100))");
         sql(&f.writer, "INSERT INTO t VALUES (3, zeroblob(100))");
         let frames = commit_frames(&f);
-        let k = frames.len() as i64 - 1;
-        // the replica's app.db is the checkpointed base; frames 1..k are assumed already
-        // in it, so only the last frame is applied, at local number 1
-        let out = f.applier.apply_commit(&frames, -k).unwrap();
-        assert_eq!(out, ApplyOutcome::Applied { frames: 1 });
-        assert_eq!(f.applier.last_frame().unwrap(), 1);
+        let t = txs(&frames);
+        let k = t[0].len() as i64;
+        // the first transaction is assumed already in app.db: all skipped, none counted
+        let out = f.applier.apply_commit(&t[0], -k).unwrap();
+        assert_eq!(out, ApplyOutcome::Applied { frames: 0 });
+        assert!(f.applier.local_wal_empty().unwrap());
+        // the second lands from local frame 1
+        let out = f.applier.apply_commit(&t[1], -k).unwrap();
+        assert_eq!(
+            out,
+            ApplyOutcome::Applied {
+                frames: t[1].len() as u64
+            }
+        );
+        assert_eq!(f.applier.last_frame().unwrap(), t[1].len() as u64);
     }
 
     #[test]
@@ -346,26 +396,57 @@ mod tests {
         let frames = commit_frames(&f);
         let out = f.applier.apply_commit(&frames, 5).unwrap();
         assert_eq!(out, ApplyOutcome::Gap);
-        assert!(f.applier.local_wal_empty());
+        assert!(f.applier.local_wal_empty().unwrap());
         assert_eq!(count(&f.reader), 1);
     }
 
     #[test]
-    fn uncommitted_tail_is_rolled_back() {
+    fn tail_only_is_incomplete_with_nothing_visible() {
         let f = fixture(false);
         sql(&f.writer, "INSERT INTO t VALUES (2, zeroblob(100))");
-        let frames = commit_frames(&f);
-        let mut tail = frames.clone();
+        let mut tail = commit_frames(&f);
         for fr in &mut tail {
             fr.header[4..8].fill(0);
         }
         let out = f.applier.apply_commit(&tail, 0).unwrap();
-        assert!(matches!(out, ApplyOutcome::Applied { .. }));
-        assert!(f.applier.local_wal_empty());
+        assert_eq!(out, ApplyOutcome::Incomplete);
+        assert!(f.applier.local_wal_empty().unwrap());
         assert_eq!(count(&f.reader), 1);
+        assert_eq!(
+            f.applier.apply_commit(&[], 0).unwrap(),
+            ApplyOutcome::Incomplete
+        );
         // the real commit then applies cleanly
-        f.applier.apply_commit(&frames, 0).unwrap();
+        f.applier.apply_commit(&commit_frames(&f), 0).unwrap();
         assert_eq!(count(&f.reader), 2);
+    }
+
+    #[test]
+    fn commit_followed_by_uncommitted_tail_is_incomplete_and_nothing_applied() {
+        let f = fixture(false);
+        sql(&f.writer, "INSERT INTO t VALUES (2, zeroblob(100))");
+        let frames = commit_frames(&f);
+        let mut mixed = frames.clone();
+        let mut extra = frames.last().unwrap().clone();
+        extra.no += 1;
+        extra.header[4..8].fill(0);
+        mixed.push(extra);
+        // ends on a non-commit frame: Incomplete, the committed part is not applied either
+        let out = f.applier.apply_commit(&mixed, 0).unwrap();
+        assert_eq!(out, ApplyOutcome::Incomplete);
+        assert!(f.applier.local_wal_empty().unwrap());
+        assert_eq!(count(&f.reader), 1);
+    }
+
+    #[test]
+    fn two_transactions_in_one_call_are_rejected() {
+        let f = fixture(false);
+        sql(&f.writer, "INSERT INTO t VALUES (2, zeroblob(100))");
+        sql(&f.writer, "INSERT INTO t VALUES (3, zeroblob(100))");
+        let frames = commit_frames(&f);
+        assert!(frames.len() >= 2);
+        assert!(f.applier.apply_commit(&frames, 0).is_err());
+        assert!(f.applier.local_wal_empty().unwrap());
     }
 
     #[test]
@@ -374,10 +455,15 @@ mod tests {
         sql(&f.writer, "INSERT INTO t VALUES (2, zeroblob(100))");
         sql(&f.writer, "INSERT INTO t VALUES (3, zeroblob(100))");
         let frames = commit_frames(&f);
-        f.applier.apply_commit(&frames, 0).unwrap();
+        let t = txs(&frames);
+        for x in &t {
+            f.applier.apply_commit(x, 0).unwrap();
+        }
         assert_eq!(count(&f.reader), 3);
         // re-delivery compares plaintext against plaintext
-        f.applier.apply_commit(&frames, 0).unwrap();
+        for x in &t {
+            f.applier.apply_commit(x, 0).unwrap();
+        }
     }
 
     #[test]
@@ -389,7 +475,7 @@ mod tests {
             f.applier.checkpoint_truncate().unwrap(),
             CheckpointResult::Done
         );
-        assert!(f.applier.local_wal_empty());
+        assert!(f.applier.local_wal_empty().unwrap());
         assert_eq!(count(&f.reader), 2);
     }
 }

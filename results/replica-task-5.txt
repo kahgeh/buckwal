@@ -21,3 +21,16 @@ test replica::apply::tests::encrypted_frames_are_decrypted_before_insert ... ok
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 579 filtered out; finished in 0.04s
 
 $ ./scripts/test.sh unit  # fmt, clippy -D warnings, tests: pass
+$ cargo test --locked -p buckwal --lib replica::apply   # after review fixes
+test replica::apply::tests::reapplying_same_frames_is_ok ... ok
+test replica::apply::tests::gap_is_reported_not_applied ... ok
+test replica::apply::tests::two_transactions_in_one_call_are_rejected ... ok
+test replica::apply::tests::checkpoint_truncate_empties_the_local_wal ... ok
+test replica::apply::tests::commit_followed_by_uncommitted_tail_is_incomplete_and_nothing_applied ... ok
+test replica::apply::tests::negative_numbering_skips_frames_already_in_app_db ... ok
+test replica::apply::tests::different_content_at_same_frame_is_conflict ... ok
+test replica::apply::tests::applies_committed_frames_and_reader_sees_rows_at_commit_frame ... ok
+test replica::apply::tests::tail_only_is_incomplete_with_nothing_visible ... ok
+test replica::apply::tests::encrypted_frames_are_decrypted_before_insert ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 579 filtered out; finished in 0.02s
+$ ./scripts/test.sh unit  # exit=0, 589 lib tests passed
