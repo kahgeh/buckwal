@@ -13,6 +13,7 @@
 use super::db_storage::{BucketDbStorage, READ_ONLY};
 use super::read_at;
 use super::stash::stash;
+use super::IoMode;
 use crate::batching::{ctx, record_outcome, Batching, PendingAck};
 use crate::error::{Error, Result};
 use crate::files::io_err;
@@ -104,7 +105,7 @@ pub(crate) struct ShippingFile {
     /// new generation's header and at `truncate(0)`.
     high_water: Arc<AtomicU64>,
     /// A read-only open: every write and truncate is refused.
-    read_only: bool,
+    mode: IoMode,
     /// An MVCC database's `-wal` (`in_mvcc`).
     mvcc: bool,
     /// The generation whose image holds this file's bytes: the current one at open when the
@@ -122,7 +123,7 @@ impl ShippingFile {
         uploader: Arc<Uploader>,
         storage: Arc<BucketDbStorage>,
         high_water: Arc<AtomicU64>,
-        read_only: bool,
+        mode: IoMode,
     ) -> turso_core::Result<ShippingFile> {
         let size = inner.size()?;
         let header = if size >= WAL_HEADER as u64 {
@@ -141,7 +142,7 @@ impl ShippingFile {
             commit: Mutex::new(None),
             header: Mutex::new(header),
             high_water,
-            read_only,
+            mode,
             mvcc: false,
             shipped_generation,
         })
@@ -283,7 +284,7 @@ impl ShippingFile {
     /// The backstop of a read-only open: a WAL database's engine never gets to change the
     /// `-wal`.
     fn refuse_if_read_only(&self) -> turso_core::Result<()> {
-        if self.read_only && !self.mvcc {
+        if self.mode == IoMode::ReadOnly && !self.mvcc {
             return Err(stash(Error::Unsupported(READ_ONLY)));
         }
         Ok(())
@@ -292,7 +293,7 @@ impl ShippingFile {
     /// A read-only MVCC open's `-wal`: the engine's recovery writes (a checkpoint's
     /// bootstrap) reach the local file only, never the bucket.
     fn local_only(&self) -> bool {
-        self.read_only && self.mvcc
+        (self.mode == IoMode::ReadOnly && self.mvcc) || self.mode == IoMode::Replica
     }
 
     /// Record `ops` once the inner call that issued them returned `Ok`: a write or truncate
@@ -476,7 +477,7 @@ mod tests {
             e.uploader.clone(),
             e.storage.clone(),
             Arc::default(),
-            false,
+            IoMode::Writer,
         )
         .unwrap();
         let buf = || Arc::new(Buffer::new(vec![7u8; 64]));
@@ -504,7 +505,7 @@ mod tests {
             e.uploader.clone(),
             e.storage.clone(),
             high_water.clone(),
-            false,
+            IoMode::Writer,
         )
         .unwrap();
         high_water.store(4096, SeqCst);
@@ -532,7 +533,7 @@ mod tests {
             e.uploader.clone(),
             e.storage.clone(),
             Arc::default(),
-            false,
+            IoMode::Writer,
         )
         .unwrap()
         .in_mvcc();

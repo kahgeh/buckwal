@@ -3,6 +3,7 @@
 //! local are fetched on first read; pages the engine writes are recorded dirty (in memory and
 //! in `<dir>/app.db-dirty`) and uploaded only when the generation is sealed (D6).
 use super::stash::stash;
+use super::IoMode;
 use super::{read_at, sync_file, write_at};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DIRTY_FILE};
@@ -94,7 +95,7 @@ pub(crate) struct BucketDbStorage {
     lazy_gets: AtomicU64,
     /// A read-only open: every engine write is refused (fetched pages are still cached),
     /// unless `mvcc`.
-    read_only: bool,
+    mode: IoMode,
     /// An MVCC database: a read-only open lets the engine's bootstrap write the local file
     /// (backfill); the pages are tracked as dirty locally and nothing is uploaded.
     mvcc: bool,
@@ -112,7 +113,7 @@ pub(crate) struct StorageParts {
     /// be written).
     pub state: LocalState,
     pub manifest: Option<Manifest>,
-    pub read_only: bool,
+    pub mode: IoMode,
     pub mvcc: bool,
 }
 
@@ -142,7 +143,7 @@ impl BucketDbStorage {
                 state: p.state,
             }),
             lazy_gets: AtomicU64::new(0),
-            read_only: p.read_only,
+            mode: p.mode,
             mvcc: p.mvcc,
         }
     }
@@ -254,7 +255,7 @@ impl BucketDbStorage {
     /// pages are local in this process).
     fn mark_complete(&self) -> Result<()> {
         let mut dirty = self.dirty.lock().unwrap();
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             self.complete.store(true, SeqCst);
             return Ok(());
         }
@@ -382,7 +383,7 @@ impl BucketDbStorage {
     /// The backstop of a read-only open: a WAL database's engine never gets to write the
     /// database file (an MVCC one's bootstrap backfills it).
     fn refuse_if_read_only(&self) -> turso_core::Result<()> {
-        if self.read_only && !self.mvcc {
+        if self.mode == IoMode::ReadOnly && !self.mvcc {
             return Err(stash(Error::Unsupported(READ_ONLY)));
         }
         Ok(())

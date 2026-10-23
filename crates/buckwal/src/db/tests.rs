@@ -1233,7 +1233,7 @@ fn reopen_after_claim_without_its_record_appends_one() {
     restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
     let mut s = state(r.path());
     let b_id = "b".repeat(32);
-    let cfg = config(r.path()).engine(false);
+    let cfg = config(r.path()).engine(crate::io::IoMode::Writer);
     let (h, etag) =
         crate::bucket::take_over(&*store, &keys(), &cfg.retry, s.generation, &b_id).unwrap();
     s.head_etag = etag;
@@ -3653,7 +3653,7 @@ fn takeover_refuses_a_mode_mismatch_without_writing() {
 
 /// The engine config `open` builds for `c`, with its encryption.
 fn engine_cfg(c: &Config) -> EngineConfig {
-    let mut cfg = c.engine(false);
+    let mut cfg = c.engine(crate::io::IoMode::Writer);
     cfg.encryption = encryption::load(c).unwrap();
     cfg
 }
@@ -4503,4 +4503,100 @@ fn previous_build_restores_from_new_head() {
     want.push(3001);
     assert_eq!(restored_ids(&store), want);
     crash(db, vec![c]);
+}
+
+/// A replica-mode engine over a lazily restored directory (no claim, no epoch raise).
+fn replica_engine(
+    store: &Arc<MemStore>,
+    dir: &Path,
+    mode: crate::io::IoMode,
+) -> (crate::engine::Engine, Arc<turso_core::Connection>) {
+    restore_with_store(&config(dir), store.clone(), dir).unwrap();
+    let cfg = config(dir).engine(mode);
+    let state = LocalState::read(dir).unwrap().unwrap();
+    let dyn_store: Arc<dyn ObjectStore> = store.clone();
+    let a = attach_existing(dir, &dyn_store, &keys(), &cfg, state).unwrap();
+    let e = crate::engine::open_engine(dir, a.bucket, &a.state, &cfg, None).unwrap();
+    let c = e.db.connect().unwrap();
+    (e, c)
+}
+
+fn scalar(c: &Arc<turso_core::Connection>, sql: &str) -> Option<i64> {
+    crate::io::stash::clear();
+    c.prepare(sql).unwrap().run_collect_rows().unwrap()[0][0].as_int()
+}
+
+/// Replica mode: the follower's frame inserts and checkpoints reach the local `-wal` and
+/// `app.db`; the bucket sees no PUT and no DELETE (GET and LIST only).
+#[test]
+fn replica_mode_allows_local_wal_and_db_writes_and_uploads_nothing() {
+    let store = mem();
+    let _a = closed_writer(&store, 5);
+    let v = tempdir();
+    let (e, c) = replica_engine(&store, v.path(), crate::io::IoMode::Replica);
+    let before = store.stats();
+    c.wal_auto_actions_disable();
+    c.prepare("INSERT INTO t(id, v) VALUES (6, 'x')")
+        .and_then(|mut s| s.run_ignore_rows())
+        .unwrap_or_else(|err| panic!("{err} ({:?})", crate::io::stash::take()));
+    assert_eq!(scalar(&c, "SELECT count(*) FROM t"), Some(6));
+    crate::io::stash::clear();
+    c.checkpoint(turso_core::CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap_or_else(|err| panic!("{err} ({:?})", crate::io::stash::take()));
+    assert_eq!(scalar(&c, "SELECT count(*) FROM t"), Some(6));
+    let d = store.stats().since(&before);
+    assert_eq!(
+        (d.puts, d.deletes),
+        (0, 0),
+        "a replica wrote to the bucket: {d:?}"
+    );
+    c.close().unwrap();
+    drop(c);
+    drop(e);
+    let d = store.stats().since(&before);
+    assert_eq!(
+        (d.puts, d.deletes),
+        (0, 0),
+        "a replica wrote at close: {d:?}"
+    );
+}
+
+/// Replica mode reads pages from the bucket until they are local, as a read-only open does.
+#[test]
+fn replica_mode_reads_pages_lazily_from_bucket() {
+    let store = mem();
+    let _a = closed_writer(&store, 200);
+    let v = tempdir();
+    let (e, c) = replica_engine(&store, v.path(), crate::io::IoMode::Replica);
+    let start = e.storage.lazy_gets();
+    let before = store.stats();
+    assert_eq!(scalar(&c, "SELECT count(*) FROM t"), Some(200));
+    assert!(e.storage.lazy_gets() > start, "no page was fetched");
+    let d = store.stats().since(&before);
+    assert!(d.gets > 0);
+    assert_eq!((d.puts, d.deletes), (0, 0));
+    c.close().unwrap();
+}
+
+/// The read-only backstop is unchanged by the third mode.
+#[test]
+fn read_only_mode_still_refuses_local_writes() {
+    let store = mem();
+    let _a = closed_writer(&store, 5);
+    let v = tempdir();
+    let (e, c) = replica_engine(&store, v.path(), crate::io::IoMode::ReadOnly);
+    crate::io::stash::clear();
+    let r = c
+        .prepare("INSERT INTO t(id, v) VALUES (6, 'x')")
+        .and_then(|mut s| s.run_ignore_rows());
+    assert!(r.is_err());
+    assert_eq!(
+        crate::io::stash::take(),
+        Some(Error::Unsupported("writes on a read-only open"))
+    );
+    c.wal_auto_actions_disable();
+    c.close().unwrap();
+    drop(e);
 }

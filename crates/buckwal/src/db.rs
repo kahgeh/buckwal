@@ -280,7 +280,11 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     let encryption = encryption::load(&config)?;
     let guard = DirGuard::acquire(&config.dir)?;
     let dir = guard.dir().to_path_buf();
-    let mut cfg = config.engine(read_only);
+    let mut cfg = config.engine(if read_only {
+        crate::io::IoMode::ReadOnly
+    } else {
+        crate::io::IoMode::Writer
+    });
     let keys = config.keys_for(encryption.as_deref());
     cfg.encryption = encryption;
     clear_interrupted_restore(&dir)?;

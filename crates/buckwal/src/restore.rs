@@ -575,8 +575,13 @@ pub fn restore_with_store(
 ) -> Result<RestoreReport> {
     config.validate()?;
     let guard = DirGuard::acquire(dir)?;
-    restore_staged(store, &config.keys()?, guard.dir(), &config.engine(false))
-        .map(|staged| staged.report)
+    restore_staged(
+        store,
+        &config.keys()?,
+        guard.dir(),
+        &config.engine(crate::io::IoMode::Writer),
+    )
+    .map(|staged| staged.report)
 }
 
 /// What [`restore_staged`] hands on.

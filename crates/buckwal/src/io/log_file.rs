@@ -27,6 +27,7 @@
 //! (`high_water`, shared with `Engine::wal_bytes`) for the maintenance trigger, which reads it.
 use super::read_at;
 use super::stash::stash;
+use super::IoMode;
 use crate::batching::{ctx, Batching, PendingAck};
 use crate::error::{Error, Result};
 use crate::files::io_err;
@@ -79,7 +80,7 @@ pub(crate) struct LogShippingFile {
     poisoned: Mutex<Option<Error>>,
     /// A read-only open (`verify`): the engine's recovery writes and truncates go to the
     /// local file only. Nothing is recorded, shipped or sealed.
-    read_only: bool,
+    mode: IoMode,
     /// The log's high-water mark: the highest offset + length written (the file's size at
     /// open), 0 after a `truncate(0)`. Shared with `Engine::wal_bytes`, which maintenance
     /// measures in MVCC mode (the `-wal` is near 0 there).
@@ -94,7 +95,7 @@ impl LogShippingFile {
         io: Arc<dyn IO>,
         uploader: Arc<Uploader>,
         high_water: Arc<AtomicU64>,
-        read_only: bool,
+        mode: IoMode,
     ) -> turso_core::Result<LogShippingFile> {
         let generation = uploader.generation();
         high_water.store(inner.size()?, SeqCst);
@@ -111,7 +112,7 @@ impl LogShippingFile {
                 fenced: None,
             }),
             poisoned: Mutex::new(None),
-            read_only,
+            mode,
             high_water,
         })
     }
@@ -293,7 +294,7 @@ impl File for LogShippingFile {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             return self.inner.pwrite(pos, buffer, c);
         }
         // A poisoned commit is refused at its write, so it rolls back (P3 variant C).
@@ -315,7 +316,7 @@ impl File for LogShippingFile {
         buffers: Vec<Arc<Buffer>>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             return self.inner.pwritev(pos, buffers, c);
         }
         self.refuse_if_poisoned()?;
@@ -336,7 +337,7 @@ impl File for LogShippingFile {
         r
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             return self.inner.sync(c, sync_type);
         }
         // Upload before any completion exists: a failure is a synchronous `Err` (the commit
@@ -358,7 +359,7 @@ impl File for LogShippingFile {
     /// length is recorded as an op (not expected from the engine but after a discarded
     /// write, and `reset_to_fresh_header`).
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             let r = self.inner.truncate(len, c);
             if r.is_ok() {
                 self.high_water.store(len, SeqCst);
@@ -600,15 +601,15 @@ mod tests {
 
     impl Rig {
         fn file(&self) -> LogShippingFile {
-            self.file_over(self.local.clone(), false)
+            self.file_over(self.local.clone(), IoMode::Writer)
         }
-        fn file_over(&self, inner: Arc<dyn File>, read_only: bool) -> LogShippingFile {
+        fn file_over(&self, inner: Arc<dyn File>, mode: IoMode) -> LogShippingFile {
             LogShippingFile::new(
                 inner,
                 self.io.clone(),
                 self.up.clone(),
                 Arc::default(),
-                read_only,
+                mode,
             )
             .unwrap()
         }
@@ -747,7 +748,7 @@ mod tests {
             mem: r.mem.clone(),
             syncs: Mutex::default(),
         });
-        let f = r.file_over(spy.clone(), false);
+        let f = r.file_over(spy.clone(), IoMode::Writer);
         write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
         write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
         assert_eq!(sync(&f, &*r.io), Ok(()));
@@ -1081,7 +1082,7 @@ mod tests {
     #[test]
     fn pwrite_refused_by_inner_records_no_op() {
         let r = rig();
-        let f = r.file_over(Arc::new(Refusing), false);
+        let f = r.file_over(Arc::new(Refusing), IoMode::Writer);
         let buf = || Arc::new(Buffer::new(vec![7u8; 64]));
         assert!(f.pwrite(56, buf(), Completion::new_write(|_| {})).is_err());
         assert!(f
@@ -1098,7 +1099,7 @@ mod tests {
     fn read_only_writes_stay_local_and_ship_nothing() {
         let r = rig();
         write(&*r.local, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
-        let f = r.file_over(r.local.clone(), true);
+        let f = r.file_over(r.local.clone(), IoMode::ReadOnly);
         let buf = || Arc::new(Buffer::new(vec![1u8; 8]));
         drop(f.pwrite(0, buf(), Completion::new_write(|_| {})).unwrap());
         let mut want = frame(0xAA, HEADER);
@@ -1117,6 +1118,22 @@ mod tests {
         assert_eq!(f.pending.lock().unwrap().len(), 0, "nothing recorded");
         assert_eq!(sync(&f, &*r.io), Ok(()));
         assert!(r.records(2).is_empty(), "a read-only sync ships nothing");
+    }
+
+    /// A replica's log writes and truncates reach the local file; nothing is recorded or
+    /// shipped.
+    #[test]
+    fn replica_mode_refuses_log_shipping() {
+        let r = rig();
+        write(&*r.local, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
+        let f = r.file_over(r.local.clone(), IoMode::Replica);
+        let buf = || Arc::new(Buffer::new(vec![1u8; 8]));
+        drop(f.pwrite(0, buf(), Completion::new_write(|_| {})).unwrap());
+        drop(f.truncate(0, Completion::new_trunc(|_| {})).unwrap());
+        assert!(r.local_bytes().is_empty());
+        assert_eq!(f.pending.lock().unwrap().len(), 0, "nothing recorded");
+        assert_eq!(sync(&f, &*r.io), Ok(()));
+        assert!(r.records(2).is_empty(), "a replica sync ships nothing");
     }
 
     /// A seal's head PUT stored and its reply was lost: generation 3 is published. The next

@@ -12,6 +12,21 @@ pub(crate) mod wal_file;
 pub(crate) use db_storage::BucketDbStorage;
 pub(crate) use durable_io::DurableIo;
 
+/// How an open uses the IO layer.
+///
+/// - `Writer`: ships, seals and claims.
+/// - `ReadOnly`: every engine write to a WAL database is refused; nothing reaches the bucket.
+/// - `Replica`: the local `-wal` and `app.db` accept writes (a follower's frame inserts and
+///   checkpoints) and pages are fetched lazily, but nothing is shipped, sealed, claimed or
+///   deleted: every write path takes the local-only branch before it reaches the uploader.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IoMode {
+    Writer,
+    ReadOnly,
+    #[allow(dead_code)] // Task 9 wires `open_replica`.
+    Replica,
+}
+
 use std::sync::atomic::{AtomicI32, Ordering::SeqCst};
 use std::sync::Arc;
 use turso_core::io::FileSyncType;

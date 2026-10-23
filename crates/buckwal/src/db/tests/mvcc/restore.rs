@@ -58,7 +58,7 @@ fn crashed_with_rows(n: i64) -> (Arc<MemStore>, TempDir) {
 
 /// What each file of a crashed `dir` needs (attached as its own writer, as an open does).
 fn outcomes(store: &Arc<MemStore>, dir: &Path) -> Outcomes {
-    let cfg = mvcc(dir).engine(false);
+    let cfg = mvcc(dir).engine(crate::io::IoMode::Writer);
     let mut state = LocalState::read(dir).unwrap().expect("local state");
     let mut b = Bucket::attach(
         store.clone(),

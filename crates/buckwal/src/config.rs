@@ -517,7 +517,7 @@ impl Config {
             .with_integrity(encryption.map(Encryption::integrity_key))
     }
 
-    pub(crate) fn engine(&self, read_only: bool) -> EngineConfig {
+    pub(crate) fn engine(&self, mode: crate::io::IoMode) -> EngineConfig {
         EngineConfig {
             retry: RetryPolicy {
                 deadline: self.retry_deadline,
@@ -530,7 +530,8 @@ impl Config {
             request_timeout: self.request_timeout,
             trim_grace: self.trim_grace,
             events: self.on_event.clone(),
-            read_only,
+            read_only: mode != crate::io::IoMode::Writer,
+            io_mode: mode,
             encryption: None,
             journal_mode: self.journal_mode,
         }
@@ -649,6 +650,8 @@ pub(crate) struct EngineConfig {
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are
     /// refused (`ShippingFile`, `BucketDbStorage`).
     pub read_only: bool,
+    /// How the IO layer treats writes (`read_only` is true for every mode but `Writer`).
+    pub(crate) io_mode: crate::io::IoMode,
     /// The cipher and key the engine opens and connects with (D16); `None` is unencrypted.
     /// [`Config::engine`] leaves it `None`: `open` loads the key file (`encryption::load`).
     pub encryption: Option<Arc<Encryption>>,
@@ -735,7 +738,7 @@ mod tests {
     fn gc_min_age_adds_the_request_budget_and_a_second() {
         let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
         assert_eq!(
-            c.engine(false).gc_min_age(),
+            c.engine(crate::io::IoMode::Writer).gc_min_age(),
             Duration::from_secs(600 + 30 + 10 + 1),
             "defaults"
         );
@@ -744,11 +747,20 @@ mod tests {
         c.retry_deadline = Duration::from_millis(400);
         c.request_timeout = Duration::from_millis(500);
         assert_eq!(c.validate(), Ok(()));
-        assert_eq!(c.engine(false).gc_min_age(), Duration::from_millis(3900));
-        assert_eq!(c.engine(true).gc_min_age(), Duration::from_millis(3900));
+        assert_eq!(
+            c.engine(crate::io::IoMode::Writer).gc_min_age(),
+            Duration::from_millis(3900)
+        );
+        assert_eq!(
+            c.engine(crate::io::IoMode::ReadOnly).gc_min_age(),
+            Duration::from_millis(3900)
+        );
         // Huge durations saturate instead of panicking.
         c.trim_grace = Duration::MAX;
-        assert_eq!(c.engine(false).gc_min_age(), Duration::MAX);
+        assert_eq!(
+            c.engine(crate::io::IoMode::Writer).gc_min_age(),
+            Duration::MAX
+        );
     }
 
     /// `trim_grace` must exceed `lease + retry_deadline + request_timeout`, and 0 is refused
@@ -809,7 +821,10 @@ mod tests {
         env.insert("BUCKWAL_LEASE_MS", "1500");
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(c.lease, Duration::from_millis(1500));
-        assert_eq!(c.engine(false).lease, Duration::from_millis(1500));
+        assert_eq!(
+            c.engine(crate::io::IoMode::Writer).lease,
+            Duration::from_millis(1500)
+        );
         let env = required();
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(c.lease, Duration::from_secs(30));
@@ -849,7 +864,7 @@ mod tests {
         let mut c = c;
         c.retry_deadline = Duration::from_millis(1234);
         c.request_timeout = Duration::from_millis(321);
-        let e = c.engine(false);
+        let e = c.engine(crate::io::IoMode::Writer);
         assert_eq!((e.lease, e.request_timeout), (c.lease, c.request_timeout));
         let r = e.retry;
         assert_eq!(
@@ -1146,7 +1161,10 @@ mod tests {
             debug.contains("/keys/db.key") && debug.contains("aegis128l"),
             "{debug}"
         );
-        assert!(c.engine(false).encryption.is_none(), "open loads the key");
+        assert!(
+            c.engine(crate::io::IoMode::Writer).encryption.is_none(),
+            "open loads the key"
+        );
     }
 
     /// A prefix is limited to `[A-Za-z0-9._/-]` with no empty segment: anything else (XML

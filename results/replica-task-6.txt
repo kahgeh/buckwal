@@ -1,0 +1,8 @@
+test io::log_file::tests::replica_mode_refuses_log_shipping ... ok
+test db::tests::replica_mode_allows_local_wal_and_db_writes_and_uploads_nothing ... FAILED
+test db::tests::replica_mode_reads_pages_lazily_from_bucket ... ok
+thread 'db::tests::replica_mode_allows_local_wal_and_db_writes_and_uploads_nothing' (173573399) panicked at crates/buckwal/src/db/tests.rs:4550:5:
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 590 filtered out; finished in 0.48s
+
+GREEN: ./scripts/test.sh unit passes (fmt, clippy -D warnings, tests).
+buckwal lib tests before 589, after 593 (+4 new); all other test binaries unchanged (33,5,5,8,5,1).

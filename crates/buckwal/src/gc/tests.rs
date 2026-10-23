@@ -21,7 +21,9 @@ fn config(dir: &Path) -> Config {
 }
 
 fn min_age() -> Duration {
-    config(Path::new("/x")).engine(false).gc_min_age()
+    config(Path::new("/x"))
+        .engine(crate::io::IoMode::Writer)
+        .gc_min_age()
 }
 
 fn mem() -> Arc<MemStore> {

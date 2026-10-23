@@ -11,6 +11,7 @@ use super::db_storage::BucketDbStorage;
 use super::log_storage::LogDurableStorage;
 use super::stash::stash;
 use super::wal_file::ShippingFile;
+use super::IoMode;
 use crate::error::Error;
 use crate::uploader::Uploader;
 use std::ptr::NonNull;
@@ -30,8 +31,8 @@ pub(crate) struct DurableIo {
     storage: Arc<BucketDbStorage>,
     /// The `-wal`'s high-water mark (`ShippingFile::high_water`).
     wal_bytes: Arc<AtomicU64>,
-    /// A read-only open: the `-wal` refuses every write.
-    read_only: bool,
+    /// How the `-wal` treats writes.
+    mode: IoMode,
     /// An MVCC database's durable storage, which owns `app.db-log`.
     log: Option<Arc<LogDurableStorage>>,
 }
@@ -43,7 +44,7 @@ impl DurableIo {
         uploader: Arc<Uploader>,
         storage: Arc<BucketDbStorage>,
         wal_bytes: Arc<AtomicU64>,
-        read_only: bool,
+        mode: IoMode,
         log: Option<Arc<LogDurableStorage>>,
     ) -> DurableIo {
         DurableIo {
@@ -52,7 +53,7 @@ impl DurableIo {
             uploader,
             storage,
             wal_bytes,
-            read_only,
+            mode,
             log,
         }
     }
@@ -108,7 +109,7 @@ impl IO for DurableIo {
             } else {
                 self.wal_bytes.clone()
             },
-            self.read_only,
+            self.mode,
         )?;
         Ok(Arc::new(if self.log.is_some() {
             wal.in_mvcc()

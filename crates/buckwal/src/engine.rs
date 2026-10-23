@@ -139,7 +139,7 @@ pub(crate) fn open_engine(
         dir: dir.to_path_buf(),
         state: state.clone(),
         manifest,
-        read_only: cfg.read_only,
+        mode: cfg.io_mode,
         mvcc: cfg.journal_mode == JournalMode::Mvcc,
     }));
     storage.adopt_persisted_dirty()?;
@@ -167,7 +167,7 @@ pub(crate) fn open_engine(
             storage.clone(),
             enc,
             wal_bytes.clone(),
-            cfg.read_only,
+            cfg.io_mode,
         )?))
     } else {
         None
@@ -178,7 +178,7 @@ pub(crate) fn open_engine(
         uploader.clone(),
         storage.clone(),
         wal_bytes.clone(),
-        cfg.read_only,
+        cfg.io_mode,
         log.clone(),
     ));
     let mut opts = OpenOptions::new(Arc::new(SqliteDialect))

@@ -1777,7 +1777,8 @@ fn take_over_after_a_rival_retries_on_the_same_generation_only() {
 }
 
 fn engine_cfg() -> crate::config::EngineConfig {
-    crate::config::Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s").engine(false)
+    crate::config::Config::new("/tmp/x", "http://127.0.0.1:1", "b", "k", "s")
+        .engine(crate::io::IoMode::Writer)
 }
 
 fn fence(writer_id: &str, epoch: u64) -> LogRecord {

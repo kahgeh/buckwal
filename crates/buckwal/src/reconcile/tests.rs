@@ -591,6 +591,7 @@ fn read_only_reconcile_refuses_to_upload_ahead() {
 
     let ro = EngineConfig {
         read_only: true,
+        io_mode: crate::io::IoMode::ReadOnly,
         ..cfg()
     };
     let (mut b, mut s) = attach(mem.clone(), crashed.path(), &ro);

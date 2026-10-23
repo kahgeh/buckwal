@@ -32,6 +32,7 @@ use super::db_storage::BucketDbStorage;
 use super::log_file::LogShippingFile;
 use super::stash::stash;
 use super::wal_file::wal_frame_pages;
+use super::IoMode;
 use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::uploader::Uploader;
@@ -72,14 +73,14 @@ pub(crate) struct LogDurableStorage {
     /// Set once a local step after a seal failed; refuses checkpoints and seals until reopen
     /// (the log file refuses writes with the same error).
     poisoned: Mutex<Option<Error>>,
-    read_only: bool,
+    mode: IoMode,
 }
 
 impl std::fmt::Debug for LogDurableStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogDurableStorage")
             .field("log_path", &self.log_path)
-            .field("read_only", &self.read_only)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -97,19 +98,19 @@ impl LogDurableStorage {
         db: Arc<BucketDbStorage>,
         enc: Option<EncryptionContext>,
         wal_bytes: Arc<AtomicU64>,
-        read_only: bool,
+        mode: IoMode,
     ) -> Result<LogDurableStorage> {
         let path = log_path
             .to_str()
             .ok_or_else(|| Error::Config(format!("{} is not UTF-8", log_path.display())))?;
         // A read-only open never creates the log.
-        if read_only && !log_path.exists() {
+        if mode == IoMode::ReadOnly && !log_path.exists() {
             return Err(Error::Corrupt(format!(
                 "{} is missing: restore the database again",
                 log_path.display()
             )));
         }
-        let flags = if read_only {
+        let flags = if mode == IoMode::ReadOnly {
             OpenFlags::None
         } else {
             OpenFlags::Create
@@ -130,14 +131,8 @@ impl LogDurableStorage {
             enc
         };
         let file = Arc::new(
-            LogShippingFile::new(
-                local,
-                platform.clone(),
-                uploader.clone(),
-                wal_bytes,
-                read_only,
-            )
-            .map_err(|e| io_err("app.db-log", e))?,
+            LogShippingFile::new(local, platform.clone(), uploader.clone(), wal_bytes, mode)
+                .map_err(|e| io_err("app.db-log", e))?,
         );
         file.ship_whole_file_next();
         Ok(LogDurableStorage {
@@ -149,7 +144,7 @@ impl LogDurableStorage {
             log_path,
             sealed: AtomicBool::new(false),
             poisoned: Mutex::new(None),
-            read_only,
+            mode,
         })
     }
 
@@ -237,7 +232,7 @@ impl DurableStorage for LogDurableStorage {
         &self,
         checkpointed_through_ts: u64,
     ) -> turso_core::Result<(Completion, LogicalLogTruncateOutcome)> {
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             // Verify's recovery cut stays local: no seal, nothing shipped.
             return self.inner.truncate(checkpointed_through_ts);
         }
@@ -302,7 +297,7 @@ impl DurableStorage for LogDurableStorage {
     /// whose head is published (the seal's flush then runs after the adopt).
     fn on_checkpoint_start(&self) -> turso_core::Result<()> {
         self.sealed.store(false, SeqCst);
-        if self.read_only {
+        if self.mode != IoMode::Writer {
             return Ok(());
         }
         self.refuse_if_poisoned().map_err(stash)?;
@@ -349,7 +344,7 @@ mod tests {
             e.storage.clone(),
             None,
             Arc::default(),
-            false,
+            IoMode::Writer,
         )
         .unwrap();
         for t in [-1, 0, 1, i64::MAX] {

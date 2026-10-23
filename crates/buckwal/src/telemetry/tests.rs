@@ -1217,7 +1217,7 @@ fn gc_exports_a_gc_span() {
     let mem = Arc::new(MemStore::new());
     let mut cfg = config(a.path());
     cfg.gc_after_seal = false;
-    let min_age = cfg.engine(false).gc_min_age();
+    let min_age = cfg.engine(crate::io::IoMode::Writer).gc_min_age();
     let (spans, young, old) = tracing::subscriber::with_default(cap.subscriber(), || {
         let db = crate::open_with_store(cfg.clone(), mem.clone()).unwrap();
         let conn = db.connect().unwrap();

@@ -450,7 +450,9 @@ fn gc_over_a_tampered_manifest_fails() {
             .unwrap();
         m.pages.insert(2, oldest);
         // Untouched first: a pass over an old enough manifest reads it and passes.
-        let min_age = cfg_for(mode, w.path(), &k).engine(false).gc_min_age();
+        let min_age = cfg_for(mode, w.path(), &k)
+            .engine(crate::io::IoMode::Writer)
+            .gc_min_age();
         store.advance_clock(min_age + Duration::from_secs(1));
         crate::gc_with_store(&cfg_for(mode, w.path(), &k), store.clone()).unwrap();
         put(&store, &key, &m.encode());
@@ -832,7 +834,9 @@ mod telemetry_signals {
             forged[n - 1] ^= 1;
             put(&store, &mk, &forged);
             // GC reads a manifest once it is old enough.
-            let min_age = cfg_for(mode, w.path(), &k).engine(false).gc_min_age();
+            let min_age = cfg_for(mode, w.path(), &k)
+                .engine(crate::io::IoMode::Writer)
+                .gc_min_age();
             store.advance_clock(min_age + Duration::from_secs(1));
             // A takeover restores first, so its restore span is the one that fails.
             for (reader, span) in [
