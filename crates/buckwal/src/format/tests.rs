@@ -888,3 +888,37 @@ fn local_state_round_trips_the_floor_and_defaults_to_zero() {
         .ends_with(r#","next_generation_floor":12}"#));
     assert_eq!(LocalState::decode(&s.encode()).unwrap(), s);
 }
+
+#[test]
+fn previous_build_reads_heads_carrying_the_new_fields() {
+    // A previous build accepts only its own formats and ignores keys it does not know.
+    let v1 = br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab","epoch":7,"lease_ms":30000,"request_timeout_ms":5000,"next_generation_floor":9}"#;
+    let h = Head::decode_accepting(v1, &[FORMAT]).unwrap();
+    assert_eq!(
+        (
+            h.format,
+            h.generation,
+            h.manifest,
+            h.writer_id.as_str(),
+            h.epoch,
+            h.journal_mode
+        ),
+        (FORMAT, 3, Some(2), "ab", 7, JournalMode::Wal)
+    );
+    let v2 = br#"{"format":2,"generation":4,"manifest":null,"writer_id":"cd","epoch":8,"journal_mode":"mvcc","lease_ms":30000,"request_timeout_ms":5000,"next_generation_floor":9}"#;
+    let h = Head::decode_accepting(v2, &[FORMAT, FORMAT_V2]).unwrap();
+    assert_eq!(
+        (
+            h.format,
+            h.generation,
+            h.manifest,
+            h.writer_id.as_str(),
+            h.epoch,
+            h.journal_mode
+        ),
+        (FORMAT_V2, 4, None, "cd", 8, JournalMode::Mvcc)
+    );
+    // And a decoder that does not know the keys (the pre-Task-2 shape) sees only the old ones.
+    let o = super::json::Obj::parse(v1).unwrap();
+    assert_eq!(o.num("generation").unwrap(), 3);
+}
