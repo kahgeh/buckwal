@@ -23,7 +23,6 @@ pub(crate) use durable_io::DurableIo;
 pub(crate) enum IoMode {
     Writer,
     ReadOnly,
-    #[allow(dead_code)] // Task 9 wires `open_replica`.
     Replica,
 }
 

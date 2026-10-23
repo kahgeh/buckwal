@@ -390,6 +390,39 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     Ok(db)
 }
 
+/// A replica's database: the engine opened in `IoMode::Replica`, read-only for every
+/// connection handed out, with no maintenance, trimmer or writer attach.
+pub(crate) fn replica_database(
+    store: Arc<dyn ObjectStore>,
+    engine: Engine,
+    guard: DirGuard,
+    cfg: &EngineConfig,
+) -> Database {
+    let uploader = engine.uploader.clone();
+    let wal_bytes = engine.wal_bytes.clone();
+    Database {
+        shared: Arc::new(Shared {
+            read_only: true,
+            store,
+            stats: uploader.stats(),
+            uploader,
+            gate: Arc::default(),
+            maintenance: None,
+            wal_bytes,
+            open: Mutex::new(Some(Open {
+                engine,
+                trimmer: None,
+                guard,
+            })),
+            connections: AtomicUsize::new(0),
+            batching: Mutex::new(Batching::Off),
+            journal_mode: JournalMode::Wal,
+            events: cfg.events.clone(),
+            reconciled: None,
+        }),
+    }
+}
+
 /// Allocate page 1 of a fresh database (`PRAGMA page_count` is 0) on a connection of its own,
 /// alone, before the open returns. turso_core 0.8.3 checks, then locks, in
 /// `maybe_allocate_page1`, so the first writes to a fresh database on several connections at
@@ -521,7 +554,7 @@ fn head_exists(store: &dyn ObjectStore, keys: &Keys, cfg: &EngineConfig) -> Resu
 }
 
 /// 16 random bytes from the platform, in hex.
-fn new_writer_id() -> Result<String> {
+pub(crate) fn new_writer_id() -> Result<String> {
     let mut id = [0u8; 16];
     PlatformIO::new()
         .map_err(|e| io_err("platform IO", e))?

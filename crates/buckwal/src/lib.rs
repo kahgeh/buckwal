@@ -40,6 +40,11 @@ pub use error::{Error, Result};
 pub use gc::gc_with_store;
 pub use gc::{gc, GcOutcome, GcReport};
 #[doc(hidden)]
+pub use replica::open_replica_with_store;
+pub use replica::{
+    open_replica, ReadConnection, ReadTransaction, Replica, ReplicaStats, ReplicaWaker,
+};
+#[doc(hidden)]
 pub use restore::restore_with_store;
 pub use restore::{restore, RestoreReport};
 pub use stats::UploadStats;

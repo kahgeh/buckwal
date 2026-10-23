@@ -63,6 +63,7 @@ impl WalImage {
         self.committed_count() as u64
     }
 
+    #[cfg(test)]
     pub(crate) fn committed_frames(&self) -> Vec<Frame> {
         self.committed_frames_from(0)
     }

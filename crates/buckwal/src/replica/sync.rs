@@ -173,7 +173,7 @@ pub(crate) struct Follower {
 }
 
 #[cfg(test)]
-type StepHook = Box<dyn FnMut(Step) -> std::result::Result<(), String>>;
+type StepHook = Box<dyn FnMut(Step) -> std::result::Result<(), String> + Send>;
 
 /// A checkpoint the position file says is pending.
 struct CkptTask {
@@ -304,7 +304,7 @@ impl Follower {
     #[cfg(test)]
     pub(crate) fn set_step_hook(
         &mut self,
-        f: impl FnMut(Step) -> std::result::Result<(), String> + 'static,
+        f: impl FnMut(Step) -> std::result::Result<(), String> + Send + 'static,
     ) {
         self.hook = Some(Box::new(f));
     }
@@ -313,6 +313,7 @@ impl Follower {
         self.generation
     }
 
+    #[cfg(test)]
     /// Frames of the generation applied (or already in `app.db`).
     pub(crate) fn applied_frames(&self) -> u64 {
         self.applied

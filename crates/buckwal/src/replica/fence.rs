@@ -26,6 +26,7 @@ impl FenceRule {
         self.current.as_ref().is_none_or(|(w, _)| w == writer_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn writer(&self) -> Option<&str> {
         self.current.as_ref().map(|(w, _)| w.as_str())
     }

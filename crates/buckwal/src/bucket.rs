@@ -523,6 +523,22 @@ impl Bucket {
         }
     }
 
+    /// A handle for a replica's engine: the head and manifest it was given, no writer id
+    /// check, no listing. A replica sends nothing through it (`IoMode::Replica`).
+    pub(crate) fn for_replica(
+        store: Arc<dyn ObjectStore>,
+        keys: Keys,
+        retry: RetryPolicy,
+        concurrency: usize,
+        head: Head,
+        head_etag: String,
+        manifest: Option<Manifest>,
+    ) -> Bucket {
+        let mut b = Bucket::new(store, keys, retry, concurrency, head, head_etag);
+        b.manifest = manifest;
+        b
+    }
+
     /// Start a new database: `put_if_absent(head)` at generation 1 and epoch 1, with no
     /// manifest.
     ///

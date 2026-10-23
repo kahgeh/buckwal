@@ -1,0 +1,44 @@
+Task 9a: open_replica, ReadConnection, follower thread, waker, slow poll, stats
+
+RED (open_replica_with_store stubbed to return Err(Config("RED stub")); same tests as below)
+$ cargo test --locked -p buckwal --lib replica::open
+test replica::open::tests::a_directory_that_is_not_a_replicas_is_refused_and_left_alone ... FAILED
+test replica::open::tests::waker_burst_coalesces_to_one_extra_pass ... FAILED
+test replica::open::tests::no_warning_when_a_notification_came_before_the_first_slow_poll ... FAILED
+test replica::open::tests::slow_poll_alone_is_correct_and_warns_once ... FAILED
+test replica::open::tests::mvcc_head_mid_follow_stops_the_follower_with_an_error_log ... FAILED
+test replica::open::tests::connect_refuses_insert_update_ddl_pragma_write_attach_checkpoint ... FAILED
+test replica::open::tests::second_open_of_same_dir_is_refused_by_lock ... FAILED
+test replica::open::tests::wrong_key_refused_at_open_before_any_follow ... FAILED
+test replica::open::tests::batching_pragma_is_refused ... FAILED
+test replica::open::tests::open_replica_follows_writer_commits ... FAILED
+test replica::open::tests::mvcc_head_refused_with_unsupported ... FAILED
+test replica::open::tests::missing_position_file_at_open_restores_into_the_replica_dir ... FAILED
+test replica::open::tests::a_replica_whose_local_wal_is_ahead_of_the_bucket_still_opens ... FAILED
+test replica::open::tests::reopen_resumes_from_the_position_file ... FAILED
+test replica::open::tests::replica_sends_zero_put_or_delete ... FAILED
+test result: FAILED. 0 passed; 15 failed; 0 ignored; 0 measured; 633 filtered out; finished in 0.49s
+
+GREEN (stub removed, 3 consecutive runs, then one added test follows_across_seals_and_resumes_after_them)
+$ cargo test --locked -p buckwal --lib replica::open
+test replica::open::tests::mvcc_head_refused_with_unsupported ... ok
+test replica::open::tests::a_directory_that_is_not_a_replicas_is_refused_and_left_alone ... ok
+test replica::open::tests::second_open_of_same_dir_is_refused_by_lock ... ok
+test replica::open::tests::connect_refuses_insert_update_ddl_pragma_write_attach_checkpoint ... ok
+test replica::open::tests::batching_pragma_is_refused ... ok
+test replica::open::tests::mvcc_head_mid_follow_stops_the_follower_with_an_error_log ... ok
+test replica::open::tests::a_replica_whose_local_wal_is_ahead_of_the_bucket_still_opens ... ok
+test replica::open::tests::reopen_resumes_from_the_position_file ... ok
+test replica::open::tests::wrong_key_refused_at_open_before_any_follow ... ok
+test replica::open::tests::open_replica_follows_writer_commits ... ok
+test replica::open::tests::replica_sends_zero_put_or_delete ... ok
+test replica::open::tests::missing_position_file_at_open_restores_into_the_replica_dir ... ok
+test replica::open::tests::slow_poll_alone_is_correct_and_warns_once ... ok
+test replica::open::tests::follows_across_seals_and_resumes_after_them ... ok
+test replica::open::tests::waker_burst_coalesces_to_one_extra_pass ... ok
+test replica::open::tests::no_warning_when_a_notification_came_before_the_first_slow_poll ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 633 filtered out; finished in 1.25s
+
+$ ./scripts/test.sh unit   (fmt, clippy -D warnings, unit tests): exit 0
+test result: ok. 649 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.90s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.80s
