@@ -1342,3 +1342,118 @@ fn span_names_use_buckwal_prefix() {
         "{names:?}"
     );
 }
+
+// ---- failure status and the resource marking (error-span-status) ----
+
+fn status_of_outcome(outcome: &'static str) -> opentelemetry::trace::Status {
+    let (sub, p, spans, _logs) = test_pipeline(None);
+    tracing::subscriber::with_default(sub, || {
+        let s = tracing::info_span!(target: "buckwal", "buckwal.probe", buckwal.outcome = tracing::field::Empty);
+        s.record("buckwal.outcome", outcome);
+    });
+    p.force_flush();
+    let got = spans.get_finished_spans().unwrap();
+    got.into_iter()
+        .find(|s| s.name == "buckwal.probe")
+        .expect("the probe span")
+        .status
+}
+
+#[test]
+fn a_failure_outcome_ends_the_span_with_status_error() {
+    for outcome in ["error", "integrity", "fenced"] {
+        assert!(
+            matches!(
+                status_of_outcome(outcome),
+                opentelemetry::trace::Status::Error { .. }
+            ),
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn every_other_outcome_ends_the_span_with_status_unset() {
+    for outcome in [
+        "ok",
+        "bucket_failing",
+        "busy",
+        "gate_timeout",
+        "closed",
+        "takeover_quiet",
+        "sealed",
+        "applied",
+        "nothing",
+        "checkpoint_deferred",
+        "re_restore",
+        "stopped",
+        "complete",
+        "unauthorized",
+        "bad_request",
+        "stream_expired",
+        "not_ready",
+        "shutting_down",
+        "too_many_streams",
+    ] {
+        assert_eq!(
+            status_of_outcome(outcome),
+            opentelemetry::trace::Status::Unset,
+            "{outcome}"
+        );
+    }
+}
+
+/// The resource a pipeline hands its span exporter, with and without a run id.
+fn resource_of(run_id: Option<&str>) -> Resource {
+    let seen = Arc::new(Mutex::new(None));
+    let spy = ResourceSpy {
+        inner: InMemorySpanExporter::default(),
+        seen: seen.clone(),
+    };
+    keep_interest_per_call();
+    let (_sub, _p) = build_for_test(
+        spy,
+        InMemoryLogExporter::default(),
+        run_id.map(str::to_string),
+    );
+    let r = seen.lock().unwrap().clone().expect("a resource");
+    r
+}
+
+fn res_attr(r: &Resource, key: &'static str) -> Option<String> {
+    r.get(&Key::new(key)).map(|v| v.to_string())
+}
+
+#[test]
+fn the_resource_names_the_machine_and_the_process() {
+    let r = resource_of(None);
+    assert!(res_attr(&r, "host.name").is_some_and(|h| !h.is_empty()));
+    let id = res_attr(&r, "service.instance.id").expect("an instance id");
+    assert_eq!(id.len(), 32, "{id}");
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    // One id per process.
+    assert_eq!(
+        res_attr(&resource_of(None), "service.instance.id"),
+        Some(id)
+    );
+}
+
+#[test]
+fn only_a_run_id_marks_the_resource_as_a_test() {
+    assert_eq!(
+        res_attr(&resource_of(None), "deployment.environment.name"),
+        None
+    );
+    assert_eq!(
+        res_attr(&resource_of(Some("run-1")), "deployment.environment.name").as_deref(),
+        Some("test")
+    );
+}
+
+#[test]
+fn without_buckwal_otel_the_pipeline_stays_off() {
+    let cfg = TelemetryConfig::from_lookup(|_| None).unwrap();
+    assert!(!cfg.enabled);
+    let guard = init(cfg).unwrap();
+    assert!(format!("{guard:?}").contains("running: false"));
+}

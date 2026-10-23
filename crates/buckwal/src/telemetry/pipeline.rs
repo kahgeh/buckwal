@@ -5,7 +5,7 @@ use super::export_filter;
 use crate::config::defaults;
 use crate::error::{Error, Result};
 use opentelemetry::logs::LogRecord as _;
-use opentelemetry::trace::{Span as _, TracerProvider as _};
+use opentelemetry::trace::{Span as _, Status, TracerProvider as _};
 use opentelemetry::{Context, InstrumentationScope, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -20,7 +20,7 @@ use opentelemetry_sdk::trace::{
     self, BatchSpanProcessor, SdkTracerProvider, Span, SpanData, SpanProcessor,
 };
 use opentelemetry_sdk::Resource;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::subscriber::Interest;
 use tracing::{Level, Metadata, Subscriber};
@@ -35,12 +35,57 @@ const SCOPE: &str = "buckwal";
 /// The span and log attribute that names a test run.
 const RUN_ID: &str = "test_run_id";
 
-/// What every export carries.
-fn resource() -> Resource {
-    Resource::builder().with_service_name(SERVICE).build()
+/// The `buckwal.outcome` values that are failures: their span ends with status Error. The
+/// maintenance skips, `sealed`, the replica's outcomes, the prefetch's `stopped` and
+/// `complete`, and the server's client-side outcomes are not failures.
+const FAILURE_OUTCOMES: [&str; 3] = ["error", "integrity", "fenced"];
+
+/// The machine's name, `None` when the system does not give one.
+fn host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for `buf.len()` bytes for the whole call, and `gethostname`
+    // writes at most that many.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+    (!name.is_empty()).then_some(name)
 }
 
-/// Adds `test_run_id` to every span as it starts, when one is set, then hands it on.
+/// A random id for this process, the same for every export it makes.
+fn instance_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        crate::db::new_writer_id().unwrap_or_else(|_| {
+            // No platform randomness: the process id and the time still tell processes apart.
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            format!("{:016x}{:016x}", std::process::id(), nanos as u64)
+        })
+    })
+}
+
+/// What every export carries: the service, the machine (`host.name`), the process
+/// (`service.instance.id`) and, for a process with a test run id,
+/// `deployment.environment.name = test`.
+fn resource(test_run: bool) -> Resource {
+    let mut b = Resource::builder()
+        .with_service_name(SERVICE)
+        .with_attribute(KeyValue::new("service.instance.id", instance_id()));
+    if let Some(host) = host_name() {
+        b = b.with_attribute(KeyValue::new("host.name", host));
+    }
+    if test_run {
+        b = b.with_attribute(KeyValue::new("deployment.environment.name", "test"));
+    }
+    b.build()
+}
+
+/// Adds `test_run_id` to every span as it starts, when one is set, and gives a span whose
+/// `buckwal.outcome` is a failure status Error as it ends, then hands it on.
 #[derive(Debug)]
 pub(crate) struct RunIdSpans<P> {
     inner: P,
@@ -60,7 +105,14 @@ impl<P: SpanProcessor> SpanProcessor for RunIdSpans<P> {
         }
         self.inner.on_start(span, cx);
     }
-    fn on_end(&self, span: SpanData) {
+    fn on_end(&self, mut span: SpanData) {
+        let failed = span.attributes.iter().any(|kv| {
+            kv.key.as_str() == "buckwal.outcome"
+                && FAILURE_OUTCOMES.contains(&kv.value.as_str().as_ref())
+        });
+        if failed {
+            span.status = Status::error("");
+        }
         self.inner.on_end(span);
     }
     fn force_flush(&self) -> OTelSdkResult {
@@ -158,14 +210,18 @@ pub(crate) struct Providers {
 }
 
 impl Providers {
-    fn new(spans: impl SpanProcessor + 'static, logs: impl LogProcessor + 'static) -> Self {
+    fn new(
+        spans: impl SpanProcessor + 'static,
+        logs: impl LogProcessor + 'static,
+        test_run: bool,
+    ) -> Self {
         Providers {
             tracer: SdkTracerProvider::builder()
-                .with_resource(resource())
+                .with_resource(resource(test_run))
                 .with_span_processor(spans)
                 .build(),
             logger: SdkLoggerProvider::builder()
-                .with_resource(resource())
+                .with_resource(resource(test_run))
                 .with_log_processor(logs)
                 .build(),
         }
@@ -224,7 +280,8 @@ impl Providers {
             .build();
         let providers = Providers::new(
             RunIdSpans::new(spans, run_id.clone()),
-            StampedLogs::new(logs, run_id),
+            StampedLogs::new(logs, run_id.clone()),
+            run_id.is_some(),
         );
         Ok((providers, rt))
     }
@@ -313,7 +370,8 @@ pub(crate) fn build_for_test(
 ) -> (impl Subscriber + Send + Sync + 'static, Providers) {
     let providers = Providers::new(
         RunIdSpans::new(trace::SimpleSpanProcessor::new(spans), run_id.clone()),
-        StampedLogs::new(logs::SimpleLogProcessor::new(logs), run_id),
+        StampedLogs::new(logs::SimpleLogProcessor::new(logs), run_id.clone()),
+        run_id.is_some(),
     );
     (providers.subscriber(defaults::OTEL_LEVEL), providers)
 }

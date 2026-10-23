@@ -17,6 +17,7 @@ tracing-subscriber.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
+libc = "=0.2.190"
 tracing-opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 tokio.workspace = true
