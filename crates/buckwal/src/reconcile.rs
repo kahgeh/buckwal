@@ -287,7 +287,7 @@ fn read_file(dir: &Path, name: &str, what: &str) -> Result<Vec<u8>> {
 }
 
 /// Write `<dir>/<name>` as a temp file, fsync, rename, fsync `dir`.
-fn replace_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn replace_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
     write_synced(&tmp, bytes)?;
     fs::rename(&tmp, dir.join(name)).map_err(|e| io_err("rename", e))?;

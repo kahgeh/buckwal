@@ -1,0 +1,29 @@
+## RED (resume mutated to ignore new_offset)
+test replica::position::tests::resume_applying_returns_offset ... ok
+test replica::position::tests::resume_ckpt_pending_nonempty_wal_uses_old_offset_and_reruns_checkpoint ... ok
+test replica::position::tests::absent_file_is_none ... ok
+test replica::position::tests::resume_ckpt_pending_empty_wal_uses_new_offset ... FAILED
+test replica::position::tests::roundtrip ... ok
+test replica::position::tests::truncated_file_is_corrupt ... FAILED
+test replica::position::tests::write_leaves_no_temp_file ... ok
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 572 filtered out; finished in 0.06s
+## GREEN
+test replica::position::tests::resume_ckpt_pending_empty_wal_uses_new_offset ... ok
+test replica::position::tests::resume_ckpt_pending_nonempty_wal_uses_old_offset_and_reruns_checkpoint ... ok
+test replica::position::tests::resume_applying_returns_offset ... ok
+test replica::position::tests::absent_file_is_none ... ok
+test replica::position::tests::truncated_file_is_corrupt ... ok
+test replica::position::tests::write_leaves_no_temp_file ... ok
+test replica::position::tests::roundtrip ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 572 filtered out; finished in 0.06s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+./scripts/test.sh unit exit: 0
+test result: ok. 579 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.34s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.13s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.53s

@@ -15,6 +15,8 @@ pub(crate) const STATE_FILE: &str = "app.db-durable";
 pub(crate) const DIRTY_FILE: &str = "app.db-dirty";
 /// Present while a restore moves its files into the directory (`restore_staged`).
 pub(crate) const RESTORING_FILE: &str = "app.db-restoring";
+/// A read replica's position file (generation, stage, offset, replica id).
+pub(crate) const REPLICA_FILE: &str = "app.db-replica";
 /// The exclusive lock of the process that has the directory open (D4).
 pub(crate) const LOCK_FILE: &str = "durable.lock";
 

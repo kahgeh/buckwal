@@ -3,3 +3,4 @@
 #![allow(dead_code)]
 
 pub(crate) mod image;
+pub(crate) mod position;
