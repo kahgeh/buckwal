@@ -1266,8 +1266,83 @@ fn reopen_after_claim_without_its_record_appends_one() {
     assert_eq!(ids(&verify.connect().unwrap()), want);
 }
 
+/// A store that parks the prefetch thread (found by its thread name) on its `hold_at`-th page
+/// GET until the test releases it, then slows every later page GET it makes by `slow_after`,
+/// so the prefetch is provably mid-flight when `close` runs and cannot finish in the instant
+/// between the release and the stop flag. The prefetch holds the page-cache lock during a
+/// GET, so the test opens read-only: a writer's open reads page 1 once more after it spawns
+/// the prefetch (`allocate_page_one`) and would wait on the parked GET.
+struct PrefetchGate {
+    inner: Arc<dyn ObjectStore>,
+    page_gets: std::sync::atomic::AtomicU64,
+    hold_at: u64,
+    slow_after: Duration,
+    held: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ObjectStore for PrefetchGate {
+    fn put(&self, k: &str, b: &[u8]) -> std::result::Result<String, crate::store::StoreError> {
+        self.inner.put(k, b)
+    }
+    fn put_if_absent(
+        &self,
+        k: &str,
+        b: &[u8],
+    ) -> std::result::Result<CondPut, crate::store::StoreError> {
+        self.inner.put_if_absent(k, b)
+    }
+    fn put_if_match(
+        &self,
+        k: &str,
+        b: &[u8],
+        etag: &str,
+    ) -> std::result::Result<CondPut, crate::store::StoreError> {
+        self.inner.put_if_match(k, b, etag)
+    }
+    fn get(
+        &self,
+        k: &str,
+    ) -> std::result::Result<Option<crate::store::Object>, crate::store::StoreError> {
+        let prefetching = std::thread::current().name() == Some("buckwal-prefetch");
+        if prefetching && k.contains("/pages/") {
+            let n = self
+                .page_gets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if n == self.hold_at {
+                let _ = self.held.send(());
+                let _ = self.release.lock().unwrap().recv();
+                // The GET ends well after the release, so a `close` that did not wait for
+                // the prefetch thread returns first and the thread is still running.
+                std::thread::sleep(Duration::from_millis(100));
+            } else if n > self.hold_at {
+                std::thread::sleep(self.slow_after);
+            }
+        }
+        self.inner.get(k)
+    }
+    fn stat(
+        &self,
+        k: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(k)
+    }
+    fn list(&self, p: &str) -> std::result::Result<Vec<String>, crate::store::StoreError> {
+        self.inner.list(p)
+    }
+    fn delete(&self, k: &str) -> std::result::Result<(), crate::store::StoreError> {
+        self.inner.delete(k)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.inner.stats()
+    }
+}
+
 /// Close stops and joins the prefetch thread before it releases the directory: nothing
-/// writes `app.db` after close, and an immediate reopen works.
+/// writes `app.db` after close, and an immediate reopen works. Deterministic: the prefetch
+/// is parked inside its 5th page GET when `close` starts, and is let go only once `close`
+/// has taken the engine, so a close that did not stop it would let it fetch every page.
 #[test]
 fn close_stops_prefetch_before_releasing_the_dir() {
     let store = mem();
@@ -1287,22 +1362,47 @@ fn close_stops_prefetch_before_releasing_the_dir() {
         db.close().unwrap();
     }
     let pages = crate::engine::tests::manifest(&*store).1.pages.len() as u64;
-    let fault = Arc::new(FaultStore::new(store.clone()));
+    let hold_at = 5;
+    assert!(pages > hold_at + 20, "{pages} pages");
     let r = tempdir();
     restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
-    fault.only_keys_containing("/pages/");
-    fault.delay_gets(Duration::from_millis(3));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(PrefetchGate {
+        inner: store.clone(),
+        page_gets: std::sync::atomic::AtomicU64::new(0),
+        hold_at,
+        slow_after: Duration::from_millis(5),
+        held: held_tx,
+        release: Mutex::new(go_rx),
+    });
     let mut cfg = config(r.path());
     cfg.prefetch = true;
-    let db = open_with_store(cfg, fault.clone()).unwrap();
+    let db = open_read_only_with_store(cfg, gate).unwrap();
     let (storage, done) = {
         let open = db.shared.open.lock().unwrap();
         let e = &open.as_ref().unwrap().engine;
         (e.storage.clone(), e.prefetch.as_ref().unwrap().done.clone())
     };
-    std::thread::sleep(Duration::from_millis(20));
+    held_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the prefetch never reached its parked GET");
+    assert!(!done.load(std::sync::atomic::Ordering::SeqCst));
+    let shared = db.shared.clone();
     let t = Instant::now();
-    db.close().unwrap();
+    std::thread::scope(|s| {
+        let closer = s.spawn(move || db.close().unwrap());
+        // `close` has taken the engine (it is stopping and joining the prefetch) once the
+        // open slot is empty; only then is the parked GET let go.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while shared.open.lock().unwrap().is_some() {
+            assert!(Instant::now() < deadline, "close never started");
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        closer.join().unwrap();
+    });
+    drop(shared);
     assert!(
         done.load(std::sync::atomic::Ordering::SeqCst),
         "prefetch still running"
@@ -1313,8 +1413,8 @@ fn close_stops_prefetch_before_releasing_the_dir() {
         t.elapsed()
     );
     assert!(
-        fetched < pages,
-        "prefetch finished before close; the test proves nothing"
+        fetched >= hold_at - 1 && fetched < pages,
+        "close did not stop the prefetch part-way: {fetched} of {pages} pages"
     );
     std::thread::sleep(Duration::from_millis(30));
     assert_eq!(storage.lazy_gets(), fetched, "prefetch fetched after close");

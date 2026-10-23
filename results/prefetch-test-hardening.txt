@@ -1,0 +1,28 @@
+# prefetch test hardening: db::tests::close_stops_prefetch_before_releasing_the_dir
+## Why it failed (before)
+Open takes ~400 ms: the prefetch thread holds the page-cache lock (db_storage ensure_local) during each page GET, and the writer open's allocate_page_one reads page 1 after the prefetch is spawned, so the open is starved until the prefetch has nearly finished. The 20 ms sleep then follows an open that already consumed the prefetch (152 of 152 pages, line 1315 assertion), unless the open happened to be quick.
+## (1) RED: production broken, hardened test fails
+-- Engine::drop without 'p.stop.store(true, SeqCst)':
+prefetch: 152 of 152 pages before close; close took 1.132683292s
+thread 'db::tests::close_stops_prefetch_before_releasing_the_dir' (183755033) panicked at crates/buckwal/src/db/tests.rs:1405:5:
+close did not stop the prefetch part-way: 152 of 152 pages
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 676 filtered out; finished in 2.00s
+-- Engine::drop without joining the thread:
+thread 'db::tests::close_stops_prefetch_before_releasing_the_dir' (183747683) panicked at crates/buckwal/src/db/tests.rs:1396:5:
+prefetch still running
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.87s
+Production restored: git diff of crates/buckwal/src/engine.rs and all non-test files is empty (git status shows only db/tests.rs).
+## (2) alone x10
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 1.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.76s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.70s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.70s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.71s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.70s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.71s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.70s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.71s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 676 filtered out; finished in 0.69s
+## (3) ./scripts/test.sh unit
+test db::tests::close_stops_prefetch_before_releasing_the_dir ... ok
+EXIT 0
