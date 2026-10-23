@@ -38,6 +38,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// The `tracing` target of every log record the notification listener writes.
+pub const LOG_TARGET: &str = "buckwal::notify";
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
@@ -242,7 +245,7 @@ pub fn serve_with(
             rt.shutdown_background();
         })
         .map_err(|e| format!("cannot start the notification thread: {e}"))?;
-    tracing::info!(target: "buckwal::notify", %addr, tls = is_tls, auth, "notification listener started");
+    tracing::info!(target: LOG_TARGET, %addr, tls = is_tls, auth, "notification listener started");
     Ok(NotifyBound {
         addr,
         tls: is_tls,
@@ -342,7 +345,7 @@ fn reply(status: StatusCode, text: &'static str) -> Response {
 /// wrong can be diagnosed.
 fn bad_request(why: &'static str) -> Response {
     tracing::debug!(
-        target: "buckwal::notify",
+        target: LOG_TARGET,
         reason = why.trim_end(),
         "notification request refused with 400"
     );
@@ -373,7 +376,7 @@ async fn notify(
         };
         if let Some(reason) = reason {
             tracing::warn!(
-                target: "buckwal::notify",
+                target: LOG_TARGET,
                 remote = %peer,
                 reason,
                 "notification rejected"
@@ -502,18 +505,18 @@ fn is_object_created(v: &Value) -> bool {
 
 async fn confirm(st: &State_, url: String, topic: String) -> Response {
     if let Err(reason) = check_subscribe_url(&url) {
-        tracing::warn!(target: "buckwal::notify", reason, "sns confirmation refused");
+        tracing::warn!(target: LOG_TARGET, reason, "sns confirmation refused");
         return bad_request("SubscribeURL refused\n");
     }
     let fetch = st.fetch.clone();
     let done = tokio::task::spawn_blocking(move || fetch.get(&url)).await;
     match done {
         Ok(Ok(())) => {
-            tracing::info!(target: "buckwal::notify", topic_arn = ?topic, "sns subscription confirmed");
+            tracing::info!(target: LOG_TARGET, topic_arn = ?topic, "sns subscription confirmed");
             reply(StatusCode::OK, "confirmed\n")
         }
         Ok(Err(e)) => {
-            tracing::warn!(target: "buckwal::notify", error = %e, "sns confirmation failed");
+            tracing::warn!(target: LOG_TARGET, error = %e, "sns confirmation failed");
             reply(StatusCode::BAD_GATEWAY, "confirmation failed\n")
         }
         Err(_) => reply(StatusCode::BAD_GATEWAY, "confirmation failed\n"),
