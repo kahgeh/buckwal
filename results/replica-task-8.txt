@@ -24,3 +24,31 @@ test replica::sync::tests::wholly_trimmed_generation_with_head_past_it_re_restor
 test replica::sync::tests::resume_after_restart_mid_checkpoint_uses_position_stage ... ok
 test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.57s
 $ ./scripts/test.sh unit  -> exit 0 (fmt, clippy -D warnings, tests)
+
+== FIX ROUND 1: RED (before the fix) ==
+$ cargo test --locked -p buckwal --lib replica::
+test replica::position::tests::resume_deferred_ckpt_pending_nonempty_wal_is_applying_at_the_old_offset ... FAILED
+test replica::sync::tests::busy_deferral_more_frames_applied_then_killed_does_not_reuse_a_stale_offset ... FAILED
+test replica::sync::tests::kill_inside_a_deferred_checkpoint_resumes_to_the_writers_rows ... FAILED
+  left: (7, 12, true)
+ right: (7, 12, false)
+assertion `left == right` failed: stale deferred offset: WAL not checkpointed
+  left: 1
+ right: 0
+assertion `left == right` failed: BeforeCkptPending: WAL not checkpointed
+  left: 1
+ right: 0
+test result: FAILED. 55 passed; 3 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.67s
+== GREEN (fix round 1) ==
+test replica::fence::tests::rule_moves_with_rising_epochs_and_ignores_stale_fences ... ok
+test replica::position::tests::resume_applying_returns_offset ... ok
+test replica::position::tests::resume_deferred_ckpt_pending_nonempty_wal_is_applying_at_the_old_offset ... ok
+test replica::position::tests::resume_ckpt_pending_empty_wal_uses_new_offset ... ok
+test replica::position::tests::resume_seal_ckpt_pending_nonempty_wal_uses_old_offset_and_reruns_checkpoint ... ok
+test replica::sync::tests::busy_deferral_more_frames_applied_then_killed_does_not_reuse_a_stale_offset ... ok
+test replica::sync::tests::deferred_checkpoint_runs_after_reader_commits ... ok
+test replica::sync::tests::stale_fence_and_empty_records_of_a_fenced_writer_are_not_counted ... ok
+test replica::sync::tests::resume_after_restart_mid_checkpoint_uses_position_stage ... ok
+test replica::sync::tests::kill_inside_a_deferred_checkpoint_resumes_to_the_writers_rows ... ok
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.94s
+$ ./scripts/test.sh unit -> exit=0

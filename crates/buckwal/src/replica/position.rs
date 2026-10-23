@@ -93,12 +93,19 @@ impl Position {
 
     /// Where to resume: `(generation, offset, run the checkpoint again)`. With `CkptPending`, an
     /// empty local WAL means the checkpoint finished, so the new offset applies; otherwise it
-    /// didn't, so the old offset stands and the checkpoint runs again.
+    /// didn't, so the old offset stands; a seal's checkpoint (new offset 0) runs again, a deferred
+    /// one (new offset below 0) is treated as `applying` because its `-k` can be stale.
     pub(crate) fn resume(&self, local_wal_empty: bool) -> (u64, i64, bool) {
         match self.stage {
             Stage::Applying => (self.generation, self.offset, false),
             Stage::CkptPending if local_wal_empty => (self.generation, self.new_offset, false),
-            Stage::CkptPending => (self.generation, self.offset, true),
+            // A seal's pending checkpoint (new offset 0, written before any frame of the new
+            // generation was applied) is re-run at once.
+            Stage::CkptPending if self.new_offset == 0 => (self.generation, self.offset, true),
+            // A deferred one (new offset -k): the file may be stale, since more frames can have
+            // been applied after it was written. Treat it as `applying` at the old offset; the
+            // follower works k out again from the WAL before the next checkpoint.
+            Stage::CkptPending => (self.generation, self.offset, false),
         }
     }
 }
@@ -166,8 +173,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_ckpt_pending_nonempty_wal_uses_old_offset_and_reruns_checkpoint() {
-        assert_eq!(pos(Stage::CkptPending).resume(false), (7, 12, true));
+    fn resume_seal_ckpt_pending_nonempty_wal_uses_old_offset_and_reruns_checkpoint() {
+        let mut p = pos(Stage::CkptPending);
+        p.new_offset = 0;
+        assert_eq!(p.resume(false), (7, 12, true));
+    }
+
+    #[test]
+    fn resume_deferred_ckpt_pending_nonempty_wal_is_applying_at_the_old_offset() {
+        // new_offset -5 may be stale (more frames were applied after it was written): the
+        // follower recomputes k from the WAL instead of running the checkpoint on it.
+        assert_eq!(pos(Stage::CkptPending).resume(false), (7, 12, false));
     }
 
     #[test]

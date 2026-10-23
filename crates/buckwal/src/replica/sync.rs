@@ -409,7 +409,13 @@ impl Follower {
             t.moved = true;
             moves += 1;
             if moves >= 16 {
-                break Outcome::Applied;
+                let msg = format!(
+                    "the head moved {moves} times in one pass; stopped at generation {}",
+                    self.generation
+                );
+                tracing::warn!(target: "buckwal", "replica: {msg}");
+                t.detail = Some(msg.clone());
+                return Outcome::Failed(msg);
             }
         };
         if !matches!(outcome, Outcome::Applied | Outcome::Nothing) {
@@ -543,6 +549,11 @@ impl Follower {
             return None;
         }
         let k = self.applied;
+        // k == 0 would write new offset 0, which resume reads as a seal's checkpoint; wait for a
+        // frame of this generation.
+        if k == 0 {
+            return None;
+        }
         let new_offset = -(k as i64);
         if self.last_pending_k != Some(k) {
             #[cfg(test)]

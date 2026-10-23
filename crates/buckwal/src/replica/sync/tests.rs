@@ -918,3 +918,106 @@ fn fenced_writers_late_record_is_skipped_while_finishing_the_generation() {
     assert_eq!(f.rows(), 2);
     assert_eq!(f.follower.generation(), 2);
 }
+
+/// Reader holds the replica; a seal's checkpoint is given up; generation 2 numbers on. Returns
+/// the held reader. The follower has applied `ship(4)` and `ship(5)`.
+fn deferred_fixture() -> (Fx, Arc<Connection>) {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.pass();
+    let (r2, _) = f.hold_reader();
+    f.ship(3);
+    f.seal_to(2);
+    f.ship(4);
+    for _ in 0..3 {
+        f.pass();
+    }
+    f.ship(5);
+    f.pass(); // try_deferred wrote ckpt_pending(-k) and the checkpoint answered Busy
+    assert_eq!(f.position().stage, Stage::CkptPending);
+    assert!(f.position().new_offset < 0);
+    assert!(f.follower.offset > 0);
+    (f, r2)
+}
+
+/// Resume from the directory and pass until quiet; rows never step back; the end state is the
+/// writer's, checkpointed, with numbering consistent (offset = -applied, WAL empty).
+fn recover_and_check(f: &Fx, case: &str) {
+    let mut seen = f.rows();
+    let mut again = Follower::resume(
+        f.fault.clone(),
+        f.keys.clone(),
+        retry(),
+        Applier::new(f.reader.clone(), None),
+        PS,
+        f.rdir.clone(),
+        BUDGET,
+    )
+    .unwrap();
+    for _ in 0..5 {
+        again.pass(Trigger::Start);
+        let n = f.rows();
+        assert!(n >= seen, "{case}: rows went {seen} -> {n}");
+        seen = n;
+    }
+    assert_eq!(f.rows(), f.writer_rows(), "{case}");
+    f.integrity_ok();
+    assert_eq!(f.local_frames(), 0, "{case}: WAL not checkpointed");
+    assert_eq!(again.offset, -(again.applied_frames() as i64), "{case}");
+    let p = f.position();
+    assert_eq!(
+        (p.generation, p.stage, p.offset),
+        (2, Stage::Applying, again.offset),
+        "{case}"
+    );
+}
+
+#[test]
+fn kill_inside_a_deferred_checkpoint_resumes_to_the_writers_rows() {
+    for abort_at in [
+        Step::BeforeCkptPending,
+        Step::AfterCkptPending,
+        Step::AfterCheckpoint,
+        Step::AfterApplying,
+    ] {
+        let (mut f, r2) = deferred_fixture();
+        sql(&r2, "COMMIT");
+        f.ship(6);
+        f.follower.set_step_hook(move |s| {
+            if s == abort_at {
+                Err(format!("killed at {s:?}"))
+            } else {
+                Ok(())
+            }
+        });
+        let seen = f.rows();
+        let r = f.pass();
+        assert!(
+            matches!(r.outcome, Outcome::Failed(_)),
+            "{abort_at:?}: {r:?}"
+        );
+        assert!(f.rows() >= seen);
+        recover_and_check(&f, &format!("{abort_at:?}"));
+    }
+}
+
+#[test]
+fn busy_deferral_more_frames_applied_then_killed_does_not_reuse_a_stale_offset() {
+    let (mut f, r2) = deferred_fixture();
+    // more frames are applied while the file still says ckpt_pending(-k); then the pass dies
+    // before try_deferred can rewrite it
+    f.ship(6);
+    f.follower.set_step_hook(|s| {
+        if s == Step::BeforeCkptPending {
+            Err("killed".into())
+        } else {
+            Ok(())
+        }
+    });
+    let r = f.pass();
+    assert!(matches!(r.outcome, Outcome::Failed(_)), "{r:?}");
+    let stale = f.position();
+    assert!(stale.new_offset < 0 && -stale.new_offset < f.follower.applied_frames() as i64);
+    sql(&r2, "COMMIT");
+    recover_and_check(&f, "stale deferred offset");
+}
