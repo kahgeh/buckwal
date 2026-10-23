@@ -325,6 +325,107 @@ refused, and the cost is a local WAL that grows while a reader is open.
   engine builds on, so they won't change without that engine changing. This repo
   stays on `=0.8.3` and the probes must be re-run on an upgrade.
 
+## Question 8: can RustFS send bucket events to a replica's webhook listener? (stage 1b)
+
+Spec question 8. Run on 2026-10-23 against the RustFS that `scripts/rustfs.sh` pins
+(`rustfs 1.0.0`, image `docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`,
+git commit d47f54bf), plain HTTP mode, through `scripts/rustfs.sh up`/`reset` only. The receiver was a
+throwaway `python3 -I` HTTP server on the host (not in this repo). No client tool was needed or
+installed: every call below is `curl --aws-sigv4 aws:amz:us-east-1:s3 --user <the harness keys>`
+against `http://127.0.0.1:9290` (`call` below stands for that, as in `scripts/rustfs.sh`).
+
+**Result: not answered, blocked by the outbound guard under the current harness.** RustFS has
+everything a per-replica webhook needs on paper, but it refuses to send to any address a developer's
+host can be reached on, and `scripts/rustfs.sh` can't set the one container setting that lifts that.
+No event was ever delivered, so no event was observed.
+
+### What RustFS offers (observed)
+
+- **The notify module is off by default and can be switched on at run time, with no container
+  setting.**
+  ```
+  call GET /rustfs/admin/v3/target/list
+  {"notify_enabled":false,"notification_endpoints":[]}
+  call PUT /rustfs/admin/v3/module-switches -d '{"notify_enabled":true,"audit_enabled":false}'
+  {"notify_enabled":true,"audit_enabled":false,"persisted_notify_enabled":true,...,"notify_source":"console",...}
+  ```
+  (Both fields are required; a body with one fails with "missing field".) Before the switch, a target
+  PUT answers 400 "notify module is disabled; ... set RUSTFS_NOTIFY_ENABLE=true". The switch makes
+  that unnecessary.
+- **A webhook target is a named admin object.** `help-config-kv?subSys=notify_webhook` lists its keys:
+  `enable`, `endpoint`, `auth_token` (the token RustFS sends), `queue_dir` (a directory for
+  undelivered events, default `/opt/rustfs/events`, queue limit default 100000), `queue_limit`,
+  `client_cert` and `client_key` (mTLS), `comment`. `multipleTargets` is `true`, so the type allows
+  several named targets. There is **no key for a CA** to trust.
+  ```
+  call PUT /rustfs/admin/v3/target/notify_webhook/<name> \
+    -d '{"key_values":[{"key":"enable","value":"on"},{"key":"endpoint","value":"<url>"},{"key":"queue_dir","value":"/tmp"}]}'
+  ```
+  `queue_dir` must already exist in the container: `/tmp` was accepted, the default
+  `/opt/rustfs/events` does not exist and gives "queue_dir does not exist".
+- The `queue_dir` and `queue_limit` keys suggest RustFS stages undelivered events on disk. **Whether
+  it keeps an event while the receiver is down was not tested, so it is unconfirmed.**
+
+### Why nothing was delivered (observed)
+
+`RUSTFS_OUTBOUND_ALLOW_ORIGINS` is the name RustFS gives for the fix, and it is a container
+environment variable read at start.
+
+| Endpoint given for the target | Result |
+|---|---|
+| `http://127.0.0.1:9301/` (also the container's own loopback, not the host) | 400 "endpoint is not allowed: outbound URL host '127.0.0.1' is not allowed: loopback address; add http://127.0.0.1:9301 to RUSTFS_OUTBOUND_ALLOW_ORIGINS (comma-separated) and restart RustFS ..." |
+| `http://<host LAN address>:9301/` | 400, the same message with "private address" |
+| `http://host.containers.internal:9301/` (192.168.127.254 inside the container) | passes the URL check, then 500 "failed to reconcile notification runtime: ... r1:webhook: initialization failed". The receiver, listening on `0.0.0.0:9301`, saw **no request**. |
+| `http://localhost:9301/` | 500, the same "initialization failed" |
+
+For the third row, `podman exec buckwal-rustfs curl -X POST http://host.containers.internal:9301/`
+returned 200 and the receiver logged it, so the host is reachable from the container; it is RustFS's
+own target that does not connect. The log level hides the reason, so this is a **reading, not a
+proof**: the outbound guard probably also refuses the private address behind that name when the target
+starts. A container's own `127.0.0.1` is the container, never the host, so loopback is not an option.
+
+Also observed: a failed target PUT is still persisted, and the notification runtime then stays stuck
+(every target call, even listing, returns the same 500) until `scripts/rustfs.sh reset`.
+
+### The four questions
+
+1. **ObjectCreated for `log/`, `head` and `manifest`, with a prefix filter (`pages/` left out)?** Not
+   answered: blocked by the outbound guard under the current harness. Unconfirmed: the filter. The
+   bucket-level notification configuration read back empty (`GET /buckwal?notification` returned an
+   empty `NotificationConfiguration`), and no target could be activated to bind a rule to, so the
+   prefix rules were not tried.
+2. **One webhook target per replica on the same prefixes (N = 2)?** Not answered: blocked by the
+   outbound guard under the current harness. The admin API allows named targets of one type
+   (`multipleTargets: true`), but a second target was never created.
+3. **Event contents (key, event name, ETag), delay after the PUT, kept or dropped while the receiver is
+   down?** Not answered: blocked by the outbound guard under the current harness. No event arrived,
+   so no contents and no delays were measured.
+4. **How the container reaches a listener on the host, with TLS and a token?** Reach: observed (below). Token and TLS: not answered: blocked by the outbound guard under the current harness.
+   - Reach: loopback no (it is the container itself). A host address the container can use exists
+     (`host.containers.internal`, 192.168.127.254; `curl` from the container got 200), but RustFS's
+     outbound guard refuses loopback and private origins unless they are in
+     `RUSTFS_OUTBOUND_ALLOW_ORIGINS` at container start, and the one name that passed the URL check
+     still failed to initialise.
+   - Token: the target has `auth_token`, which RustFS would send; not exercised.
+   - TLS: the target has `client_cert`/`client_key` for mTLS but no CA key, so trusting the test CA
+     probably needs the CA in the container's trust store, which means a mount `scripts/rustfs.sh`
+     does not make. Unconfirmed, and the HTTPS pass was not tried (no `tls-material.sh` run).
+
+### What it would take
+
+Not done, as the spec and the kickoff restrict this stage to `docs/`: `scripts/rustfs.sh` would have to
+start the container with `-e RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://host.containers.internal:<port>` (a
+fixed port, since the setting takes origins) and, for the HTTPS pass, mount a CA. Even then the
+`host.containers.internal` target failed to initialise once, so delivery there is unproven.
+
+real RustFS events: no under the current harness. Possible only if scripts/rustfs.sh sets RUSTFS_OUTBOUND_ALLOW_ORIGINS at container start (and a CA mount for the HTTPS pass), and even then host.containers.internal delivery failed once and is unproven.
+
+**What this changes.** The stage-2 notification tests post S3-format events to the webhook listener
+from the test itself, with the listener rules (TLS and token on a non-loopback address) unchanged, and
+real RustFS delivery goes under "Not tested until real use". The rest of the design stands. Nothing
+else in the spec changes, except that the README's Replicas section should not promise RustFS
+notifications until someone has seen one arrive.
+
 ## Stage-2 design (the spec's "How it works", confirmed and corrected)
 
 Unchanged from the spec: start from today's restore, then follow the bucket from its own thread;
