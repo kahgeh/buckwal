@@ -15,15 +15,15 @@
 # bench counts: log_puts = log objects after the CREATE TABLE; bucket_puts = every PUT incl.
 # setup (the first head, the CREATE TABLE's record); page_puts = PUTs to pages/ counted at the store.
 #
-# Commands (DURABLE_* from scripts/rustfs.sh env; run id 1792148480):
-#   DURABLE_PREFIX=bench13/1792148480/c500  buckwal bench --dir <tmp>/c500  --commits 500
-#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal bench --dir <tmp>/c5000 --commits 5000
-#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal restore --dir <tmp>/r5000
-#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal verify  --dir <tmp>/r5000
-#   DURABLE_PREFIX=bench13/1792148480/c5000 buckwal sql --dir <tmp>/r5000 "SELECT count(*), min(id), max(id) FROM bench"
+# Commands (BUCKWAL_* from scripts/rustfs.sh env; run id 1792148480):
+#   BUCKWAL_PREFIX=bench13/1792148480/c500  buckwal bench --dir <tmp>/c500  --commits 500
+#   BUCKWAL_PREFIX=bench13/1792148480/c5000 buckwal bench --dir <tmp>/c5000 --commits 5000
+#   BUCKWAL_PREFIX=bench13/1792148480/c5000 buckwal restore --dir <tmp>/r5000
+#   BUCKWAL_PREFIX=bench13/1792148480/c5000 buckwal verify  --dir <tmp>/r5000
+#   BUCKWAL_PREFIX=bench13/1792148480/c5000 buckwal sql --dir <tmp>/r5000 "SELECT count(*), min(id), max(id) FROM bench"
 #   (then, for a timed verify of a fresh copy:)
-#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p buckwal restore --dir <tmp>/r5000b
-#   DURABLE_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p buckwal verify  --dir <tmp>/r5000b
+#   BUCKWAL_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p buckwal restore --dir <tmp>/r5000b
+#   BUCKWAL_PREFIX=bench13/1792148480/c5000 /usr/bin/time -p buckwal verify  --dir <tmp>/r5000b
 
 ## bench --commits 500 (raw)
 commits=500

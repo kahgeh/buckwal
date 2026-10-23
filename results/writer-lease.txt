@@ -8,7 +8,7 @@
 #   target/release/buckwal and target/release/examples/stage3_costs
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop figures (Apple M4 Max, RustFS in podman on the same Mac), not production numbers
-# telemetry: DURABLE_OTEL unset (off). DURABLE_BATCHING unset (off). One run per measure.
+# telemetry: BUCKWAL_OTEL unset (off). BUCKWAL_BATCHING unset (off). One run per measure.
 #
 # What each measure is:
 # - bench: stage 1's workload (one connection, CREATE TABLE bench, 5000 INSERT OR REPLACE of
@@ -20,32 +20,32 @@
 #   included; each request follows as "request <op> <key>" (stat = HEAD, counted as a GET).
 # - CLI takeover: the CLI's line, for a second takeover (over the first).
 # - stage3_costs open DIR: open_with_store of a directory this writer owns; open_* are the
-#   bucket_stats right after open returns (DURABLE_GC_AFTER_SEAL=off, so no GC thread
+#   bucket_stats right after open returns (BUCKWAL_GC_AFTER_SEAL=off, so no GC thread
 #   requests are mixed in); close_* the close's delta.
 # - stage3_costs lease DIR PAUSE_MS: open, CREATE TABLE IF NOT EXISTS lease_cost, commit row 1;
 #   then no_pause_* = the bucket_stats delta of commit 2, made right after; after_pause_* =
 #   the delta of commit 3, made after sleeping PAUSE_MS (31 s; the default lease is 30 s).
-#   DURABLE_GC_AFTER_SEAL=off for the same reason.
+#   BUCKWAL_GC_AFTER_SEAL=off for the same reason.
 # - gc: the CLI's gc, first with the defaults (trim grace 10 min: every manifest too young),
-#   then, 10 s later, with DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000
-#   DURABLE_RETRY_DEADLINE_MS=1000 DURABLE_REQUEST_TIMEOUT_MS=1000, whose minimum manifest age
+#   then, 10 s later, with BUCKWAL_TRIM_GRACE_SECS=5 BUCKWAL_LEASE_MS=1000
+#   BUCKWAL_RETRY_DEADLINE_MS=1000 BUCKWAL_REQUEST_TIMEOUT_MS=1000, whose minimum manifest age
 #   is 5 + 1 + 1 + 1 = 8 s, twice. Then a restore + verify, and a count of the rows.
 #
-# Commands (DURABLE_* from scripts/rustfs.sh env; <P> = stage3/<run id>, <T> from mktemp -d;
+# Commands (BUCKWAL_* from scripts/rustfs.sh env; <P> = stage3/<run id>, <T> from mktemp -d;
 # the prefix and <T> were deleted afterwards):
-#   DURABLE_PREFIX=<P> buckwal bench --dir <T>/bench --commits 5000
-#   DURABLE_PREFIX=<P> buckwal restore --dir <T>/restored
-#   DURABLE_PREFIX=<P> stage3_costs takeover <T>/took-ex           (run 2; run 1: second)
-#   DURABLE_PREFIX=<P> buckwal takeover --dir <T>/took       (run 2; run 1: first)
-#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <T>/took    (twice)
-#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs lease <T>/took 31000
-#   DURABLE_PREFIX=<P> buckwal gc
+#   BUCKWAL_PREFIX=<P> buckwal bench --dir <T>/bench --commits 5000
+#   BUCKWAL_PREFIX=<P> buckwal restore --dir <T>/restored
+#   BUCKWAL_PREFIX=<P> stage3_costs takeover <T>/took-ex           (run 2; run 1: second)
+#   BUCKWAL_PREFIX=<P> buckwal takeover --dir <T>/took       (run 2; run 1: first)
+#   BUCKWAL_PREFIX=<P> BUCKWAL_GC_AFTER_SEAL=off stage3_costs open <T>/took    (twice)
+#   BUCKWAL_PREFIX=<P> BUCKWAL_GC_AFTER_SEAL=off stage3_costs lease <T>/took 31000
+#   BUCKWAL_PREFIX=<P> buckwal gc
 #   sleep 10
-#   DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 \
-#     DURABLE_REQUEST_TIMEOUT_MS=1000 DURABLE_PREFIX=<P> buckwal gc     (twice)
-#   DURABLE_PREFIX=<P> buckwal restore --dir <T>/after-gc
-#   DURABLE_PREFIX=<P> buckwal verify --dir <T>/after-gc
-#   DURABLE_PREFIX=<P> buckwal sql --dir <T>/took \
+#   BUCKWAL_TRIM_GRACE_SECS=5 BUCKWAL_LEASE_MS=1000 BUCKWAL_RETRY_DEADLINE_MS=1000 \
+#     BUCKWAL_REQUEST_TIMEOUT_MS=1000 BUCKWAL_PREFIX=<P> buckwal gc     (twice)
+#   BUCKWAL_PREFIX=<P> buckwal restore --dir <T>/after-gc
+#   BUCKWAL_PREFIX=<P> buckwal verify --dir <T>/after-gc
+#   BUCKWAL_PREFIX=<P> buckwal sql --dir <T>/took \
 #     "SELECT count(*), min(id), max(id) FROM bench" "SELECT count(*) FROM lease_cost"
 #
 # Summary (run 2):
@@ -142,7 +142,7 @@ request get stage3/1792250790/log/0000000013/00000000000000000002
 ## CLI takeover (second takeover, over the first)
 took over generation=13 epoch=3 fence_seq=3 writer_id=485382e72e5bce8d36a9fff6b6e8ffc9 quiet_ms=0 ms=67
 
-## stage3_costs open #1 of the taken-over directory (DURABLE_GC_AFTER_SEAL=off)
+## stage3_costs open #1 of the taken-over directory (BUCKWAL_GC_AFTER_SEAL=off)
 open_ms=16
 generation=13
 open_puts=1
@@ -164,7 +164,7 @@ close_gets=0
 close_lists=0
 close_deletes=0
 
-## stage3_costs open #2 of the same directory (DURABLE_GC_AFTER_SEAL=off)
+## stage3_costs open #2 of the same directory (BUCKWAL_GC_AFTER_SEAL=off)
 open_ms=17
 generation=13
 open_puts=1
@@ -186,7 +186,7 @@ close_gets=0
 close_lists=0
 close_deletes=0
 
-## stage3_costs lease, default lease 30 s, pause 31 s (DURABLE_GC_AFTER_SEAL=off)
+## stage3_costs lease, default lease 30 s, pause 31 s (BUCKWAL_GC_AFTER_SEAL=off)
 lease_ms=30000
 pause_ms=31000
 no_pause_puts=1
@@ -206,7 +206,7 @@ gc generation=14 trimmed_against=- age_ms=39000 deleted=0 outcome=too_young ms=6
 
 ## wait 10 s (the small settings' minimum age is 5 + 1 + 1 + 1 = 8 s)
 
-## gc with DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 DURABLE_REQUEST_TIMEOUT_MS=1000
+## gc with BUCKWAL_TRIM_GRACE_SECS=5 BUCKWAL_LEASE_MS=1000 BUCKWAL_RETRY_DEADLINE_MS=1000 BUCKWAL_REQUEST_TIMEOUT_MS=1000
 gc generation=14 trimmed_against=13 age_ms=10000 deleted=5095 outcome=trimmed ms=7035
 
 ## gc again, same settings
@@ -299,7 +299,7 @@ request get stage3/1792250683/log/0000000013/00000000000000000001
 request get stage3/1792250683/log/0000000013/00000000000000000002
 request get stage3/1792250683/log/0000000013/00000000000000000003
 
-## stage3_costs open #1 of the taken-over directory (DURABLE_GC_AFTER_SEAL=off)
+## stage3_costs open #1 of the taken-over directory (BUCKWAL_GC_AFTER_SEAL=off)
 open_ms=42
 generation=13
 open_puts=1
@@ -321,7 +321,7 @@ close_gets=0
 close_lists=0
 close_deletes=0
 
-## stage3_costs open #2 of the same directory (DURABLE_GC_AFTER_SEAL=off)
+## stage3_costs open #2 of the same directory (BUCKWAL_GC_AFTER_SEAL=off)
 open_ms=37
 generation=13
 open_puts=1
@@ -343,7 +343,7 @@ close_gets=0
 close_lists=0
 close_deletes=0
 
-## stage3_costs lease, default lease 30 s, pause 31 s (DURABLE_GC_AFTER_SEAL=off)
+## stage3_costs lease, default lease 30 s, pause 31 s (BUCKWAL_GC_AFTER_SEAL=off)
 lease_ms=30000
 pause_ms=31000
 no_pause_puts=1
@@ -363,7 +363,7 @@ gc generation=14 trimmed_against=- age_ms=39000 deleted=0 outcome=too_young ms=1
 
 ## wait 10 s (the small settings' minimum age is 5 + 1 + 1 + 1 = 8 s)
 
-## gc with DURABLE_TRIM_GRACE_SECS=5 DURABLE_LEASE_MS=1000 DURABLE_RETRY_DEADLINE_MS=1000 DURABLE_REQUEST_TIMEOUT_MS=1000
+## gc with BUCKWAL_TRIM_GRACE_SECS=5 BUCKWAL_LEASE_MS=1000 BUCKWAL_RETRY_DEADLINE_MS=1000 BUCKWAL_REQUEST_TIMEOUT_MS=1000
 gc generation=14 trimmed_against=13 age_ms=10000 deleted=5095 outcome=trimmed ms=7108
 
 ## gc again, same settings

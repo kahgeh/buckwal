@@ -99,7 +99,7 @@ After:
 Other Batching entries: Config::validate (config.rs:466), Database::set_batching (db.rs:1007), Connection::set_batching (conn.rs:140) and the guard's PRAGMA check (guard.rs:104) already call check_mode. The server only calls Connection::set_batching. The PRAGMA path is covered by the guard before batching_pragma runs (the new test asserts it inside BEGIN). Only transaction_with was a gap.
 
 -- 2. Commit 389cd5a: CLI writers follow the head's journal mode --
-Command: DURABLE_KEEP_PREFIXES=1 cargo test --locked -p buckwal-cli --test system -- --ignored --test-threads=1 mvcc_refusals_cli mvcc_takeover_cli
+Command: BUCKWAL_KEEP_PREFIXES=1 cargo test --locked -p buckwal-cli --test system -- --ignored --test-threads=1 mvcc_refusals_cli mvcc_takeover_cli
 Mutation: the CLI's writer_config was temporarily changed so that it never looked at the bucket's head and always used the default (WAL) when no flag or env var was given; main.rs was then restored from a backup and git diff showed it unchanged. With the mutation, FAILING:
   test mvcc_refusals_cli ... FAILED
   test mvcc_takeover_cli ... FAILED
@@ -114,7 +114,7 @@ With main.rs restored, PASSING:
   test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 4.53s
 
 -- 3. mvcc_takeover_fences_a_running_soak, five runs --
-Command (each run): DURABLE_KEEP_PREFIXES=1 cargo test --locked -p buckwal-cli --test system -- --ignored --test-threads=1 --nocapture mvcc_takeover_fences_a_running_soak
+Command (each run): BUCKWAL_KEEP_PREFIXES=1 cargo test --locked -p buckwal-cli --test system -- --ignored --test-threads=1 --nocapture mvcc_takeover_fences_a_running_soak
 The test asserts epoch == before+1, the old writer fenced and silent, and restore --verify of every ack; all five passed those assertions.
 run 1: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2001; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2011 restored generation=2 log_objects=1018 gets=1021 lists=2 bytes=7184550 ms=240; test result: ok. 1 passed
 run 2: mvcc_takeover_fences_a_running_soak: timed out (fence probes); soak acks=2000; first fenced error "error fenced by a newer writer: another writer took over this database"; acked=2010 restored generation=2 log_objects=1017 gets=1020 lists=2 bytes=7182315 ms=240; test result: ok. 1 passed

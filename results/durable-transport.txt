@@ -8,35 +8,35 @@
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop figures (Apple M4 Max, RustFS in podman on the same Mac, loopback), not production
 # numbers and not S3. TLS here is rustls/ring to a RustFS on 127.0.0.1 with a test CA.
-# telemetry: DURABLE_OTEL unset (off). One run per configuration; no repeats, so treat small
+# telemetry: BUCKWAL_OTEL unset (off). One run per configuration; no repeats, so treat small
 # differences as noise.
 #
 # Setups:
 #   (a) plain HTTP, no encryption
-#   (b) HTTPS (DURABLE_CA_BUNDLE = the test CA), no encryption
-#   (c) HTTPS + encryption (DURABLE_ENCRYPTION_KEY_FILE, default cipher aegis256)
+#   (b) HTTPS (BUCKWAL_CA_BUNDLE = the test CA), no encryption
+#   (c) HTTPS + encryption (BUCKWAL_ENCRYPTION_KEY_FILE, default cipher aegis256)
 # Between setups RustFS was reset (scripts/rustfs.sh reset), so each setup ran on an empty
 # bucket. HTTPS setups: BUCKWAL_TLS_DIR = <T>/m made by scripts/tls-material.sh, <T> from
 # mktemp -d. Key material is not recorded here.
 #
-# Commands (DURABLE_* from `eval "$(scripts/rustfs.sh env)"`; <P> a distinct DURABLE_PREFIX per
+# Commands (BUCKWAL_* from `eval "$(scripts/rustfs.sh env)"`; <P> a distinct BUCKWAL_PREFIX per
 # run, t7/<setup>-<off|win>-<pid>; <W> a scratch directory, deleted afterwards):
 #   T=$(mktemp -d <scratchpad>/tls.XXXXXX); scripts/tls-material.sh $T/m          (b, c)
-#   unset BUCKWAL_TLS_DIR DURABLE_ENCRYPTION_KEY_FILE DURABLE_CA_BUNDLE
+#   unset BUCKWAL_TLS_DIR BUCKWAL_ENCRYPTION_KEY_FILE BUCKWAL_CA_BUNDLE
 #   export BUCKWAL_TLS_DIR=$T/m                                              (b, c)
-#   export DURABLE_ENCRYPTION_KEY_FILE=<the key file tls-material.sh made>   (c)
+#   export BUCKWAL_ENCRYPTION_KEY_FILE=<the key file tls-material.sh made>   (c)
 #   scripts/rustfs.sh reset; eval "$(scripts/rustfs.sh env)"
-#   DURABLE_PREFIX=<P> buckwal bench --dir <W>/bench-off --commits 1000 --batching off
-#   DURABLE_PREFIX=<P> buckwal bench --dir <W>/bench-win --commits 1000 \
+#   BUCKWAL_PREFIX=<P> buckwal bench --dir <W>/bench-off --commits 1000 --batching off
+#   BUCKWAL_PREFIX=<P> buckwal bench --dir <W>/bench-win --commits 1000 \
 #     --batching 'window 10ms 64 1MiB'
-#   DURABLE_PREFIX=<P> buckwal restore --dir <W>/restored-<off|win>          (a, c)
-#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/restored-<off|win>  (a, c)
+#   BUCKWAL_PREFIX=<P> buckwal restore --dir <W>/restored-<off|win>          (a, c)
+#   BUCKWAL_PREFIX=<P> BUCKWAL_GC_AFTER_SEAL=off stage3_costs open <W>/restored-<off|win>  (a, c)
 # Stage 3's costs, re-measured on plain RustFS (setup a):
-#   DURABLE_PREFIX=<P> buckwal bench --dir <W>/bench --commits 5000
-#   DURABLE_PREFIX=<P> stage3_costs takeover <W>/took-ex
-#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/took-ex     (twice)
-#   DURABLE_PREFIX=<P> buckwal restore --dir <W>/restored
-#   DURABLE_PREFIX=<P> DURABLE_GC_AFTER_SEAL=off stage3_costs open <W>/restored
+#   BUCKWAL_PREFIX=<P> buckwal bench --dir <W>/bench --commits 5000
+#   BUCKWAL_PREFIX=<P> stage3_costs takeover <W>/took-ex
+#   BUCKWAL_PREFIX=<P> BUCKWAL_GC_AFTER_SEAL=off stage3_costs open <W>/took-ex     (twice)
+#   BUCKWAL_PREFIX=<P> buckwal restore --dir <W>/restored
+#   BUCKWAL_PREFIX=<P> BUCKWAL_GC_AFTER_SEAL=off stage3_costs open <W>/restored
 #
 # Workload (bench): CREATE TABLE bench(id INTEGER PRIMARY KEY, payload BLOB), then 1000
 # autocommit INSERT OR REPLACE statements of a 1024-byte blob on one connection, then close

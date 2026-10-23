@@ -13,7 +13,7 @@
 # build: cargo test --locked (debug profile, rustc 1.97.1)
 # machine: Apple M4 Max, macOS 27.0.1
 # laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
-# telemetry: DURABLE_OTEL=1 for the RustFS passes (scripts/test.sh), exported to the local
+# telemetry: BUCKWAL_OTEL=1 for the RustFS passes (scripts/test.sh), exported to the local
 #   observability stack, which was up, so the ClickHouse check ran.
 #
 # Command: ( time ./scripts/test.sh ) in the background, output in a scratch log outside the repo.

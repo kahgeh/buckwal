@@ -89,7 +89,7 @@ and all in the stage-2 design below:
   fsync the directory, which the probe did not test (it kills the process, not the machine).
 - **Cost of a resume.** After a restart the follower re-reads the current generation's log from
   seq 1 to rebuild frames, skipping what it already holds. That is about
-  `DURABLE_MAINTENANCE_LOG_OBJECTS` (default 1000) objects, as the writer's maintenance
+  `BUCKWAL_MAINTENANCE_LOG_OBJECTS` (default 1000) objects, as the writer's maintenance
   checkpoint keeps the log near that size. Set to 0, that measure is off and the bound is the
   WAL-size one (`config.rs`), or none if both are 0.
 - **Big rolled-back transactions.** The writer ships the spilled frames of a transaction it later

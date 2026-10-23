@@ -1,7 +1,5 @@
 # buckwal
 
-An old `DURABLE_*` setting is refused; set `BUCKWAL_*` instead.
-
 Make a tursodb database durable in an S3 bucket. A Rust library (`buckwal`) and a CLI (`buckwal`).
 
 Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
@@ -223,7 +221,6 @@ pub enum Batching {
 **Which setting a commit uses:** the transaction's, else the connection's, else the database's. A change takes effect from the next commit. It never changes a commit already waiting.
 
 **`PRAGMA buckwal_batching`.** The wrapper runs it itself; the engine never sees it.
-- `PRAGMA durable_batching` (the old name) in any form is refused with `Config`, which names `PRAGMA buckwal_batching` instead.
 - `PRAGMA buckwal_batching = off`, `PRAGMA buckwal_batching = 'window 50ms 64 1MiB'`, or the call form `PRAGMA buckwal_batching('…')`.
 - Setting it works only inside a transaction (`BEGIN` … `COMMIT`), and lasts until that transaction ends. Outside a transaction it fails with `Config`; use `Connection::set_batching` there.
 - Reading it (`PRAGMA buckwal_batching`, anywhere) returns one row: the effective setting as text, for example `off` or `window 50ms 64 1MiB`.
@@ -705,8 +702,6 @@ How the suite was run:
 ## Settings
 
 `Config::from_env(dir)` reads these variables. `Config::new(dir, endpoint, bucket, access_key, secret_key)` uses the same defaults, and every `Config` field is public.
-
-The old `DURABLE_*` names are refused at startup, not read: a process that still sets one stops with "{old} is no longer read, set {new} instead" (for example `DURABLE_SERVE_TOKEN_FILE is no longer read, set BUCKWAL_SERVE_TOKEN_FILE instead`).
 
 | Variable | `Config` field | Default | Notes |
 |---|---|---|---|
