@@ -422,17 +422,7 @@ impl Config {
 
     /// The checks `open` and `restore` make before touching anything.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.ca_bundle.is_some()
-            && self
-                .endpoint
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("http://")
-        {
-            return Err(Error::Config(
-                "BUCKWAL_CA_BUNDLE is set but the endpoint is http://".into(),
-            ));
-        }
+        crate::store::s3::check_ca_bundle_scheme(&self.endpoint, &self.ca_bundle)?;
         if self.bucket.is_empty() {
             return Err(Error::Config("bucket is empty".into()));
         }

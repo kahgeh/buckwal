@@ -365,8 +365,27 @@ fn tls_failure(e: &reqwest::Error) -> Option<String> {
     None
 }
 
+/// A CA bundle only applies to TLS; with an `http://` endpoint it would be silently ignored.
+pub(crate) fn check_ca_bundle_scheme(
+    endpoint: &str,
+    ca_bundle: &Option<std::path::PathBuf>,
+) -> crate::Result<()> {
+    if ca_bundle.is_some()
+        && endpoint
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+    {
+        return Err(crate::Error::Config(
+            "BUCKWAL_CA_BUNDLE is set but the endpoint is http://".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl S3Store {
     pub fn new(cfg: S3Config) -> crate::Result<Self> {
+        check_ca_bundle_scheme(&cfg.endpoint, &cfg.ca_bundle)?;
         let mut cfg = cfg;
         cfg.endpoint = normalize_endpoint(&cfg.endpoint)?;
         let http = http_client(&cfg)?;
@@ -1230,6 +1249,35 @@ mod tests {
                 Err(crate::Error::Config(m)) => assert!(m.contains("no PEM certificate"), "{m}"),
                 r => panic!("{name}: {:?}", r.err()),
             }
+        }
+    }
+
+    #[test]
+    fn s3_new_refuses_ca_bundle_with_http_endpoint() {
+        for ep in ["HTTP://x", " http://x"] {
+            let mut cfg = cfg_for("https://s3.example.com");
+            cfg.endpoint = ep.to_string();
+            cfg.ca_bundle = Some("/ca.pem".into());
+            match S3Store::new(cfg) {
+                Err(crate::Error::Config(m)) => assert_eq!(
+                    m, "BUCKWAL_CA_BUNDLE is set but the endpoint is http://",
+                    "{ep:?}"
+                ),
+                r => panic!("{ep:?}: {:?}", r.err()),
+            }
+        }
+    }
+
+    #[test]
+    fn s3_new_accepts_ca_bundle_with_https_endpoint() {
+        let mut cfg = cfg_for("https://s3.example.com");
+        cfg.ca_bundle = Some("/nonexistent/ca.pem".into());
+        match S3Store::new(cfg) {
+            Err(crate::Error::Config(m)) => {
+                assert!(!m.contains("endpoint is http://"), "{m}");
+                assert!(m.contains("/nonexistent/ca.pem"), "{m}");
+            }
+            r => panic!("{:?}", r.err()),
         }
     }
 }
