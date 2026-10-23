@@ -77,8 +77,11 @@ enum Reader {
     Restore,
     /// `takeover_with_store`.
     Takeover,
-    /// `gc_with_store`: reads the head.
+    /// `gc_with_store`: reads the head, and the manifest it trims against.
     Gc,
+    /// What `buckwal verify` does: restore into a directory, then a read-only open of it, a
+    /// full read and `PRAGMA integrity_check`.
+    Verify,
 }
 
 /// Rows read (0 for a reader that reads none).
@@ -96,6 +99,15 @@ fn read_with(reader: Reader, mode: Mode, store: &Arc<MemStore>, k: &TempDir) -> 
         Reader::Restore => restore_with_store(&c, store.clone(), &fresh(&t)).map(|_| 0),
         Reader::Takeover => crate::takeover_with_store(c, store.clone()).map(|_| 0),
         Reader::Gc => crate::gc_with_store(&c, store.clone()).map(|_| 0),
+        Reader::Verify => {
+            let dir = fresh(&t);
+            restore_with_store(&c, store.clone(), &dir)?;
+            let db = open_read_only_with_store(cfg_for(mode, &dir, k), store.clone())?;
+            let conn = db.connect()?;
+            let rows = conn.query("SELECT id, v FROM t ORDER BY id", &[])?;
+            conn.query("PRAGMA integrity_check", &[])?;
+            Ok(rows.len())
+        }
     }
 }
 
@@ -392,6 +404,107 @@ fn an_encrypted_bucket_has_a_format_3_head_and_a_keyless_open_is_refused() {
                 )
             }
             r => panic!("{mode:?}: {r:?}"),
+        }
+    }
+}
+
+/// `buckwal verify` over a swapped page and a replayed record fails like the open it wraps.
+#[test]
+fn verify_fails_over_tampered_objects() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        assert_eq!(read_with(Reader::Verify, mode, &store, &k).unwrap(), 45);
+        // A swap of the two highest pages.
+        let (_, m) = current_manifest(&store);
+        let mut top: Vec<u32> = m.pages.keys().copied().collect();
+        top.sort_unstable();
+        let (p, q) = (top[top.len() - 1], top[top.len() - 2]);
+        let (a, b) = (keys().page(m.pages[&p], p), keys().page(m.pages[&q], q));
+        let (ba, bb) = (body(&store, &a), body(&store, &b));
+        put(&store, &a, &bb);
+        put(&store, &b, &ba);
+        assert_integrity(
+            read_with(Reader::Verify, mode, &store, &k),
+            &[a.clone(), b.clone()],
+            &format!("{mode:?} verify swap"),
+        );
+        put(&store, &a, &ba);
+        put(&store, &b, &bb);
+        assert_eq!(read_with(Reader::Verify, mode, &store, &k).unwrap(), 45);
+        // A record replayed at another seq.
+        let g = head(&*store).generation;
+        let mut seqs = log_seqs(&*store, g);
+        seqs.sort_unstable();
+        let (src, dst) = (keys().log(g, seqs[1]), keys().log(g, *seqs.last().unwrap()));
+        let b = body(&store, &src);
+        put(&store, &dst, &b);
+        assert_integrity(
+            read_with(Reader::Verify, mode, &store, &k),
+            std::slice::from_ref(&dst),
+            &format!("{mode:?} verify record"),
+        );
+    }
+}
+
+/// GC trims against a manifest once it is old enough, so it reads and checks that manifest.
+#[test]
+fn gc_over_a_tampered_manifest_fails() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let w = writer(mode, &store, &k);
+        let g = head(&*store).manifest.unwrap();
+        let key = keys().manifest(g);
+        let (_, mut m) = current_manifest(&store);
+        let oldest = page_objects(&store)
+            .iter()
+            .map(|(_, g, _)| *g)
+            .min()
+            .unwrap();
+        m.pages.insert(2, oldest);
+        // Untouched first: a pass over an old enough manifest reads it and passes.
+        let min_age = cfg_for(mode, w.path(), &k).engine(false).gc_min_age();
+        store.advance_clock(min_age + Duration::from_secs(1));
+        crate::gc_with_store(&cfg_for(mode, w.path(), &k), store.clone()).unwrap();
+        put(&store, &key, &m.encode());
+        // The forged object is new: let it come of age.
+        store.advance_clock(min_age + Duration::from_secs(1));
+        assert_integrity(
+            read_with(Reader::Gc, mode, &store, &k),
+            std::slice::from_ref(&key),
+            &format!("{mode:?} gc manifest"),
+        );
+    }
+}
+
+/// A format 3 head whose integrity field is removed is not an unchecked head.
+#[test]
+fn a_format_3_head_without_its_integrity_field_fails_the_read() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        let key = keys().head();
+        let real = String::from_utf8(body(&store, &key)).unwrap();
+        let at = real
+            .find(",\"integrity\"")
+            .expect("a format 3 head is coded");
+        let stripped = format!("{}}}", &real[..at]);
+        put(&store, &key, stripped.as_bytes());
+        for r in [
+            Reader::ReadOnly,
+            Reader::Restore,
+            Reader::Takeover,
+            Reader::Gc,
+            Reader::Verify,
+        ] {
+            assert_integrity(
+                read_with(r, mode, &store, &k),
+                std::slice::from_ref(&key),
+                &format!("{mode:?} stripped head, {r:?}"),
+            );
         }
     }
 }
