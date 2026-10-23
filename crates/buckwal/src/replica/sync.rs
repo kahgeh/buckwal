@@ -1,16 +1,17 @@
 //! The sync pass: list the generation's log after the last record seen, fetch the new records
 //! in an unbroken seq run, rebuild the WAL image, apply each committed transaction, then look
 //! at the head once. Read-only against the bucket: GET, stat (HEAD) and LIST only.
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     config::JournalMode,
-    error::Error,
+    error::{Error, Result},
     format::{Head, Keys, LogFile, LogRecord},
     replica::{
-        apply::{is_conflict, Applier, ApplyOutcome},
+        apply::{is_conflict, Applier, ApplyOutcome, CheckpointResult},
         fence::FenceRule,
         image::{Frame, WalImage},
+        position::{Position, Stage},
     },
     store::{with_retry, ObjectStore, RetryPolicy},
 };
@@ -32,6 +33,15 @@ pub(crate) enum Reason {
     Gap,
 }
 
+/// The `reason` of the `replica stopped` event and log line, one string per `StopReason`. Change
+/// them here only.
+pub(crate) mod reason {
+    pub(crate) const CONFLICT: &str = "conflict";
+    pub(crate) const MVCC: &str = "mvcc";
+    pub(crate) const INTEGRITY: &str = "integrity";
+    pub(crate) const CORRUPT: &str = "corrupt";
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StopReason {
     /// A frame already in the local WAL differs from the log's. The pass logged an ERROR line
@@ -44,6 +54,18 @@ pub(crate) enum StopReason {
     /// A record or the head is malformed in a way that is not an integrity failure (bad
     /// encoding, ops that cannot be applied to the image).
     Corrupt(String),
+}
+
+impl StopReason {
+    /// The reason string for `replica stopped` (see `reason`).
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            StopReason::Conflict => reason::CONFLICT,
+            StopReason::Mvcc => reason::MVCC,
+            StopReason::Integrity(_) => reason::INTEGRITY,
+            StopReason::Corrupt(_) => reason::CORRUPT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +124,8 @@ struct Tally {
     found_new: bool,
     skipped: u64,
     applied_tx: u64,
+    moved: bool,
+    deferred: bool,
     detail: Option<String>,
 }
 
@@ -111,7 +135,7 @@ struct HeadView {
     mvcc: bool,
 }
 
-enum Step {
+enum Flow {
     Go,
     Done(Outcome),
     /// The local numbering has a gap: re-read the generation from seq 1.
@@ -134,6 +158,45 @@ pub(crate) struct Follower {
     head_etag: Option<String>,
     head_view: Option<(u64, bool)>,
     fence: FenceRule,
+    /// The last admitted record of the generation was a seal-start (an empty Extents record).
+    sealed: bool,
+    /// Where the position file lives; `None` writes none (the pure-pass tests).
+    dir: Option<PathBuf>,
+    replica_id: String,
+    /// Passes a checkpoint may stay `Busy` before the follower carries on without it.
+    pass_budget: u32,
+    ckpt: Option<CkptTask>,
+    /// The `-k` the position file last named for a deferred checkpoint (to skip rewrites).
+    last_pending_k: Option<u64>,
+    #[cfg(test)]
+    hook: Option<StepHook>,
+}
+
+#[cfg(test)]
+type StepHook = Box<dyn FnMut(Step) -> std::result::Result<(), String>>;
+
+/// A checkpoint the position file says is pending.
+struct CkptTask {
+    new_offset: i64,
+    /// Busy attempts so far (counted in passes).
+    passes: u32,
+    /// A deferred checkpoint of frames already applied: a `Busy` is silent, no budget.
+    deferred: bool,
+}
+
+/// The points between position-file writes and checkpoint stages where a test can abort the
+/// follower (returning `Err` from the hook) to emulate `kill -9`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// About to write `ckpt_pending`.
+    BeforeCkptPending,
+    /// `ckpt_pending` is on disk; the checkpoint has not run.
+    AfterCkptPending,
+    /// The checkpoint finished; the `applying` write has not happened.
+    AfterCheckpoint,
+    /// `applying` is on disk.
+    AfterApplying,
 }
 
 /// True for the error the library's integrity check returns (`integrity: <key>`).
@@ -181,7 +244,69 @@ impl Follower {
             head_etag: None,
             head_view: None,
             fence: FenceRule::default(),
+            sealed: false,
+            dir: None,
+            replica_id: String::new(),
+            pass_budget: 0,
+            ckpt: None,
+            last_pending_k: None,
+            #[cfg(test)]
+            hook: None,
         }
+    }
+
+    /// Write the position file in `dir`; a checkpoint may stay `Busy` for `pass_budget` passes
+    /// (twice the slow-poll interval's worth of passes, worked out by the caller).
+    pub(crate) fn with_position(
+        mut self,
+        dir: PathBuf,
+        replica_id: String,
+        pass_budget: u32,
+    ) -> Follower {
+        self.dir = Some(dir);
+        self.replica_id = replica_id;
+        self.pass_budget = pass_budget;
+        self
+    }
+
+    /// Resume from the position file in `dir`. A missing file cannot resume (the caller
+    /// re-restores).
+    pub(crate) fn resume(
+        store: Arc<dyn ObjectStore>,
+        keys: Keys,
+        retry: RetryPolicy,
+        applier: Applier,
+        page_size: usize,
+        dir: PathBuf,
+        pass_budget: u32,
+    ) -> Result<Follower> {
+        let Some(pos) = Position::read(&dir)? else {
+            return Err(Error::Corrupt("replica position file is missing".into()));
+        };
+        let (generation, offset, rerun) = pos.resume(applier.local_wal_empty()?);
+        let finished = pos.stage == Stage::CkptPending && !rerun;
+        let new_offset = pos.new_offset;
+        let mut f = Follower::new(store, keys, retry, applier, page_size, generation, offset)
+            .with_position(dir, pos.replica_id, pass_budget);
+        if rerun {
+            f.ckpt = Some(CkptTask {
+                new_offset,
+                passes: 0,
+                deferred: false,
+            });
+        } else if finished {
+            // The checkpoint finished before the kill; record it.
+            f.write_pos(generation, Stage::Applying, offset, offset)?;
+        }
+        Ok(f)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_step_hook(
+        &mut self,
+        f: impl FnMut(Step) -> std::result::Result<(), String> + 'static,
+    ) {
+        self.hook = Some(Box::new(f));
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -211,11 +336,28 @@ impl Follower {
         self.image = WalImage::new(self.page_size);
         self.applied = 0;
         self.fence = FenceRule::default();
+        self.sealed = false;
     }
 
     pub(crate) fn pass(&mut self, trigger: Trigger) -> PassResult {
         let mut t = Tally::default();
         tracing::debug!(target: "buckwal", ?trigger, generation = self.generation, "replica pass");
+        let outcome = self.drive(&mut t);
+        PassResult {
+            outcome,
+            objects: t.objects,
+            lists: t.lists,
+            gets: t.gets,
+            found_new: t.found_new || t.moved,
+            skipped: t.skipped,
+            lag_ms: None,
+            detail: t.detail,
+        }
+    }
+
+    #[cfg(test)]
+    fn run_once_for_test(&mut self) -> PassResult {
+        let mut t = Tally::default();
         let outcome = self.run(&mut t);
         PassResult {
             outcome,
@@ -229,82 +371,208 @@ impl Follower {
         }
     }
 
-    fn run(&mut self, t: &mut Tally) -> Outcome {
-        let mut rereads = 0;
-        let mut hole;
-        // A previous pass may have stopped between fetching a record and applying it.
-        match self.apply_ready(t) {
-            Step::Go => {}
-            Step::Done(o) => return o,
-            Step::Reread => {
-                self.restart_log();
-                rereads += 1;
-            }
+    #[cfg(test)]
+    fn step(&mut self, s: Step) -> std::result::Result<(), String> {
+        match self.hook.as_mut() {
+            Some(h) => h(s),
+            None => Ok(()),
         }
-        'reread: loop {
-            let prefix = self.keys.log_prefix(self.generation);
-            t.lists += 1;
-            let listed = match with_retry(&self.retry, &prefix, |_| self.store.list(&prefix)) {
-                Ok(l) => l,
-                Err(e) => return failed(t, e),
+    }
+
+    fn write_pos(&self, generation: u64, stage: Stage, offset: i64, new_offset: i64) -> Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        Position {
+            generation,
+            stage,
+            offset,
+            new_offset,
+            replica_id: self.replica_id.clone(),
+        }
+        .write(dir)
+    }
+
+    /// One pass: finish a pending checkpoint, follow the log, finish a generation the head has
+    /// moved past (any number in a row), try a deferred checkpoint.
+    fn drive(&mut self, t: &mut Tally) -> Outcome {
+        if let Some(o) = self.run_ckpt_task(t) {
+            return o;
+        }
+        let mut moves = 0;
+        let outcome = loop {
+            let o = self.run(t);
+            let Outcome::GenerationMoved { head_generation } = o else {
+                break o;
             };
-            let mut seqs: Vec<u64> = listed
-                .iter()
-                .filter_map(|k| self.keys.parse_log(k))
-                .filter(|(g, s)| *g == self.generation && *s > self.last_seq)
-                .map(|(_, s)| s)
-                .collect();
-            seqs.sort_unstable();
-            hole = false;
-            for s in seqs {
-                if s != self.last_seq + 1 {
-                    hole = true;
-                    break;
-                }
-                let key = self.keys.log(self.generation, s);
-                t.gets += 1;
-                let body = match with_retry(&self.retry, &key, |_| self.store.get(&key)) {
-                    Ok(Some(o)) => o.body,
-                    // Listed, then gone: trimmed (or not visible yet); decided with the head.
-                    Ok(None) => {
-                        hole = true;
-                        break;
-                    }
-                    Err(e) => return failed(t, e),
-                };
-                t.objects += 1;
-                let rec = match self.keys.decode_record(&body, self.generation, s) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        t.detail = Some(e.to_string());
-                        return decode_failure(&e, &key);
-                    }
-                };
-                if let Some(o) = self.take_record(rec, &key, s, t) {
-                    return o;
-                }
-                self.last_seq = s;
-                t.found_new = true;
-                match self.apply_ready(t) {
-                    Step::Go => {}
-                    Step::Done(o) => return o,
-                    Step::Reread => {
-                        if rereads > 0 {
-                            t.detail = Some(format!(
-                                "generation {}: gap in local frame numbering after re-reading \
-                                 from seq 1",
-                                self.generation
-                            ));
-                            return Outcome::ReRestore(Reason::Gap);
-                        }
-                        rereads += 1;
-                        self.restart_log();
-                        continue 'reread;
-                    }
-                }
+            if let Some(o) = self.finish_generation(head_generation, t) {
+                return o;
             }
-            break;
+            t.moved = true;
+            moves += 1;
+            if moves >= 16 {
+                break Outcome::Applied;
+            }
+        };
+        if !matches!(outcome, Outcome::Applied | Outcome::Nothing) {
+            return outcome;
         }
+        if !t.deferred {
+            if let Some(o) = self.try_deferred(t) {
+                return o;
+            }
+        }
+        match outcome {
+            _ if t.deferred => Outcome::CheckpointDeferred,
+            Outcome::Nothing if t.moved => Outcome::Applied,
+            o => o,
+        }
+    }
+
+    /// The head names `head_generation` > ours. Apply what is left of our log, then move: write
+    /// `ckpt_pending`, checkpoint, write `applying`. `Some` ends the pass.
+    fn finish_generation(&mut self, head_generation: u64, t: &mut Tally) -> Option<Outcome> {
+        // The head GET followed the LIST, so a last record may have landed between them.
+        let hole = match self.read_log(t) {
+            Ok(h) => h,
+            Err(o) => return Some(o),
+        };
+        // The sealing writer's seal-start (an empty record) is the last admitted record of a
+        // sealed generation; without it the tail was trimmed. See the report for the limit.
+        if hole || !self.sealed {
+            t.detail = Some(format!(
+                "log/{} {} and the head is at generation {head_generation}",
+                self.generation,
+                if hole {
+                    "has a hole"
+                } else {
+                    "does not end in a seal-start record (trimmed)"
+                }
+            ));
+            return Some(Outcome::ReRestore(Reason::Trimmed));
+        }
+        let last = match self.applier.local_last_frame() {
+            Ok(l) => l as i64,
+            Err(e) => return Some(failed(t, e)),
+        };
+        #[cfg(test)]
+        if let Err(m) = self.step(Step::BeforeCkptPending) {
+            return Some(failed_msg(t, m));
+        }
+        if let Err(e) = self.write_pos(head_generation, Stage::CkptPending, last, 0) {
+            return Some(failed(t, e));
+        }
+        #[cfg(test)]
+        if let Err(m) = self.step(Step::AfterCkptPending) {
+            return Some(failed_msg(t, m));
+        }
+        self.reset(head_generation, last);
+        self.last_pending_k = None;
+        self.ckpt = Some(CkptTask {
+            new_offset: 0,
+            passes: 0,
+            deferred: false,
+        });
+        self.run_ckpt_task(t)
+    }
+
+    /// Run the pending checkpoint. `Some` ends the pass (Busy within the budget, or an error).
+    fn run_ckpt_task(&mut self, t: &mut Tally) -> Option<Outcome> {
+        let task = self.ckpt.as_mut()?;
+        let (new_offset, deferred) = (task.new_offset, task.deferred);
+        match self.applier.checkpoint_truncate() {
+            Err(e) => Some(failed(t, e)),
+            Ok(CheckpointResult::Done) => {
+                #[cfg(test)]
+                if let Err(m) = self.step(Step::AfterCheckpoint) {
+                    return Some(failed_msg(t, m));
+                }
+                if let Err(e) =
+                    self.write_pos(self.generation, Stage::Applying, new_offset, new_offset)
+                {
+                    return Some(failed(t, e));
+                }
+                self.offset = new_offset;
+                self.ckpt = None;
+                self.last_pending_k = None;
+                #[cfg(test)]
+                if let Err(m) = self.step(Step::AfterApplying) {
+                    return Some(failed_msg(t, m));
+                }
+                None
+            }
+            Ok(CheckpointResult::Busy) if deferred => {
+                // The position file stays `ckpt_pending` with the old offset, which is right
+                // until the checkpoint lands.
+                self.ckpt = None;
+                None
+            }
+            Ok(CheckpointResult::Busy) => {
+                task.passes += 1;
+                if task.passes < self.pass_budget {
+                    t.detail = Some(format!(
+                        "checkpoint busy: readers hold the local WAL (pass {} of {})",
+                        task.passes, self.pass_budget
+                    ));
+                    return Some(if t.applied_tx > 0 || t.moved {
+                        Outcome::Applied
+                    } else {
+                        Outcome::Nothing
+                    });
+                }
+                // Readers keep it: number on past the local last frame and try again later.
+                tracing::warn!(target: "buckwal", generation = self.generation, offset = self.offset, "replica: checkpoint deferred, readers hold the local WAL");
+                if let Err(e) =
+                    self.write_pos(self.generation, Stage::Applying, self.offset, self.offset)
+                {
+                    return Some(failed(t, e));
+                }
+                self.ckpt = None;
+                t.deferred = true;
+                #[cfg(test)]
+                if let Err(m) = self.step(Step::AfterApplying) {
+                    return Some(failed_msg(t, m));
+                }
+                None
+            }
+        }
+    }
+
+    /// A later pass, after a checkpoint was given up: `k` frames of this generation are
+    /// applied, so write `ckpt_pending` (old offset, new offset `-k`) and checkpoint.
+    fn try_deferred(&mut self, t: &mut Tally) -> Option<Outcome> {
+        if self.dir.is_none() || self.ckpt.is_some() || self.offset <= 0 {
+            return None;
+        }
+        let k = self.applied;
+        let new_offset = -(k as i64);
+        if self.last_pending_k != Some(k) {
+            #[cfg(test)]
+            if let Err(m) = self.step(Step::BeforeCkptPending) {
+                return Some(failed_msg(t, m));
+            }
+            if let Err(e) =
+                self.write_pos(self.generation, Stage::CkptPending, self.offset, new_offset)
+            {
+                return Some(failed(t, e));
+            }
+            self.last_pending_k = Some(k);
+            #[cfg(test)]
+            if let Err(m) = self.step(Step::AfterCkptPending) {
+                return Some(failed_msg(t, m));
+            }
+        }
+        self.ckpt = Some(CkptTask {
+            new_offset,
+            passes: 0,
+            deferred: true,
+        });
+        self.run_ckpt_task(t)
+    }
+
+    fn run(&mut self, t: &mut Tally) -> Outcome {
+        let hole = match self.read_log(t) {
+            Ok(h) => h,
+            Err(o) => return o,
+        };
         let head = match self.check_head(t) {
             Ok(h) => h,
             Err(o) => return o,
@@ -334,6 +602,87 @@ impl Follower {
         }
     }
 
+    /// Read the generation's log from after `last_seq` as an unbroken run and apply what is
+    /// committed. `Ok(hole)`: a seq is missing or its object is gone.
+    fn read_log(&mut self, t: &mut Tally) -> std::result::Result<bool, Outcome> {
+        let mut rereads = 0;
+        let mut hole;
+        // A previous pass may have stopped between fetching a record and applying it.
+        match self.apply_ready(t) {
+            Flow::Go => {}
+            Flow::Done(o) => return Err(o),
+            Flow::Reread => {
+                self.restart_log();
+                rereads += 1;
+            }
+        }
+        'reread: loop {
+            let prefix = self.keys.log_prefix(self.generation);
+            t.lists += 1;
+            let listed = match with_retry(&self.retry, &prefix, |_| self.store.list(&prefix)) {
+                Ok(l) => l,
+                Err(e) => return Err(failed(t, e)),
+            };
+            let mut seqs: Vec<u64> = listed
+                .iter()
+                .filter_map(|k| self.keys.parse_log(k))
+                .filter(|(g, s)| *g == self.generation && *s > self.last_seq)
+                .map(|(_, s)| s)
+                .collect();
+            seqs.sort_unstable();
+            hole = false;
+            for s in seqs {
+                if s != self.last_seq + 1 {
+                    hole = true;
+                    break;
+                }
+                let key = self.keys.log(self.generation, s);
+                t.gets += 1;
+                let body = match with_retry(&self.retry, &key, |_| self.store.get(&key)) {
+                    Ok(Some(o)) => o.body,
+                    // Listed, then gone: trimmed (or not visible yet); decided with the head.
+                    Ok(None) => {
+                        hole = true;
+                        break;
+                    }
+                    Err(e) => return Err(failed(t, e)),
+                };
+                t.objects += 1;
+                let rec = match self.keys.decode_record(&body, self.generation, s) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        t.detail = Some(e.to_string());
+                        return Err(decode_failure(&e, &key));
+                    }
+                };
+                if let Some(o) = self.take_record(rec, &key, s, t) {
+                    return Err(o);
+                }
+                self.last_seq = s;
+                t.found_new = true;
+                match self.apply_ready(t) {
+                    Flow::Go => {}
+                    Flow::Done(o) => return Err(o),
+                    Flow::Reread => {
+                        if rereads > 0 {
+                            t.detail = Some(format!(
+                                "generation {}: gap in local frame numbering after re-reading \
+                                 from seq 1",
+                                self.generation
+                            ));
+                            return Err(Outcome::ReRestore(Reason::Gap));
+                        }
+                        rereads += 1;
+                        self.restart_log();
+                        continue 'reread;
+                    }
+                }
+            }
+            break;
+        }
+        Ok(hole)
+    }
+
     /// Fold one record into the image. `Some` stops the pass.
     fn take_record(
         &mut self,
@@ -345,7 +694,9 @@ impl Follower {
         match rec {
             LogRecord::Fence { writer_id, epoch } => {
                 // A stale fence changes nothing and is not counted.
-                self.fence.on_fence(&writer_id, epoch);
+                if self.fence.on_fence(&writer_id, epoch) {
+                    self.sealed = false;
+                }
                 None
             }
             LogRecord::Extents {
@@ -372,6 +723,8 @@ impl Follower {
                     }
                     return None;
                 }
+                // An empty record is the writer's seal-start: the log's end once a head moves.
+                self.sealed = syncs.iter().all(|ops| ops.is_empty());
                 for ops in &syncs {
                     if let Err(e) = self.image.apply_sync(ops) {
                         t.detail = Some(e.to_string());
@@ -384,7 +737,7 @@ impl Follower {
     }
 
     /// Apply the committed transactions the image holds beyond `applied`, one at a time.
-    fn apply_ready(&mut self, t: &mut Tally) -> Step {
+    fn apply_ready(&mut self, t: &mut Tally) -> Flow {
         if self.image.committed_len() < self.applied {
             let msg = format!(
                 "replica conflict: generation {} lost committed frames (image {} < applied {})",
@@ -394,7 +747,7 @@ impl Follower {
             );
             tracing::error!(target: "buckwal", "{msg}");
             t.detail = Some(msg);
-            return Step::Done(Outcome::Stopped(StopReason::Conflict));
+            return Flow::Done(Outcome::Stopped(StopReason::Conflict));
         }
         let frames = self.image.committed_frames_from(self.applied);
         let mut tx: Vec<Frame> = Vec::new();
@@ -411,17 +764,17 @@ impl Follower {
                     t.applied_tx += 1;
                     tx.clear();
                 }
-                Ok(ApplyOutcome::Gap) => return Step::Reread,
-                Ok(ApplyOutcome::Incomplete) => return Step::Go,
+                Ok(ApplyOutcome::Gap) => return Flow::Reread,
+                Ok(ApplyOutcome::Incomplete) => return Flow::Go,
                 Err(e) if is_conflict(&e) => {
                     tracing::error!(target: "buckwal", generation = self.generation, error = %e, "replica conflict; the replica must re-restore");
                     t.detail = Some(e.to_string());
-                    return Step::Done(Outcome::Stopped(StopReason::Conflict));
+                    return Flow::Done(Outcome::Stopped(StopReason::Conflict));
                 }
-                Err(e) => return Step::Done(failed(t, e)),
+                Err(e) => return Flow::Done(failed(t, e)),
             }
         }
-        Step::Go
+        Flow::Go
     }
 
     /// One head check per pass: a stat against the last ETag, and a GET only when it changed
@@ -459,6 +812,12 @@ impl Follower {
             mvcc: view.1,
         })
     }
+}
+
+#[cfg(test)]
+fn failed_msg(t: &mut Tally, msg: String) -> Outcome {
+    t.detail = Some(msg.clone());
+    Outcome::Failed(msg)
 }
 
 fn failed(t: &mut Tally, e: Error) -> Outcome {

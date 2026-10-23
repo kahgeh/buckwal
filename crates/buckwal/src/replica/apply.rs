@@ -89,6 +89,11 @@ impl Applier {
         Ok(self.conn.wal_state().map_err(engine)?.max_frame)
     }
 
+    /// The local WAL's last frame number.
+    pub(crate) fn local_last_frame(&self) -> Result<u64> {
+        self.last_frame()
+    }
+
     pub(crate) fn local_wal_empty(&self) -> Result<bool> {
         Ok(self.last_frame()? == 0)
     }

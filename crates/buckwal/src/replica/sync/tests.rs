@@ -3,6 +3,7 @@ use crate::{
     config::JournalMode,
     encryption::Encryption,
     format::Op,
+    replica::position::{Position, Stage},
     store::{FaultStore, MemStore},
 };
 use std::{path::Path, sync::Arc, time::Duration};
@@ -60,7 +61,10 @@ struct Fx {
     _wdb: Arc<Database>,
     writer: Arc<Connection>,
     wal: std::path::PathBuf,
-    _rdb: Arc<Database>,
+    rdb: Arc<Database>,
+    rdir: std::path::PathBuf,
+    gen: u64,
+    next_seq: u64,
     reader: Arc<Connection>,
     mem: Arc<MemStore>,
     fault: Arc<FaultStore>,
@@ -111,7 +115,10 @@ impl Fx {
             _dir: dir,
             _wdb: wdb,
             writer,
-            _rdb: rdb,
+            rdb,
+            rdir: r.clone(),
+            gen: 1,
+            next_seq: 1,
             reader,
             mem,
             fault,
@@ -160,6 +167,84 @@ impl Fx {
 
     fn rows(&self) -> i64 {
         count(&self.reader)
+    }
+
+    /// A follower that writes the position file next to the replica database.
+    fn positioned(mut self, budget: u32) -> Fx {
+        let applier = Applier::new(self.reader.clone(), None);
+        self.follower = Follower::new(
+            self.fault.clone(),
+            self.keys.clone(),
+            retry(),
+            applier,
+            PS,
+            1,
+            0,
+        )
+        .with_position(self.rdir.clone(), "r-test".into(), budget);
+        Position {
+            generation: 1,
+            stage: Stage::Applying,
+            offset: 0,
+            new_offset: 0,
+            replica_id: "r-test".into(),
+        }
+        .write(&self.rdir)
+        .unwrap();
+        self
+    }
+
+    fn put_next(&mut self, rec: &LogRecord) {
+        self.put_gen(self.gen, self.next_seq, rec);
+        self.next_seq += 1;
+    }
+
+    /// Commit on the writer and ship it as the next record of the current generation.
+    fn ship(&mut self, id: i64) {
+        let ops = self.commit(id);
+        self.put_next(&ext("w1", ops));
+    }
+
+    /// The writer seals: a seal-start record, a WAL restart, the head moves to `to`.
+    fn seal_to(&mut self, to: u64) {
+        self.put_next(&ext("w1", vec![]));
+        self.writer
+            .checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        self.shipped = 0;
+        self.set_head(to);
+        self.gen = to;
+        self.next_seq = 1;
+    }
+
+    fn position(&self) -> Position {
+        Position::read(&self.rdir).unwrap().unwrap()
+    }
+
+    fn local_frames(&self) -> u64 {
+        self.reader.wal_state().unwrap().max_frame
+    }
+
+    fn writer_rows(&self) -> i64 {
+        count(&self.writer)
+    }
+
+    fn integrity_ok(&self) {
+        let r = sql(&self.reader, "PRAGMA integrity_check");
+        assert!(
+            matches!(&r[0][0], Value::Text(t) if t.as_str() == "ok"),
+            "{r:?}"
+        );
+    }
+
+    /// A second read connection holding a snapshot.
+    fn hold_reader(&self) -> (Arc<Connection>, i64) {
+        let c = self.rdb.connect().unwrap();
+        sql(&c, "BEGIN");
+        let n = count(&c);
+        (c, n)
     }
 }
 
@@ -498,7 +583,8 @@ fn new_generation_is_reported_after_applying_the_rest() {
     let a = f.commit(2);
     f.put(1, &ext("w1", a));
     f.set_head(2);
-    let r = f.pass();
+    // the pass alone reports the move; finishing it is the checkpoint stages' job
+    let r = f.follower.run_once_for_test();
     assert_eq!(r.outcome, Outcome::GenerationMoved { head_generation: 2 });
     assert_eq!(f.rows(), 2);
 }
@@ -579,4 +665,256 @@ fn redelivered_history_after_restart_is_harmless_and_conflict_stops() {
     assert_eq!(r.outcome.re_restore(), Some(Reason::Conflict));
     let d = r.detail.unwrap();
     assert!(d.contains("generation 1 frame 1"), "{d}");
+}
+
+const BUDGET: u32 = 2;
+
+fn names(ev: &[String]) -> String {
+    ev.join("\n")
+}
+
+#[test]
+fn stop_reason_strings_come_from_named_constants() {
+    assert_eq!(StopReason::Conflict.as_str(), reason::CONFLICT);
+    assert_eq!(StopReason::Mvcc.as_str(), reason::MVCC);
+    assert_eq!(
+        StopReason::Integrity("k".into()).as_str(),
+        reason::INTEGRITY
+    );
+    assert_eq!(StopReason::Corrupt("x".into()).as_str(), reason::CORRUPT);
+    assert_eq!(reason::CORRUPT, "corrupt");
+}
+
+#[test]
+fn seal_with_no_readers_checkpoints_and_resets_offset() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.ship(3);
+    f.seal_to(2);
+    f.ship(4);
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::Applied, "{r:?}");
+    assert_eq!(f.follower.generation(), 2);
+    assert_eq!(f.follower.offset, 0);
+    let p = f.position();
+    assert_eq!((p.generation, p.stage, p.offset), (2, Stage::Applying, 0));
+    assert_eq!(f.rows(), 4);
+    assert_eq!(f.rows(), f.writer_rows());
+    // the local WAL holds only generation 2's frames
+    assert_eq!(f.local_frames(), f.follower.applied_frames());
+    f.integrity_ok();
+}
+
+#[test]
+fn seal_with_open_reader_numbers_on_and_reader_keeps_snapshot() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.pass();
+    let (r2, before) = f.hold_reader();
+    f.ship(3);
+    f.seal_to(2);
+    f.ship(4);
+    let last_local = {
+        // frames of generation 1 applied so far plus the one the pass is about to add
+        let r = f.pass();
+        assert!(!matches!(r.outcome, Outcome::CheckpointDeferred), "{r:?}");
+        let p = f.position();
+        assert_eq!(
+            (p.generation, p.stage, p.new_offset),
+            (2, Stage::CkptPending, 0)
+        );
+        p.offset
+    };
+    assert!(last_local > 0);
+    // the retry budget is counted in passes: the second Busy pass gives up
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::CheckpointDeferred, "{r:?}");
+    let p = f.position();
+    assert_eq!(
+        (p.generation, p.stage, p.offset),
+        (2, Stage::Applying, last_local)
+    );
+    // generation 2 numbers on past the local last frame; the reader keeps its snapshot
+    f.pass();
+    assert_eq!(f.rows(), 4);
+    assert_eq!(count(&r2), before);
+    assert_eq!(
+        f.local_frames(),
+        last_local as u64 + f.follower.applied_frames()
+    );
+    sql(&r2, "COMMIT");
+    f.integrity_ok();
+}
+
+#[test]
+fn deferred_checkpoint_runs_after_reader_commits() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.pass();
+    let (r2, _) = f.hold_reader();
+    f.ship(3);
+    f.seal_to(2);
+    f.ship(4);
+    for _ in 0..4 {
+        f.pass();
+    }
+    assert_eq!(f.follower.generation(), 2);
+    assert!(f.follower.offset > 0);
+    // still held: later passes keep trying and stay deferred
+    f.ship(5);
+    f.pass();
+    assert!(f.follower.offset > 0);
+    sql(&r2, "COMMIT");
+    f.ship(6);
+    f.pass();
+    let k = f.follower.applied_frames();
+    assert_eq!(f.follower.offset, -(k as i64));
+    let p = f.position();
+    assert_eq!(
+        (p.generation, p.stage, p.offset),
+        (2, Stage::Applying, -(k as i64))
+    );
+    assert_eq!(f.local_frames(), 0);
+    // numbering continues from the new offset
+    f.ship(7);
+    f.pass();
+    assert_eq!(f.rows(), f.writer_rows());
+    assert_eq!(f.local_frames(), f.follower.applied_frames() - k);
+    f.integrity_ok();
+}
+
+#[test]
+fn head_skipping_a_generation_never_lists_the_skipped_one() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.seal_to(3); // the head goes 1 -> 3; log/2 never exists
+    f.ship(4);
+    let start = f.fault.events().len();
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::Applied, "{r:?}");
+    f.pass();
+    assert_eq!(f.follower.generation(), 3);
+    assert_eq!(f.rows(), 3);
+    let ev = f.fault.events()[start..].to_vec();
+    assert!(
+        ev.iter().all(|e| !e.contains(&f.keys.log_prefix(2))),
+        "{}",
+        names(&ev)
+    );
+    assert!(
+        ev.iter().any(|e| e.contains(&f.keys.log_prefix(3))),
+        "{}",
+        names(&ev)
+    );
+    assert_eq!(f.position().generation, 3);
+}
+
+#[test]
+fn resume_after_restart_mid_checkpoint_uses_position_stage() {
+    for (case, abort_at) in [
+        Step::BeforeCkptPending,
+        Step::AfterCkptPending,
+        Step::AfterCheckpoint,
+        Step::AfterApplying,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut f = Fx::new().positioned(BUDGET);
+        f.ship(2);
+        f.ship(3);
+        f.seal_to(2);
+        f.ship(4);
+        f.ship(5);
+        f.follower.set_step_hook(move |s| {
+            if s == abort_at {
+                Err(format!("killed at {s:?}"))
+            } else {
+                Ok(())
+            }
+        });
+        let mut seen = f.rows();
+        let r = f.pass();
+        assert!(
+            matches!(r.outcome, Outcome::Failed(_)),
+            "case {case}: {r:?}"
+        );
+        assert!(f.rows() >= seen);
+        seen = f.rows();
+        // a new follower from the same directory (the same replica database)
+        let mut again = Follower::resume(
+            f.fault.clone(),
+            f.keys.clone(),
+            retry(),
+            Applier::new(f.reader.clone(), None),
+            PS,
+            f.rdir.clone(),
+            BUDGET,
+        )
+        .unwrap();
+        for _ in 0..6 {
+            again.pass(Trigger::Start);
+            let n = f.rows();
+            assert!(n >= seen, "case {case}: rows went {seen} -> {n}");
+            seen = n;
+        }
+        assert_eq!(f.rows(), f.writer_rows(), "case {case}");
+        assert_eq!(again.generation(), 2, "case {case}");
+        f.integrity_ok();
+        let p = f.position();
+        assert_eq!((p.generation, p.stage), (2, Stage::Applying), "case {case}");
+    }
+}
+
+#[test]
+fn sealed_generation_missing_its_tail_re_restores() {
+    // the head moved but the log ends without the seal-start record: the tail is gone
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.set_head(2);
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+}
+
+#[test]
+fn wholly_trimmed_generation_with_head_past_it_re_restores() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.set_head(2); // log/1 is empty
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    // also after some records were applied and the rest was trimmed
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.pass();
+    f.mem.delete(&f.keys.log(1, 1)).unwrap();
+    f.set_head(2);
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+}
+
+#[test]
+fn holed_generation_with_head_past_it_re_restores() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.next_seq += 1; // seq 2 never exists
+    f.ship(3);
+    f.seal_to(2);
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+}
+
+#[test]
+fn fenced_writers_late_record_is_skipped_while_finishing_the_generation() {
+    let mut f = Fx::new().positioned(BUDGET);
+    let (a, late) = (f.commit(2), f.commit(3));
+    f.put_next(&ext("w1", a));
+    f.put_next(&fence("w2", 2));
+    f.put_next(&ext("w1", late)); // the fenced writer's late record
+    f.put_next(&ext("w2", vec![])); // the new writer's seal-start
+    f.set_head(2);
+    let r = f.pass();
+    assert_ne!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    assert_eq!(r.skipped, 1);
+    assert_eq!(f.rows(), 2);
+    assert_eq!(f.follower.generation(), 2);
 }

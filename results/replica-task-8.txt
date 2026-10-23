@@ -1,0 +1,26 @@
+== RED: tests written before the implementation (stubs only for the API) ==
+$ cargo test --locked -p buckwal --lib replica::sync
+test replica::sync::tests::head_skipping_a_generation_never_lists_the_skipped_one ... FAILED
+test replica::sync::tests::fenced_writers_late_record_is_skipped_while_finishing_the_generation ... FAILED
+test replica::sync::tests::deferred_checkpoint_runs_after_reader_commits ... FAILED
+test replica::sync::tests::sealed_generation_missing_its_tail_re_restores ... FAILED
+test replica::sync::tests::seal_with_open_reader_numbers_on_and_reader_keeps_snapshot ... FAILED
+test replica::sync::tests::seal_with_no_readers_checkpoints_and_resets_offset ... FAILED
+test replica::sync::tests::resume_after_restart_mid_checkpoint_uses_position_stage ... FAILED
+test replica::sync::tests::wholly_trimmed_generation_with_head_past_it_re_restores ... FAILED
+test result: FAILED. 23 passed; 8 failed; 0 ignored; 0 measured; 594 filtered out; finished in 0.11s
+== GREEN ==
+$ cargo test --locked -p buckwal --lib replica::
+test replica::sync::tests::fenced_writers_late_record_is_skipped_while_finishing_the_generation ... ok
+test replica::sync::tests::holed_generation_with_head_past_it_re_restores ... ok
+test replica::sync::tests::stop_reason_strings_come_from_named_constants ... ok
+test replica::sync::tests::head_skipping_a_generation_never_lists_the_skipped_one ... ok
+test replica::sync::tests::deferred_checkpoint_runs_after_reader_commits ... ok
+test replica::sync::tests::sealed_generation_missing_its_tail_re_restores ... ok
+test replica::sync::tests::trimmed_log_object_requests_re_restore ... ok
+test replica::sync::tests::seal_with_no_readers_checkpoints_and_resets_offset ... ok
+test replica::sync::tests::seal_with_open_reader_numbers_on_and_reader_keeps_snapshot ... ok
+test replica::sync::tests::wholly_trimmed_generation_with_head_past_it_re_restores ... ok
+test replica::sync::tests::resume_after_restart_mid_checkpoint_uses_position_stage ... ok
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.57s
+$ ./scripts/test.sh unit  -> exit 0 (fmt, clippy -D warnings, tests)
