@@ -170,7 +170,7 @@ impl Fx {
     }
 
     /// A follower that writes the position file next to the replica database.
-    fn positioned(mut self, budget: u32) -> Fx {
+    fn positioned(mut self, budget: Duration) -> Fx {
         let applier = Applier::new(self.reader.clone(), None);
         self.follower = Follower::new(
             self.fault.clone(),
@@ -668,7 +668,7 @@ fn redelivered_history_after_restart_is_harmless_and_conflict_stops() {
     assert!(d.contains("generation 1 frame 1"), "{d}");
 }
 
-const BUDGET: u32 = 2;
+const BUDGET: Duration = Duration::from_secs(120);
 
 fn names(ev: &[String]) -> String {
     ev.join("\n")
@@ -727,7 +727,15 @@ fn seal_with_open_reader_numbers_on_and_reader_keeps_snapshot() {
         p.offset
     };
     assert!(last_local > 0);
-    // the retry budget is counted in passes: the second Busy pass gives up
+    // the retry budget is time: many Busy passes inside it do not exhaust it, the first one
+    // after it gives up
+    for _ in 0..20 {
+        let r = f.pass();
+        assert!(!matches!(r.outcome, Outcome::CheckpointDeferred), "{r:?}");
+        assert!(r.detail.is_some_and(|d| d.starts_with("checkpoint busy")));
+    }
+    assert_eq!(f.position().stage, Stage::CkptPending);
+    f.follower.advance_clock(BUDGET);
     let r = f.pass();
     assert_eq!(r.outcome, Outcome::CheckpointDeferred, "{r:?}");
     let p = f.position();
@@ -756,7 +764,9 @@ fn deferred_checkpoint_runs_after_reader_commits() {
     f.ship(3);
     f.seal_to(2);
     f.ship(4);
-    for _ in 0..4 {
+    f.pass();
+    f.follower.advance_clock(BUDGET);
+    for _ in 0..3 {
         f.pass();
     }
     assert_eq!(f.follower.generation(), 2);
@@ -930,9 +940,10 @@ fn deferred_fixture() -> (Fx, Arc<Connection>) {
     f.ship(3);
     f.seal_to(2);
     f.ship(4);
-    for _ in 0..3 {
-        f.pass();
-    }
+    f.pass();
+    f.follower.advance_clock(BUDGET);
+    f.pass();
+    f.pass();
     f.ship(5);
     f.pass(); // try_deferred wrote ckpt_pending(-k) and the checkpoint answered Busy
     assert_eq!(f.position().stage, Stage::CkptPending);

@@ -42,3 +42,18 @@ test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 633 filtered out; f
 $ ./scripts/test.sh unit   (fmt, clippy -D warnings, unit tests): exit 0
 test result: ok. 649 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.90s
 test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.80s
+
+FIX ROUND 1
+RED (budget as passes, mutation of the new logic; test now does 20 Busy passes then advances the clock past the budget):
+test replica::sync::tests::seal_with_open_reader_numbers_on_and_reader_keeps_snapshot ... FAILED
+
+failures:
+
+--
+thread 'replica::sync::tests::seal_with_open_reader_numbers_on_and_reader_keeps_snapshot' (176045934) panicked at crates/buckwal/src/replica/sync/tests.rs:734:9:
+PassResult { outcome: CheckpointDeferred, objects: 1, lists: 1, gets: 2, found_new: true, skipped: 0, lag_ms: None, detail: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+--
+GREEN: ./scripts/test.sh unit -> EXIT=0, lib 652 passed (was 649)
+New tests (written with the fix, no separate RED): stopped stat, refusals leave dir untouched, files without local state refused, dirty file compaction.

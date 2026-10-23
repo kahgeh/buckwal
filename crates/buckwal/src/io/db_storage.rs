@@ -223,10 +223,15 @@ impl BucketDbStorage {
     /// before the engine reads anything.
     pub(crate) fn adopt_persisted_dirty(&self) -> Result<()> {
         let persisted = read_dirty_file(&self.dirty_path())?;
-        self.local
-            .lock()
-            .unwrap()
-            .extend(persisted_pages(&persisted));
+        let pages: BTreeSet<u32> = persisted_pages(&persisted).collect();
+        // A replica never seals, so nothing truncates the file: every sync appends its pages
+        // again. Rewrite it once, atomically, as the distinct pages when it holds repeats (or
+        // a torn tail).
+        if self.mode == IoMode::Replica && persisted.len() != pages.len() * 4 {
+            let bytes: Vec<u8> = pages.iter().flat_map(|p| p.to_le_bytes()).collect();
+            crate::reconcile::replace_file(&self.dir, DIRTY_FILE, &bytes)?;
+        }
+        self.local.lock().unwrap().extend(pages);
         Ok(())
     }
 

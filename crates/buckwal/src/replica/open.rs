@@ -15,7 +15,7 @@ use crate::db::{new_writer_id, replica_database, Database, DirGuard};
 use crate::encryption::{self, check_page_one, file_page_one};
 use crate::engine::{engine_error, open_engine};
 use crate::error::{Error, Result};
-use crate::files::{io_err, DB_FILE, LOCK_FILE, STATE_FILE};
+use crate::files::{io_err, DB_FILE, LOCK_FILE, LOG_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{Keys, LocalState, Manifest};
 use crate::io::IoMode;
 use crate::replica::{
@@ -28,10 +28,6 @@ use crate::replica::{
 };
 use crate::restore::{clear_interrupted_restore, remove_restored, restore_staged};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
-
-/// How many passes a seal's checkpoint may stay `Busy` before the follower carries on without
-/// it: two slow-poll intervals' worth of passes (one pass per slow poll).
-const CHECKPOINT_BUDGET_PASSES: u32 = 2;
 
 /// Open the read replica `config` names. See [`Replica`].
 pub fn open_replica(config: Config) -> Result<Replica> {
@@ -119,7 +115,9 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
     cfg.encryption = encryption.clone();
     // A replica follows WAL databases only; an MVCC head is refused below.
     cfg.journal_mode = JournalMode::Wal;
-    clear_interrupted_restore(&dir)?;
+    // The lock is taken first, as the writer's open does (it creates the directory and
+    // `durable.lock`, nothing else). Every refusal below happens before any other file is
+    // touched.
 
     // The head first: an MVCC bucket or a wrong key is refused before anything is fetched.
     let head_key = keys.head();
@@ -130,6 +128,7 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
         return Err(Error::Unsupported("replica: MVCC"));
     }
 
+    clear_interrupted_restore(&dir)?;
     let state = match resumable_state(&dir)? {
         Some(state) => state,
         None => {
@@ -193,7 +192,8 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
         Applier::new(core, decrypt),
         page_size,
         dir,
-        CHECKPOINT_BUDGET_PASSES,
+        // A seal's checkpoint may stay Busy for two slow-poll intervals.
+        config.replica_poll_interval * 2,
     )?;
 
     let stats = Arc::new(Mutex::new(ReplicaStats {
@@ -260,7 +260,19 @@ fn is_replica_file(name: &str) -> bool {
 fn clear_replica_dir(dir: &Path) -> Result<()> {
     match LocalState::read(dir) {
         Ok(Some(s)) => refuse_writer_dir(dir, &s)?,
-        Ok(None) => {}
+        Ok(None) => {
+            // Without a local state the files are not known to be a replica's: they may be a
+            // writer's database, whose `-wal` or `-log` holds commits only it has.
+            for f in [DB_FILE, WAL_FILE, LOG_FILE] {
+                if dir.join(f).exists() {
+                    return Err(Error::Config(format!(
+                        "{} holds {f} without a replica's local state; it is not cleared for \
+                         a replica",
+                        dir.display()
+                    )));
+                }
+            }
+        }
         Err(e) => {
             return Err(Error::Config(format!(
                 "{} holds a local state that cannot be read ({e}); it is not cleared for a \
@@ -324,7 +336,7 @@ fn local_page_size(dir: &Path) -> Option<usize> {
         n => Some(n as usize),
     });
     from_db.or_else(|| {
-        let wal = fs::read(dir.join(crate::files::WAL_FILE)).ok()?;
+        let wal = fs::read(dir.join(WAL_FILE)).ok()?;
         let b = wal.get(8..12)?;
         let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
         (n != 0).then_some(n)
@@ -453,6 +465,7 @@ impl Runner {
     }
 
     fn stop(&self, reason: &str, key: Option<&str>, detail: Option<String>) {
+        lock(&self.stats).stopped = Some(reason.to_string());
         tracing::error!(
             target: "buckwal",
             generation = self.follower.generation(),

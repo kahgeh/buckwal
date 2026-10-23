@@ -1,7 +1,11 @@
 //! The sync pass: list the generation's log after the last record seen, fetch the new records
 //! in an unbroken seq run, rebuild the WAL image, apply each committed transaction, then look
 //! at the head once. Read-only against the bucket: GET, stat (HEAD) and LIST only.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     config::JournalMode,
@@ -164,8 +168,13 @@ pub(crate) struct Follower {
     dir: Option<PathBuf>,
     replica_id: String,
     /// Passes a checkpoint may stay `Busy` before the follower carries on without it.
-    pass_budget: u32,
+    /// How long a seal's checkpoint may stay `Busy` before the follower carries on without it
+    /// (two slow-poll intervals, worked out by the caller).
+    busy_budget: Duration,
     ckpt: Option<CkptTask>,
+    /// Tests move the follower's clock forward.
+    #[cfg(test)]
+    clock_skew: Duration,
     /// The `-k` the position file last named for a deferred checkpoint (to skip rewrites).
     last_pending_k: Option<u64>,
     #[cfg(test)]
@@ -178,8 +187,10 @@ type StepHook = Box<dyn FnMut(Step) -> std::result::Result<(), String> + Send>;
 /// A checkpoint the position file says is pending.
 struct CkptTask {
     new_offset: i64,
-    /// Busy attempts so far (counted in passes).
+    /// Busy attempts so far (counted in passes, for the detail text).
     passes: u32,
+    /// When the first `Busy` came; the budget runs from it.
+    first_busy: Option<Instant>,
     /// A deferred checkpoint of frames already applied: a `Busy` is silent, no budget.
     deferred: bool,
 }
@@ -247,7 +258,9 @@ impl Follower {
             sealed: false,
             dir: None,
             replica_id: String::new(),
-            pass_budget: 0,
+            busy_budget: Duration::ZERO,
+            #[cfg(test)]
+            clock_skew: Duration::ZERO,
             ckpt: None,
             last_pending_k: None,
             #[cfg(test)]
@@ -255,17 +268,17 @@ impl Follower {
         }
     }
 
-    /// Write the position file in `dir`; a checkpoint may stay `Busy` for `pass_budget` passes
-    /// (twice the slow-poll interval's worth of passes, worked out by the caller).
+    /// Write the position file in `dir`; a seal's checkpoint may stay `Busy` for `busy_budget`
+    /// (two slow-poll intervals, worked out by the caller), however many passes that takes.
     pub(crate) fn with_position(
         mut self,
         dir: PathBuf,
         replica_id: String,
-        pass_budget: u32,
+        busy_budget: Duration,
     ) -> Follower {
         self.dir = Some(dir);
         self.replica_id = replica_id;
-        self.pass_budget = pass_budget;
+        self.busy_budget = busy_budget;
         self
     }
 
@@ -278,7 +291,7 @@ impl Follower {
         applier: Applier,
         page_size: usize,
         dir: PathBuf,
-        pass_budget: u32,
+        busy_budget: Duration,
     ) -> Result<Follower> {
         let Some(pos) = Position::read(&dir)? else {
             return Err(Error::Corrupt("replica position file is missing".into()));
@@ -287,11 +300,12 @@ impl Follower {
         let finished = pos.stage == Stage::CkptPending && !rerun;
         let new_offset = pos.new_offset;
         let mut f = Follower::new(store, keys, retry, applier, page_size, generation, offset)
-            .with_position(dir, pos.replica_id, pass_budget);
+            .with_position(dir, pos.replica_id, busy_budget);
         if rerun {
             f.ckpt = Some(CkptTask {
                 new_offset,
                 passes: 0,
+                first_busy: None,
                 deferred: false,
             });
         } else if finished {
@@ -307,6 +321,18 @@ impl Follower {
         f: impl FnMut(Step) -> std::result::Result<(), String> + Send + 'static,
     ) {
         self.hook = Some(Box::new(f));
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        return Instant::now() + self.clock_skew;
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&mut self, by: Duration) {
+        self.clock_skew += by;
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -476,6 +502,7 @@ impl Follower {
         self.ckpt = Some(CkptTask {
             new_offset: 0,
             passes: 0,
+            first_busy: None,
             deferred: false,
         });
         self.run_ckpt_task(t)
@@ -483,6 +510,8 @@ impl Follower {
 
     /// Run the pending checkpoint. `Some` ends the pass (Busy within the budget, or an error).
     fn run_ckpt_task(&mut self, t: &mut Tally) -> Option<Outcome> {
+        let now = self.now();
+        let budget = self.busy_budget;
         let task = self.ckpt.as_mut()?;
         let (new_offset, deferred) = (task.new_offset, task.deferred);
         match self.applier.checkpoint_truncate() {
@@ -514,10 +543,14 @@ impl Follower {
             }
             Ok(CheckpointResult::Busy) => {
                 task.passes += 1;
-                if task.passes < self.pass_budget {
+                let first = *task.first_busy.get_or_insert(now);
+                let waited = now.saturating_duration_since(first);
+                if waited < budget {
                     t.detail = Some(format!(
-                        "checkpoint busy: readers hold the local WAL (pass {} of {})",
-                        task.passes, self.pass_budget
+                        "checkpoint busy: readers hold the local WAL (pass {}, {} ms of {} ms)",
+                        task.passes,
+                        waited.as_millis(),
+                        budget.as_millis()
                     ));
                     return Some(if t.applied_tx > 0 || t.moved {
                         Outcome::Applied
@@ -575,6 +608,7 @@ impl Follower {
         self.ckpt = Some(CkptTask {
             new_offset,
             passes: 0,
+            first_busy: None,
             deferred: true,
         });
         self.run_ckpt_task(t)

@@ -31,6 +31,10 @@ pub struct ReplicaStats {
     /// Log records skipped by the fence rule.
     pub fenced_records_skipped: u64,
     pub re_restores: u64,
+    /// Set when the follower has stopped for good: the `reason` of the `replica stopped` log
+    /// line (`conflict`, `mvcc`, `integrity`, `corrupt`, or `trimmed` / `gap` until re-restore
+    /// exists). Connections still work on the last applied state.
+    pub stopped: Option<String>,
     /// When the last re-restore happened, and why.
     pub last_re_restore_at: Option<(SystemTime, String)>,
 }

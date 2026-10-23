@@ -372,8 +372,10 @@ fn mvcc_head_mid_follow_stops_the_follower_with_an_error_log() {
         head.journal_mode = JournalMode::Mvcc;
         head.format = crate::format::FORMAT_V2;
         store.put(&keys.head(), &keys.encode_head(&head)).unwrap();
+        assert_eq!(replica.stats().stopped, None);
         replica.waker().wake();
         until("the follower to stop", || replica.thread_finished());
+        assert_eq!(replica.stats().stopped.as_deref(), Some("mvcc"));
         // Stats stay readable and connections still work on the last applied state.
         assert!(replica.stats().last_pass_at.is_some());
         assert_eq!(count(&replica.connect().unwrap()), 2);
@@ -660,6 +662,85 @@ fn follows_across_seals_and_resumes_after_them() {
         .map(|r| r[0].as_int().unwrap())
         .collect();
     assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+    rc.close().unwrap();
+    replica.close().unwrap();
+}
+
+#[test]
+fn refusals_before_the_restore_leave_the_directory_untouched() {
+    let store = Arc::new(MemStore::new());
+    let t = tempfile::tempdir().unwrap();
+    let mut c = wconfig(&t.path().join("w"));
+    c.journal_mode = JournalMode::Mvcc;
+    let db = crate::open_with_store(c, store.clone()).unwrap();
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    std::fs::create_dir_all(&dir).unwrap();
+    // An interrupted restore's marker is not swept by a refused open.
+    std::fs::write(dir.join("app.db-restoring"), b"").unwrap();
+    assert_eq!(
+        unsupported(open_replica_with_store(rconfig(&dir), store.clone())),
+        "replica: MVCC"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["app.db-restoring", "durable.lock"]);
+    drop(db);
+}
+
+#[test]
+fn files_without_a_local_state_are_refused_and_left_alone() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, _wc) = writer(&store, 1);
+    for f in ["app.db-wal", "app.db-log", "app.db"] {
+        let r = tempfile::tempdir().unwrap();
+        std::fs::write(r.path().join(f), b"unshipped").unwrap();
+        assert!(
+            matches!(
+                open_replica_with_store(rconfig(r.path()), store.clone()),
+                Err(Error::Config(m)) if m.contains(f)
+            ),
+            "{f}"
+        );
+        assert_eq!(std::fs::read(r.path().join(f)).unwrap(), b"unshipped");
+    }
+}
+
+#[test]
+fn the_dirty_file_is_compacted_at_open() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, wc) = writer(&store, 3);
+    wc.checkpoint(CheckpointMode::Truncate).unwrap();
+    add(&wc, 4);
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    let replica = open_replica_with_store(rconfig(&dir), store.clone()).unwrap();
+    let rc = replica.connect().unwrap();
+    wait_rows(&rc, 4);
+    rc.close().unwrap();
+    replica.close().unwrap();
+    // Every sync appends its pages again: repeats and a torn tail.
+    let path = dir.join("app.db-dirty");
+    let mut bytes = std::fs::read(&path).unwrap_or_default();
+    let distinct: std::collections::BTreeSet<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .chain([2, 3])
+        .collect();
+    for p in [3u32, 2, 3, 2, 3] {
+        bytes.extend(p.to_le_bytes());
+    }
+    bytes.extend([9, 9]);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let replica = open_replica_with_store(rconfig(&dir), store.clone()).unwrap();
+    let want: Vec<u8> = distinct.iter().flat_map(|p| p.to_le_bytes()).collect();
+    assert_eq!(std::fs::read(&path).unwrap(), want);
+    let rc = replica.connect().unwrap();
+    assert_eq!(count(&rc), 4);
     rc.close().unwrap();
     replica.close().unwrap();
 }
