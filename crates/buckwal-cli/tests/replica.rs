@@ -980,9 +980,9 @@ fn replica_refuses_writes_and_sends_zero_puts_and_deletes() {
 // ---------------------------------------------------------------------------------------
 
 /// Two `follow` children on one bucket, each with its own listener (port 0, own directory),
-/// slow poll 60 s. The writer commits; the event is posted to the first only: it applies the
-/// commit (`applied generation=G seq=N`, `notified received=1`) and the second has applied
-/// nothing. Then the event goes to the second, which applies it. The same again the other
+/// slow poll 60 s. Both catch up with the writer first. The writer commits; the event is posted
+/// to the first only: it applies the commit (`applied generation=G seq=N`, `notified
+/// received=1`) and the second prints no new `applied` line. Then the event goes to the second, which applies it. The same again the other
 /// way round. Both exit 0 and their directories hold the writer's rows.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
@@ -997,6 +997,26 @@ fn two_replicas_each_with_own_listener() {
     let (p1, p2) = (f1.poster.clone().unwrap(), f2.poster.clone().unwrap());
     assert_ne!(p1.port, p2.port, "each replica has its own listener");
     let applied = |l: &str| l.starts_with("applied ");
+
+    // Both replicas first catch up with the writer (a replica's own start pass may apply
+    // commits made after its restore), so a later `applied` line can only come from an event.
+    let (g, n) = {
+        let g = ctx.head().generation;
+        (g, ctx.assert_log_contiguous(g))
+    };
+    for f in [&mut f1, &mut f2] {
+        let (a, b) = (
+            format!("applied generation={g} seq={n}"),
+            format!("following generation={g} seq={n}"),
+        );
+        f.wait_line(
+            0,
+            "caught up with the writer",
+            Duration::from_secs(30),
+            |l| l == a || l == b,
+        );
+    }
+    std::thread::sleep(Duration::from_secs(1));
 
     for (id, first_is_1) in [(6, true), (7, false)] {
         let (from1, from2) = (f1.lines.len(), f2.lines.len());
