@@ -1,7 +1,7 @@
 //! `head` object (bucket) and `app.db-durable` (local state): flat JSON.
 use super::integrity::{
-    head_code, head_verifies, integrity_failed, key_check, key_check_matches, no_codes, wrong_key,
-    Kind,
+    head_code, head_verifies, integrity_failed, integrity_failed_as, key_check, key_check_matches,
+    no_codes, wrong_key, Kind,
 };
 use super::json::{escape, Obj};
 use super::{FORMAT, FORMAT_V2, FORMAT_V3};
@@ -101,7 +101,8 @@ impl Head {
     /// Decode the head at `key` as a read with (`Some`) or without (`None`) an integrity key
     /// reads it. Without a key, a format 3 head (an encrypted database's) is refused with
     /// `Encryption`. With one:
-    /// - a format 1 or 2 head is `Encryption` ("no integrity codes"), no record;
+    /// - on an `open` a format 1 or 2 head is `Encryption` ("no integrity codes"), no record;
+    ///   after a good open it is `Corrupt("integrity: <key> format downgraded")` and the record;
     /// - on an `open` (a process's first read of the bucket) a `key_check` that is missing or
     ///   not this key's is `Encryption` ("not the key this bucket was written with"), checked
     ///   before any integrity code, no record: a wrong key is not tampering;
@@ -125,7 +126,13 @@ impl Head {
             return Ok(head);
         };
         if head.format != FORMAT_V3 {
-            return Err(no_codes());
+            // Before a good open this is a plaintext or pre-codes bucket; after one, someone
+            // put back a plaintext-format head to strip the codes.
+            return Err(if open {
+                no_codes()
+            } else {
+                integrity_failed_as(key, " format downgraded", Kind::Head, head.generation, 0)
+            });
         }
         let kc = kc.and_then(|h| hex::decode(h).ok());
         if !kc.as_deref().is_some_and(|k| key_check_matches(ik, k)) {

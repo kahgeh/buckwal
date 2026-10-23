@@ -1024,6 +1024,55 @@ fn encrypted_swapped_page_objects_fail_read() {
     swapped_page_objects_fail_read("encrypted_swapped_page_objects_fail_read", &[]);
 }
 
+/// Pass 2 (an encryption key): after a good open, a plaintext format 1 head put back over the
+/// encrypted bucket's head is a downgrade. The running writer's next head read (its seal)
+/// fails with `integrity: <prefix>/head format downgraded` and the writer stops with an error;
+/// nothing is accepted. Pass 1 has no key, so the test only returns there.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn encrypted_downgraded_head_after_open_is_tampering() {
+    let ctx = Ctx::new("encrypted_downgraded_head_after_open_is_tampering");
+    if !ctx
+        .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
+        .is_some_and(|k| !k.is_empty())
+    {
+        eprintln!("encrypted_downgraded_head_after_open_is_tampering: pass 1, no key: skipped");
+        return;
+    }
+    let dir = ctx.dir("db");
+    let mut soak = Soak::spawn(&ctx, &dir, &["--checkpoint", "truncate", "--every", "50"]);
+    soak.wait_acks(120);
+    let store = ctx.store();
+    let key = format!("{}/head", ctx.prefix());
+    let real = String::from_utf8(store.get(&key).unwrap().expect("head").body).unwrap();
+    assert!(real.contains("\"format\":3"), "{real}");
+    // Format 1: no journal_mode, key_check or integrity field.
+    let mut old = real.replace("\"format\":3", "\"format\":1");
+    for field in ["journal_mode", "key_check", "integrity"] {
+        if let Some(at) = old.find(&format!(",\"{field}\":\"")) {
+            let end = old[at + 1..].find('"').unwrap() + at + 1; // the field name's end
+            let end = old[end + 1..].find('"').unwrap() + end + 1; // its closing quote
+            let end = old[end + 1..].find('"').unwrap() + end + 1; // the value's opening quote
+            let end = old[end + 1..].find('"').unwrap() + end + 2; // the value's closing quote
+            old.replace_range(at..end, "");
+        }
+    }
+    store.put(&key, old.as_bytes()).unwrap();
+    soak.drain();
+    let status = soak.child.wait().expect("wait soak");
+    assert!(!status.success(), "the writer accepted a downgraded head");
+    let want = format!("integrity: {key} format downgraded");
+    assert!(
+        soak.stderr().contains(&want),
+        "stderr names the downgrade: {}",
+        soak.stderr()
+    );
+    fs::remove_dir_all(&dir).ok();
+    let r = ctx.dir("restored");
+    let out = ctx.run(&["restore", "--dir", r.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
+}
+
 /// The coordinator's ruling: a read-only verify of the same bucket while the writer runs
 /// claims nothing (head unchanged) and does not disturb the writer.
 #[test]

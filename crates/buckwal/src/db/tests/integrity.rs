@@ -688,6 +688,67 @@ fn after_a_good_open_an_edited_head_or_key_check_is_tampering() {
     }
 }
 
+/// Task 5c: after a good open a plaintext-format head is a downgrade, an edited or stripped
+/// `key_check` is tampering, each with exactly one record, and a restore refuses all of them.
+#[test]
+fn after_a_good_open_a_downgraded_or_stripped_head_is_tampering() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        let enc_keys = cfg_for(mode, _w.path(), &k).keys().unwrap();
+        let key = keys().head();
+        let good = body(&store, &key);
+        let h = head(&*store);
+        let pass = || crate::gc::gc_once(&*store, &enc_keys, Duration::ZERO, None);
+        pass().unwrap_or_else(|e| panic!("{mode:?}: the untouched head: {e}"));
+        for what in [
+            "format 1",
+            "format 2",
+            "key_check edited",
+            "key_check stripped",
+        ] {
+            put(&store, &key, &good);
+            match what {
+                "format 1" | "format 2" => {
+                    let format = if what == "format 1" { 1 } else { 2 };
+                    let old = Head {
+                        format,
+                        journal_mode: if format == 1 {
+                            JournalMode::Wal
+                        } else {
+                            JournalMode::Mvcc
+                        },
+                        ..h.clone()
+                    };
+                    put(&store, &key, &old.encode());
+                }
+                "key_check edited" => edit_head(&store, flip_key_check),
+                _ => edit_head(&store, |h| {
+                    let at = h.find(",\"key_check\"").unwrap();
+                    let end = h[at + 1..].find(",\"integrity\"").unwrap() + at + 1;
+                    format!("{}{}", &h[..at], &h[end..])
+                }),
+            }
+            let want = if what.starts_with("format") {
+                format!("integrity: {key} format downgraded")
+            } else {
+                format!("integrity: {key}")
+            };
+            let (got, records) = integrity_records(pass);
+            match got {
+                Err(Error::Corrupt(m)) => assert_eq!(m, want, "{mode:?} {what}"),
+                r => panic!("{mode:?} {what}: expected Corrupt, got {:?}", r.map(|_| ())),
+            }
+            assert_eq!(records, 1, "{mode:?} {what}");
+            let r = read_with(Reader::Restore, mode, &store, &k);
+            assert!(r.is_err(), "{mode:?} {what}: restore accepted the head");
+        }
+        put(&store, &key, &good);
+        pass().unwrap_or_else(|e| panic!("{mode:?}: the head put back: {e}"));
+    }
+}
+
 /// Task 6: what a failed read leaves in telemetry: one ERROR record, nothing but the object's
 /// key, kind, generation and seq in it, and `buckwal.outcome = integrity` on the reading span.
 mod telemetry_signals {

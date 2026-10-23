@@ -37,6 +37,18 @@ impl Kind {
 /// around a lazy page read have none); `restore`, `gc` and `takeover` also set it from the
 /// error when they end (`Error::outcome`).
 pub(crate) fn integrity_failed(key: &str, kind: Kind, generation: u64, seq: u64) -> Error {
+    integrity_failed_as(key, "", kind, generation, seq)
+}
+
+/// `integrity_failed` with `detail` (for example ` format downgraded`) after the key in the
+/// error only; the record still carries just the key.
+pub(crate) fn integrity_failed_as(
+    key: &str,
+    detail: &str,
+    kind: Kind,
+    generation: u64,
+    seq: u64,
+) -> Error {
     tracing::error!(
         target: "buckwal",
         key,
@@ -46,7 +58,7 @@ pub(crate) fn integrity_failed(key: &str, kind: Kind, generation: u64, seq: u64)
         "integrity check failed"
     );
     crate::telemetry::record_enclosing_outcome("integrity");
-    Error::Corrupt(format!("integrity: {key}"))
+    Error::Corrupt(format!("integrity: {key}{detail}"))
 }
 
 /// What a coded decode needs: the integrity key, the object's key (for the error) and the

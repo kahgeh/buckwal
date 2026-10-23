@@ -1197,16 +1197,19 @@ mod integrity_codes {
             ..v1.clone()
         };
         for h in [v1, v2] {
-            for r in [k.decode_head(&h.encode()), k.decode_head_open(&h.encode())] {
-                assert_eq!(
-                    r,
-                    Err(Error::Encryption(
-                        "the bucket has no integrity codes: it is plaintext, or was encrypted \
-                         before this version"
-                            .into()
-                    ))
-                );
-            }
+            // At open: a plaintext or pre-codes bucket. After a good open: a downgrade.
+            assert_eq!(
+                k.decode_head_open(&h.encode()),
+                Err(Error::Encryption(
+                    "the bucket has no integrity codes: it is plaintext, or was encrypted \
+                     before this version"
+                        .into()
+                ))
+            );
+            assert_eq!(
+                k.decode_head(&h.encode()),
+                Err(Error::Corrupt("integrity: p/head format downgraded".into()))
+            );
         }
     }
 

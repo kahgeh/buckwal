@@ -167,3 +167,15 @@ telemetry_signals::a_wrong_key_yields_no_record_...                 ok (no recor
 SealStarted/SealFinished after a skip (reverting the fix only, `seal_events_report_the_generation_sealed_after_a_skip_too`): `SealStarted { generation: 2 }`, `SealFinished { generation: 3 }` (left [3], right [2]). After: both report 2, the generation sealed.
 
 After: the same 8 tests, plus the seal-events test: 9 passed. `./scripts/test.sh unit`: see the Task 6 report.
+
+## Task 5c: a downgraded head after a good open is tampering
+
+Before (new test `db::tests::integrity::after_a_good_open_a_downgraded_or_stripped_head_is_tampering`, fix not written; `cargo test --locked -p buckwal --lib -- after_a_good_open`): 1 failed, 1 passed (the Task 5b edited key_check/epoch test).
+
+```
+Wal format 1: expected Corrupt, got Err(Encryption("the bucket has no integrity codes: it is plaintext, or was encrypted before this version"))
+```
+
+After (`Head::decode_checked`: a format 1 or 2 head is `Encryption` no-codes only at open; later it is `Corrupt("integrity: <prefix>/head format downgraded")` through `integrity_failed_as`, kind head): 2 passed. The test covers both modes: format 1 head, format 2 head, edited key_check, stripped key_check, each after a good open (GC pass): the exact text, exactly one record each, restore refuses, and the good head put back is accepted. Open-time tests (wrong key, key on plaintext, no codes: Encryption, zero records) unchanged and green.
+
+System version (pass 2, `#[ignore]`, compiled only): `encrypted_downgraded_head_after_open_is_tampering`.
