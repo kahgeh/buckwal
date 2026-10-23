@@ -163,6 +163,12 @@ struct Tally {
     detail: Option<String>,
 }
 
+/// The frame number a conflict error names (`replica conflict: generation G frame F`).
+fn conflict_frame(e: &Error) -> Option<u64> {
+    let Error::Corrupt(m) = e else { return None };
+    m.rsplit_once(" frame ")?.1.trim().parse().ok()
+}
+
 /// What the head said, once per pass.
 struct HeadView {
     generation: u64,
@@ -836,7 +842,13 @@ impl Follower {
                 self.image.committed_len(),
                 self.applied
             );
-            tracing::error!(target: "buckwal", "{msg}");
+            tracing::error!(
+                target: "buckwal",
+                generation = self.generation,
+                image_frames = self.image.committed_len() as u64,
+                applied_frames = self.applied,
+                "{msg}"
+            );
             t.detail = Some(msg);
             return Flow::Done(Outcome::Stopped(StopReason::Conflict));
         }
@@ -858,7 +870,13 @@ impl Follower {
                 Ok(ApplyOutcome::Gap) => return Flow::Reread,
                 Ok(ApplyOutcome::Incomplete) => return Flow::Go,
                 Err(e) if is_conflict(&e) => {
-                    tracing::error!(target: "buckwal", generation = self.generation, error = %e, "replica conflict; the replica must re-restore");
+                    tracing::error!(
+                        target: "buckwal",
+                        generation = self.generation,
+                        frame = conflict_frame(&e),
+                        error = %e,
+                        "replica conflict; the replica must re-restore"
+                    );
                     t.detail = Some(e.to_string());
                     return Flow::Done(Outcome::Stopped(StopReason::Conflict));
                 }

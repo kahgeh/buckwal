@@ -972,6 +972,10 @@ fn conflict_re_restores_after_error_log() {
         .expect("an ERROR naming the generation");
     assert_eq!(err.field("generation"), Some("1"));
     assert!(
+        err.field("frame").is_some_and(|f| f.parse::<u64>().is_ok()),
+        "the frame is its own field: {err:?}"
+    );
+    assert!(
         err.field("error").is_some_and(|e| e.contains("frame")),
         "{err:?}"
     );
