@@ -2,7 +2,7 @@
 
 What this product is made of and how its parts talk. Kept true by the product's pod. This
 file was started by the `mvcc-durability` work (2026-10-22), so "new", "changed" and "existing"
-in the diagram mean: new, changed or unchanged by that work. The README is the full contract
+in the diagram mean: new, changed or unchanged by that work. `durable-hardening` (2026-10-23) changed the head, the takeover and the seal, and added integrity codes: see "Takeover, generations and integrity codes" below. The README is the full contract
 and `docs/glossary.md` defines the terms.
 
 ## Purpose
@@ -94,9 +94,9 @@ flowchart LR
 | LogShippingFile | `app.db-log` (MVCC): records every write as an op, and at `sync` uploads the unconfirmed ops as one kind 3 record before the local fsync (the confirmed-sync rule) | `crates/buckwal/src/io/log_file.rs` |
 | LogDurableStorage | The `DurableStorage` wrapper given to the engine: delegates to the engine's own `Storage`, seals in `truncate`, poisons on a checkpoint failure after a seal | `crates/buckwal/src/io/log_storage.rs` |
 | Uploader and Bucket | The one upload at a time per database: log records, in-doubt settling, the seal (seal-start, pages, manifest, head), the lease and the fence checks | `crates/buckwal/src/uploader.rs`, `uploader/batch.rs`, `bucket.rs`, `clock.rs` |
-| Format codec | Bytes of the head, local state, log records (kinds 1 to 3), manifests and keys | `crates/buckwal/src/format/` |
+| Format codec | Bytes of the head (its fields, format 3 with `key_check` and the integrity code), local state, log records (kinds 1 to 3), manifests and keys, and the integrity codes of an encrypted bucket's objects | `crates/buckwal/src/format/` |
 | Object store | The S3 client (SigV4, conditional PUTs, HTTPS), retry, and the in-memory and fault stores the tests use | `crates/buckwal/src/store/` |
-| Encryption and telemetry | The key file and page-1 checks, and OTLP export through `tracing` | `crates/buckwal/src/encryption.rs`, `telemetry/` |
+| Encryption and telemetry | The key file, the integrity key and page-1 checks, and OTLP export through `tracing` | `crates/buckwal/src/encryption.rs`, `telemetry/` |
 | CLI | The `buckwal` binary, its argument parsing, `soak`, `bench`, `serve` and the whole-bucket `scan` | `crates/buckwal-cli/src/main.rs`, `args.rs`, `soak.rs`, `bench.rs`, `serve.rs`, `scan.rs` |
 | CLI tests | The system tests against RustFS, including the crash matrix and the MVCC tests | `crates/buckwal-cli/tests/system.rs`, `server.rs` |
 | Server | SQL over HTTP v3 (pipeline, cursor, describe, batons), health, TLS and token, streams, shutdown | `crates/buckwal-server/src/lib.rs`, `http.rs`, `proto.rs`, `exec.rs`, `streams.rs`, `listener.rs`, `config.rs` |
@@ -118,7 +118,9 @@ flowchart LR
 **Bucket.** Everything under `<prefix>/`.
 - Format v1 (WAL databases): `head` (`format` 1, generation, manifest, writer id, epoch), `log/<generation:010>/<seq:020>` (kind 1 WAL extents, kind 2 fence), `pages/<generation:010>/<page:010>`, `manifest/<generation:010>`.
 - Format v2 (MVCC databases only): the same keys, the head also carries `"format":2` and `"journal_mode":"mvcc"`, and a log record of kind 3 holds `app.db-log` extents. WAL buckets stay byte-identical v1, and a v1 build refuses a v2 head.
-- Contract: README, Bucket format v1 and Bucket format v2; codec in `crates/buckwal/src/format/`.
+- Format v3 (encrypted databases, WAL or MVCC): the same keys, the head has `"format":3`, `journal_mode`, `key_check` and an `integrity` code, and page objects, log records and manifests carry a 32-byte integrity code. An older build refuses it.
+- Head fields added by `durable-hardening`, in every format when set: `lease_ms`, `request_timeout_ms` (the writer's own, for the takeover quiet) and `next_generation_floor` (see below).
+- Contract: README, Bucket format v1, v2 and v3; codec in `crates/buckwal/src/format/`.
 
 **Local files** in the database directory. Contract: README, Use (the files table), and Bucket format v1 (local state).
 
@@ -127,16 +129,30 @@ flowchart LR
 | `app.db` | The database. After a restore it fills in lazily from the bucket. |
 | `app.db-wal` | The engine's WAL. In MVCC mode it only carries checkpoint frames and is near empty. |
 | `app.db-log` | MVCC databases only: the engine's logical log, the commit point. |
-| `app.db-durable` | Local state as JSON: writer id, generation, completeness, claim, epoch, takeover quiet. `"format":2` for an MVCC directory. |
+| `app.db-durable` | Local state as JSON: writer id, generation, completeness, claim, epoch, takeover quiet, next generation floor. `"format":2` for an MVCC directory. |
 | `app.db-dirty` | Page numbers checkpointed since the last seal. |
 | `app.db-restoring` | Present only while a restore moves its files in. |
 | `durable.lock` | The exclusive lock of the process that has the directory open. |
 
 **Settings and telemetry.** `BUCKWAL_*` environment variables (README, Settings), `BUCKWAL_OTEL*` and the span names (README, Telemetry, a contract the HyperDX searches depend on).
 
+## Takeover, generations and integrity codes
+
+Added by `durable-hardening` ([ADR 0005](adr/0005-takeover-generation-floor-quiet-and-integrity-codes.md)); the README, Guarantees and Bucket format are the contract.
+
+**The skipped generation.** A seal of generation G writes `pages/G/…` and `manifest/G` and moves the head to G+1 naming manifest G. A takeover's head write carries `next_generation_floor = max(G + 1, replaced floor) + 1`, also kept in `app.db-durable`. A seal now moves the head to `T = max(G + 1, floor)` and writes its pages and manifest under `T - 1`, so the new writer's first seal writes under G+1 and moves the head to G+2 naming manifest G+1, while the fenced writer can only write seal keys under G. The seal-start record and the log stay on `log/<head.generation>`; nothing is ever written to `log/<G+1>`. The WAL seal, the maintenance seal and the MVCC seal in `LogDurableStorage::truncate` (with its adoption of a head whose write had an unknown result) share the rule. Heads and manifests are therefore not consecutive: nothing may assume `G + 1`, a manifest generation can be missing, and restore, verify, GC, reconcile and a later takeover accept a head that went up by two.
+
+**The GC floor rule.** The skip seal's head keeps `next_generation_floor = T` and every later head carries it. While the field is present, GC ignores manifests below `floor - 1`, so it never trims against the fenced writer's leftover `manifest/G`. Between a takeover and the skip seal every manifest is below `floor - 1`, so GC trims nothing. A head without the field keeps the old rule.
+
+**The takeover quiet.** Every head carries the writer's `lease_ms` and `request_timeout_ms`. A takeover's quiet is the larger of the replaced head's sum and its own, capped at `MAX_SEAL_QUIET`. In a chain of takeovers C sizes its quiet from B's head and its own; a writer two takeovers back is kept off C's keys by the floor.
+
+**Integrity codes (encrypted buckets only).** The integrity key is HKDF-SHA256 over the key file's key (written over `hmac` and `sha2`, `encryption.rs`). A 32-byte HMAC-SHA256 integrity code ends each page object (over page number, generation, ciphertext), replaces the SHA-256 trailer of each log record (generation, seq, bytes), and covers each manifest (generation, bytes) and the head (its fields). Every fetch checks it, and a failure is `Corrupt("integrity: <key>")` plus the `integrity check failed` record. The codes bind generation, page and seq, not the prefix or a database id, and do not catch a rollback of the whole bucket to an earlier consistent point.
+
+**`key_check` and the open rule.** A format 3 head carries `key_check`, compared at every open of an encrypted bucket (writer open, restore, takeover, verify, GC on its own store) before any integrity code. At open, a different or missing `key_check`, a format 1 or 2 head under a key, are `Encryption` errors with no record and no alert. After a good open (`key_check` matched once in the process), any later head read that finds a bad head code, a different or missing `key_check`, or a format 1 or 2 head (a downgrade) is `Corrupt` plus the record and the alert. A running writer that meets such a head is fenced by its byte-comparing head check and stops without a record.
+
 ## Decisions
 
-Newest last. "Spec" is the id of the work that made it: `durable-library` stages 1 to 4, `durable-server`, `mvcc-durability`. The earlier stages' spec files are not in this repository, so they are named by id. Evidence for D1 to D29 is in README, Decisions. ADRs 0001 to 0004 in `docs/adr/` (index: `docs/adr/README.md`) record the four decisions of `mvcc-durability` that most shape the design, in Nygard's form; the earlier stages' decisions are not back-filled.
+Newest last. "Spec" is the id of the work that made it: `durable-library` stages 1 to 4, `durable-server`, `mvcc-durability`, `durable-hardening`. The earlier stages' spec files are not in this repository, so they are named by id. Evidence for D1 to D29 is in README, Decisions. ADRs 0001 to 0004 in `docs/adr/` (index: `docs/adr/README.md`) record the four decisions of `mvcc-durability` that most shape the design, in Nygard's form; the earlier stages' decisions are not back-filled.
 
 - 2026-10-16, `durable-library` stage 1: use turso_core `=0.8.3` through its public APIs only (an `IO`/`File` wrapper and `DatabaseStorage`), no fork, so the engine upgrades by version bump (D1, D2).
 - 2026-10-16, `durable-library` stage 1: the commit point is the WAL's fsync, and a failed upload fails the commit synchronously, so the engine rolls it back and never reaches the fsync panic (D3).
@@ -155,13 +171,14 @@ Newest last. "Spec" is the id of the work that made it: `durable-library` stages
 - 2026-10-22, `mvcc-durability`: a new MVCC database starts at generation 2 naming manifest 1 (D22, [ADR 0004](adr/0004-new-mvcc-database-starts-at-generation-2.md)). Why: a head at generation 1 would let the first real seal overwrite objects under a live head.
 - 2026-10-22, `mvcc-durability`: restore and reconcile work on two images (D23), a read-only open lets recovery writes through locally (D24), and a checkpoint failure after a seal poisons the database until reopen (D25).
 - 2026-10-22, `mvcc-durability`: the CLI follows the head's journal mode and the library does not (D26), maintenance measures the `.db-log` (D27), `run` and `is_autocommit` share the guard, gate and ack path (D28), and the engine's MVCC limits are accepted and pinned in tests (D29).
+- 2026-10-23, `durable-hardening`: a takeover's first seal skips a generation number and the head keeps a next generation floor that GC honours, the takeover quiet is the larger of both writers' timeouts, and an encrypted bucket carries integrity codes in a format 3 head ([ADR 0005](adr/0005-takeover-generation-floor-quiet-and-integrity-codes.md)). Why: a late PUT from the fenced writer could replace a key the new writer relies on, and an encrypted page was bound to neither its number nor its version.
 
 ## Departures from the standards
 
 None found. The organisation's standards file is kept outside this repository. Section by section:
 
 - **Glossary.** Followed. `docs/glossary.md` gives every term a one-line meaning and the words not to use, and lists the older text that still uses such a word under "Not yet consistent". The `mvcc-durability` work added its new terms in the same change.
-- **Architecture decisions.** Followed from this work on. `docs/adr/` holds ADRs 0001 to 0004 in Nygard's form (see Decisions). The earlier stages' decisions stay in the README, Decisions (D1 to D29), and are not back-filled. `docs/architecture.md` stays alongside the ADRs, as the standard says.
+- **Architecture decisions.** Followed from this work on. `docs/adr/` holds ADRs 0001 to 0005 in Nygard's form (see Decisions). The earlier stages' decisions stay in the README, Decisions (D1 to D29), and are not back-filled. `docs/architecture.md` stays alongside the ADRs, as the standard says.
 - **Telemetry.** Followed. Spans and logs leave over OTLP/gRPC, to `http://localhost:4317` by default (`Config::OTEL_ENDPOINT`, `crates/buckwal/src/config.rs`). `service.name` is set in code (`telemetry/pipeline.rs`, and the test `spans_carry_service_name_and_run_id_and_engine_spans_are_dropped`). No SQL text, row data or secret goes in a span or a log line. The MVCC path adds no span names: it reuses `buckwal.commit`, `buckwal.upload`, `buckwal.ack_wait` and `buckwal.local_fsync`, with their existing attributes (counts, bytes, generation, seq, retries, status, outcome). `git diff 332b45f..HEAD -- crates` adds two log lines: `log upload failed` (warn, the bucket error) and `database poisoned` (error, a text naming the failed checkpoint step). Neither carries SQL text. The stage's fixes show their logged problem and the passing lines in `results/mvcc-durability.txt`. Observability for the work is in the README, Telemetry.
 - **APIs and messaging.** Nothing to follow. The product has no gRPC interface and no web app; its HTTP server speaks tursodb's SQL over HTTP v3, a protocol set by turso, not a REST API behind pages.
 - **Stacks.** Followed: Rust. It is not a web app, so the axum, askama and Datastar stack does not apply.
