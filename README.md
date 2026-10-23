@@ -52,7 +52,7 @@ buckwal sql --dir shop2 "SELECT id, item FROM orders"
 # 1	book
 ```
 
-The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The numbers on the `takeover` line are explained under CLI. Use a new `BUCKWAL_PREFIX` to start another database; settings are listed under Settings.
+The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The numbers on the `takeover` line are listed under CLI. Use a new `BUCKWAL_PREFIX` to start another database; settings are listed under Settings.
 
 ## What it covers
 
@@ -61,7 +61,7 @@ The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The
 - **Clean-up on the bucket's clock.** Files in the bucket that the database no longer needs are deleted once the bucket's own clock says they have sat unused for 10 minutes. The clean-up is called garbage collection (GC).
 - **Batching.** The setting that groups commits into one upload can be changed while the database runs (see Batching).
 - **Telemetry.** buckwal can send traces and metrics in the OpenTelemetry format, a standard one for monitoring tools (see Telemetry).
-- **HTTPS and encryption.** `https://` endpoints are checked against the platform's trust store, or against a list of certificate authorities you name in `BUCKWAL_CA_BUNDLE`. With a key file named in `BUCKWAL_ENCRYPTION_KEY_FILE`, the database is encrypted before it leaves the machine, so the bucket holds only ciphertext.
+- **HTTPS and encryption.** `https://` endpoints are checked against the platform's trust store, or against a list of certificate authorities you name in `BUCKWAL_CA_BUNDLE`. With a key file named in `BUCKWAL_ENCRYPTION_KEY_FILE`, the database is encrypted before it leaves the machine, so the bucket holds only scrambled bytes that only your key can read.
 - **A server for other languages.** `buckwal serve` serves the database over tursodb's SQL over HTTP v3, so apps in other languages and several processes can use it through tursodb's serverless drivers (see Server).
 - **Concurrent writers.** A database created new in a mode that lets several writes run at once (`BEGIN CONCURRENT`) is durable too, with limits. A section further down describes it.
 - **What it was tested on.** A laptop, against RustFS, over plain HTTP and over HTTPS with encryption. It was not tested on AWS S3 (see Not tested until real use).
