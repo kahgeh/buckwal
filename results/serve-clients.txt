@@ -20,8 +20,8 @@ Skip check (the suites skip silently without a server):
 Certificate checks are on (no NODE_TLS_REJECT_UNAUTHORIZED, no verify=False):
 - TypeScript trusts the CA through NODE_EXTRA_CA_CERTS=<scratch>/tls/ca.pem; Python through SSL_CERT_FILE=<scratch>/tls/ca.pem.
 - Negative check with the unrelated CA (other-ca.pem) over HTTPS:
-  TypeScript: fetch fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE (serverless.test.mjs: 15 failed);
-  Python: 43 failed, 41 passed (offline tests), `[SSL: CERTIFICATE_VERIFY_FAILED]`.
+  TypeScript: serverless.test.mjs 15 failed with `TypeError: fetch failed`; a separate `fetch` of /health with the same CA setting printed cause code UNABLE_TO_VERIFY_LEAF_SIGNATURE (and the same with no extra CA);
+  Python: 43 failed, 41 passed (the 39 offline tests plus 2 server tests that do not need a successful connection, not examined further), `[SSL: CERTIFICATE_VERIFY_FAILED]`.
 - Server log of each run: `serve listening addr=127.0.0.1:<port> tls=<false|true> auth=true`, then
   `serve stopped clean=true fenced=false in_flight_failed=0`.
 

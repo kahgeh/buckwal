@@ -787,7 +787,7 @@ How the suite was run:
    TURSO_DATABASE_URL=http://127.0.0.1:<port> TURSO_AUTH_TOKEN=<token> python -I -m pytest -p no:cacheprovider -rs -v <scratch>/py-src/tests
    # HTTPS: https://localhost:<port> plus NODE_EXTRA_CA_CERTS=<dir>/ca.pem (TypeScript) or SSL_CERT_FILE=<dir>/ca.pem (Python)
    ```
-9. Check that the drivers really reached the server and verified the certificate. The Python suite skips its 45 server tests (`SKIPPED … TURSO_DATABASE_URL is not set`, 39 passed) when the URL is unset, so `-rs` must show no `SKIPPED`; the TypeScript suite fails rather than skips without the URL, and its ava output must show 48 passed. Run each driver once over HTTPS with `ca.pem` swapped for `other-ca.pem`: the TypeScript tests must fail with a certificate error (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) and the Python ones with `CERTIFICATE_VERIFY_FAILED`. Never set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
+9. Check that the drivers really reached the server and verified the certificate. The Python suite skips its 45 server tests (`SKIPPED … TURSO_DATABASE_URL is not set`, 39 passed) when the URL is unset, so `-rs` must show no `SKIPPED`; the TypeScript suite fails rather than skips without the URL, and its ava output must show 48 passed. Run each driver once over HTTPS with `ca.pem` swapped for `other-ca.pem`: the TypeScript tests must fail (`TypeError: fetch failed`; a bare `fetch` shows the cause `UNABLE_TO_VERIFY_LEAF_SIGNATURE`) and the Python ones with `CERTIFICATE_VERIFY_FAILED`. Never set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
 
 ## Replicas
 
