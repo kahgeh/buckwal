@@ -238,17 +238,42 @@ impl BucketDbStorage {
     /// Fetch every page the manifest names; once all are local, nothing is fetched again, in
     /// this process or a later one (`mark_complete`). Returns early, leaving the rest to be
     /// fetched on read, once `stop` is set.
+    ///
+    /// One `buckwal.prefetch` span covers the run, from its first page to its return, with
+    /// `buckwal.pages` (pages fetched during the run) and `buckwal.outcome`: `complete`,
+    /// `stopped`, `integrity` or `error`. It records once, never per page.
     pub(crate) fn prefetch(&self, stop: &AtomicBool) {
         let Some(m) = &self.manifest else {
             return;
         };
+        let span = tracing::info_span!(
+            target: "buckwal",
+            "buckwal.prefetch",
+            buckwal.pages = tracing::field::Empty,
+            buckwal.outcome = tracing::field::Empty,
+        );
+        let _run = span.enter();
+        let mut fetched = 0u64;
+        let mut outcome = "complete";
         for &p in m.pages.keys() {
-            if stop.load(SeqCst) || self.ensure_local(p).is_err() {
-                return;
+            if stop.load(SeqCst) {
+                outcome = "stopped";
+                break;
+            }
+            let before = self.lazy_gets.load(Relaxed);
+            let r = self.ensure_local(p);
+            fetched += self.lazy_gets.load(Relaxed).saturating_sub(before);
+            if let Err(e) = r {
+                outcome = e.outcome();
+                break;
             }
         }
-        // A failure leaves `complete=false` on disk: the next seal records it.
-        let _ = self.mark_complete();
+        if outcome == "complete" {
+            // A failure leaves `complete=false` on disk: the next seal records it.
+            let _ = self.mark_complete();
+        }
+        span.record("buckwal.pages", fetched);
+        span.record("buckwal.outcome", outcome);
     }
 
     /// Every page is local. A writer open fsyncs the fetched pages, then records

@@ -1023,3 +1023,71 @@ fn passive_checkpoint_flag_never_set() {
     let (e, _conn) = writer(Arc::new(MemStore::new()), d.path());
     assert!(!e.db.db.experimental_mvcc_passive_checkpoint_enabled());
 }
+
+/// A restored copy of a sealed 200-row database in a fresh directory, with prefetch off:
+/// the storage to run `prefetch` on by hand.
+fn sealed_and_restored(mem: &Arc<MemStore>) -> (tempfile::TempDir, Engine, Arc<Connection>) {
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    create_table(&conn);
+    for id in 1..=200 {
+        commit_row(&conn, id).unwrap();
+    }
+    seal_now(&conn);
+    let _crashed = crash(e, conn, d.path());
+    let r = tempfile::tempdir().unwrap();
+    restore_into(mem.clone(), &keys(), r.path(), &cfg()).unwrap();
+    let (e2, c2) = writer_with(mem.clone(), r.path(), &cfg());
+    (r, e2, c2)
+}
+
+/// The one `buckwal.prefetch` span `f` makes, closed: its target, pages and outcome.
+fn prefetch_span(f: impl FnOnce()) -> crate::telemetry::testing::SpanRec {
+    let cap = crate::telemetry::testing::Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        f();
+        cap.spans()
+    });
+    let all = spans.named("buckwal.prefetch");
+    assert_eq!(all.len(), 1, "{all:?}");
+    let s = all[0].clone();
+    assert!(s.closed.is_some(), "the span is open: {s:?}");
+    s
+}
+
+#[test]
+fn a_prefetch_that_finishes_ends_complete_with_its_pages() {
+    let mem = Arc::new(MemStore::new());
+    let (_r, e2, _c2) = sealed_and_restored(&mem);
+    let pages = manifest(&*mem).1.pages.len();
+    // The open already fetched page 1.
+    let before = e2.storage.lazy_gets();
+    let s = prefetch_span(|| e2.storage.prefetch(&AtomicBool::new(false)));
+    assert_eq!(s.target, "buckwal");
+    assert_eq!(s.field("buckwal.outcome"), Some("complete"), "{s:?}");
+    let fetched = (pages as u64 - before).to_string();
+    assert_eq!(s.field("buckwal.pages"), Some(fetched.as_str()));
+    assert!(e2.storage.is_complete());
+}
+
+#[test]
+fn a_prefetch_stopped_early_ends_stopped() {
+    let mem = Arc::new(MemStore::new());
+    let (_r, e2, _c2) = sealed_and_restored(&mem);
+    let s = prefetch_span(|| e2.storage.prefetch(&AtomicBool::new(true)));
+    assert_eq!(s.field("buckwal.outcome"), Some("stopped"), "{s:?}");
+    assert_eq!(s.field("buckwal.pages"), Some("0"));
+    assert!(!e2.storage.is_complete());
+}
+
+#[test]
+fn a_prefetch_over_a_missing_page_ends_error() {
+    let mem = Arc::new(MemStore::new());
+    let (_r, e2, _c2) = sealed_and_restored(&mem);
+    let m = manifest(&*mem).1;
+    let (&p, &g) = m.pages.iter().next_back().unwrap();
+    mem.delete(&keys().page(g, p)).unwrap();
+    let s = prefetch_span(|| e2.storage.prefetch(&AtomicBool::new(false)));
+    assert_eq!(s.field("buckwal.outcome"), Some("error"), "{s:?}");
+    assert!(!e2.storage.is_complete());
+}

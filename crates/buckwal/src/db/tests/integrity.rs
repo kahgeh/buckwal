@@ -883,3 +883,43 @@ mod telemetry_signals {
         }
     }
 }
+
+/// A prefetch that meets a tampered page ends its `buckwal.prefetch` span with outcome
+/// `integrity`, which is a failure; the page is not made local.
+#[test]
+fn a_prefetch_over_a_tampered_page_ends_integrity() {
+    use crate::telemetry::testing::Capture;
+    let store = mem();
+    let k = tempdir();
+    let _w = writer(Mode::Wal, &store, &k);
+    let (_, m) = current_manifest(&store);
+    let mut top: Vec<u32> = m.pages.keys().copied().collect();
+    top.sort_unstable();
+    let (p, q) = (top[top.len() - 1], top[top.len() - 2]);
+    let (a, b) = (keys().page(m.pages[&p], p), keys().page(m.pages[&q], q));
+    let (ba, bb) = (body(&store, &a), body(&store, &b));
+    put(&store, &a, &bb);
+    put(&store, &b, &ba);
+    let t = tempdir();
+    let mut c = cfg_for(Mode::Wal, &fresh(&t), &k);
+    c.prefetch = true;
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let _db = open_read_only_with_store(c, store.clone()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let spans = cap.spans();
+            if spans
+                .named("buckwal.prefetch")
+                .iter()
+                .any(|s| s.closed.is_some())
+            {
+                break spans;
+            }
+            assert!(std::time::Instant::now() < until, "no prefetch span closed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let s = spans.last_named("buckwal.prefetch");
+    assert_eq!(s.field("buckwal.outcome"), Some("integrity"), "{s:?}");
+}
