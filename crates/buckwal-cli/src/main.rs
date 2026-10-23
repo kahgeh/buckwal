@@ -1,6 +1,8 @@
 //! `buckwal`: restore, verify, query and exercise a durable database.
 mod args;
 mod bench;
+mod follow;
+mod notify_setup;
 mod scan;
 mod serve;
 mod soak;
@@ -384,6 +386,29 @@ fn main() -> ExitCode {
             }
         };
     }
+    let handled = match &cmd {
+        Command::Follow { dir, poll_ms } => Some(follow::run(dir, *poll_ms)),
+        Command::NotifySetup {
+            bucket,
+            replicas,
+            region,
+            topic,
+        } => {
+            // A settings error: usage, exit 2.
+            let r = notify_setup::run(bucket, *replicas, region.as_deref(), topic.as_deref());
+            Some(r.map_err(serve::Failure::Usage))
+        }
+        _ => None,
+    };
+    if let Some(result) = handled {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(f) => {
+                eprintln!("error: {}", f.message());
+                ExitCode::from(f.exit_code())
+            }
+        };
+    }
     let result = match &cmd {
         Command::Restore { dir } => restore(dir),
         Command::Takeover { dir } => takeover(dir),
@@ -404,7 +429,9 @@ fn main() -> ExitCode {
         Command::Soak(a) => soak::run(a),
         Command::Bench(a) => bench::run(a),
         Command::Scan(a) => scan::run(a),
-        Command::Serve { .. } => unreachable!("handled above"),
+        Command::Serve { .. } | Command::Follow { .. } | Command::NotifySetup { .. } => {
+            unreachable!("handled above")
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

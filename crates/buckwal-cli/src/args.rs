@@ -115,6 +115,19 @@ pub enum Command {
         claim: bool,
         batching: Option<Batching>,
     },
+    /// Follow the bucket's database as a read replica until SIGTERM or SIGINT.
+    Follow {
+        dir: PathBuf,
+        /// Overrides `BUCKWAL_REPLICA_POLL_MS`.
+        poll_ms: Option<u64>,
+    },
+    /// Print what to set up on the bucket for replica notifications; runs nothing.
+    NotifySetup {
+        bucket: String,
+        replicas: u32,
+        region: Option<String>,
+        topic: Option<String>,
+    },
     Soak(SoakArgs),
     Bench(BenchArgs),
     Scan(ScanArgs),
@@ -133,6 +146,8 @@ pub const USAGE: &str = "usage: buckwal <command> [options]
   bench   --dir DIR --commits N [--connections N] [--batching SPEC] [--journal-mode wal|mvcc]
   serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal|mvcc]
   takeover --dir DIR [--journal-mode wal|mvcc]
+  follow  --dir DIR [--poll-ms N]
+  notify-setup --bucket B --replicas N [--region R] [--topic NAME]
 --journal-mode is the mode a new database is created in (an existing one keeps its own; asking
 for the other is refused); without it, BUCKWAL_JOURNAL_MODE applies; with neither, an existing
 database's own mode is used and a new one is wal. restore and verify follow the bucket head's mode.
@@ -140,6 +155,10 @@ database's own mode is used and a new one is wal. restore and verify follow the 
 `mixed` has even-numbered threads use plain BEGIN and odd-numbered ones BEGIN CONCURRENT.
 SPEC is `off` or `window <max_wait> <max_commits> <max_bytes>` (e.g. 'window 10ms 64 1MiB');
 without --batching, BUCKWAL_BATCHING applies.
+follow runs a read replica until SIGTERM or SIGINT and prints a status line per event; --poll-ms
+overrides BUCKWAL_REPLICA_POLL_MS, and BUCKWAL_REPLICA_NOTIFY_* start the notification listener.
+notify-setup only prints the AWS CLI commands and bucket notification JSON (and RustFS
+equivalents, untested) that route bucket events to N replicas; it runs nothing.
 S3 settings come from the BUCKWAL_* environment variables; serve also reads BUCKWAL_SERVE_*.";
 
 fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
@@ -193,6 +212,11 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
     let mut expect = None;
     let mut all = false;
     let mut markers = Vec::new();
+    let mut poll_ms = None;
+    let mut bucket: Option<String> = None;
+    let mut replicas: Option<u32> = None;
+    let mut region = None;
+    let mut topic = None;
 
     let mut it = rest.iter().peekable();
     while let Some(a) = it.next() {
@@ -206,7 +230,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         let known = match (cmd.as_str(), a.as_str()) {
-            (c, "--dir") if c != "gc" && c != "scan" => {
+            (c, "--dir") if !matches!(c, "gc" | "scan" | "notify-setup") => {
                 dir = Some(PathBuf::from(value(a)?));
                 true
             }
@@ -247,6 +271,26 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             }
             ("serve", "--listen") => {
                 listen = Some(value(a)?);
+                true
+            }
+            ("follow", "--poll-ms") => {
+                poll_ms = Some(positive(a, &value(a)?)?);
+                true
+            }
+            ("notify-setup", "--bucket") => {
+                bucket = Some(value(a)?);
+                true
+            }
+            ("notify-setup", "--replicas") => {
+                replicas = Some(positive(a, &value(a)?)?);
+                true
+            }
+            ("notify-setup", "--region") => {
+                region = Some(value(a)?);
+                true
+            }
+            ("notify-setup", "--topic") => {
+                topic = Some(value(a)?);
                 true
             }
             ("verify", "--acked") => {
@@ -331,6 +375,17 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             markers,
         }));
     }
+    if cmd == "notify-setup" {
+        if let Some(a) = positional.first() {
+            return Err(format!("unexpected argument {a:?}"));
+        }
+        return parsed(Command::NotifySetup {
+            bucket: bucket.ok_or("--bucket is required")?,
+            replicas: replicas.ok_or("--replicas is required")?,
+            region,
+            topic,
+        });
+    }
     let dir = dir.ok_or("--dir is required")?;
     if !matches!(cmd.as_str(), "sql" | "stats") && !positional.is_empty() {
         return Err(format!("unexpected argument {:?}", positional[0]));
@@ -354,6 +409,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             claim,
             batching: batching_spec,
         },
+        "follow" => Command::Follow { dir, poll_ms },
         "serve" => Command::Serve {
             dir,
             listen,
@@ -532,6 +588,89 @@ mod tests {
                 "{c}"
             );
         }
+    }
+
+    #[test]
+    fn args_parse_follow_and_notify_setup() {
+        assert_eq!(
+            p(&["follow", "--dir", "d"]),
+            Ok(Command::Follow {
+                dir: "d".into(),
+                poll_ms: None
+            })
+        );
+        assert_eq!(
+            p(&["follow", "--dir", "d", "--poll-ms", "250"]),
+            Ok(Command::Follow {
+                dir: "d".into(),
+                poll_ms: Some(250)
+            })
+        );
+        assert!(p(&["follow", "--dir", "d", "--poll-ms", "0"]).is_err());
+        assert!(p(&["follow", "--dir", "d", "--poll-ms", "x"]).is_err());
+        assert!(p(&["follow", "--dir", "d", "--claim"]).is_err());
+        assert!(p(&["follow", "--dir", "d", "extra"]).is_err());
+        assert!(p(&["sql", "--dir", "d", "--poll-ms", "5", "SELECT 1"]).is_err());
+        assert_eq!(
+            p(&["notify-setup", "--bucket", "b-1", "--replicas", "2"]),
+            Ok(Command::NotifySetup {
+                bucket: "b-1".into(),
+                replicas: 2,
+                region: None,
+                topic: None
+            })
+        );
+        assert_eq!(
+            p(&[
+                "notify-setup",
+                "--replicas",
+                "1",
+                "--bucket",
+                "b-1",
+                "--region",
+                "eu-west-1",
+                "--topic",
+                "t"
+            ]),
+            Ok(Command::NotifySetup {
+                bucket: "b-1".into(),
+                replicas: 1,
+                region: Some("eu-west-1".into()),
+                topic: Some("t".into())
+            })
+        );
+        assert!(p(&[
+            "notify-setup",
+            "--bucket",
+            "b",
+            "--replicas",
+            "1",
+            "--dir",
+            "d"
+        ])
+        .is_err());
+        assert!(p(&["notify-setup", "--bucket", "b", "--replicas", "1", "x"]).is_err());
+        assert!(USAGE.contains("follow") && USAGE.contains("notify-setup"));
+    }
+
+    #[test]
+    fn follow_requires_dir() {
+        let e = p(&["follow"]).unwrap_err();
+        assert!(e.contains("--dir"), "{e}");
+        assert!(p(&["follow", "--poll-ms", "5"]).is_err());
+    }
+
+    #[test]
+    fn notify_setup_requires_bucket_and_replicas() {
+        assert!(p(&["notify-setup"]).unwrap_err().contains("--bucket"));
+        assert!(p(&["notify-setup", "--bucket", "b"])
+            .unwrap_err()
+            .contains("--replicas"));
+        assert!(p(&["notify-setup", "--replicas", "2"])
+            .unwrap_err()
+            .contains("--bucket"));
+        assert!(p(&["notify-setup", "--bucket", "b", "--replicas", "0"]).is_err());
+        assert!(p(&["notify-setup", "--bucket", "b", "--replicas", "-1"]).is_err());
     }
 
     #[test]

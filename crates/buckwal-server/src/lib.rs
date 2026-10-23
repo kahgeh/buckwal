@@ -351,6 +351,42 @@ pub async fn os_signals() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// A stop request from SIGTERM or SIGINT, for a process that has no tokio runtime of its own
+/// (`buckwal follow`). Clones share the one signal.
+#[derive(Clone)]
+pub struct StopSignal {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl StopSignal {
+    /// Whether a signal has arrived.
+    pub fn is_set(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    /// Resolves when a signal has arrived (at once if one already has).
+    pub async fn stopped(mut self) {
+        let _ = self.rx.wait_for(|stop| *stop).await;
+    }
+}
+
+/// Start watching for SIGTERM and SIGINT on a thread of its own.
+pub fn watch_signals() -> Result<StopSignal, String> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the signal runtime: {e}"))?;
+    std::thread::Builder::new()
+        .name("buckwal-signals".to_string())
+        .spawn(move || {
+            rt.block_on(os_signals());
+            let _ = tx.send(true);
+        })
+        .map_err(|e| format!("cannot start the signal thread: {e}"))?;
+    Ok(StopSignal { rx })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

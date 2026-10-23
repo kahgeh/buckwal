@@ -1,0 +1,6 @@
+Task 12 evidence
+RED: cargo test --locked -p buckwal-cli --bin buckwal (render/events/apply_poll stubs; args parsing already implemented in the same step so its tests passed)
+test result: FAILED. 36 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+GREEN: same command after implementation
+test result: ok. 44 passed; 0 failed (cargo test --locked -p buckwal-cli --bin buckwal)
+./scripts/test.sh unit: exit 0 (fmt, clippy -D warnings, tests)
