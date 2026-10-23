@@ -42,3 +42,9 @@ thread 'replica::sync::tests::two_seals_between_passes_follow_the_intermediate_g
 test result: FAILED. 37 passed; 5 failed; 0 ignored; 0 measured; 644 filtered out; finished in 0.94s
 GREEN (new sync.rs): cargo test --locked -p buckwal --lib replica::
 test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 572 filtered out; finished in 6.78s
+
+== Rev 17: skip only within trim_grace of the last sighting (wall clock); head_generation; INFO line ==
+New tests (first RED against the d9e6320 floor-based rule would not exist; written with the rule): empty_log_after_a_long_pause_re_restores_and_never_jumps, empty_log_with_a_wall_clock_stepped_back_re_restores, resumed_follower_with_no_sighting_re_restores_on_an_empty_log, skipped_generation_logs_an_info_line_with_generation_and_reason
+GREEN: cargo test --locked -p buckwal --lib replica::
+test result: ok. 117 passed; 0 failed; 0 ignored; 0 measured; 572 filtered out; finished in 7.13s
+./scripts/test.sh unit: exit 0, lib 689 passed

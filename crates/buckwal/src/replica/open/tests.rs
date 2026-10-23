@@ -1581,6 +1581,13 @@ fn sync_span_carries_all_attributes() {
     let all = sync_spans(&spans);
     assert_eq!(all.len(), 3, "{all:?}");
     all.iter().for_each(|s| check_sync_span(s));
+    // The head generation the pass saw: the writer has not sealed, so it is the replica's own.
+    for s in &all {
+        assert_eq!(
+            num(s, "buckwal.head_generation"),
+            num(s, "buckwal.generation")
+        );
+    }
     let (start, nothing, applied) = (all[0], all[1], all[2]);
     assert_eq!(start.field("buckwal.trigger"), Some("start"));
     assert_eq!(nothing.field("buckwal.trigger"), Some("notification"));

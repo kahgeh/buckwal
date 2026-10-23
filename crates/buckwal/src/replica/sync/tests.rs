@@ -6,7 +6,11 @@ use crate::{
     replica::position::{Position, Stage},
     store::{FaultStore, MemStore},
 };
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use turso_core::{
     CheckpointMode, CipherMode, Connection, Database, EncryptionKey, PlatformIO, SqliteDialect,
     Value, IO,
@@ -160,13 +164,7 @@ impl Fx {
     }
 
     fn set_head(&self, generation: u64) {
-        self.set_head_floor(generation, None);
-    }
-
-    /// A head after a takeover's skip seal carries the floor (`next_generation_floor`).
-    fn set_head_floor(&self, generation: u64, floor: Option<u64>) {
-        let mut h = head(&self.keys, generation, JournalMode::Wal);
-        h.next_generation_floor = floor;
+        let h = head(&self.keys, generation, JournalMode::Wal);
         self.mem
             .put(&self.keys.head(), &self.keys.encode_head(&h))
             .unwrap();
@@ -815,8 +813,7 @@ fn deferred_checkpoint_runs_after_reader_commits() {
 fn head_skipping_a_generation_lists_the_skipped_one_once_and_jumps() {
     let mut f = Fx::new().positioned(BUDGET);
     f.ship(2);
-    f.seal_to(3); // the head goes 1 -> 3 with the floor 3 of a takeover; log/2 never exists
-    f.set_head_floor(3, Some(3));
+    f.seal_to(3); // the head goes 1 -> 3 as after a takeover; log/2 never exists
     f.ship(4);
     let start = f.fault.events().len();
     let r = f.pass();
@@ -876,30 +873,98 @@ fn three_seals_between_passes_follow_every_generation() {
     f.integrity_ok();
 }
 
-#[test]
-fn trimmed_intermediate_generation_re_restores() {
+fn trimmed_intermediate_fixture() -> Fx {
     let mut f = Fx::new().positioned(BUDGET);
     f.ship_big(2);
     f.seal_to(2);
     f.ship_big(3);
     f.seal_to(3);
     f.ship_big(4);
-    // GC deleted log/2 (the replica was long gone); the head carries no floor
+    // GC deleted log/2 (the replica was long gone)
     f.mem.delete(&f.keys.log(2, 1)).unwrap();
     f.mem.delete(&f.keys.log(2, 2)).unwrap();
+    f
+}
+
+fn assert_never_jumped(f: &Fx, start: usize) {
+    assert_eq!(f.follower.generation(), 1);
+    assert_eq!(f.position().generation, 1);
+    let ev = f.fault.events()[start..].to_vec();
+    assert!(
+        ev.iter().all(|e| !e.contains(&f.keys.log_prefix(3))),
+        "{}",
+        names(&ev)
+    );
+}
+
+#[test]
+fn empty_log_after_a_long_pause_re_restores_and_never_jumps() {
+    let mut f = trimmed_intermediate_fixture();
+    // the last sighting of the head near us is older than trim_grace by the wall clock
+    f.follower.advance_wall_clock(Duration::from_secs(601));
+    let start = f.fault.events().len();
     let r = f.pass();
     assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
-    // also when an older takeover left a floor, but log/2 is not the generation below it
-    let mut g = Fx::new().positioned(BUDGET);
-    g.ship_big(2);
-    g.seal_to(2);
-    g.ship_big(3);
-    g.seal_to(3);
-    g.mem.delete(&g.keys.log(2, 1)).unwrap();
-    g.mem.delete(&g.keys.log(2, 2)).unwrap();
-    g.set_head_floor(3, Some(2));
-    let r = g.pass();
+    assert_never_jumped(&f, start);
+}
+
+#[test]
+fn empty_log_with_a_wall_clock_stepped_back_re_restores() {
+    let mut f = trimmed_intermediate_fixture();
+    // the sighting is in the future: a negative elapsed time is not recent
+    f.follower
+        .note_head_seen(1, SystemTime::now() + Duration::from_secs(3600));
+    let start = f.fault.events().len();
+    let r = f.pass();
     assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    assert_never_jumped(&f, start);
+}
+
+#[test]
+fn resumed_follower_with_no_sighting_re_restores_on_an_empty_log() {
+    let f = trimmed_intermediate_fixture();
+    let mut again = Follower::resume(
+        f.fault.clone(),
+        f.keys.clone(),
+        retry(),
+        Applier::new(f.reader.clone(), None),
+        PS,
+        f.rdir.clone(),
+        BUDGET,
+    )
+    .unwrap();
+    let r = again.pass(Trigger::Notification);
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    // a head read that named a generation past ours is no sighting near us
+    again.note_head_seen(3, SystemTime::now());
+    let r = again.pass(Trigger::Notification);
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    again.note_head_seen(2, SystemTime::now());
+    let r = again.pass(Trigger::Notification);
+    assert!(!matches!(r.outcome, Outcome::ReRestore(_)), "{r:?}");
+}
+
+#[test]
+fn skipped_generation_logs_an_info_line_with_generation_and_reason() {
+    use crate::telemetry::testing::Capture;
+    let cap = Capture::new();
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.seal_to(3);
+    f.ship(4);
+    let r = tracing::subscriber::with_default(cap.subscriber(), || f.pass());
+    assert_eq!(r.head_generation, Some(3), "{r:?}");
+    let snap = cap.spans();
+    let ev: Vec<_> = snap
+        .events
+        .iter()
+        .filter(|e| e.field("message") == Some("replica skipped a generation"))
+        .collect();
+    assert_eq!(ev.len(), 1, "{:?}", snap.events);
+    assert_eq!(ev[0].level, tracing::Level::INFO);
+    assert_eq!(ev[0].target, "buckwal");
+    assert_eq!(ev[0].field("generation"), Some("2"));
+    assert_eq!(ev[0].field("reason"), Some("takeover"));
 }
 
 #[test]
@@ -911,7 +976,6 @@ fn ordinary_then_skipped_generation_in_one_jump() {
     f.seal_to(2);
     f.ship_big(3);
     f.seal_to(4);
-    f.set_head_floor(4, Some(4));
     f.ship_big(4);
     let start = f.fault.events().len();
     let r = f.pass();

@@ -4,7 +4,7 @@
 use std::{
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
@@ -146,6 +146,8 @@ pub(crate) struct PassResult {
     pub lag_ms: Option<u64>,
     /// The error text behind a `Stopped`, `ReRestore` or `Failed`.
     pub detail: Option<String>,
+    /// The head generation the pass last saw (`None`: it never got that far).
+    pub head_generation: Option<u64>,
 }
 
 #[derive(Default)]
@@ -161,6 +163,7 @@ struct Tally {
     /// The last log read of the pass ended on a hole.
     hole: bool,
     detail: Option<String>,
+    head_generation: Option<u64>,
 }
 
 /// The frame number a conflict error names (`replica conflict: generation G frame F`).
@@ -174,9 +177,6 @@ struct HeadView {
     generation: u64,
     mvcc: bool,
 }
-
-/// The head as cached between passes: generation, MVCC, `next_generation_floor`.
-type HeadSeen = (u64, bool, Option<u64>);
 
 enum Flow {
     Go,
@@ -199,7 +199,7 @@ pub(crate) struct Follower {
     /// Frames of the generation already applied (or already in `app.db`).
     applied: u64,
     head_etag: Option<String>,
-    head_view: Option<HeadSeen>,
+    head_view: Option<(u64, bool)>,
     fence: FenceRule,
     /// The last admitted record of the generation was a seal-start (an empty Extents record).
     sealed: bool,
@@ -214,6 +214,16 @@ pub(crate) struct Follower {
     /// Tests move the follower's clock forward.
     #[cfg(test)]
     clock_skew: Duration,
+    /// `Config::trim_grace`: GC may empty a log once the seal that moved the head past it is
+    /// older than this.
+    trim_grace: Duration,
+    /// Wall-clock time of the last look at the head that found it no further than the
+    /// generation after ours (`None`: no such look is known, so no skip can be shown safe).
+    /// Wall clock, not `Instant`: `Instant` stops while a laptop sleeps, and GC does not.
+    last_seen: Option<SystemTime>,
+    /// Tests move the wall clock forward.
+    #[cfg(test)]
+    wall_skew: Duration,
     /// The `-k` the position file last named for a deferred checkpoint (to skip rewrites).
     last_pending_k: Option<u64>,
     #[cfg(test)]
@@ -300,6 +310,11 @@ impl Follower {
             busy_budget: Duration::ZERO,
             #[cfg(test)]
             clock_skew: Duration::ZERO,
+            trim_grace: crate::config::defaults::TRIM_GRACE,
+            // A new follower follows a restore that has just read the head.
+            last_seen: Some(SystemTime::now()),
+            #[cfg(test)]
+            wall_skew: Duration::ZERO,
             ckpt: None,
             last_pending_k: None,
             #[cfg(test)]
@@ -321,6 +336,34 @@ impl Follower {
         self
     }
 
+    /// GC's `trim_grace`, which bounds how long a sighting of the head vouches for an empty
+    /// log being a skipped generation.
+    pub(crate) fn with_trim_grace(mut self, trim_grace: Duration) -> Follower {
+        self.trim_grace = trim_grace;
+        self
+    }
+
+    /// The head was read at `at` (the opener's read) and named `generation`: the sighting that
+    /// lets a resumed follower tell a skipped generation from a trimmed one. Ignored when the
+    /// head was further than the generation after ours.
+    pub(crate) fn note_head_seen(&mut self, generation: u64, at: SystemTime) {
+        if generation <= self.generation + 1 {
+            self.last_seen = Some(at);
+        }
+    }
+
+    fn wall_now(&self) -> SystemTime {
+        #[cfg(test)]
+        return SystemTime::now() + self.wall_skew;
+        #[cfg(not(test))]
+        SystemTime::now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_wall_clock(&mut self, by: Duration) {
+        self.wall_skew += by;
+    }
+
     /// Resume from the position file in `dir`. A missing file cannot resume (the caller
     /// re-restores).
     pub(crate) fn resume(
@@ -340,6 +383,9 @@ impl Follower {
         let new_offset = pos.new_offset;
         let mut f = Follower::new(store, keys, retry, applier, page_size, generation, offset)
             .with_position(dir, pos.replica_id, busy_budget);
+        // The position file's age says nothing about when the head was last seen near us; the
+        // opener's own head read does (`note_head_seen`).
+        f.last_seen = None;
         if rerun {
             f.ckpt = Some(CkptTask {
                 new_offset,
@@ -422,6 +468,7 @@ impl Follower {
             skipped: t.skipped,
             lag_ms: None,
             detail: t.detail,
+            head_generation: t.head_generation,
         }
     }
 
@@ -438,6 +485,7 @@ impl Follower {
             skipped: t.skipped,
             lag_ms: None,
             detail: t.detail,
+            head_generation: t.head_generation,
         }
     }
 
@@ -559,41 +607,55 @@ impl Follower {
     /// The generation after ours that the log continues in. The head only tells where the writer
     /// is now: a writer that sealed twice between two passes left the head at G+2 with an
     /// ordinary generation G+1 in between, whose log must be followed. So when the head is past
-    /// G+1, LIST `log/<G+1>/`: any record means an ordinary generation (a seal always writes its
-    /// seal-start record first), and we follow it. An empty listing is a takeover's skipped
-    /// generation (no log is ever written under it) only when it is the generation just below
-    /// the head's `next_generation_floor`; otherwise it is an ordinary generation whose log was
-    /// trimmed, which needs a re-restore.
+    /// G+1, LIST `log/<G+1>/`, then G+2 ... below the head, and follow the first one with a
+    /// record (a seal always writes its seal-start record first). A number with an empty
+    /// listing is a takeover's skipped generation (nothing is ever written under it), but GC
+    /// also empties the log of an old generation. The two are told apart by time: GC trims
+    /// only after the seal that moved the head past a generation is `trim_grace` old, so an
+    /// empty listing is a skip only when the head was last seen no further than G+1 less than
+    /// `trim_grace` ago (wall clock). Otherwise the replica re-restores.
     fn next_generation(
         &mut self,
         head_generation: u64,
         t: &mut Tally,
     ) -> std::result::Result<u64, Outcome> {
-        let next = self.generation + 1;
-        if head_generation <= next {
-            return Ok(head_generation);
+        for next in self.generation + 1..head_generation {
+            let prefix = self.keys.log_prefix(next);
+            t.lists += 1;
+            let listed = with_retry(&self.retry, &prefix, |_| {
+                self.store.list_after(&prefix, &prefix)
+            })
+            .map_err(|e| failed(t, e))?;
+            if listed
+                .iter()
+                .any(|k| matches!(self.keys.parse_log(k), Some((g, _)) if g == next))
+            {
+                return Ok(next);
+            }
+            // Empty: a skip if the last sighting is young enough to rule out a trim.
+            let young = self.last_seen.is_some_and(|s| {
+                self.wall_now()
+                    .duration_since(s)
+                    .is_ok_and(|age| age < self.trim_grace)
+            });
+            if young {
+                tracing::info!(
+                    target: "buckwal",
+                    generation = next,
+                    reason = "takeover",
+                    "replica skipped a generation"
+                );
+            } else {
+                t.detail = Some(format!(
+                    "log/{next} is empty and the head is at generation {head_generation}: \
+                     trimmed (the head was last seen near generation {} longer than the \
+                     trim grace ago, or never)",
+                    self.generation
+                ));
+                return Err(Outcome::ReRestore(Reason::Trimmed));
+            }
         }
-        let prefix = self.keys.log_prefix(next);
-        t.lists += 1;
-        let listed = with_retry(&self.retry, &prefix, |_| {
-            self.store.list_after(&prefix, &prefix)
-        })
-        .map_err(|e| failed(t, e))?;
-        if listed
-            .iter()
-            .any(|k| matches!(self.keys.parse_log(k), Some((g, _)) if g == next))
-        {
-            return Ok(next);
-        }
-        let floor = self.head_view.and_then(|v| v.2);
-        if floor.is_some_and(|f| f == next + 1) {
-            // The skipped generation: the seal that wrote the floor moved the head past it.
-            return Ok(next + 1);
-        }
-        t.detail = Some(format!(
-            "log/{next} is empty (trimmed) and the head is at generation {head_generation}"
-        ));
-        Err(Outcome::ReRestore(Reason::Trimmed))
+        Ok(head_generation)
     }
 
     /// Run the pending checkpoint. `Some` ends the pass (Busy within the budget, or an error).
@@ -708,10 +770,15 @@ impl Follower {
             Err(o) => return o,
         };
         t.hole = hole;
+        let asked_at = self.wall_now();
         let head = match self.check_head(t) {
             Ok(h) => h,
             Err(o) => return o,
         };
+        t.head_generation = Some(head.generation);
+        if head.generation <= self.generation + 1 {
+            self.last_seen = Some(asked_at);
+        }
         if head.mvcc {
             tracing::error!(target: "buckwal", "replica: the head says MVCC; replicas do not follow it");
             return Outcome::Stopped(StopReason::Mvcc);
@@ -939,7 +1006,7 @@ impl Follower {
     fn check_head(&mut self, t: &mut Tally) -> std::result::Result<HeadView, Outcome> {
         let key = self.keys.head();
         t.gets += 1;
-        if let (Some(etag), Some((generation, mvcc, _))) = (&self.head_etag, self.head_view) {
+        if let (Some(etag), Some((generation, mvcc))) = (&self.head_etag, self.head_view) {
             match with_retry(&self.retry, &key, |_| self.store.stat(&key)) {
                 Ok(Some(s)) if &s.etag == etag => return Ok(HeadView { generation, mvcc }),
                 Ok(_) => t.gets += 1,
@@ -960,11 +1027,7 @@ impl Follower {
                 return Err(decode_failure(&e, &key));
             }
         };
-        let view = (
-            head.generation,
-            head.journal_mode == JournalMode::Mvcc,
-            head.next_generation_floor,
-        );
+        let view = (head.generation, head.journal_mode == JournalMode::Mvcc);
         self.head_etag = Some(obj.etag);
         self.head_view = Some(view);
         Ok(HeadView {

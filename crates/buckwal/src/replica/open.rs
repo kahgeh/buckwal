@@ -169,7 +169,9 @@ impl Env {
         state: &LocalState,
         head: Head,
         head_etag: String,
+        head_read_at: SystemTime,
     ) -> Result<(Database, Follower)> {
+        let head_generation = head.generation;
         let manifest =
             manifest_before(&*self.store, &self.keys, &self.cfg.retry, state.generation)?;
         let page_size = manifest
@@ -200,7 +202,7 @@ impl Env {
             Some(enc) => Some(PageDecrypt::from_encryption(enc, page_size)?),
             None => None,
         };
-        let follower = Follower::resume(
+        let mut follower = Follower::resume(
             self.store.clone(),
             self.keys.clone(),
             self.cfg.retry.clone(),
@@ -208,12 +210,16 @@ impl Env {
             page_size,
             data.to_path_buf(),
             self.busy_budget,
-        )?;
+        )?
+        .with_trim_grace(self.cfg.trim_grace);
+        // The head read that opened (or re-restored) this copy is the first sighting.
+        follower.note_head_seen(head_generation, head_read_at);
         Ok((db, follower))
     }
 
     /// The head, read afresh; an MVCC head is refused.
-    fn read_head(&self) -> Result<(Head, String)> {
+    fn read_head(&self) -> Result<(Head, String, SystemTime)> {
+        let read_at = SystemTime::now();
         let key = self.keys.head();
         let obj = with_retry(&self.cfg.retry, &key, |_| self.store.get(&key))?
             .ok_or_else(|| Error::NotFound(key.clone()))?;
@@ -221,7 +227,7 @@ impl Env {
         if head.journal_mode == JournalMode::Mvcc {
             return Err(Error::Unsupported("replica: MVCC"));
         }
-        Ok((head, obj.etag))
+        Ok((head, obj.etag, read_at))
     }
 }
 
@@ -254,7 +260,7 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
     };
 
     // The head first: an MVCC bucket or a wrong key is refused before anything is fetched.
-    let (head, head_etag) = env.read_head()?;
+    let (head, head_etag, head_read_at) = env.read_head()?;
 
     clear_interrupted_restore(&dir)?;
     let mut data = settle_layout(&dir)?;
@@ -270,7 +276,7 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
         }
     };
 
-    let (db, follower) = env.open_copy(&data, &state, head, head_etag)?;
+    let (db, follower) = env.open_copy(&data, &state, head, head_etag, head_read_at)?;
     let caught_up = restart_caught_up(&dir, &data);
     let stats = Arc::new(Mutex::new(ReplicaStats {
         generation: follower.generation(),
@@ -716,6 +722,7 @@ impl Runner {
             "buckwal.replica.sync",
             buckwal.replica_id = self.follower.replica_id(),
             buckwal.generation = tracing::field::Empty,
+            buckwal.head_generation = tracing::field::Empty,
             buckwal.seq = tracing::field::Empty,
             buckwal.trigger = trigger.as_str(),
             buckwal.lag_ms = tracing::field::Empty,
@@ -759,6 +766,9 @@ impl Runner {
             if let Some(lag) = s.lag_ms.filter(|_| ok) {
                 span.record("buckwal.lag_ms", lag);
             }
+        }
+        if let Some(h) = r.head_generation {
+            span.record("buckwal.head_generation", h);
         }
         span.record("buckwal.objects", r.objects);
         span.record("buckwal.lists", r.lists);
@@ -938,11 +948,11 @@ impl Runner {
     }
 
     fn build_copy(&self, copy: &Path) -> Result<(Database, Follower)> {
-        let (head, etag) = self.env.read_head()?;
+        let (head, etag, read_at) = self.env.read_head()?;
         let state = self
             .env
             .restore_copy(copy, self.follower.replica_id().to_string())?;
-        self.env.open_copy(copy, &state, head, etag)
+        self.env.open_copy(copy, &state, head, etag, read_at)
     }
 
     fn remove_old_copy(&self, old: &Path) {
