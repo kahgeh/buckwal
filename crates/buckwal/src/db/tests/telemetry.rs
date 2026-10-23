@@ -191,3 +191,33 @@ fn seal_events_report_the_generation_sealed_after_a_skip_too() {
     c.close().unwrap();
     db.close().unwrap();
 }
+
+/// A takeover that fails before its head write still carries what it knew by then: its own
+/// quiet. One that fails after the head write also carries the epoch the write set.
+#[test]
+fn a_failed_takeover_keeps_the_attributes_it_reached() {
+    for (key, want_epoch) in [("head", false), ("log/", true)] {
+        let mem = Arc::new(crate::store::MemStore::new());
+        let a = tempdir();
+        let db_a = open_with_store(quiet_config(a.path(), None), mem.clone()).unwrap();
+        let ca = db_a.connect().unwrap();
+        create(&ca);
+        insert(&ca, 1).unwrap();
+        let fault = Arc::new(crate::store::FaultStore::new(mem.clone()));
+        fault.only_keys_containing(key);
+        fault.fail_next_puts_permanently(1);
+        let bt = tempdir();
+        let (r, spans) =
+            captured(|| crate::takeover_with_store(quiet_config(&fresh(&bt), None), fault.clone()));
+        assert!(r.is_err(), "{key}");
+        let t = spans.last_named("buckwal.takeover");
+        assert_eq!(t.field("buckwal.outcome"), Some("error"), "{key}: {t:?}");
+        assert_eq!(t.field("buckwal.quiet_own_ms"), Some("800"), "{key}: {t:?}");
+        assert_eq!(
+            t.field("buckwal.epoch").is_some(),
+            want_epoch,
+            "{key}: {t:?}"
+        );
+        crash(db_a, vec![ca]);
+    }
+}

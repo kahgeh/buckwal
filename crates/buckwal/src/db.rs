@@ -1049,6 +1049,8 @@ fn claim_in_span(
     retries: &AtomicU64,
     span: &tracing::Span,
 ) -> Result<(Bucket, FenceOutcome)> {
+    // Known from the configuration: a takeover that fails before its head write has it too.
+    span.record("buckwal.quiet_own_ms", duration_ms(timeouts_of(cfg).sum()));
     if state.claim_id.is_empty() {
         state.claim_id = new_writer_id()?;
         state.write_atomic(dir)?;
@@ -1063,7 +1065,6 @@ fn claim_in_span(
         retries,
     )?;
     span.record("buckwal.epoch", head.epoch);
-    span.record("buckwal.quiet_own_ms", duration_ms(timeouts_of(cfg).sum()));
     if let Some(old) = replaced
         .as_ref()
         .and_then(|h| Some((h.lease_ms?, h.request_timeout_ms?)))

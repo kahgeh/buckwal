@@ -1345,6 +1345,13 @@ fn span_names_use_buckwal_prefix() {
 
 // ---- failure status and the resource marking (error-span-status) ----
 
+fn attr_of(s: &SpanData, key: &str) -> Option<String> {
+    s.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.to_string())
+}
+
 fn status_of_outcome(outcome: &'static str) -> opentelemetry::trace::Status {
     let (sub, p, spans, _logs) = test_pipeline(None);
     tracing::subscriber::with_default(sub, || {
@@ -1456,4 +1463,45 @@ fn without_buckwal_otel_the_pipeline_stays_off() {
     assert!(!cfg.enabled);
     let guard = init(cfg).unwrap();
     assert!(format!("{guard:?}").contains("running: false"));
+}
+
+/// A checkpoint whose seal cannot reach the bucket records `error` on its maintenance span.
+#[test]
+fn a_failed_maintenance_checkpoint_records_error_on_its_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sub, _p, exporter, _logs) = test_pipeline(None);
+    let outcomes = tracing::subscriber::with_default(sub, || {
+        let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
+        let mut c = config(dir.path());
+        c.maintenance_log_objects = 5;
+        c.retry_deadline = Duration::from_millis(100);
+        c.request_timeout = Duration::from_millis(50);
+        let db = crate::open_with_store(c, fault.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        fault.only_keys_containing("pages/");
+        fault.fail_puts_after(0);
+        for i in 0..10 {
+            let _ = insert(&conn, i);
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let outcomes: Vec<_> = exporter
+                .get_finished_spans()
+                .unwrap()
+                .iter()
+                .filter(|s| s.name == "buckwal.maintenance")
+                .map(|s| (attr_of(s, "buckwal.outcome"), s.status.clone()))
+                .collect();
+            if !outcomes.is_empty() {
+                break outcomes;
+            }
+            assert!(Instant::now() < until, "no maintenance span ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let (outcome, status) = &outcomes[0];
+    assert_eq!(outcome.as_deref(), Some("error"), "{outcomes:?}");
+    assert!(matches!(status, opentelemetry::trace::Status::Error { .. }));
 }
