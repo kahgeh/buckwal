@@ -64,6 +64,16 @@ mod tests {
     }
 
     #[test]
+    fn conn_raw_api_is_compiled_in() {
+        let io = Arc::new(MemoryIO::new());
+        let opts = OpenOptions::new(Arc::new(SqliteDialect));
+        let db = Database::open(io, ":memory:", opts).expect("open");
+        let conn = db.connect().expect("connect");
+        // The test pins that the symbol exists; an Err on an empty db is fine.
+        let _ = conn.wal_insert_begin();
+    }
+
+    #[test]
     fn encryption_feature_is_compiled_in() {
         use turso_core::{CipherMode, EncryptionContext, EncryptionKey};
         let key = EncryptionKey::new_256([7; 32]);

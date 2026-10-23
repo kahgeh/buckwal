@@ -1,0 +1,5 @@
+RED: cargo test -p buckwal --locked conn_raw_api
+error[E0599]: no method named `wal_insert_begin` found for struct `Arc<turso_core::Connection>`
+GREEN (after adding "conn_raw_api" to turso_core features): cargo test -p buckwal --locked --lib conn_raw_api
+test tests::conn_raw_api_is_compiled_in ... ok
+Cargo.lock unchanged (git diff --stat shows Cargo.toml and lib.rs only).
