@@ -52,3 +52,8 @@ mermaid not found
    1 ok docs/adr/README.md -> 0001-mvcc-commit-point-is-the-db-log-sync.md
 ## mermaid: mmdc (existing install) rendered both docs/architecture.md blocks to SVG without error (mmdc -i m0.mmd / m1.mmd)
 ## price lookups 2026-10-24: WebFetch aws.amazon.com/s3/pricing: GET US$0.0004/1000 confirmed; LIST rate and SNS rates not returned (tables absent) -> README labels them the spec's estimate
+## fix round (2026-10-24)
+first screen hunks:
+@@ -64,6 +64,7 @@ The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The
+mermaid: mmdc re-rendered both blocks of docs/architecture.md without error
+(no match above = fixed)

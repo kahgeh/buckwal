@@ -11,7 +11,7 @@ Replicas are woken by a bucket event. On AWS, through an SNS HTTPS subscription 
 
 ## Decision
 
-The listener lives in `crates/buckwal-server` as a `notify` module and reuses that crate's listener, bind check and token. The library exposes `Replica::waker()` and gains no server code. It binds `127.0.0.1` by default and refuses a non-loopback address without TLS and the token. The token is compared in constant time, never logged, and a bad request gets 401 and wakes nothing. A notification is only a hint: it starts a sync pass that reads the log by seq.
+The listener lives in `crates/buckwal-server` as a `notify` module and reuses that crate's listener, bind check and token. The library exposes `Replica::waker()` and gains no server code. It has no default address: it runs only when `BUCKWAL_REPLICA_NOTIFY_LISTEN` is set. A loopback address needs neither TLS nor the token, and a non-loopback address is refused without both. The token is compared in constant time, never logged, and a bad request gets 401 and wakes nothing. A notification is only a hint: it starts a sync pass that reads the log by seq.
 
 ## Consequences
 
