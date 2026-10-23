@@ -472,7 +472,15 @@ pub struct Writer {
 impl Writer {
     /// Open (creating, or taking over a bucket that has a database) and create the table.
     pub fn open(cfg: Config) -> Writer {
-        let db = buckwal::open(cfg).expect("open writer");
+        Writer::from_db(buckwal::open(cfg).expect("open writer"))
+    }
+
+    /// Like `open`, over `store` (for example a `GateStore`).
+    pub fn open_with_store(cfg: Config, store: std::sync::Arc<dyn ObjectStore>) -> Writer {
+        Writer::from_db(buckwal::open_with_store(cfg, store).expect("open writer"))
+    }
+
+    fn from_db(db: buckwal::Database) -> Writer {
         let conn = db.connect().expect("writer connection");
         conn.execute(CREATE_SOAK, &[]).expect("create soak");
         Writer {
@@ -1033,6 +1041,20 @@ impl Follower {
         }
     }
 
+    /// `kill -<sig> <pid>` (`STOP`, `CONT`).
+    pub fn signal(&self, sig: &str) {
+        let st = Command::new("kill")
+            .args([&format!("-{sig}"), &self.child.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(st.success(), "kill -{sig} {}", self.child.id());
+    }
+
+    /// Everything the child wrote to stderr so far.
+    pub fn stderr_text(&self) -> String {
+        fs::read_to_string(&self.stderr).unwrap_or_default()
+    }
+
     /// Whether the child is still running.
     pub fn running(&mut self) -> bool {
         self.child.try_wait().expect("try_wait").is_none()
@@ -1115,4 +1137,128 @@ impl Drop for SoakProc {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A store that holds back one `put_if_absent` of a `log/` record until released, and keeps
+/// a copy of its key and body: a writer whose append is "in flight" while another machine
+/// takes over (the late record of a fenced writer, with no hook in the writer's own path).
+pub struct GateStore {
+    inner: std::sync::Arc<dyn ObjectStore>,
+    state: std::sync::Mutex<GateState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    armed: bool,
+    released: bool,
+    held: Option<(String, Vec<u8>)>,
+}
+
+impl GateStore {
+    pub fn new(inner: std::sync::Arc<dyn ObjectStore>) -> GateStore {
+        GateStore {
+            inner,
+            state: Default::default(),
+            cv: Default::default(),
+        }
+    }
+
+    /// The next `put_if_absent` of a `log/` key blocks until `release`.
+    pub fn arm(&self) {
+        *self.state.lock().unwrap() = GateState {
+            armed: true,
+            ..Default::default()
+        };
+    }
+
+    /// The key and body of the held put, once a writer is blocked on it.
+    pub fn wait_held(&self, limit: Duration) -> (String, Vec<u8>) {
+        wait_until("a log put to be held", limit, || {
+            self.state.lock().unwrap().held.clone()
+        })
+    }
+
+    /// Let the held put through (it then runs against the real store, and may be refused).
+    pub fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.cv.notify_all();
+    }
+}
+
+impl ObjectStore for GateStore {
+    fn put(&self, key: &str, body: &[u8]) -> Result<String, buckwal::store::StoreError> {
+        self.inner.put(key, body)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        body: &[u8],
+    ) -> Result<buckwal::store::CondPut, buckwal::store::StoreError> {
+        let mut g = self.state.lock().unwrap();
+        if g.armed && key.contains("/log/") {
+            g.armed = false;
+            g.held = Some((key.to_string(), body.to_vec()));
+            // Bounded, so a test that failed before `release` does not leave this thread forever.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !g.released && Instant::now() < deadline {
+                g = self.cv.wait_timeout(g, Duration::from_secs(1)).unwrap().0;
+            }
+        }
+        drop(g);
+        self.inner.put_if_absent(key, body)
+    }
+
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> Result<buckwal::store::CondPut, buckwal::store::StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<buckwal::store::Object>, buckwal::store::StoreError> {
+        self.inner.get(key)
+    }
+
+    fn stat(
+        &self,
+        key: &str,
+    ) -> Result<Option<buckwal::store::ObjectStat>, buckwal::store::StoreError> {
+        self.inner.stat(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>, buckwal::store::StoreError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> Result<Vec<String>, buckwal::store::StoreError> {
+        self.inner.list_after(prefix, start_after)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), buckwal::store::StoreError> {
+        self.inner.delete(key)
+    }
+
+    fn stats(&self) -> buckwal::store::StatsSnap {
+        self.inner.stats()
+    }
+}
+
+/// The setting that makes a bucket encrypted.
+pub const KEY_FILE_VAR: &str = "BUCKWAL_ENCRYPTION_KEY_FILE";
+
+/// A key file (64 hex digits, a test key) in the test's temp directory.
+pub fn write_key_file(ctx: &Ctx, tag: &str) -> PathBuf {
+    let p = ctx.tmp.path().join(format!("key-{tag}"));
+    let a = nanos();
+    let b = nanos().rotate_left(29) ^ (std::process::id() as u128) ^ ((tag.len() as u128) << 70);
+    fs::write(&p, format!("{a:032x}{b:032x}\n")).expect("write a key file");
+    p
 }

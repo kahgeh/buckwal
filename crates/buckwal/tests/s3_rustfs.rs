@@ -223,6 +223,57 @@ fn rustfs_delete() {
     assert_eq!(s.stats().deletes, 2);
 }
 
+/// `list_after` against the real server: only keys strictly greater than `start_after`, in
+/// order, and a listing past the 1,000 keys of one `ListObjectsV2` page comes back whole
+/// (the continuation token is followed) with `start-after` honoured. About 1,100 tiny
+/// objects; deleted by the prefix's drop.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn s3_list_after_start_after_and_paging() {
+    let s = store();
+    let p = prefix("listafter");
+    let key = |i: usize| format!("{p}k/{i:010}");
+    const N: usize = 1100;
+    std::thread::scope(|sc| {
+        let (s, key) = (&s, &key);
+        for t in 0..8 {
+            sc.spawn(move || {
+                for i in (t..N).step_by(8) {
+                    s.put(&key(i), b"x").unwrap();
+                }
+            });
+        }
+    });
+    let dir = format!("{p}k/");
+    let all = s.list(&dir).unwrap();
+    assert_eq!(
+        all,
+        (0..N).map(key).collect::<Vec<_>>(),
+        "list pages past 1000"
+    );
+
+    // Strictly greater: the start key itself is not returned, and it need not exist.
+    let after = s.list_after(&dir, &key(4)).unwrap();
+    assert_eq!(after, (5..N).map(key).collect::<Vec<_>>());
+    assert!(
+        after.len() > 1000,
+        "{} keys: the listing paged",
+        after.len()
+    );
+    let between = s.list_after(&dir, &format!("{}x", key(9))).unwrap();
+    assert_eq!(between, (10..N).map(key).collect::<Vec<_>>());
+    assert!(s.list_after(&dir, &key(N - 1)).unwrap().is_empty());
+    assert_eq!(s.list_after(&dir, "").unwrap(), all);
+    // Beyond the first page's last key.
+    assert_eq!(
+        s.list_after(&dir, &key(1049)).unwrap(),
+        (1050..N).map(key).collect::<Vec<_>>()
+    );
+    // A neighbouring prefix is not listed.
+    s.put(&format!("{p}kk"), b"x").unwrap();
+    assert_eq!(s.list_after(&dir, &key(N - 2)).unwrap(), vec![key(N - 1)]);
+}
+
 /// The public API end to end over S3: open (create), commit, close, restore, reopen.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
