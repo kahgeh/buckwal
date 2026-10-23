@@ -195,6 +195,23 @@ pub(crate) fn seal_now(conn: &Arc<Connection>) {
     .unwrap_or_else(|e| panic!("checkpoint: {e} ({:?})", stash::take()));
 }
 
+/// A manifest or log record of a bucket that may be encrypted, as the plain codec reads it: the
+/// 32-byte trailer (a SHA-256, or an integrity code) is replaced by the SHA-256 of the rest.
+/// Tests that look inside a bucket use it instead of holding the key.
+pub(crate) fn as_plain(body: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = body[..body.len() - 32].to_vec();
+    let sha = Sha256::digest(&out);
+    out.extend(sha);
+    out
+}
+
+/// A page object's page: without the integrity code an encrypted bucket's carries.
+pub(crate) fn page_of(body: &[u8], page_size: usize) -> &[u8] {
+    assert!(body.len() == page_size || body.len() == page_size + 32);
+    &body[..page_size]
+}
+
 pub(crate) fn head(store: &dyn ObjectStore) -> Head {
     Head::decode(&store.get(&keys().head()).unwrap().unwrap().body).unwrap()
 }
@@ -202,7 +219,7 @@ pub(crate) fn head(store: &dyn ObjectStore) -> Head {
 pub(crate) fn manifest(store: &dyn ObjectStore) -> (u64, Manifest) {
     let g = head(store).manifest.expect("sealed at least once");
     let body = store.get(&keys().manifest(g)).unwrap().unwrap().body;
-    (g, Manifest::decode(&body).unwrap())
+    (g, Manifest::decode(&as_plain(&body)).unwrap())
 }
 
 pub(crate) fn log_seqs(store: &dyn ObjectStore, gen: u64) -> Vec<u64> {

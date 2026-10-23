@@ -474,8 +474,17 @@ impl Config {
         validate_prefix(&self.prefix)
     }
 
-    pub(crate) fn keys(&self) -> Keys {
+    /// The object keys of the database this configuration names, for its encryption setting:
+    /// with a key file, its objects carry integrity codes (`Keys::with_integrity`). Loads the
+    /// key file (`encryption::load`), so a missing or bad one is `Config`.
+    pub(crate) fn keys(&self) -> Result<Keys> {
+        Ok(self.keys_for(crate::encryption::load(self)?.as_deref()))
+    }
+
+    /// `keys` for an encryption setting `open` has loaded already.
+    pub(crate) fn keys_for(&self, encryption: Option<&Encryption>) -> Keys {
         Keys::new(self.prefix.trim_matches('/'))
+            .with_integrity(encryption.map(Encryption::integrity_key))
     }
 
     pub(crate) fn engine(&self, read_only: bool) -> EngineConfig {

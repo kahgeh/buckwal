@@ -8,7 +8,7 @@ use crate::encryption::{self, check_page_one};
 use crate::engine::{engine_error, open_engine, Engine, EngineDb};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
-use crate::format::{decode_record, Head, Keys, LocalState, LogRecord, FORMAT, FORMAT_V2};
+use crate::format::{Head, Keys, LocalState, LogRecord, FORMAT, FORMAT_V2};
 use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, restore_staged, sealed_page_one};
@@ -281,8 +281,8 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     let guard = DirGuard::acquire(&config.dir)?;
     let dir = guard.dir().to_path_buf();
     let mut cfg = config.engine(read_only);
+    let keys = config.keys_for(encryption.as_deref());
     cfg.encryption = encryption;
-    let keys = config.keys();
     clear_interrupted_restore(&dir)?;
     clear_interrupted_create(&dir)?;
     let local = LocalState::read(&dir)?;
@@ -1026,11 +1026,17 @@ fn last_record_is_foreign(bucket: &Bucket, writer_id: &str, cfg: &EngineConfig) 
     let Some(obj) = with_retry(&cfg.retry, &key, |_| store.get(&key))? else {
         return Ok(false);
     };
-    Ok(match decode_record(&obj.body)? {
-        LogRecord::Extents { writer_id: w, .. } | LogRecord::Fence { writer_id: w, .. } => {
-            w != writer_id
-        }
-    })
+    let gen_seq = (bucket.head().generation, seq - 1);
+    Ok(
+        match bucket
+            .keys()
+            .decode_record(&obj.body, gen_seq.0, gen_seq.1)?
+        {
+            LogRecord::Extents { writer_id: w, .. } | LogRecord::Fence { writer_id: w, .. } => {
+                w != writer_id
+            }
+        },
+    )
 }
 
 impl Database {

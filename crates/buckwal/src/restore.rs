@@ -7,7 +7,7 @@ use crate::db::{refuse_mode_mismatch, DirGuard};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
-    apply_ops, decode_record, Head, Keys, LocalState, LogFile, LogRecord, Manifest, FORMAT_V2,
+    apply_ops, Head, Keys, LocalState, LogFile, LogRecord, FORMAT, FORMAT_V2, FORMAT_V3,
 };
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
@@ -102,7 +102,7 @@ pub(crate) fn fetch_generation(
                         return;
                     };
                     let r = get(store, retry, retries, &keys.log(gen, seq))
-                        .and_then(|b| decode_record(&b));
+                        .and_then(|b| keys.decode_record(&b, gen, seq));
                     match r {
                         Ok(rec) => *slots[i].lock().unwrap() = Some(rec),
                         Err(e) => {
@@ -152,12 +152,13 @@ fn manifest_page_one(
     retry: &RetryPolicy,
     retries: &AtomicU64,
 ) -> Result<Vec<u8>> {
-    let manifest = Manifest::decode(&get(store, retry, retries, &keys.manifest(g))?)?;
+    let manifest = keys.decode_manifest(&get(store, retry, retries, &keys.manifest(g))?, g)?;
     let pg = manifest
         .pages
         .get(&1)
         .ok_or_else(|| Error::Corrupt(format!("manifest/{g} has no entry for page 1")))?;
-    get(store, retry, retries, &keys.page(*pg, 1))
+    let obj = get(store, retry, retries, &keys.page(*pg, 1))?;
+    keys.open_page(1, *pg, &obj).map(<[u8]>::to_vec)
 }
 
 /// The bucket's sealed page 1: the head, its manifest, then the page (3 GETs). None while the
@@ -168,7 +169,7 @@ pub(crate) fn sealed_page_one(
     retry: &RetryPolicy,
 ) -> Result<Option<Vec<u8>>> {
     let retries = AtomicU64::new(0);
-    let head = Head::decode(&get(store, retry, &retries, &keys.head())?)?;
+    let head = keys.decode_head(&get(store, retry, &retries, &keys.head())?)?;
     head.manifest
         .map(|g| manifest_page_one(store, keys, g, retry, &retries))
         .transpose()
@@ -247,8 +248,8 @@ fn generation_image_counted(
                 writer_id,
                 syncs,
             } => {
-                // Kind 3 exists only in format 2 (an MVCC bucket).
-                if *file == LogFile::Log && head.format != FORMAT_V2 {
+                // Kind 3 exists only in an MVCC bucket (format 2, or 3 when encrypted).
+                if *file == LogFile::Log && head.journal_mode != JournalMode::Mvcc {
                     return Err(Error::Corrupt(format!(
                         "log/{} seq {seq}: a .db-log record in a format {} bucket",
                         head.generation, head.format
@@ -409,6 +410,18 @@ pub(crate) fn restore_into(
     restore_into_seen(store, keys, dir, cfg).map(|(report, _)| report)
 }
 
+/// The `format` of the local state a restore of `head` writes: the head's, except that an
+/// encrypted bucket's format 3 says nothing of the mode, which the local state's format does
+/// (1 WAL, 2 MVCC; whether the database is encrypted is the configuration's, checked
+/// against page 1).
+pub(crate) fn local_format(head: &Head) -> u32 {
+    match (head.format, head.journal_mode) {
+        (FORMAT_V3, JournalMode::Mvcc) => FORMAT_V2,
+        (FORMAT_V3, JournalMode::Wal) => FORMAT,
+        (f, _) => f,
+    }
+}
+
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
 /// writes nothing to the bucket. Runs in a `buckwal.restore` span, and logs the finished
 /// restore. The span's `buckwal.seq` is the highest log seq replayed (0 for an empty log), and
@@ -476,7 +489,7 @@ fn restore_files(
     let head_key = keys.head();
     let head_obj = counted(retries, retry, &head_key, || store.get(&head_key))?
         .ok_or_else(|| Error::NotFound(head_key.clone()))?;
-    let head = Head::decode(&head_obj.body)?;
+    let head = keys.decode_head(&head_obj.body)?;
     // The mode is checked on the head alone first: nothing is fetched for a mismatch.
     refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
     let sealed_page1 = match head.manifest {
@@ -509,7 +522,7 @@ fn restore_files(
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))?;
     LocalState {
-        format: head.format,
+        format: local_format(&head),
         writer_id: head.writer_id.clone(),
         generation: head.generation,
         complete: false,
@@ -553,7 +566,7 @@ pub fn restore_with_store(
 ) -> Result<RestoreReport> {
     config.validate()?;
     let guard = DirGuard::acquire(dir)?;
-    restore_staged(store, &config.keys(), guard.dir(), &config.engine(false))
+    restore_staged(store, &config.keys()?, guard.dir(), &config.engine(false))
         .map(|staged| staged.report)
 }
 

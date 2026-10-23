@@ -1,10 +1,13 @@
 //! Bucket format v1: key layout and byte/JSON codecs.
 
 mod head;
+mod integrity;
 mod json;
 mod keys;
 mod manifest;
 mod record;
+
+use crate::config::JournalMode;
 
 /// The format number of bucket format v1: the head and the local state carry it.
 pub(crate) const FORMAT: u32 = 1;
@@ -16,7 +19,9 @@ pub(crate) const FORMAT_V3: u32 = 3;
 pub(crate) use head::{Head, LocalState};
 pub(crate) use keys::Keys;
 pub(crate) use manifest::Manifest;
-pub(crate) use record::{apply_ops, decode_record, encode_record, LogFile, LogRecord, Op};
+pub(crate) use record::{apply_ops, LogFile, LogRecord, Op};
+#[cfg(test)]
+pub(crate) use record::{decode_record, encode_record};
 
 #[cfg(test)]
 mod tests;

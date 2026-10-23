@@ -922,3 +922,410 @@ fn previous_build_reads_heads_carrying_the_new_fields() {
     let o = super::json::Obj::parse(v1).unwrap();
     assert_eq!(o.num("generation").unwrap(), 3);
 }
+
+// Integrity codes (spec item 4).
+
+mod integrity_codes {
+    use super::super::integrity::{
+        head_code, manifest_code, open_page, record_code, seal_page, CODE_LEN,
+    };
+    use super::*;
+    use crate::encryption::{Encryption, IntegrityKey};
+    use crate::format::{decode_record, encode_record, Op, FORMAT_V3};
+    use crate::telemetry::testing::Capture;
+    use turso_core::{CipherMode, EncryptionKey};
+
+    fn ik(seed: u8) -> IntegrityKey {
+        Encryption::new(CipherMode::Aegis256, EncryptionKey::new_256([seed; 32])).integrity_key()
+    }
+
+    fn coded(seed: u8) -> Keys {
+        Keys::new("p").with_integrity(Some(ik(seed)))
+    }
+
+    fn extents() -> LogRecord {
+        LogRecord::Extents {
+            file: LogFile::Wal,
+            writer_id: "w".into(),
+            syncs: vec![vec![Op::Write {
+                off: 0,
+                bytes: vec![1, 2, 3],
+            }]],
+        }
+    }
+
+    fn manifest() -> Manifest {
+        Manifest {
+            page_size: 4096,
+            page_count: 3,
+            pages: BTreeMap::from([(1, 1), (2, 1), (3, 2)]),
+        }
+    }
+
+    fn head3(mode: JournalMode) -> Head {
+        Head {
+            format: FORMAT_V3,
+            generation: 7,
+            manifest: Some(6),
+            writer_id: "w1".into(),
+            epoch: 3,
+            journal_mode: mode,
+            lease_ms: Some(30_000),
+            request_timeout_ms: Some(10_000),
+            next_generation_floor: Some(7),
+        }
+    }
+
+    /// The message of an integrity failure for `key`, and nothing else.
+    fn assert_failed<T: std::fmt::Debug>(r: crate::Result<T>, key: &str) {
+        assert_eq!(r.unwrap_err(), Error::Corrupt(format!("integrity: {key}")));
+    }
+
+    #[test]
+    fn record_code_replaces_the_checksum_and_binds_generation_and_seq() {
+        let k = coded(1);
+        let plain = encode_record(&extents());
+        let body = k.encode_record(&extents(), 4, 9);
+        assert_eq!(body.len(), plain.len(), "a code is as long as the checksum");
+        assert_eq!(body[..body.len() - 32], plain[..plain.len() - 32]);
+        assert_ne!(body[body.len() - 32..], plain[plain.len() - 32..]);
+        assert_eq!(k.decode_record(&body, 4, 9).unwrap(), extents());
+        // Another seq or generation, and another key.
+        assert_failed(k.decode_record(&body, 4, 10), &k.log(4, 10));
+        assert_failed(k.decode_record(&body, 5, 9), &k.log(5, 9));
+        assert_failed(coded(2).decode_record(&body, 4, 9), &k.log(4, 9));
+        // The plain checksum is not a code, and a code is not a checksum.
+        assert_failed(k.decode_record(&plain, 4, 9), &k.log(4, 9));
+        assert!(is_corrupt(decode_record(&body)));
+        // Every kind: a fence and a kind 3 record.
+        let fence = LogRecord::Fence {
+            writer_id: "w".into(),
+            epoch: 2,
+        };
+        let log3 = LogRecord::Extents {
+            file: LogFile::Log,
+            writer_id: "w".into(),
+            syncs: vec![vec![Op::Truncate { len: 5 }]],
+        };
+        for rec in [fence, log3] {
+            let b = k.encode_record(&rec, 1, 2);
+            assert_eq!(k.decode_record(&b, 1, 2).unwrap(), rec);
+            assert_failed(k.decode_record(&b, 1, 3), &k.log(1, 3));
+        }
+        // A record shorter than a code.
+        for len in [0, 8, 31] {
+            assert_failed(k.decode_record(&body[..len], 4, 9), &k.log(4, 9));
+        }
+        // An edited byte.
+        let mut edited = body.clone();
+        edited[12] ^= 1;
+        assert_failed(k.decode_record(&edited, 4, 9), &k.log(4, 9));
+    }
+
+    #[test]
+    fn manifest_code_binds_the_generation() {
+        let k = coded(1);
+        let body = k.encode_manifest(&manifest(), 5);
+        assert_eq!(k.decode_manifest(&body, 5).unwrap(), manifest());
+        assert_failed(k.decode_manifest(&body, 6), &k.manifest(6));
+        assert_failed(coded(2).decode_manifest(&body, 5), &k.manifest(5));
+        let plain = manifest().encode();
+        assert_eq!(body[..body.len() - 32], plain[..plain.len() - 32]);
+        assert_failed(k.decode_manifest(&plain, 5), &k.manifest(5));
+        assert!(is_corrupt(Manifest::decode(&body)));
+        assert_failed(k.decode_manifest(&body[..31], 5), &k.manifest(5));
+    }
+
+    #[test]
+    fn page_code_binds_page_number_and_generation() {
+        let k = ik(1);
+        let ct = vec![0xab; 4096];
+        let obj = seal_page(&k, 7, 3, &ct);
+        assert_eq!(obj.len(), ct.len() + CODE_LEN);
+        assert_eq!(&obj[..ct.len()], &ct[..]);
+        let key = "p/pages/0000000003/0000000007";
+        assert_eq!(open_page(&k, 7, 3, &obj, key).unwrap(), &ct[..]);
+        assert_failed(open_page(&k, 8, 3, &obj, key), key);
+        assert_failed(open_page(&k, 7, 4, &obj, key), key);
+        assert_failed(open_page(&ik(2), 7, 3, &obj, key), key);
+        for len in [0, 1, 31] {
+            assert_failed(open_page(&k, 7, 3, &obj[..len], key), key);
+        }
+        // Exactly a code: an empty page still has to verify.
+        assert_failed(open_page(&k, 7, 3, &[0; 32], key), key);
+        let mut edited = obj.clone();
+        edited[100] ^= 1;
+        assert_failed(open_page(&k, 7, 3, &edited, key), key);
+    }
+
+    #[test]
+    fn code_kinds_are_domain_separated() {
+        let k = ik(1);
+        let bytes = b"same bytes";
+        let codes = [
+            record_code(&k, 1, 0, bytes),
+            manifest_code(&k, 1, bytes),
+            head_code(&k, bytes),
+            k.code(&[b"page", &0u32.to_be_bytes(), &1u64.to_be_bytes(), bytes]),
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn coded_head_round_trips_and_every_field_is_covered() {
+        let k = coded(1);
+        for mode in [JournalMode::Wal, JournalMode::Mvcc] {
+            let h = head3(mode);
+            let body = k.encode_head(&h);
+            let text = String::from_utf8(body.clone()).unwrap();
+            assert!(text.starts_with("{\"format\":3,"), "{text}");
+            assert!(text.contains(",\"integrity\":\""), "{text}");
+            assert_eq!(k.decode_head(&body).unwrap(), h);
+            // Deterministic: bytes compare equal for the same head.
+            assert_eq!(k.encode_head(&h), body);
+            // Each field edited: the code no longer verifies.
+            for (from, to) in [
+                ("\"generation\":7", "\"generation\":8"),
+                ("\"manifest/0000000006\"", "\"manifest/0000000005\""),
+                ("\"writer_id\":\"w1\"", "\"writer_id\":\"w2\""),
+                ("\"epoch\":3", "\"epoch\":4"),
+                ("\"lease_ms\":30000", "\"lease_ms\":30001"),
+                ("\"request_timeout_ms\":10000", "\"request_timeout_ms\":1"),
+                ("\"next_generation_floor\":7", "\"next_generation_floor\":6"),
+                (
+                    &format!("\"journal_mode\":\"{}\"", mode.as_str()),
+                    &format!(
+                        "\"journal_mode\":\"{}\"",
+                        if mode == JournalMode::Wal {
+                            "mvcc"
+                        } else {
+                            "wal"
+                        }
+                    ),
+                ),
+            ] {
+                assert!(text.contains(from), "{from} not in {text}");
+                assert_failed(k.decode_head(text.replace(from, to).as_bytes()), "p/head");
+            }
+            // The code removed, truncated, or from another key.
+            let at = text.find(",\"integrity\"").unwrap();
+            assert_failed(
+                k.decode_head(format!("{}}}", &text[..at]).as_bytes()),
+                "p/head",
+            );
+            assert_failed(coded(2).decode_head(&body), "p/head");
+            assert_failed(
+                k.decode_head(
+                    text.replace("\"integrity\":\"", "\"integrity\":\"00")
+                        .as_bytes(),
+                ),
+                "p/head",
+            );
+        }
+    }
+
+    #[test]
+    fn coded_head_refused_by_older_decoders() {
+        let body = coded(1).encode_head(&head3(JournalMode::Mvcc));
+        for accepted in [&[FORMAT][..], &[FORMAT, FORMAT_V2][..]] {
+            assert_eq!(
+                Head::decode_accepting(&body, accepted),
+                Err(Error::Corrupt("head: unsupported format 3".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_open_refuses_heads_written_before_integrity_codes() {
+        let k = coded(1);
+        let v1 = head_v1(Some(1), Some(2), None);
+        let v2 = Head {
+            format: FORMAT_V2,
+            journal_mode: JournalMode::Mvcc,
+            ..v1.clone()
+        };
+        for h in [v1, v2] {
+            assert_eq!(
+                k.decode_head(&h.encode()),
+                Err(Error::Corrupt(
+                    "integrity: bucket written before integrity codes".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_open_refuses_a_format_3_head_and_reads_the_others() {
+        let plain = Keys::new("p");
+        let body = coded(1).encode_head(&head3(JournalMode::Wal));
+        match plain.decode_head(&body) {
+            Err(Error::Encryption(m)) => {
+                assert!(
+                    m.contains("format 3") && m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"),
+                    "{m}"
+                )
+            }
+            r => panic!("{r:?}"),
+        }
+        let v1 = head_v1(Some(1), Some(2), Some(5));
+        assert_eq!(plain.decode_head(&v1.encode()).unwrap(), v1);
+    }
+
+    /// A previous build (format 1 and 2 only, unknown keys ignored) reads a plaintext head of a
+    /// takeover's skip seal: generation G+2 naming manifest G+1, with the new fields.
+    #[test]
+    fn previous_build_follows_a_skipped_generation() {
+        let h = Head {
+            generation: 9,
+            manifest: Some(8),
+            next_generation_floor: Some(9),
+            ..head_v1(Some(30_000), Some(10_000), Some(9))
+        };
+        let body = h.encode();
+        let old = Head::decode_accepting(&body, &[FORMAT, FORMAT_V2]).unwrap();
+        assert_eq!(
+            (old.generation, old.manifest, old.format),
+            (9, Some(8), FORMAT)
+        );
+    }
+
+    // The plaintext bytes of main, written down: an encoded object of a database without
+    // encryption is exactly these (the trailer is the SHA-256 of the rest).
+    const GOLDEN_RECORD: &str = "54444c4f470000010101770100000001000000010000000000000000030000000102036a9d58532f48cff4220663817e761921820a6baa5b8280de12af672d16237973";
+    const GOLDEN_FENCE: &str = "54444c4f4700000102017700000000070000000000000066df30f71bfc713f2075ae4cbe806f5fd7558a26bc65f144e8622781c5581e21";
+    const GOLDEN_KIND3: &str = "54444c4f4700000103017701000000010000000205000000000000000f2636f4ee7d84fe5ea39b32e92b61376bf7ccaabc3c50c90e8b3303ed260a06";
+    const GOLDEN_MANIFEST: &str = "54444d414e0000010010000003000000020000000100000002000000010000000000000003000000010000000200000000000000f7604622e0cc59f46527d3e3202baa1beaa28f24e77568d51da2b96289933cda";
+
+    #[test]
+    fn plaintext_objects_are_byte_identical_to_main() {
+        let plain = Keys::new("p");
+        let fence = LogRecord::Fence {
+            writer_id: "w".into(),
+            epoch: 7,
+        };
+        let log3 = LogRecord::Extents {
+            file: LogFile::Log,
+            writer_id: "w".into(),
+            syncs: vec![vec![Op::Truncate { len: 5 }]],
+        };
+        for (rec, golden) in [
+            (extents(), GOLDEN_RECORD),
+            (fence, GOLDEN_FENCE),
+            (log3, GOLDEN_KIND3),
+        ] {
+            // Whatever the generation and seq: a plaintext record does not depend on them.
+            assert_eq!(hex::encode(plain.encode_record(&rec, 3, 8)), golden);
+            assert_eq!(hex::encode(encode_record(&rec)), golden);
+            assert_eq!(
+                plain
+                    .decode_record(&hex::decode(golden).unwrap(), 1, 1)
+                    .unwrap(),
+                rec
+            );
+        }
+        assert_eq!(
+            hex::encode(plain.encode_manifest(&manifest(), 9)),
+            GOLDEN_MANIFEST
+        );
+        assert_eq!(hex::encode(manifest().encode()), GOLDEN_MANIFEST);
+        // A page object is the page.
+        let page = vec![0x5a; 4096];
+        assert_eq!(&*plain.seal_page(3, 2, &page), &page[..]);
+        assert_eq!(plain.open_page(3, 2, &page).unwrap(), &page[..]);
+        // The plaintext head has no code and keeps its format.
+        let h = head_v1(Some(30_000), Some(10_000), None);
+        let text = String::from_utf8(plain.encode_head(&h)).unwrap();
+        assert!(!text.contains("integrity"), "{text}");
+        assert!(text.starts_with("{\"format\":1,"), "{text}");
+    }
+
+    #[test]
+    fn new_bucket_format_follows_encryption_and_mode() {
+        let plain = Keys::new("p");
+        assert_eq!(plain.new_format(JournalMode::Wal), FORMAT);
+        assert_eq!(plain.new_format(JournalMode::Mvcc), FORMAT_V2);
+        for mode in [JournalMode::Wal, JournalMode::Mvcc] {
+            assert_eq!(coded(1).new_format(mode), FORMAT_V3);
+        }
+    }
+
+    /// One ERROR record per failed check, with the key, kind, generation and seq, and nothing
+    /// else of the object.
+    #[test]
+    fn a_failed_check_logs_one_error_record_without_data() {
+        let k = coded(1);
+        let obj = k.encode_record(&extents(), 4, 9);
+        let page = seal_page(&ik(1), 7, 3, &[0xcd; 64]);
+        let cap = Capture::new();
+        tracing::subscriber::with_default(cap.subscriber(), || {
+            let _ = k.decode_record(&obj, 4, 10);
+            let _ = k.open_page(7, 4, &page);
+            let _ = k.decode_manifest(&obj, 2);
+            let _ = k.decode_head(b"{\"format\":3,\"generation\":5,\"manifest\":null,\"writer_id\":\"w\",\"epoch\":1,\"journal_mode\":\"wal\"}");
+        });
+        let events = cap.spans().events;
+        let errs: Vec<_> = events
+            .iter()
+            .filter(|e| e.field("message") == Some("integrity check failed"))
+            .collect();
+        let got: Vec<_> = errs
+            .iter()
+            .map(|e| {
+                (
+                    e.level,
+                    e.target.as_str(),
+                    e.field("key").unwrap().to_string(),
+                    e.field("kind").unwrap().to_string(),
+                    e.field("generation").unwrap().to_string(),
+                    e.field("seq").unwrap().to_string(),
+                )
+            })
+            .collect();
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    tracing::Level::ERROR,
+                    "buckwal",
+                    k.log(4, 10),
+                    s("record"),
+                    s("4"),
+                    s("10")
+                ),
+                (
+                    tracing::Level::ERROR,
+                    "buckwal",
+                    k.page(4, 7),
+                    s("page"),
+                    s("4"),
+                    s("0")
+                ),
+                (
+                    tracing::Level::ERROR,
+                    "buckwal",
+                    k.manifest(2),
+                    s("manifest"),
+                    s("2"),
+                    s("0")
+                ),
+                (
+                    tracing::Level::ERROR,
+                    "buckwal",
+                    k.head(),
+                    s("head"),
+                    s("5"),
+                    s("0")
+                ),
+            ]
+        );
+        for e in errs {
+            let all = format!("{:?}", e.fields);
+            assert!(!all.contains("cdcdcd") && !all.contains(&hex::encode(&obj[obj.len() - 32..])));
+        }
+    }
+}

@@ -408,7 +408,7 @@ fn maintenance_skips_during_takeover_quiet() {
     conn.execute("CREATE TABLE t(x)", &[]).unwrap();
     conn.close().unwrap();
     db.close().unwrap();
-    let keys = ca.keys();
+    let keys = ca.keys().unwrap();
     let gen = db_generation(&*store, &keys);
     let next = store.list(&keys.log_prefix(gen)).unwrap().len() as u64 + 1;
     let rec = LogRecord::Extents {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::tests::{head, keys, log_seqs, PREFIX};
+use crate::engine::tests::{as_plain, head, keys, log_seqs, page_of, PREFIX};
 use crate::format::LogFile;
 use crate::format::{decode_record, Head, LocalState, LogRecord};
 use crate::reconcile::Reconciled;
@@ -3016,14 +3016,18 @@ fn open_with_wrong_key_is_refused() {
     let a = encrypted_writer(&store, &k);
     let wrong = tempdir();
     let wrong_hex = "22".repeat(32);
-    for dir in [a.path().to_path_buf(), fresh(&tempdir())] {
-        let m = encryption_err(open_with_store(
-            enc_config(&dir, &wrong, &wrong_hex),
-            store.clone(),
-        ));
-        assert!(m.contains("does not decrypt"), "{m}");
-        assert!(!m.contains(&key_hex()) && !m.contains(&wrong_hex), "{m}");
-    }
+    // Its own directory: page 1 is local, and the key does not decrypt it.
+    let m = encryption_err(open_with_store(
+        enc_config(a.path(), &wrong, &wrong_hex),
+        store.clone(),
+    ));
+    assert!(m.contains("does not decrypt"), "{m}");
+    assert!(!m.contains(&key_hex()) && !m.contains(&wrong_hex), "{m}");
+    // A fresh directory restores first, and the head's integrity code does not verify.
+    assert_head_integrity(open_with_store(
+        enc_config(&fresh(&tempdir()), &wrong, &wrong_hex),
+        store.clone(),
+    ));
 }
 
 /// Every object in the bucket with its ETag.
@@ -3293,17 +3297,36 @@ fn encrypted_torn_page_one_is_unopenable_but_restores() {
 /// A takeover whose key does not fit the database is refused before its claim: the bucket is
 /// unchanged, the directory holds no database, and the running writer keeps committing.
 fn refused_takeover(store: &Arc<MemStore>, cfg: impl Fn(&Path) -> Config) -> String {
+    encryption_err(refused_takeover_with(store, cfg))
+}
+
+/// `refused_takeover`, for a refusal that is not an `Encryption` error: the error itself.
+fn refused_takeover_with(
+    store: &Arc<MemStore>,
+    cfg: impl Fn(&Path) -> Config,
+) -> Result<crate::TakeoverReport> {
     let before = etags(store);
     let t = tempdir();
     let dir = fresh(&t);
-    let m = encryption_err(crate::takeover_with_store(cfg(&dir), store.clone()));
+    let r = crate::takeover_with_store(cfg(&dir), store.clone());
+    assert!(r.is_err(), "the takeover was not refused");
     assert_eq!(
         etags(store),
         before,
         "the refused takeover wrote to the bucket"
     );
     no_database_files(&dir);
-    m
+    r
+}
+
+/// The error of a restore-first open or takeover that fails to verify the head with the key it
+/// was given: a wrong key and a tampered head are the same to the integrity code, so it is
+/// `Corrupt("integrity: <head key>")` and not the `Encryption` error of the local-page-1 path.
+fn assert_head_integrity<T: std::fmt::Debug>(r: Result<T>) {
+    match r {
+        Err(Error::Corrupt(m)) => assert_eq!(m, format!("integrity: {PREFIX}/head")),
+        r => panic!("expected Corrupt(integrity: head), got {r:?}"),
+    }
 }
 
 #[test]
@@ -3317,12 +3340,9 @@ fn takeover_with_a_mismatched_key_is_refused_before_the_claim() {
     let c = db.connect().unwrap();
 
     let wrong = tempdir();
-    let m = refused_takeover(&store, |d| enc_config(d, &wrong, &"22".repeat(32)));
-    assert!(m.contains("does not decrypt"), "{m}");
-    assert!(
-        !m.contains(&key_hex()) && !m.contains(&"22".repeat(32)),
-        "{m}"
-    );
+    assert_head_integrity(refused_takeover_with(&store, |d| {
+        enc_config(d, &wrong, &"22".repeat(32))
+    }));
     let m = refused_takeover(&store, |d| {
         let mut cfg = enc_config(d, &k, &key_hex());
         cfg.encryption_cipher = "aes256gcm".into();
@@ -3334,7 +3354,9 @@ fn takeover_with_a_mismatched_key_is_refused_before_the_claim() {
     // Page 1 now in the log too: still refused.
     c.execute("CREATE TABLE u(x)", &[]).unwrap();
     let wrong = tempdir();
-    refused_takeover(&store, |d| enc_config(d, &wrong, &"22".repeat(32)));
+    assert_head_integrity(refused_takeover_with(&store, |d| {
+        enc_config(d, &wrong, &"22".repeat(32))
+    }));
     insert(&c, 62).unwrap();
 
     // The right key takes over as before.
@@ -3356,8 +3378,15 @@ fn takeover_with_a_key_on_a_plaintext_database_is_refused() {
     let db = open_mem(&store, a.path());
     let c = db.connect().unwrap();
     let k = tempdir();
-    let m = refused_takeover(&store, |d| enc_config(d, &k, &key_hex()));
-    assert!(m.contains("cannot be encrypted in place"), "{m}");
+    // The restore reads the head first: a plaintext bucket's head (format 1) under a key is
+    // "written before integrity codes" (the local-page-1 path says "cannot be encrypted in
+    // place", `open_with_key_on_plaintext_database_is_refused`).
+    match refused_takeover_with(&store, |d| enc_config(d, &k, &key_hex())) {
+        Err(Error::Corrupt(m)) => {
+            assert_eq!(m, "integrity: bucket written before integrity codes")
+        }
+        r => panic!("{r:?}"),
+    }
     insert(&c, 11).unwrap();
     assert_eq!(ids(&c), (1..=11).collect::<Vec<_>>());
 }
@@ -3636,7 +3665,7 @@ fn engine_cfg(c: &Config) -> EngineConfig {
 /// `create_new_mvcc` for `c` against `store`, as `open` runs it (the directory exists).
 fn create_mvcc(store: Arc<dyn ObjectStore>, c: &Config) -> Result<(Bucket, LocalState)> {
     std::fs::create_dir_all(&c.dir).unwrap();
-    create_new_mvcc(&c.dir, &store, &c.keys(), &engine_cfg(c))
+    create_new_mvcc(&c.dir, &store, &c.keys().unwrap(), &engine_cfg(c))
 }
 
 /// `mvcc_config` with a 100 ms retry deadline, so a failing store fails fast.
@@ -3651,9 +3680,14 @@ fn mvcc_fast_config(dir: &Path) -> Config {
 /// no log object. Returns the head and the `app.db` image the pages make.
 fn created_bucket(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
     let h = head(store);
+    // Format 2, or 3 for an encrypted database.
+    assert!(
+        h.format == crate::format::FORMAT_V2 || h.format == crate::format::FORMAT_V3,
+        "{h:?}"
+    );
     assert_eq!(
-        (h.format, h.generation, h.manifest, h.journal_mode),
-        (crate::format::FORMAT_V2, 2, Some(1), JournalMode::Mvcc),
+        (h.generation, h.manifest, h.journal_mode),
+        (2, Some(1), JournalMode::Mvcc),
         "{h:?}"
     );
     let body = store
@@ -3661,15 +3695,14 @@ fn created_bucket(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
         .unwrap()
         .expect("manifest/1")
         .body;
-    let m = crate::format::Manifest::decode(&body).unwrap();
+    let m = crate::format::Manifest::decode(&as_plain(&body)).unwrap();
     assert_eq!(m.page_size, 4096);
     assert!(m.page_count >= 1, "{m:?}");
     assert_eq!(m.pages, (1..=m.page_count).map(|p| (p, 1)).collect());
     let mut image = Vec::new();
     for p in 1..=m.page_count {
         let page = store.get(&keys().page(1, p)).unwrap().expect("page").body;
-        assert_eq!(page.len(), 4096);
-        image.extend(page);
+        image.extend(page_of(&page, 4096));
     }
     assert_eq!(
         store.list(&keys().log_root()).unwrap(),
@@ -3688,7 +3721,8 @@ fn head_has_its_manifest(store: &dyn ObjectStore) {
         return;
     };
     let body = store.get(&keys().manifest(g)).unwrap();
-    let m = crate::format::Manifest::decode(&body.expect("the head's manifest").body).unwrap();
+    let m = crate::format::Manifest::decode(&as_plain(&body.expect("the head's manifest").body))
+        .unwrap();
     for (p, pg) in m.pages {
         assert!(
             store.get(&keys().page(pg, p)).unwrap().is_some(),
@@ -4055,6 +4089,7 @@ fn create_mvcc_encrypted_has_no_plaintext() {
     );
 }
 
+mod integrity;
 mod mvcc;
 
 /// `quiet_config` with the lease and request timeout (ms) given.

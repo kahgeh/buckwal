@@ -10,9 +10,7 @@ use crate::clock::Stamp;
 use crate::config::{Event, EventHook, JournalMode};
 use crate::create::Image;
 use crate::error::{Error, Result};
-use crate::format::{
-    decode_record, encode_record, Head, Keys, LogFile, LogRecord, Manifest, Op, FORMAT, FORMAT_V2,
-};
+use crate::format::{Head, Keys, LogFile, LogRecord, Manifest, Op};
 use crate::store::{with_retry, CondPut, Object, ObjectStore, RetryPolicy, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -393,7 +391,7 @@ pub(crate) fn take_over_counted(
         let Some(current) = retry_rest(retry, start, retries, &key, || store.get(&key))? else {
             return Err(restore_again());
         };
-        let head = Head::decode(&current.body)?;
+        let head = keys.decode_head(&current.body)?;
         if head.writer_id == writer_id {
             return Ok((head, current.etag, None));
         }
@@ -406,7 +404,7 @@ pub(crate) fn take_over_counted(
             next_generation_floor: Some(next_floor(&head)),
             ..head.clone()
         });
-        let body = new.encode();
+        let body = keys.encode_head(&new);
         let put = retry_rest(retry, start, retries, &key, || {
             store.put_if_match(&key, &body, &current.etag)
         })
@@ -540,7 +538,7 @@ impl Bucket {
     ) -> Result<Bucket> {
         check_writer_id(&writer_id)?;
         let head = own.stamp(Head {
-            format: FORMAT,
+            format: keys.new_format(JournalMode::Wal),
             generation: 1,
             manifest: None,
             writer_id,
@@ -587,7 +585,8 @@ impl Bucket {
         let counters = Counters::default();
         for (p, body) in &pages {
             let key = keys.page(gen, *p);
-            retrying(&counters, &retry, &key, || store.put(&key, body))?;
+            let obj = keys.seal_page(*p, gen, body);
+            retrying(&counters, &retry, &key, || store.put(&key, &obj))?;
             counters.page_puts.fetch_add(1, Relaxed);
         }
         let dirty: BTreeSet<u32> = pages.iter().map(|(p, _)| *p).collect();
@@ -598,11 +597,10 @@ impl Bucket {
         }
         .sealed(gen, &dirty, page_size, page_count);
         let key = keys.manifest(gen);
-        retrying(&counters, &retry, &key, || {
-            store.put(&key, &manifest.encode())
-        })?;
+        let manifest_body = keys.encode_manifest(&manifest, gen);
+        retrying(&counters, &retry, &key, || store.put(&key, &manifest_body))?;
         let head = own.stamp(Head {
-            format: FORMAT_V2,
+            format: keys.new_format(JournalMode::Mvcc),
             generation: gen + 1,
             manifest: Some(gen),
             writer_id,
@@ -672,7 +670,7 @@ impl Bucket {
         concurrency: usize,
         head: Head,
     ) -> Result<Bucket> {
-        let body = head.encode();
+        let body = keys.encode_head(&head);
         let key = keys.head();
         let counters = Counters::default();
         let sent = Stamp::now();
@@ -719,7 +717,7 @@ impl Bucket {
         let sent = Stamp::now();
         let obj = retrying(&counters, &retry, &key, || store.get(&key))?
             .ok_or_else(|| Error::NotFound("head".into()))?;
-        let head = Head::decode(&obj.body)?;
+        let head = keys.decode_head(&obj.body)?;
         let refused = if head.writer_id != writer_id {
             Some(format!(
                 "head names writer {:?}, not {writer_id:?}",
@@ -750,7 +748,7 @@ impl Bucket {
                 let key = keys.manifest(g);
                 let m = retrying(&counters, &retry, &key, || store.get(&key))?
                     .ok_or_else(|| Error::NotFound(key.clone()))?;
-                Some(Manifest::decode(&m.body)?)
+                Some(keys.decode_manifest(&m.body, g)?)
             }
         };
         let prefix = keys.log_prefix(head.generation);
@@ -964,8 +962,9 @@ impl Bucket {
         syncs: Vec<Vec<Op>>,
         retries: u64,
     ) -> std::result::Result<Appended, AppendFailure> {
-        // Kind 3 exists only in format 2 (an MVCC bucket); a v1 reader would misread it.
-        if matches!(file, LogFile::Log) && self.head.format != FORMAT_V2 {
+        // Kind 3 exists only in an MVCC bucket (format 2, or 3 when encrypted); a v1 reader would
+        // misread it.
+        if matches!(file, LogFile::Log) && self.head.journal_mode != JournalMode::Mvcc {
             return Err(AppendFailure {
                 error: Error::Unsupported("MVCC: a .db-log record in a WAL bucket"),
                 unsent: Some(syncs),
@@ -978,11 +977,15 @@ impl Bucket {
                 unsent: Some(syncs),
             });
         }
-        let body = encode_record(&LogRecord::Extents {
-            file,
-            writer_id: self.head.writer_id.clone(),
-            syncs,
-        });
+        let body = self.keys.encode_record(
+            &LogRecord::Extents {
+                file,
+                writer_id: self.head.writer_id.clone(),
+                syncs,
+            },
+            self.head.generation,
+            self.seq,
+        );
         let bytes = body.len() as u64;
         match self.put_log(start, body) {
             Ok(pos) => Ok(Appended {
@@ -1044,25 +1047,29 @@ impl Bucket {
 
     fn append_fence_at(&mut self, start: Instant) -> Result<FenceOutcome> {
         self.before_record(start)?;
-        let body = encode_record(&LogRecord::Fence {
+        let fence = LogRecord::Fence {
             writer_id: self.head.writer_id.clone(),
             epoch: self.head.epoch,
-        });
+        };
         let mut steps = 0u64;
         loop {
             let pos = LogPos {
                 generation: self.head.generation,
                 seq: self.seq,
             };
+            // The integrity code covers the seq, so the fence is encoded for each seq it tries.
+            let body = self.keys.encode_record(&fence, pos.generation, pos.seq);
             let key = self.keys.log(pos.generation, pos.seq);
             let confirmed = self.last_confirmed;
             let sent = Stamp::now();
-            let put = self.put_fence_at(start, &key, &body).and_then(|p| match p {
-                FencePut::Landed => self
-                    .confirm_landed(start, confirmed, sent)
-                    .map(|()| FencePut::Landed),
-                occupied => Ok(occupied),
-            });
+            let put = self
+                .put_fence_at(start, pos, &key, &body)
+                .and_then(|p| match p {
+                    FencePut::Landed => self
+                        .confirm_landed(start, confirmed, sent)
+                        .map(|()| FencePut::Landed),
+                    occupied => Ok(occupied),
+                });
             match put {
                 Ok(FencePut::Landed) => {
                     self.seq += 1;
@@ -1098,7 +1105,13 @@ impl Bucket {
     }
 
     /// `put_if_absent` of the fence `body` at `key`; on a 412, what holds the key decides.
-    fn put_fence_at(&self, start: Instant, key: &str, body: &[u8]) -> Result<FencePut> {
+    fn put_fence_at(
+        &self,
+        start: Instant,
+        pos: LogPos,
+        key: &str,
+        body: &[u8],
+    ) -> Result<FencePut> {
         let c = &self.counters;
         let r = retrying(c, &self.remaining(start), key, || {
             self.store.put_if_absent(key, body)
@@ -1115,7 +1128,7 @@ impl Bucket {
         if o.body == body {
             return Ok(FencePut::Landed);
         }
-        let rec = decode_record(&o.body)?;
+        let rec = self.keys.decode_record(&o.body, pos.generation, pos.seq)?;
         let (ours, epoch) = (&self.head.writer_id, self.head.epoch);
         match &rec {
             LogRecord::Extents { writer_id, .. } if writer_id != ours => Ok(FencePut::Occupied),
@@ -1307,7 +1320,7 @@ impl Bucket {
         let Some(pending) = &self.pending_seal else {
             return Ok(HeadCheck::Unmoved);
         };
-        let pending_body = pending.head.encode();
+        let pending_body = self.keys.encode_head(&pending.head);
         let raised = self.raised_head();
         let key = self.keys.head();
         let sent = Stamp::now();
@@ -1323,7 +1336,7 @@ impl Bucket {
                 Ok(HeadCheck::Unmoved)
             }
             Some(o) if o.body == pending_body => Ok(HeadCheck::Published(o.etag)),
-            Some(o) if o.body == raised.encode() => {
+            Some(o) if o.body == self.keys.encode_head(&raised) => {
                 self.adopt_head(raised, o.etag, sent);
                 self.pending_seal = None;
                 Ok(HeadCheck::Unmoved)
@@ -1368,7 +1381,7 @@ impl Bucket {
     pub(crate) fn raise_epoch(&mut self) -> Result<Option<u64>> {
         let start = Instant::now();
         self.check_fenced()?;
-        let sealed = self.sealed_head().encode();
+        let sealed = self.keys.encode_head(&self.sealed_head());
         match self
             .raise_epoch_at(start, Some(&sealed))
             .map_err(upload_error)?
@@ -1633,7 +1646,7 @@ impl Bucket {
             .unwrap_or(&empty)
             .sealed(key_gen, &dirty, page_size, page_count);
         let key = self.keys.manifest(key_gen);
-        let body = manifest.encode();
+        let body = self.keys.encode_manifest(&manifest, key_gen);
         // The page PUTs, not a head check, came just before: no free attempt (a zero lease
         // checks the head first). The first lapse here always renews: the PUTs before it
         // went out after the last head check, and a seal is stuck only when a lapse follows
@@ -1693,11 +1706,15 @@ impl Bucket {
     /// the lease, whose head check fences this writer (`seal`), and one landing after that
     /// writer wrote its key fails its condition.
     fn seal_start(&mut self, start: Instant) -> Result<()> {
-        let body = encode_record(&LogRecord::Extents {
-            file: LogFile::Wal,
-            writer_id: self.head.writer_id.clone(),
-            syncs: Vec::new(),
-        });
+        let body = self.keys.encode_record(
+            &LogRecord::Extents {
+                file: LogFile::Wal,
+                writer_id: self.head.writer_id.clone(),
+                syncs: Vec::new(),
+            },
+            self.head.generation,
+            self.seq,
+        );
         let bytes = body.len() as u64;
         let pos = self.put_log(start, body)?;
         self.emit_uploaded(pos, bytes);
@@ -1715,7 +1732,7 @@ impl Bucket {
         let key = self.keys.head();
         let sent = Stamp::now();
         let stored = retrying(&self.counters, policy, &key, || self.store.get(&key))?;
-        let ours = self.sealed_head().encode();
+        let ours = self.keys.encode_head(&self.sealed_head());
         match stored {
             Some(o) if o.etag == self.head_etag => {
                 self.last_confirmed = sent;
@@ -1930,7 +1947,8 @@ impl Bucket {
                         };
                         let (page, body) = &pages[i];
                         let key = self.keys.page(gen, *page);
-                        match self.seal_put(start, &key, body, &mut free, &answered) {
+                        let obj = self.keys.seal_page(*page, gen, body);
+                        match self.seal_put(start, &key, &obj, &mut free, &answered) {
                             Ok(Step::Done) => {
                                 self.counters.page_puts.fetch_add(1, Relaxed);
                             }
@@ -1992,7 +2010,7 @@ impl Bucket {
         head: &Head,
     ) -> Result<std::result::Result<String, Option<Object>>> {
         let key = self.keys.head();
-        let body = head.encode();
+        let body = self.keys.encode_head(head);
         let c = &self.counters;
         let r = retrying(c, &self.remaining(start), &key, || {
             self.store.put_if_match(&key, &body, &self.head_etag)

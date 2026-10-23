@@ -201,15 +201,16 @@ impl BucketDbStorage {
         let key = self.keys.page(g, p);
         let obj = with_retry(&self.retry, &key, |_| self.store.get(&key))?
             .ok_or_else(|| Error::NotFound(key.clone()))?;
-        if obj.body.len() != m.page_size as usize {
+        let page = self.keys.open_page(p, g, &obj.body)?;
+        if page.len() != m.page_size as usize {
             return Err(Error::Corrupt(format!(
                 "{key} is {} bytes, not the page size {}",
-                obj.body.len(),
+                page.len(),
                 m.page_size
             )));
         }
         let pos = (p as u64 - 1) * m.page_size as u64;
-        write_at(&*self.file, &*self.io, pos, obj.body)
+        write_at(&*self.file, &*self.io, pos, page.to_vec())
             .map_err(|e| io_err("write fetched page", e))?;
         self.lazy_gets.fetch_add(1, Relaxed);
         local.insert(p);

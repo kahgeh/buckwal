@@ -256,7 +256,7 @@ fn restore_prefix_of_log_gives_prefix_rows() {
         file,
         writer_id,
         mut syncs,
-    } = decode_record(&store.get(&key).unwrap().unwrap().body).unwrap()
+    } = decode_record(&as_plain(&store.get(&key).unwrap().unwrap().body)).unwrap()
     else {
         panic!("not extents")
     };
@@ -349,7 +349,7 @@ fn restore_with_wal_frames_and_empty_log_image_writes_a_header() {
         let key = keys().log(2, seq as u64 + 1);
         let LogRecord::Extents {
             file, writer_id, ..
-        } = decode_record(&mem.get(&key).unwrap().unwrap().body).unwrap()
+        } = decode_record(&as_plain(&mem.get(&key).unwrap().unwrap().body)).unwrap()
         else {
             panic!("not extents")
         };
@@ -573,7 +573,9 @@ fn restore_wal_bucket_files_match_kind1_replay() {
             let Some(o) = store.get(&keys().log(h.generation, seq)).unwrap() else {
                 break;
             };
-            if let LogRecord::Extents { file, syncs, .. } = decode_record(&o.body).unwrap() {
+            if let LogRecord::Extents { file, syncs, .. } =
+                decode_record(&as_plain(&o.body)).unwrap()
+            {
                 assert_eq!(file, LogFile::Wal);
                 for ops in syncs {
                     apply_ops(&mut wal, &ops).unwrap();

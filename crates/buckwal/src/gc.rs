@@ -7,7 +7,7 @@
 //! process, so a process of any lifetime trims what has been unreferenced long enough.
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::format::{Head, Keys, Manifest};
+use crate::format::{Head, Keys};
 use crate::store::ObjectStore;
 use crate::trim::trim_once;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ pub fn gc_with_store(config: &Config, store: Arc<dyn ObjectStore>) -> Result<GcR
     let start = Instant::now();
     config.validate()?;
     let min_age = config.engine(false).gc_min_age();
-    let pass = gc_once(&*store, &config.keys(), min_age, None)?;
+    let pass = gc_once(&*store, &config.keys()?, min_age, None)?;
     Ok(GcReport {
         generation: pass.generation,
         trimmed_against: pass.trimmed_against,
@@ -169,7 +169,7 @@ fn pass(
     else {
         return Ok(out);
     };
-    let head = Head::decode(&obj.body)?;
+    let head = keys.decode_head(&obj.body)?;
     out.generation = head.generation;
     span.record("buckwal.generation", head.generation);
     let Some(head_manifest) = head.manifest else {
@@ -228,7 +228,7 @@ fn pass(
         .map_err(|e| bucket_err(&format!("get {key}"), e))?
         .ok_or_else(|| Error::Bucket(format!("{key} is gone")))?
         .body;
-    let manifest = Manifest::decode(&body)?;
+    let manifest = keys.decode_manifest(&body, m)?;
     let trim_head = Head {
         generation: m + 1,
         manifest: Some(m),

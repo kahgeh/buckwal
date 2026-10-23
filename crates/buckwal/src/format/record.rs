@@ -1,6 +1,7 @@
 //! Log object codec: magic, kind, writer id, syncs of ops, sha256 trailer.
 // Op and its wire encoding (tag 1: [u64 off][u32 len][bytes]; tag 2: [u64 len])
 // are Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
+use super::integrity::{integrity_failed, record_code, record_verifies, Check, Kind, CODE_LEN};
 use crate::error::{Error, Result};
 use sha2::{Digest, Sha256};
 
@@ -49,7 +50,15 @@ fn put_writer_id(out: &mut Vec<u8>, id: &str) {
     out.extend(id.as_bytes());
 }
 
+/// A plaintext database's record: the SHA-256 trailer.
+#[cfg(test)]
 pub(crate) fn encode_record(r: &LogRecord) -> Vec<u8> {
+    encode_record_with(r, None)
+}
+
+/// With `Some`, the 32-byte integrity code over the generation, the seq and the record's
+/// bytes replaces the SHA-256 trailer; `None` is `encode_record`. (`key` is not used.)
+pub(crate) fn encode_record_with(r: &LogRecord, ik: Option<Check<'_>>) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     match r {
         LogRecord::Extents {
@@ -88,8 +97,16 @@ pub(crate) fn encode_record(r: &LogRecord) -> Vec<u8> {
             out.extend(epoch.to_le_bytes());
         }
     }
-    let sha = Sha256::digest(&out);
-    out.extend(sha);
+    match ik {
+        None => {
+            let sha = Sha256::digest(&out);
+            out.extend(sha);
+        }
+        Some(c) => {
+            let code = record_code(c.ik, c.generation, c.seq, &out);
+            out.extend(code);
+        }
+    }
     out
 }
 
@@ -115,7 +132,23 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
+    decode_record_with(b, None)
+}
+
+/// With `Some`, the trailer must be the integrity code for that generation and seq, else
+/// `Corrupt("integrity: <key>")` (also for a record too short to hold one); `None` is
+/// `decode_record`.
+pub(crate) fn decode_record_with(b: &[u8], ik: Option<Check<'_>>) -> Result<LogRecord> {
+    if let Some(c) = ik {
+        let fail = || integrity_failed(c.key, Kind::Record, c.generation, c.seq);
+        let split = b.len().checked_sub(CODE_LEN).ok_or_else(fail)?;
+        let (body, code) = b.split_at(split);
+        if !record_verifies(c.ik, c.generation, c.seq, body, code) {
+            return Err(fail());
+        }
+    }
     if b.len() < MAGIC.len() + 32 {
         return Err(corrupt("too short"));
     }
@@ -123,7 +156,7 @@ pub(crate) fn decode_record(b: &[u8]) -> Result<LogRecord> {
     if body[..MAGIC.len()] != MAGIC[..] {
         return Err(corrupt("bad magic"));
     }
-    if Sha256::digest(body).as_slice() != sha {
+    if ik.is_none() && Sha256::digest(body).as_slice() != sha {
         return Err(corrupt("checksum mismatch"));
     }
     let mut r = Reader(&body[MAGIC.len()..]);

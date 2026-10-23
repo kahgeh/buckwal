@@ -27,7 +27,7 @@ fn open_mvcc(store: Arc<dyn ObjectStore>, c: Config) -> Database {
 }
 
 /// One `BEGIN CONCURRENT` insert of row `id`.
-fn insert_c(c: &Connection, id: i64) -> Result<()> {
+pub(super) fn insert_c(c: &Connection, id: i64) -> Result<()> {
     c.execute("BEGIN CONCURRENT", &[])?;
     let r = c
         .execute(
@@ -45,7 +45,7 @@ fn insert_c(c: &Connection, id: i64) -> Result<()> {
     r.map(|_| ())
 }
 
-fn truncate_checkpoint(c: &Connection) -> Result<()> {
+pub(super) fn truncate_checkpoint(c: &Connection) -> Result<()> {
     c.checkpoint(CheckpointMode::Truncate)
 }
 
@@ -74,20 +74,20 @@ fn bucket_image(store: &dyn ObjectStore) -> BucketImage {
     let head = head(store);
     let g = head.manifest.expect("an MVCC head names its manifest");
     let body = store.get(&keys().manifest(g)).unwrap().unwrap().body;
-    let m = Manifest::decode(&body).unwrap();
+    let m = Manifest::decode(&as_plain(&body)).unwrap();
     let ps = m.page_size as usize;
     let mut db = vec![0u8; ps * m.page_count as usize];
     for (p, pg) in &m.pages {
         let page = store.get(&keys().page(*pg, *p)).unwrap().unwrap().body;
         let at = (*p as usize - 1) * ps;
-        db[at..at + ps].copy_from_slice(&page);
+        db[at..at + ps].copy_from_slice(page_of(&page, ps));
     }
     let (mut wal, mut log, mut kinds, mut records) = (Vec::new(), Vec::new(), vec![], vec![]);
     for seq in 1.. {
         let Some(o) = store.get(&keys().log(head.generation, seq)).unwrap() else {
             break;
         };
-        match decode_record(&o.body).unwrap() {
+        match decode_record(&as_plain(&o.body)).unwrap() {
             LogRecord::Extents { file, syncs, .. } => {
                 let (kind, img) = match file {
                     LogFile::Wal => (1, &mut wal),
@@ -182,7 +182,11 @@ fn crash_rows(
 }
 
 /// A new MVCC database with table `t` and rows `1..=n`.
-fn mvcc_with_rows(store: Arc<dyn ObjectStore>, c: Config, n: i64) -> (Database, Connection) {
+pub(super) fn mvcc_with_rows(
+    store: Arc<dyn ObjectStore>,
+    c: Config,
+    n: i64,
+) -> (Database, Connection) {
     let db = open_mvcc(store, c);
     let conn = db.connect().unwrap();
     create(&conn);
@@ -512,7 +516,7 @@ fn db_log_opened_outside_wrapper_is_refused() {
 }
 
 /// `enc_config` in MVCC mode.
-fn mvcc_enc(dir: &Path, keydir: &TempDir, hex: &str) -> Config {
+pub(super) fn mvcc_enc(dir: &Path, keydir: &TempDir, hex: &str) -> Config {
     let mut c = enc_config(dir, keydir, hex);
     let m = mvcc(dir);
     c.journal_mode = m.journal_mode;

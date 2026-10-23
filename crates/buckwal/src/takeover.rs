@@ -77,7 +77,7 @@ pub fn takeover_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Resul
     // Checked again under the lock: nothing else may have appeared.
     refuse_entries(&dir, &[LOCK_FILE])?;
     let cfg = config.engine(false);
-    let keys = config.keys();
+    let keys = config.keys_for(encryption.as_deref());
     let mut attempt = 1;
     loop {
         let staged = restore_staged(store.clone(), &keys, &dir, &cfg)?;

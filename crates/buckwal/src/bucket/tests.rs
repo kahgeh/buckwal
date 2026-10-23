@@ -1,8 +1,8 @@
 use super::*;
 use crate::config::Event;
 use crate::config::JournalMode;
-use crate::format::decode_record;
 use crate::format::LogFile;
+use crate::format::{decode_record, encode_record};
 use crate::store::fault::HoldStore;
 use crate::store::{FaultStore, MemStore};
 use std::time::Duration;

@@ -49,8 +49,6 @@ impl Encryption {
     }
 
     /// The key integrity codes are made with: HKDF of the page key, never the page key itself.
-    /// Unused outside tests until the codes are wired in (Task 5).
-    #[allow(dead_code)]
     pub(crate) fn integrity_key(&self) -> IntegrityKey {
         self.integrity.clone()
     }
@@ -63,8 +61,6 @@ const INTEGRITY_LABEL: &[u8] = b"buckwal integrity v1";
 #[derive(Clone)]
 pub(crate) struct IntegrityKey([u8; 32]);
 
-// Unused outside tests until the codes are wired in (Task 5).
-#[allow(dead_code)]
 impl IntegrityKey {
     fn derive(page_key: &[u8]) -> Self {
         let mut okm = hkdf_sha256(&[], page_key, INTEGRITY_LABEL, 32);

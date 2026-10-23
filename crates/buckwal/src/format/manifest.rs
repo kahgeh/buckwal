@@ -1,4 +1,5 @@
 //! Manifest codec: page_size, page_count and generation runs, sha256 trailer.
+use super::integrity::{integrity_failed, manifest_code, manifest_verifies, Check, Kind, CODE_LEN};
 use crate::error::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +19,14 @@ fn corrupt(m: &str) -> Error {
 }
 
 impl Manifest {
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
+        self.encode_with(None)
+    }
+
+    /// With `Some`, the integrity code over the generation and the bytes replaces the SHA-256
+    /// trailer (`generation` is the manifest's, `seq` and `key` are not used).
+    pub(crate) fn encode_with(&self, ik: Option<Check<'_>>) -> Vec<u8> {
         // (first_page, count, generation); consecutive pages of one generation merge.
         let mut runs: Vec<(u32, u32, u64)> = Vec::new();
         for (&page, &gen) in &self.pages {
@@ -36,12 +44,35 @@ impl Manifest {
             out.extend(count.to_le_bytes());
             out.extend(gen.to_le_bytes());
         }
-        let sha = Sha256::digest(&out);
-        out.extend(sha);
+        match ik {
+            None => {
+                let sha = Sha256::digest(&out);
+                out.extend(sha);
+            }
+            Some(c) => {
+                let code = manifest_code(c.ik, c.generation, &out);
+                out.extend(code);
+            }
+        }
         out
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(b: &[u8]) -> Result<Manifest> {
+        Manifest::decode_with(b, None)
+    }
+
+    /// With `Some`, the trailer must be the integrity code for that generation, else
+    /// `Corrupt("integrity: <key>")`.
+    pub(crate) fn decode_with(b: &[u8], ik: Option<Check<'_>>) -> Result<Manifest> {
+        if let Some(c) = ik {
+            let fail = || integrity_failed(c.key, Kind::Manifest, c.generation, 0);
+            let split = b.len().checked_sub(CODE_LEN).ok_or_else(fail)?;
+            let (body, code) = b.split_at(split);
+            if !manifest_verifies(c.ik, c.generation, body, code) {
+                return Err(fail());
+            }
+        }
         if b.len() < MAGIC.len() + 12 + 32 {
             return Err(corrupt("too short"));
         }
@@ -49,7 +80,7 @@ impl Manifest {
         if body[..MAGIC.len()] != MAGIC[..] {
             return Err(corrupt("bad magic"));
         }
-        if Sha256::digest(body).as_slice() != sha {
+        if ik.is_none() && Sha256::digest(body).as_slice() != sha {
             return Err(corrupt("checksum mismatch"));
         }
         let u32_at = |i: usize| u32::from_le_bytes(body[i..i + 4].try_into().unwrap());

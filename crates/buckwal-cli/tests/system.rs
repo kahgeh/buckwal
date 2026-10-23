@@ -947,6 +947,83 @@ fn fault_window_deleted_page_object_fails_read() {
     deleted_page_object_fails_read("fault_window_deleted_page_object_fails_read", &WINDOW_ARGS);
 }
 
+/// Pass 2 (an encryption key): two sealed page objects swapped in the bucket. Restore
+/// succeeds (pages are fetched lazily) and the first read of either page fails with
+/// `integrity: <key>`, naming the object and nothing of its bytes. Pass 1 has no integrity
+/// codes: the test then only checks that the swap is not caught, so it is not vacuous.
+/// `extra` goes to soak.
+fn swapped_page_objects_fail_read(name: &str, extra: &[&str]) {
+    let ctx = Ctx::new(name);
+    let encrypted = ctx
+        .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
+        .is_some_and(|k| !k.is_empty());
+    let dir = ctx.dir("db");
+    let mut args = vec![
+        "--checkpoint",
+        "truncate",
+        "--every",
+        "100",
+        "--count",
+        "300",
+    ];
+    args.extend_from_slice(extra);
+    Soak::spawn(&ctx, &dir, &args).finish();
+    let head = ctx.head();
+    let m = head.manifest.expect("closed soak sealed a manifest");
+    let m_gen: u64 = m.strip_prefix("manifest/").unwrap().parse().unwrap();
+    let pages = ctx.list(&format!("pages/{m_gen:010}/"));
+    // The two highest pages: table leaves the scan reads (page 1 is fetched by restore itself).
+    assert!(pages.len() >= 3, "{pages:?}");
+    let (a, b) = (
+        pages[pages.len() - 1].clone(),
+        pages[pages.len() - 2].clone(),
+    );
+    let store = ctx.store();
+    let body = |k: &str| store.get(k).unwrap().expect("page object").body;
+    let (ba, bb) = (body(&a), body(&b));
+    assert_eq!(ba.len(), bb.len());
+    store.put(&a, &bb).unwrap();
+    store.put(&b, &ba).unwrap();
+
+    let r = ctx.dir("restored");
+    let r = r.to_str().unwrap();
+    ctx.ok(&["restore", "--dir", r]);
+    let out = ctx.run(&[
+        "sql",
+        "--claim",
+        "--dir",
+        r,
+        "SELECT count(*), sum(length(payload)) FROM soak",
+    ]);
+    if !encrypted {
+        eprintln!(
+            "{name}: no integrity codes: the swap read {}",
+            out.stdout.trim()
+        );
+        return;
+    }
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
+    let prefix = format!("{}/", ctx.prefix());
+    let keys = [
+        a.strip_prefix(&prefix).unwrap(),
+        b.strip_prefix(&prefix).unwrap(),
+    ];
+    assert!(
+        keys.iter().any(|k| out
+            .stderr
+            .contains(&format!("integrity: {}/{k}", ctx.prefix()))),
+        "stderr names an integrity failure of {keys:?}: {}",
+        out.stderr
+    );
+    eprintln!("{name}: swapped {a} and {b}; stderr: {}", out.stderr.trim());
+}
+
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn encrypted_swapped_page_objects_fail_read() {
+    swapped_page_objects_fail_read("encrypted_swapped_page_objects_fail_read", &[]);
+}
+
 /// The coordinator's ruling: a read-only verify of the same bucket while the writer runs
 /// claims nothing (head unchanged) and does not disturb the writer.
 #[test]

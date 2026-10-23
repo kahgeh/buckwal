@@ -1,8 +1,10 @@
 //! `head` object (bucket) and `app.db-durable` (local state): flat JSON.
+use super::integrity::{head_code, head_verifies, integrity_failed, Kind};
 use super::json::{escape, Obj};
 use super::{FORMAT, FORMAT_V2, FORMAT_V3};
 use crate::config::defaults;
 use crate::config::JournalMode;
+use crate::encryption::IntegrityKey;
 use crate::error::{Error, Result};
 use crate::files::{io_err, STATE_FILE};
 use std::fs::{self, File};
@@ -72,12 +74,60 @@ impl Head {
         .into_bytes()
     }
 
+    /// A format 3 head's bytes: the fields of `encode` and the integrity code over them (the
+    /// canonical field encoding, so the code does not depend on the bytes' whitespace or on
+    /// keys this build does not know). Only a format 3 head carries one.
+    pub(crate) fn encode_coded(&self, ik: &IntegrityKey) -> Vec<u8> {
+        debug_assert_eq!(self.format, FORMAT_V3, "only a format 3 head is coded");
+        let mut out = self.encode();
+        let code = head_code(ik, &out);
+        out.pop(); // the closing brace
+        out.extend_from_slice(format!(",\"integrity\":\"{}\"}}", hex::encode(code)).as_bytes());
+        out
+    }
+
+    /// Decode the head at `key` as the open of a database with (`Some`) or without (`None`)
+    /// an integrity key reads it. With a key: a format 1 or 2 head is
+    /// `Corrupt("integrity: bucket written before integrity codes")`, and a format 3 head
+    /// must carry the right integrity code, else `Corrupt("integrity: <key>")`. Without one,
+    /// a format 3 head (an encrypted database's) is refused with `Encryption`.
+    pub(crate) fn decode_checked(b: &[u8], key: &str, ik: Option<&IntegrityKey>) -> Result<Head> {
+        let (head, code) = Head::decode_inner(b, ACCEPTED)?;
+        let Some(ik) = ik else {
+            if head.format == FORMAT_V3 {
+                return Err(Error::Encryption(format!(
+                    "{key} is a format {FORMAT_V3} head, an encrypted database's: set \
+                     BUCKWAL_ENCRYPTION_KEY_FILE"
+                )));
+            }
+            return Ok(head);
+        };
+        if head.format != FORMAT_V3 {
+            return Err(corrupt("integrity: bucket written before integrity codes"));
+        }
+        let ok = code
+            .and_then(|c| hex::decode(c).ok())
+            .is_some_and(|c| head_verifies(ik, &head.encode(), &c));
+        if ok {
+            Ok(head)
+        } else {
+            Err(integrity_failed(key, Kind::Head, head.generation, 0))
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn decode(b: &[u8]) -> Result<Head> {
         Head::decode_accepting(b, ACCEPTED)
     }
 
     /// Decode a head, accepting only the listed formats (a v1 build passes `[FORMAT]`).
+    #[cfg(test)]
     pub(crate) fn decode_accepting(b: &[u8], accepted: &[u32]) -> Result<Head> {
+        Head::decode_inner(b, accepted).map(|(h, _)| h)
+    }
+
+    /// The head and its `integrity` field (hex), when it has one.
+    fn decode_inner(b: &[u8], accepted: &[u32]) -> Result<(Head, Option<String>)> {
         let o = Obj::parse(b)?;
         let format = check_format(&o, "head", accepted)?;
         let journal_mode = if format == FORMAT_V3 {
@@ -127,7 +177,12 @@ impl Head {
                 "head: lease_ms + request_timeout_ms {quiet} is over a day"
             )));
         }
-        Ok(Head {
+        let integrity = if o.has("integrity") {
+            Some(o.str("integrity")?.to_string())
+        } else {
+            None
+        };
+        let head = Head {
             format,
             generation: o.num("generation")?,
             manifest,
@@ -137,7 +192,8 @@ impl Head {
             lease_ms,
             request_timeout_ms,
             next_generation_floor: opt("next_generation_floor")?,
-        })
+        };
+        Ok((head, integrity))
     }
 }
 
