@@ -41,7 +41,7 @@ const RUN_ID: &str = "test_run_id";
 const FAILURE_OUTCOMES: [&str; 3] = ["error", "integrity", "fenced"];
 
 /// The machine's name, `None` when the system does not give one.
-fn host_name() -> Option<String> {
+pub(super) fn host_name() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for `buf.len()` bytes for the whole call, and `gethostname`
     // writes at most that many.
@@ -71,11 +71,20 @@ fn instance_id() -> &'static str {
 /// What every export carries: the service, the machine (`host.name`), the process
 /// (`service.instance.id`) and, for a process with a test run id,
 /// `deployment.environment.name = test`.
+///
+/// The builder reads `OTEL_RESOURCE_ATTRIBUTES` first, and a later attribute replaces an
+/// earlier one of the same key. So `host.name` is set from `gethostname` only when the
+/// environment does not give one: the operator's value wins. `service.instance.id` and
+/// `deployment.environment.name` are always the code's.
 fn resource(test_run: bool) -> Resource {
+    let env_has_host = Resource::builder()
+        .build()
+        .get(&opentelemetry::Key::new("host.name"))
+        .is_some();
     let mut b = Resource::builder()
         .with_service_name(SERVICE)
         .with_attribute(KeyValue::new("service.instance.id", instance_id()));
-    if let Some(host) = host_name() {
+    if let Some(host) = host_name().filter(|_| !env_has_host) {
         b = b.with_attribute(KeyValue::new("host.name", host));
     }
     if test_run {

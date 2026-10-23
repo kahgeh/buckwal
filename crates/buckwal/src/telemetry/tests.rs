@@ -1434,7 +1434,6 @@ fn res_attr(r: &Resource, key: &'static str) -> Option<String> {
 #[test]
 fn the_resource_names_the_machine_and_the_process() {
     let r = resource_of(None);
-    assert!(res_attr(&r, "host.name").is_some_and(|h| !h.is_empty()));
     let id = res_attr(&r, "service.instance.id").expect("an instance id");
     assert_eq!(id.len(), 32, "{id}");
     assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -1504,4 +1503,32 @@ fn a_failed_maintenance_checkpoint_records_error_on_its_span() {
     let (outcome, status) = &outcomes[0];
     assert_eq!(outcome.as_deref(), Some("error"), "{outcomes:?}");
     assert!(matches!(status, opentelemetry::trace::Status::Error { .. }));
+}
+
+/// Removes `OTEL_RESOURCE_ATTRIBUTES` when dropped, so a failed assertion leaves none.
+struct ResourceEnvGuard;
+
+impl Drop for ResourceEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("OTEL_RESOURCE_ATTRIBUTES");
+    }
+}
+
+/// `host.name` is the machine's name unless `OTEL_RESOURCE_ATTRIBUTES` gives one, which then
+/// wins. Both cases run in this one test: it is the only one that sets the variable, so no
+/// other test races it for the two `host.name` readings (other tests do not read `host.name`).
+#[test]
+fn host_name_is_the_machines_unless_the_environment_gives_one() {
+    let _guard = ResourceEnvGuard;
+    std::env::remove_var("OTEL_RESOURCE_ATTRIBUTES");
+    let host = super::pipeline::host_name().expect("the system gives a host name");
+    assert_eq!(res_attr(&resource_of(None), "host.name"), Some(host));
+    std::env::set_var("OTEL_RESOURCE_ATTRIBUTES", "host.name=operator-box");
+    let r = resource_of(Some("run-1"));
+    assert_eq!(res_attr(&r, "host.name").as_deref(), Some("operator-box"));
+    // The code's own id is not the environment's to set. (`deployment.environment.name` is
+    // not tried: another test reads its absence, and this one must not race it.)
+    std::env::set_var("OTEL_RESOURCE_ATTRIBUTES", "service.instance.id=mine");
+    let r = resource_of(None);
+    assert_ne!(res_attr(&r, "service.instance.id").as_deref(), Some("mine"));
 }
