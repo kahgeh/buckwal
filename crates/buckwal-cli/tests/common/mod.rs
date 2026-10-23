@@ -16,7 +16,12 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_buckwal");
 /// environment never leaks into a test (the TLS and encryption ones come back through
 /// `env()`). `BUCKWAL_OTEL*` and `BUCKWAL_TEST_RUN_ID` are not here: `scripts/test.sh` sets
 /// them so the children export under its run id.
-pub const OPTIONAL: [&str; 25] = [
+pub const OPTIONAL: [&str; 30] = [
+    "BUCKWAL_REPLICA_POLL_MS",
+    "BUCKWAL_REPLICA_NOTIFY_LISTEN",
+    "BUCKWAL_REPLICA_NOTIFY_TLS_CERT",
+    "BUCKWAL_REPLICA_NOTIFY_TLS_KEY",
+    "BUCKWAL_REPLICA_NOTIFY_TOKEN_FILE",
     "BUCKWAL_PREFIX",
     "BUCKWAL_RETRY_DEADLINE_MS",
     "BUCKWAL_REQUEST_TIMEOUT_MS",
@@ -939,6 +944,15 @@ impl Follower {
         }
     }
 
+    /// How many lines at or after `from` `p` accepts, counting what has arrived so far.
+    pub fn count_lines(&mut self, from: usize, p: impl Fn(&str) -> bool) -> usize {
+        self.pump();
+        self.lines[from.min(self.lines.len())..]
+            .iter()
+            .filter(|l| p(l))
+            .count()
+    }
+
     pub fn tail(&mut self) -> String {
         self.pump();
         let from = self.lines.len().saturating_sub(20);
@@ -1035,6 +1049,7 @@ impl Drop for Follower {
 /// A running `buckwal soak`, its stdout lines collected on a thread.
 pub struct SoakProc {
     child: std::process::Child,
+    reader: Option<std::thread::JoinHandle<()>>,
     lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -1052,14 +1067,18 @@ impl SoakProc {
         let out = child.stdout.take().unwrap();
         let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let l2 = lines.clone();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             use std::io::BufRead;
             for line in std::io::BufReader::new(out).lines() {
                 let Ok(line) = line else { break };
                 l2.lock().unwrap().push(line);
             }
         });
-        SoakProc { child, lines }
+        SoakProc {
+            child,
+            reader: Some(reader),
+            lines,
+        }
     }
 
     pub fn lines(&self) -> Vec<String> {
@@ -1074,8 +1093,14 @@ impl SoakProc {
             .collect()
     }
 
+    /// The exit status once the process has exited; its stdout reader is joined first, so
+    /// every line it printed is in `lines()`.
     pub fn exited(&mut self) -> Option<ExitStatus> {
-        self.child.try_wait().expect("try_wait")
+        let s = self.child.try_wait().expect("try_wait")?;
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
+        Some(s)
     }
 
     pub fn wait_acks(&mut self, n: usize, limit: Duration) {
