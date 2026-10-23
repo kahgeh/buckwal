@@ -34,6 +34,8 @@ struct Spy {
     /// GETs of keys containing this fail (non-retryable) while it is set.
     fail_gets: Mutex<Option<String>>,
     failed_gets: AtomicU64,
+    /// Each GET of a page object sleeps this many milliseconds.
+    page_delay_ms: AtomicU64,
 }
 
 #[derive(Default)]
@@ -54,7 +56,12 @@ impl Spy {
             cv: Condvar::new(),
             fail_gets: Mutex::default(),
             failed_gets: AtomicU64::new(0),
+            page_delay_ms: AtomicU64::new(0),
         })
+    }
+    /// How many page objects were fetched so far.
+    fn page_gets(&self) -> usize {
+        self.got().iter().filter(|k| k.contains("/pages/")).count()
     }
     fn fail_gets_under(&self, part: &str) {
         *self.fail_gets.lock().unwrap() = Some(part.to_string());
@@ -116,6 +123,12 @@ impl ObjectStore for Spy {
     }
     fn get(&self, key: &str) -> std::result::Result<Option<Object>, StoreError> {
         self.gets.lock().unwrap().push(key.to_string());
+        if key.contains("/pages/") {
+            let d = self.page_delay_ms.load(SeqCst);
+            if d > 0 {
+                std::thread::sleep(Duration::from_millis(d));
+            }
+        }
         if let Some(part) = &*self.fail_gets.lock().unwrap() {
             if key.contains(part.as_str()) {
                 self.failed_gets.fetch_add(1, SeqCst);
@@ -1245,6 +1258,57 @@ fn unrelated_files_and_directories_survive_the_old_copy_removal_after_a_re_resto
     wait_rows(&rc, 8);
     rc.close().unwrap();
     again.close().unwrap();
+}
+
+/// A sealed database of about 300 pages (`Config::prefetch` is unset in `rconfig`).
+fn sealed_big(store: &Arc<MemStore>) -> (tempfile::TempDir, crate::Database, crate::Connection) {
+    let (w, wdb, wc) = writer(store, 0);
+    for id in 1..=300 {
+        wc.execute(
+            "INSERT INTO t(id, v) VALUES (?, zeroblob(2000))",
+            &[int(id)],
+        )
+        .unwrap();
+    }
+    wc.checkpoint(CheckpointMode::Truncate).unwrap();
+    (w, wdb, wc)
+}
+
+#[test]
+fn a_replica_fetches_every_sealed_page_in_the_background_without_a_query() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, _wc) = sealed_big(&store);
+    let pages = crate::engine::tests::manifest(&*store).1.pages.len();
+    assert!(pages > 100, "{pages} pages");
+    let spy = Spy::new(store.clone());
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    let c = rconfig(&dir);
+    assert!(!c.prefetch, "the test relies on prefetch being unset");
+    let replica = open_replica_with_store(c, spy.clone()).unwrap();
+    // No query: the page GETs still rise to every page of the manifest.
+    until("every sealed page fetched", || spy.page_gets() >= pages);
+    let rc = replica.connect().unwrap();
+    assert_eq!(count(&rc), 300);
+    rc.close().unwrap();
+    replica.close().unwrap();
+}
+
+#[test]
+fn closing_a_replica_stops_its_prefetch() {
+    let store = Arc::new(MemStore::new());
+    let (_w, _wdb, _wc) = sealed_big(&store);
+    let pages = crate::engine::tests::manifest(&*store).1.pages.len();
+    let spy = Spy::new(store.clone());
+    spy.page_delay_ms.store(5, SeqCst);
+    let r = tempfile::tempdir().unwrap();
+    let replica = open_replica_with_store(rconfig(&r.path().join("r")), spy.clone()).unwrap();
+    until("the prefetch started", || spy.page_gets() >= 3);
+    replica.close().unwrap();
+    let at_close = spy.page_gets();
+    assert!(at_close < pages, "{at_close} of {pages} before close");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(spy.page_gets(), at_close, "pages fetched after close");
 }
 
 #[test]

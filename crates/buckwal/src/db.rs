@@ -175,6 +175,13 @@ impl Shared {
         lock(&self.open).as_ref().map(|o| o.engine.db.clone())
     }
 
+    /// Ask the prefetch thread to stop, without waiting for it (the engine's drop joins it).
+    pub(crate) fn stop_prefetch(&self) {
+        if let Some(o) = lock(&self.open).as_ref() {
+            o.engine.stop_prefetch();
+        }
+    }
+
     /// Stop maintenance, drop the engine (and with it the engine's registry entry), drain the
     /// uploader, stop the trimmer, unlock `durable.lock` and leave the process registry.
     fn shutdown(&self) {

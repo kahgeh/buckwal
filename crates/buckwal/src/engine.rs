@@ -70,6 +70,15 @@ pub(crate) struct Prefetch {
     thread: Option<JoinHandle<()>>,
 }
 
+impl Engine {
+    /// Ask the prefetch thread to stop; `drop` still joins it.
+    pub(crate) fn stop_prefetch(&self) {
+        if let Some(p) = &self.prefetch {
+            p.stop.store(true, SeqCst);
+        }
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(p) = &mut self.prefetch {

@@ -240,6 +240,9 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
     cfg.encryption = encryption.clone();
     // A replica follows WAL databases only; an MVCC head is refused below.
     cfg.journal_mode = JournalMode::Wal;
+    // The replica fetches every sealed page in the background once restored (the spec's
+    // "today's prefetch"), whatever BUCKWAL_PREFETCH says for the other opens.
+    cfg.prefetch = true;
     let env = Env {
         store: store.clone(),
         keys: keys.clone(),
@@ -920,6 +923,9 @@ impl Runner {
                 }
                 let old = std::mem::replace(&mut self.data, copy);
                 let old_db = self.current.swap(db);
+                // Readers still on the old copy keep its engine; its prefetch need not go on
+                // fetching pages for a copy whose files are about to be removed.
+                old_db.shared.stop_prefetch();
                 // The old apply connection goes first, then the handle; readers still on the
                 // old copy keep its engine (and its unlinked files) until they close.
                 self.follower = follower;

@@ -7,3 +7,14 @@ RED (before the fix):
   test result: FAILED. 0 passed; 1 failed
 GREEN (after the fix): cargo test --locked -p buckwal --lib replica::
   test result: ok. 106 passed; 0 failed
+
+== Fix 2: the replica open sets prefetch = true in its engine config ==
+cargo test --locked -p buckwal --lib -- a_replica_fetches_every closing_a_replica_stops
+RED (before the fix, Config::prefetch unset):
+  timed out waiting for: every sealed page fetched
+  timed out waiting for: the prefetch started
+  test result: FAILED. 0 passed; 2 failed
+GREEN (after the fix):
+  test result: ok. 2 passed; 0 failed   (replica:: module: 108 passed)
+Also: the re-restore swap asks the old copy's prefetch to stop (Engine::stop_prefetch);
+Engine's drop still joins the thread before the copy's files are released.
