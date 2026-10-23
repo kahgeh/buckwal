@@ -845,7 +845,7 @@ impl Follower {
             tracing::error!(
                 target: "buckwal",
                 generation = self.generation,
-                image_frames = self.image.committed_len() as u64,
+                image_frames = self.image.committed_len(),
                 applied_frames = self.applied,
                 "{msg}"
             );
