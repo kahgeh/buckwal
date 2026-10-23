@@ -1,0 +1,88 @@
+# Task 9b RED (tests written first; follower still stops on ReRestore, clear_replica_dir in read_dir order)
+$ cargo test --locked -p buckwal --lib replica::open
+test replica::open::tests::a_refused_directory_says_what_to_delete ... FAILED
+test replica::open::tests::a_directory_that_is_not_a_replicas_is_refused_and_left_alone ... ok
+test replica::open::tests::batching_pragma_is_refused ... ok
+test replica::open::tests::mvcc_head_mid_follow_stops_the_follower_with_an_error_log ... ok
+test replica::open::tests::a_crash_mid_restore_leaves_nothing_visible_at_the_next_open ... FAILED
+test replica::open::tests::conflict_re_restores_after_error_log ... FAILED
+test replica::open::tests::a_replica_whose_local_wal_is_ahead_of_the_bucket_still_opens ... ok
+test replica::open::tests::connect_refuses_insert_update_ddl_pragma_write_attach_checkpoint ... ok
+test replica::open::tests::mvcc_head_refused_with_unsupported ... ok
+test replica::open::tests::files_without_a_local_state_are_refused_and_left_alone ... ok
+test replica::open::tests::refusals_before_the_restore_leave_the_directory_untouched ... ok
+test replica::open::tests::missing_position_file_at_open_restores_into_the_replica_dir ... ok
+test replica::open::tests::a_crash_after_any_removal_of_the_clear_still_re_restores_at_the_next_open ... FAILED
+test replica::open::tests::follows_across_seals_and_resumes_after_them ... ok
+test replica::open::tests::reopen_resumes_from_the_position_file ... ok
+test replica::open::tests::open_replica_follows_writer_commits ... ok
+test replica::open::tests::second_open_of_same_dir_is_refused_by_lock ... ok
+test replica::open::tests::replica_sends_zero_put_or_delete ... ok
+test replica::open::tests::no_warning_when_a_notification_came_before_the_first_slow_poll ... ok
+test replica::open::tests::the_dirty_file_is_compacted_at_open ... ok
+test replica::open::tests::wrong_key_refused_at_open_before_any_follow ... ok
+test replica::open::tests::slow_poll_alone_is_correct_and_warns_once ... ok
+test replica::open::tests::waker_burst_coalesces_to_one_extra_pass ... ok
+test replica::open::tests::a_reader_holding_a_transaction_across_the_swap_gets_an_error_or_its_snapshot_and_nothing_worse ... FAILED
+test replica::open::tests::a_failed_re_restore_leaves_no_half_directory_and_the_replica_goes_on ... FAILED
+test replica::open::tests::lagging_past_trim_grace_re_restores_warns_once_and_catches_up ... FAILED
+test replica::open::tests::a_second_re_restore_removes_the_first_new_copy ... FAILED
+test replica::open::tests::old_connection_outside_a_transaction_keeps_working_new_connections_see_new_copy ... FAILED
+test replica::open::tests::re_restore_removes_the_old_copy_sends_nothing_and_a_reopen_follows_the_new_one ... FAILED
+test replica::open::tests::stats_after_re_restore_shows_count_reason_and_jumped_position ... FAILED
+thread 'replica::open::tests::a_refused_directory_says_what_to_delete' (179511704) panicked at crates/buckwal/src/replica/open/tests.rs:1156:5:
+thread 'replica::open::tests::a_crash_mid_restore_leaves_nothing_visible_at_the_next_open' (179511700) panicked at crates/buckwal/src/replica/open/tests.rs:1114:5:
+thread 'replica::open::tests::conflict_re_restores_after_error_log' (179511708) panicked at crates/buckwal/src/replica/open/tests.rs:893:10:
+thread 'replica::open::tests::a_crash_after_any_removal_of_the_clear_still_re_restores_at_the_next_open' (179511699) panicked at crates/buckwal/src/replica/open/tests.rs:1139:33:
+open after 3 removals: config error: /private/var/folders/xs/x0t8b0kd4j301q9nbtjqlplh0000gp/T/.tmpkqduqw/r holds app.db-wal without a replica's local state; it is not cleared for a replica
+thread 'replica::open::tests::a_reader_holding_a_transaction_across_the_swap_gets_an_error_or_its_snapshot_and_nothing_worse' (179511703) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a re-restore
+thread 'replica::open::tests::a_failed_re_restore_leaves_no_half_directory_and_the_replica_goes_on' (179511702) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a failed attempt
+thread 'replica::open::tests::lagging_past_trim_grace_re_restores_warns_once_and_catches_up' (179511712) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a re-restore
+thread 'replica::open::tests::a_second_re_restore_removes_the_first_new_copy' (179511706) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a re-restore
+thread 'replica::open::tests::old_connection_outside_a_transaction_keeps_working_new_connections_see_new_copy' (179512043) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a re-restore
+thread 'replica::open::tests::re_restore_removes_the_old_copy_sends_nothing_and_a_reopen_follows_the_new_one' (179512109) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a re-restore
+thread 'replica::open::tests::stats_after_re_restore_shows_count_reason_and_jumped_position' (179512282) panicked at crates/buckwal/src/replica/open/tests.rs:195:9:
+timed out waiting for: a re-restore
+test result: FAILED. 19 passed; 11 failed; 0 ignored; 0 measured; 633 filtered out; finished in 21.74s
+
+# GREEN after the implementation (same command)
+$ cargo test --locked -p buckwal --lib replica::open
+test replica::open::tests::batching_pragma_is_refused ... ok
+test replica::open::tests::mvcc_head_mid_follow_stops_the_follower_with_an_error_log ... ok
+test replica::open::tests::a_replica_whose_local_wal_is_ahead_of_the_bucket_still_opens ... ok
+test replica::open::tests::connect_refuses_insert_update_ddl_pragma_write_attach_checkpoint ... ok
+test replica::open::tests::a_crash_mid_restore_leaves_nothing_visible_at_the_next_open ... ok
+test replica::open::tests::mvcc_head_refused_with_unsupported ... ok
+test replica::open::tests::conflict_re_restores_after_error_log ... ok
+test replica::open::tests::a_failed_re_restore_leaves_no_half_directory_and_the_replica_goes_on ... ok
+test replica::open::tests::missing_position_file_at_open_restores_into_the_replica_dir ... ok
+test replica::open::tests::a_reader_holding_a_transaction_across_the_swap_gets_an_error_or_its_snapshot_and_nothing_worse ... ok
+test replica::open::tests::follows_across_seals_and_resumes_after_them ... ok
+test replica::open::tests::lagging_past_trim_grace_re_restores_warns_once_and_catches_up ... ok
+test replica::open::tests::refusals_before_the_restore_leave_the_directory_untouched ... ok
+test replica::open::tests::a_second_re_restore_removes_the_first_new_copy ... ok
+test replica::open::tests::a_refused_directory_says_what_to_delete ... ok
+test replica::open::tests::open_replica_follows_writer_commits ... ok
+test replica::open::tests::a_directory_that_is_not_a_replicas_is_refused_and_left_alone ... ok
+test replica::open::tests::a_crash_after_any_removal_of_the_clear_still_re_restores_at_the_next_open ... ok
+test replica::open::tests::no_warning_when_a_notification_came_before_the_first_slow_poll ... ok
+test replica::open::tests::reopen_resumes_from_the_position_file ... ok
+test replica::open::tests::old_connection_outside_a_transaction_keeps_working_new_connections_see_new_copy ... ok
+test replica::open::tests::second_open_of_same_dir_is_refused_by_lock ... ok
+test replica::open::tests::re_restore_removes_the_old_copy_sends_nothing_and_a_reopen_follows_the_new_one ... ok
+test replica::open::tests::replica_sends_zero_put_or_delete ... ok
+test replica::open::tests::the_dirty_file_is_compacted_at_open ... ok
+test replica::open::tests::stats_after_re_restore_shows_count_reason_and_jumped_position ... ok
+test replica::open::tests::slow_poll_alone_is_correct_and_warns_once ... ok
+test replica::open::tests::wrong_key_refused_at_open_before_any_follow ... ok
+test replica::open::tests::waker_burst_coalesces_to_one_extra_pass ... ok
+test replica::open::tests::files_without_a_local_state_are_refused_and_left_alone ... ok
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 633 filtered out; finished in 3.02s
+
+./scripts/test.sh unit: exit 0 (fmt, clippy -D warnings, 663 buckwal lib tests + the other suites)

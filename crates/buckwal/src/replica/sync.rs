@@ -44,6 +44,9 @@ pub(crate) mod reason {
     pub(crate) const MVCC: &str = "mvcc";
     pub(crate) const INTEGRITY: &str = "integrity";
     pub(crate) const CORRUPT: &str = "corrupt";
+    /// The `reason` of the `replica fell behind, restoring again` WARN (`Reason::Trimmed` and
+    /// `Reason::Gap`; a `Conflict` uses `CONFLICT`).
+    pub(crate) const TRIMMED: &str = "trimmed";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +346,10 @@ impl Follower {
     /// Frames of the generation applied (or already in `app.db`).
     pub(crate) fn applied_frames(&self) -> u64 {
         self.applied
+    }
+
+    pub(crate) fn replica_id(&self) -> &str {
+        &self.replica_id
     }
 
     pub(crate) fn last_seq(&self) -> u64 {

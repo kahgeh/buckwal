@@ -98,8 +98,10 @@ impl Drop for DirGuard {
 struct Open {
     engine: Engine,
     trimmer: Option<JoinHandle<()>>,
-    /// Dropped last: the lock outlives every file of the engine.
-    guard: DirGuard,
+    /// Dropped last: the lock outlives every file of the engine. A replica's database has
+    /// none: its `Replica` holds the directory lock for its whole life, across the swaps of
+    /// the copy it follows.
+    guard: Option<DirGuard>,
 }
 
 /// Shared by every [`Database`] handle and [`Connection`] of one open.
@@ -375,7 +377,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             open: Mutex::new(Some(Open {
                 engine,
                 trimmer,
-                guard,
+                guard: Some(guard),
             })),
             connections: AtomicUsize::new(0),
             batching: Mutex::new(config.batching),
@@ -395,7 +397,6 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
 pub(crate) fn replica_database(
     store: Arc<dyn ObjectStore>,
     engine: Engine,
-    guard: DirGuard,
     cfg: &EngineConfig,
 ) -> Database {
     let uploader = engine.uploader.clone();
@@ -412,7 +413,7 @@ pub(crate) fn replica_database(
             open: Mutex::new(Some(Open {
                 engine,
                 trimmer: None,
-                guard,
+                guard: None,
             })),
             connections: AtomicUsize::new(0),
             batching: Mutex::new(Batching::Off),

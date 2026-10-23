@@ -17,6 +17,9 @@ pub(crate) const DIRTY_FILE: &str = "app.db-dirty";
 pub(crate) const RESTORING_FILE: &str = "app.db-restoring";
 /// A read replica's position file (generation, stage, offset, replica id).
 pub(crate) const REPLICA_FILE: &str = "app.db-replica";
+/// Names the sibling directory a replica's current copy lives in, once a re-restore has
+/// moved it there (`replica::open`). Absent: the copy is in the directory itself.
+pub(crate) const REPLICA_AT_FILE: &str = "app.db-replica-at";
 /// The exclusive lock of the process that has the directory open (D4).
 pub(crate) const LOCK_FILE: &str = "durable.lock";
 

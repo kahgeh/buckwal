@@ -656,7 +656,7 @@ fn staging_dir(dir: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!("{prefix}{}-{nanos}", std::process::id())))
 }
 
-fn fsync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))
