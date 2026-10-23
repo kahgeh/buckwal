@@ -1229,7 +1229,12 @@ D1–D10 are the design decisions behind stage 1; their evidence is turso_core 0
 - `docs/`: `architecture.md` (components, interfaces, decisions), `glossary.md` (every term, with the words not to use), `adr/` (architecture decision records, with an index), `mvcc-recon.md` (the MVCC finding and design, with `mvcc-recon-probes/`) and `read-replicas-recon.md`.
 - `scripts/`: `test.sh`, `rustfs.sh` (local S3), `tls-material.sh` (test CA, certificate and key), `s3-gate.sh`, `otel-check.sh` (the ClickHouse check).
 - `results/`: `rustfs-gate.txt` (conditional-PUT gate), `rustfs-gate-tls.txt` (the same gate over HTTPS), `durable-core.txt` (stage 1 measurements), `batching-knob.txt` (stage 2 measurements), `writer-lease.txt` (stage 3 measurements) `durable-transport.txt` (stage 4 measurements) and `durable-server.txt` (the server's full test run, the canonical full run) and `mvcc-durability.txt` (the MVCC work's before and after logs).
+- `LICENSE`: buckwal's MIT licence.
 - `LICENSES/`: third-party licences.
+
+## Licence
+
+buckwal is MIT licensed (see [`LICENSE`](LICENSE)). The parts derived from turso keep turso's MIT notice ([`LICENSES/turso-MIT.md`](LICENSES/turso-MIT.md)).
 
 ## Provenance
 
