@@ -151,3 +151,35 @@ pub(crate) fn head_code(ik: &IntegrityKey, fields: &[u8]) -> [u8; 32] {
 pub(crate) fn head_verifies(ik: &IntegrityKey, fields: &[u8], code: &[u8]) -> bool {
     ik.verify(&[b"head", fields], code)
 }
+
+/// The length of a head's `key_check`.
+pub(crate) const KEY_CHECK_LEN: usize = 16;
+
+/// The `Encryption` error of a head whose `key_check` is not this key's: a wrong key, not
+/// tampering (no `integrity check failed` record). Names the setting, never key material.
+pub(crate) fn wrong_key() -> Error {
+    Error::Encryption(
+        "the key in BUCKWAL_ENCRYPTION_KEY_FILE is not the key this bucket was written with".into(),
+    )
+}
+
+/// The `Encryption` error of an encrypted open of a head that has no integrity codes.
+pub(crate) fn no_codes() -> Error {
+    Error::Encryption(
+        "the bucket has no integrity codes: it is plaintext, or was encrypted before this version"
+            .into(),
+    )
+}
+
+/// A head's `key_check`: the first 16 bytes of the integrity code over the fixed kind
+/// `key_check`. It says which key the bucket was written with and reveals nothing of the key.
+pub(crate) fn key_check(ik: &IntegrityKey) -> [u8; KEY_CHECK_LEN] {
+    let mut out = [0u8; KEY_CHECK_LEN];
+    out.copy_from_slice(&ik.code(&[b"key_check"])[..KEY_CHECK_LEN]);
+    out
+}
+
+/// Whether `got` is this key's `key_check`; constant time.
+pub(crate) fn key_check_matches(ik: &IntegrityKey, got: &[u8]) -> bool {
+    got.len() == KEY_CHECK_LEN && ik.verify_truncated(&[b"key_check"], got)
+}

@@ -16,9 +16,13 @@ enum Mode {
 const MODES: [Mode; 2] = [Mode::Wal, Mode::Mvcc];
 
 fn cfg_for(mode: Mode, dir: &Path, k: &TempDir) -> Config {
+    cfg_with(mode, dir, k, &key_hex())
+}
+
+fn cfg_with(mode: Mode, dir: &Path, k: &TempDir, hex: &str) -> Config {
     match mode {
-        Mode::Wal => enc_config(dir, k, &key_hex()),
-        Mode::Mvcc => mvcc_enc(dir, k, &key_hex()),
+        Mode::Wal => enc_config(dir, k, hex),
+        Mode::Mvcc => mvcc_enc(dir, k, hex),
     }
 }
 
@@ -86,8 +90,19 @@ enum Reader {
 
 /// Rows read (0 for a reader that reads none).
 fn read_with(reader: Reader, mode: Mode, store: &Arc<MemStore>, k: &TempDir) -> Result<usize> {
+    read_with_key(reader, mode, store, k, &key_hex())
+}
+
+/// `read_with` with the key `hex` (written to `k/key`).
+fn read_with_key(
+    reader: Reader,
+    mode: Mode,
+    store: &Arc<MemStore>,
+    k: &TempDir,
+    hex: &str,
+) -> Result<usize> {
     let t = tempdir();
-    let mut c = cfg_for(mode, &fresh(&t), k);
+    let mut c = cfg_with(mode, &fresh(&t), k, hex);
     c.prefetch = false;
     match reader {
         Reader::ReadOnly => {
@@ -102,7 +117,7 @@ fn read_with(reader: Reader, mode: Mode, store: &Arc<MemStore>, k: &TempDir) -> 
         Reader::Verify => {
             let dir = fresh(&t);
             restore_with_store(&c, store.clone(), &dir)?;
-            let db = open_read_only_with_store(cfg_for(mode, &dir, k), store.clone())?;
+            let db = open_read_only_with_store(cfg_with(mode, &dir, k, hex), store.clone())?;
             let conn = db.connect()?;
             let rows = conn.query("SELECT id, v FROM t ORDER BY id", &[])?;
             conn.query("PRAGMA integrity_check", &[])?;
@@ -345,36 +360,6 @@ fn a_page_object_shorter_than_a_code_fails_without_a_panic() {
     }
 }
 
-/// An encrypted database under a format 1 or 2 head: refused by this build.
-#[test]
-fn an_encrypted_open_refuses_a_head_written_before_integrity_codes() {
-    for mode in MODES {
-        let store = mem();
-        let k = tempdir();
-        let _w = writer(mode, &store, &k);
-        let key = keys().head();
-        let h = head(&*store);
-        for format in [1u32, 2] {
-            let old = Head {
-                format,
-                journal_mode: if format == 1 {
-                    JournalMode::Wal
-                } else {
-                    JournalMode::Mvcc
-                },
-                ..h.clone()
-            };
-            put(&store, &key, &old.encode());
-            match read_with(Reader::Restore, mode, &store, &k) {
-                Err(Error::Corrupt(m)) => {
-                    assert_eq!(m, "integrity: bucket written before integrity codes")
-                }
-                r => panic!("{mode:?} format {format}: {r:?}"),
-            }
-        }
-    }
-}
-
 /// The encrypted bucket's head is format 3 in both modes, naming the mode; a plaintext open
 /// of it is refused.
 #[test]
@@ -505,6 +490,200 @@ fn a_format_3_head_without_its_integrity_field_fails_the_read() {
                 std::slice::from_ref(&key),
                 &format!("{mode:?} stripped head, {r:?}"),
             );
+        }
+    }
+}
+
+// A wrong key is not tampering (spec rev 7): `key_check` says which key the bucket was written
+// with, and is compared at every open before any integrity code.
+
+const WRONG_KEY: &str =
+    "the key in BUCKWAL_ENCRYPTION_KEY_FILE is not the key this bucket was written with";
+const NO_CODES: &str =
+    "the bucket has no integrity codes: it is plaintext, or was encrypted before this version";
+
+const ALL_READERS: [Reader; 5] = [
+    Reader::ReadOnly,
+    Reader::Restore,
+    Reader::Takeover,
+    Reader::Gc,
+    Reader::Verify,
+];
+
+/// The `integrity check failed` records emitted on this thread while `f` runs.
+fn integrity_records<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    use crate::telemetry::testing::Capture;
+    let cap = Capture::new();
+    let out = tracing::subscriber::with_default(cap.subscriber(), f);
+    let n = cap
+        .spans()
+        .events
+        .iter()
+        .filter(|e| e.field("message") == Some("integrity check failed"))
+        .count();
+    (out, n)
+}
+
+/// The refusal is `Encryption(want)` and says nothing of any key.
+fn assert_encryption(r: Result<usize>, want: &str, what: &str) {
+    match r {
+        Err(Error::Encryption(m)) => {
+            assert_eq!(m, want, "{what}");
+            assert!(
+                !m.contains(&key_hex()) && !m.contains(&"22".repeat(32)),
+                "{what}"
+            );
+        }
+        r => panic!("{what}: expected Encryption({want:?}), got {r:?}"),
+    }
+}
+
+fn edit_head(store: &MemStore, f: impl Fn(&str) -> String) {
+    let key = keys().head();
+    let real = String::from_utf8(body(store, &key)).unwrap();
+    let edited = f(&real);
+    assert_ne!(edited, real, "the edit changed nothing: {real}");
+    put(store, &key, edited.as_bytes());
+}
+
+/// The head with its `key_check` value's first hex digit changed.
+fn flip_key_check(head: &str) -> String {
+    let Some(at) = head.find("\"key_check\":\"").map(|i| i + 13) else {
+        return head.to_string();
+    };
+    let c = &head[at..at + 1];
+    let flipped = if c == "0" { "1" } else { "0" };
+    format!("{}{flipped}{}", &head[..at], &head[at + 1..])
+}
+
+#[test]
+fn a_different_valid_key_is_the_wrong_key_and_not_tampering() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        let other = tempdir();
+        for r in ALL_READERS {
+            let (got, records) =
+                integrity_records(|| read_with_key(r, mode, &store, &other, &"22".repeat(32)));
+            let what = format!("{mode:?} {r:?}");
+            assert_encryption(got, WRONG_KEY, &what);
+            assert_eq!(records, 0, "{what}: a wrong key logged an integrity record");
+        }
+    }
+}
+
+#[test]
+fn a_key_on_a_plaintext_bucket_has_no_integrity_codes() {
+    let store = mem();
+    let a = closed_writer(&store, 10);
+    drop(a);
+    for takeover in [false, true] {
+        let k = tempdir();
+        let t = tempdir();
+        let cfg = enc_config(&fresh(&t), &k, &key_hex());
+        let (got, records) = integrity_records(|| {
+            if takeover {
+                crate::takeover_with_store(cfg, store.clone()).map(|_| 0)
+            } else {
+                restore_with_store(&cfg, store.clone(), &fresh(&t)).map(|_| 0)
+            }
+        });
+        assert_encryption(got, NO_CODES, &format!("takeover {takeover}"));
+        assert_eq!(records, 0, "takeover {takeover}");
+        no_database_files(&fresh(&t));
+    }
+}
+
+#[test]
+fn an_encrypted_open_refuses_a_head_written_before_integrity_codes() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        let key = keys().head();
+        let h = head(&*store);
+        for format in [1u32, 2] {
+            let old = Head {
+                format,
+                journal_mode: if format == 1 {
+                    JournalMode::Wal
+                } else {
+                    JournalMode::Mvcc
+                },
+                ..h.clone()
+            };
+            put(&store, &key, &old.encode());
+            let (got, records) = integrity_records(|| read_with(Reader::Restore, mode, &store, &k));
+            assert_encryption(got, NO_CODES, &format!("{mode:?} format {format}"));
+            assert_eq!(records, 0);
+        }
+    }
+}
+
+/// Whoever edits `key_check` (or removes it) gets the wrong-key error at open, never an object
+/// accepted unchecked, and nothing is restored.
+#[test]
+fn an_edited_key_check_is_the_wrong_key_error_and_nothing_is_restored() {
+    for mode in MODES {
+        for strip in [false, true] {
+            let store = mem();
+            let k = tempdir();
+            let _w = writer(mode, &store, &k);
+            edit_head(&store, |h| {
+                if strip {
+                    let at = h
+                        .find(",\"key_check\"")
+                        .expect("a format 3 head has key_check");
+                    let end = h[at + 1..].find(',').map_or(h.len() - 1, |i| at + 1 + i);
+                    format!("{}{}", &h[..at], &h[end..])
+                } else {
+                    flip_key_check(h)
+                }
+            });
+            for r in ALL_READERS {
+                let (got, records) = integrity_records(|| read_with(r, mode, &store, &k));
+                let what = format!("{mode:?} strip {strip} {r:?}");
+                assert_encryption(got, WRONG_KEY, &what);
+                assert_eq!(records, 0, "{what}");
+            }
+            let t = tempdir();
+            let dir = fresh(&t);
+            let r = restore_with_store(&cfg_for(mode, &dir, &k), store.clone(), &dir);
+            assert!(matches!(r, Err(Error::Encryption(_))), "{r:?}");
+            no_database_files(&dir);
+        }
+    }
+}
+
+/// After a good open, a head that fails its code or its `key_check` is tampering: `Corrupt`
+/// and one record (a later head read is the GC thread's, here a `gc_once` pass).
+#[test]
+fn after_a_good_open_an_edited_head_or_key_check_is_tampering() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        let enc_keys = cfg_for(mode, _w.path(), &k).keys().unwrap();
+        let key = keys().head();
+        let good = body(&store, &key);
+        let pass = || crate::gc::gc_once(&*store, &enc_keys, Duration::ZERO, None);
+        pass().unwrap_or_else(|e| panic!("{mode:?}: the untouched head: {e}"));
+        for what in ["key_check", "epoch"] {
+            put(&store, &key, &good);
+            edit_head(&store, |h| match what {
+                "epoch" => {
+                    let e = head(&*store).epoch;
+                    h.replace(&format!("\"epoch\":{e}"), &format!("\"epoch\":{}", e + 1))
+                }
+                _ => flip_key_check(h),
+            });
+            let (got, records) = integrity_records(pass);
+            match got {
+                Err(Error::Corrupt(m)) => assert_eq!(m, format!("integrity: {key}"), "{what}"),
+                r => panic!("{mode:?} {what}: expected Corrupt, got {:?}", r.map(|_| ())),
+            }
+            assert_eq!(records, 1, "{mode:?} {what}");
         }
     }
 }

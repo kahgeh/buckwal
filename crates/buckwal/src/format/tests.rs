@@ -1128,6 +1128,54 @@ mod integrity_codes {
         }
     }
 
+    /// `key_check`: 16 bytes under the key, in the coded fields; at open a different one is the
+    /// wrong-key error before any code is looked at, and after a good open it is tampering.
+    #[test]
+    fn key_check_is_compared_at_open_before_the_integrity_code() {
+        let k = coded(1);
+        let other = coded(2);
+        let h = head3(JournalMode::Mvcc);
+        let body = k.encode_head(&h);
+        let text = String::from_utf8(body.clone()).unwrap();
+        let kc = hex::encode(super::super::integrity::key_check(&ik(1)));
+        assert_eq!(kc.len(), 32);
+        assert!(
+            text.contains(&format!(",\"key_check\":\"{kc}\",\"integrity\":")),
+            "{text}"
+        );
+        assert_ne!(kc, hex::encode(super::super::integrity::key_check(&ik(2))));
+        assert_eq!(k.decode_head_open(&body).unwrap(), h);
+        let wrong = Error::Encryption(
+            "the key in BUCKWAL_ENCRYPTION_KEY_FILE is not the key this bucket was written with"
+                .into(),
+        );
+        let cap = Capture::new();
+        let got = tracing::subscriber::with_default(cap.subscriber(), || {
+            let flipped = text.replace(&kc, &format!("{}{}", "0", &kc[1..]));
+            let stripped = text.replace(&format!(",\"key_check\":\"{kc}\""), "");
+            [
+                other.decode_head_open(&body),
+                k.decode_head_open(flipped.as_bytes()),
+                k.decode_head_open(stripped.as_bytes()),
+            ]
+        });
+        for r in got {
+            assert_eq!(r, Err(wrong.clone()));
+        }
+        assert!(cap.spans().events.is_empty(), "a wrong key logged a record");
+        // Matching key_check, wrong code: tampering.
+        let edited = text.replace("\"epoch\":3", "\"epoch\":4");
+        assert_failed(k.decode_head_open(edited.as_bytes()), "p/head");
+        // After a good open the same failures are tampering.
+        assert_failed(other.decode_head(&body), "p/head");
+        let flipped = text.replace(&kc, &format!("{}{}", "0", &kc[1..]));
+        assert_failed(k.decode_head(flipped.as_bytes()), "p/head");
+        // for_open keys read as an open does.
+        assert_eq!(other.for_open().decode_head(&body), Err(wrong));
+        // The error and a key_check never carry key material.
+        assert!(!format!("{:?}", other.decode_head_open(&body)).contains(&kc));
+    }
+
     #[test]
     fn coded_head_refused_by_older_decoders() {
         let body = coded(1).encode_head(&head3(JournalMode::Mvcc));
@@ -1149,12 +1197,16 @@ mod integrity_codes {
             ..v1.clone()
         };
         for h in [v1, v2] {
-            assert_eq!(
-                k.decode_head(&h.encode()),
-                Err(Error::Corrupt(
-                    "integrity: bucket written before integrity codes".into()
-                ))
-            );
+            for r in [k.decode_head(&h.encode()), k.decode_head_open(&h.encode())] {
+                assert_eq!(
+                    r,
+                    Err(Error::Encryption(
+                        "the bucket has no integrity codes: it is plaintext, or was encrypted \
+                         before this version"
+                            .into()
+                    ))
+                );
+            }
         }
     }
 

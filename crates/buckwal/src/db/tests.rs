@@ -3023,11 +3023,14 @@ fn open_with_wrong_key_is_refused() {
     ));
     assert!(m.contains("does not decrypt"), "{m}");
     assert!(!m.contains(&key_hex()) && !m.contains(&wrong_hex), "{m}");
-    // A fresh directory restores first, and the head's integrity code does not verify.
-    assert_head_integrity(open_with_store(
+    // A fresh directory restores first: the head's key_check is not this key's, the same
+    // wrong-key error (not tampering: no integrity record).
+    let m = encryption_err(open_with_store(
         enc_config(&fresh(&tempdir()), &wrong, &wrong_hex),
         store.clone(),
     ));
+    assert_eq!(m, WRONG_KEY_CHECK);
+    assert!(!m.contains(&key_hex()) && !m.contains(&wrong_hex), "{m}");
 }
 
 /// Every object in the bucket with its ETag.
@@ -3319,15 +3322,11 @@ fn refused_takeover_with(
     r
 }
 
-/// The error of a restore-first open or takeover that fails to verify the head with the key it
-/// was given: a wrong key and a tampered head are the same to the integrity code, so it is
-/// `Corrupt("integrity: <head key>")` and not the `Encryption` error of the local-page-1 path.
-fn assert_head_integrity<T: std::fmt::Debug>(r: Result<T>) {
-    match r {
-        Err(Error::Corrupt(m)) => assert_eq!(m, format!("integrity: {PREFIX}/head")),
-        r => panic!("expected Corrupt(integrity: head), got {r:?}"),
-    }
-}
+/// A restore-first open or takeover with a different valid key: the head's `key_check` is not
+/// this key's (`Encryption`, no integrity record), where a directory that holds page 1 says
+/// "does not decrypt".
+const WRONG_KEY_CHECK: &str =
+    "the key in BUCKWAL_ENCRYPTION_KEY_FILE is not the key this bucket was written with";
 
 #[test]
 fn takeover_with_a_mismatched_key_is_refused_before_the_claim() {
@@ -3340,9 +3339,8 @@ fn takeover_with_a_mismatched_key_is_refused_before_the_claim() {
     let c = db.connect().unwrap();
 
     let wrong = tempdir();
-    assert_head_integrity(refused_takeover_with(&store, |d| {
-        enc_config(d, &wrong, &"22".repeat(32))
-    }));
+    let m = refused_takeover(&store, |d| enc_config(d, &wrong, &"22".repeat(32)));
+    assert_eq!(m, WRONG_KEY_CHECK);
     let m = refused_takeover(&store, |d| {
         let mut cfg = enc_config(d, &k, &key_hex());
         cfg.encryption_cipher = "aes256gcm".into();
@@ -3354,9 +3352,8 @@ fn takeover_with_a_mismatched_key_is_refused_before_the_claim() {
     // Page 1 now in the log too: still refused.
     c.execute("CREATE TABLE u(x)", &[]).unwrap();
     let wrong = tempdir();
-    assert_head_integrity(refused_takeover_with(&store, |d| {
-        enc_config(d, &wrong, &"22".repeat(32))
-    }));
+    let m = refused_takeover(&store, |d| enc_config(d, &wrong, &"22".repeat(32)));
+    assert_eq!(m, WRONG_KEY_CHECK);
     insert(&c, 62).unwrap();
 
     // The right key takes over as before.
@@ -3378,15 +3375,14 @@ fn takeover_with_a_key_on_a_plaintext_database_is_refused() {
     let db = open_mem(&store, a.path());
     let c = db.connect().unwrap();
     let k = tempdir();
-    // The restore reads the head first: a plaintext bucket's head (format 1) under a key is
-    // "written before integrity codes" (the local-page-1 path says "cannot be encrypted in
-    // place", `open_with_key_on_plaintext_database_is_refused`).
-    match refused_takeover_with(&store, |d| enc_config(d, &k, &key_hex())) {
-        Err(Error::Corrupt(m)) => {
-            assert_eq!(m, "integrity: bucket written before integrity codes")
-        }
-        r => panic!("{r:?}"),
-    }
+    // The restore reads the head first: a plaintext bucket's head (format 1) under a key has
+    // no integrity codes (the local-page-1 path says "cannot be encrypted in place",
+    // `open_with_key_on_plaintext_database_is_refused`).
+    let m = refused_takeover(&store, |d| enc_config(d, &k, &key_hex()));
+    assert_eq!(
+        m,
+        "the bucket has no integrity codes: it is plaintext, or was encrypted before this version"
+    );
     insert(&c, 11).unwrap();
     assert_eq!(ids(&c), (1..=11).collect::<Vec<_>>());
 }

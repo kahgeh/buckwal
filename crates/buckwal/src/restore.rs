@@ -169,7 +169,7 @@ pub(crate) fn sealed_page_one(
     retry: &RetryPolicy,
 ) -> Result<Option<Vec<u8>>> {
     let retries = AtomicU64::new(0);
-    let head = keys.decode_head(&get(store, retry, &retries, &keys.head())?)?;
+    let head = keys.decode_head_open(&get(store, retry, &retries, &keys.head())?)?;
     head.manifest
         .map(|g| manifest_page_one(store, keys, g, retry, &retries))
         .transpose()
@@ -489,7 +489,7 @@ fn restore_files(
     let head_key = keys.head();
     let head_obj = counted(retries, retry, &head_key, || store.get(&head_key))?
         .ok_or_else(|| Error::NotFound(head_key.clone()))?;
-    let head = keys.decode_head(&head_obj.body)?;
+    let head = keys.decode_head_open(&head_obj.body)?;
     // The mode is checked on the head alone first: nothing is fetched for a mismatch.
     refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
     let sealed_page1 = match head.manifest {

@@ -391,7 +391,7 @@ pub(crate) fn take_over_counted(
         let Some(current) = retry_rest(retry, start, retries, &key, || store.get(&key))? else {
             return Err(restore_again());
         };
-        let head = keys.decode_head(&current.body)?;
+        let head = keys.decode_head_open(&current.body)?;
         if head.writer_id == writer_id {
             return Ok((head, current.etag, None));
         }
@@ -717,7 +717,7 @@ impl Bucket {
         let sent = Stamp::now();
         let obj = retrying(&counters, &retry, &key, || store.get(&key))?
             .ok_or_else(|| Error::NotFound("head".into()))?;
-        let head = keys.decode_head(&obj.body)?;
+        let head = keys.decode_head_open(&obj.body)?;
         let refused = if head.writer_id != writer_id {
             Some(format!(
                 "head names writer {:?}, not {writer_id:?}",

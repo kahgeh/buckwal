@@ -94,6 +94,12 @@ impl IntegrityKey {
         self.mac(parts).verify_slice(code).is_ok()
     }
 
+    /// Whether `code`, shorter than a full code, is the first bytes of the integrity code over
+    /// `parts`; constant time in the bytes compared. False for an empty or over-long `code`.
+    pub(crate) fn verify_truncated(&self, parts: &[&[u8]], code: &[u8]) -> bool {
+        self.mac(parts).verify_truncated_left(code).is_ok()
+    }
+
     #[cfg(test)]
     fn bytes(&self) -> &[u8] {
         &self.0

@@ -92,3 +92,59 @@ test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 519 filtered out; f
 ```
 
 `./scripts/test.sh unit`: exit 0; buckwal lib 543 passed (including `db::tests::close_stops_prefetch_before_releasing_the_dir`), the rest of the workspace passed.
+
+## key_check (Task 5b, spec rev 7)
+
+### Before (HEAD c60bd16, tests added first; 5 of 16 fail)
+
+```
+---- db::tests::integrity::a_key_on_a_plaintext_bucket_has_no_integrity_codes stdout ----
+thread 'db::tests::integrity::a_key_on_a_plaintext_bucket_has_no_integrity_codes' (171085886) panicked at crates/buckwal/src/db/tests/integrity.rs:534:14:
+takeover false: expected Encryption("the bucket has no integrity codes: it is plaintext, or was encrypted before this version"), got Err(Corrupt("integrity: bucket written before integrity codes"))
+--
+---- db::tests::integrity::after_a_good_open_an_edited_head_or_key_check_is_tampering stdout ----
+thread 'db::tests::integrity::after_a_good_open_an_edited_head_or_key_check_is_tampering' (171085889) panicked at crates/buckwal/src/db/tests/integrity.rs:542:5:
+assertion `left != right` failed: the edit changed nothing: {"format":3,"generation":3,"manifest":"manifest/0000000002","writer_id":"3e3e02acd22de3d87d4221be62ae668c","epoch":1,"journal_mode":"wal","lease_ms":30000,"request_timeout_ms":10000,"integrity":"df4aa353029a321d69b787311969b8738ae7c9c302604c37d430ba58e6635aa2"}
+--
+---- db::tests::integrity::an_edited_key_check_is_the_wrong_key_error_and_nothing_is_restored stdout ----
+thread 'db::tests::integrity::an_edited_key_check_is_the_wrong_key_error_and_nothing_is_restored' (171085891) panicked at crates/buckwal/src/db/tests/integrity.rs:542:5:
+assertion `left != right` failed: the edit changed nothing: {"format":3,"generation":3,"manifest":"manifest/0000000002","writer_id":"9acc285e7bbbf12ea28d7489fbe8c3ba","epoch":1,"journal_mode":"wal","lease_ms":30000,"request_timeout_ms":10000,"integrity":"604f887c9ac797af77bce99cd88c576da1e873b413a3e724a537e28315ec7825"}
+--
+---- db::tests::integrity::an_encrypted_open_refuses_a_head_written_before_integrity_codes stdout ----
+thread 'db::tests::integrity::an_encrypted_open_refuses_a_head_written_before_integrity_codes' (171085894) panicked at crates/buckwal/src/db/tests/integrity.rs:534:14:
+Wal format 1: expected Encryption("the bucket has no integrity codes: it is plaintext, or was encrypted before this version"), got Err(Corrupt("integrity: bucket written before integrity codes"))
+---- db::tests::integrity::a_different_valid_key_is_the_wrong_key_and_not_tampering stdout ----
+thread 'db::tests::integrity::a_different_valid_key_is_the_wrong_key_and_not_tampering' (171085884) panicked at crates/buckwal/src/db/tests/integrity.rs:534:14:
+Wal ReadOnly: expected Encryption("the key in BUCKWAL_ENCRYPTION_KEY_FILE is not the key this bucket was written with"), got Err(Corrupt("integrity: t/head"))
+--
+test result: FAILED. 11 passed; 5 failed; 0 ignored; 0 measured; 534 filtered out; finished in 3.46s
+error: test failed, to rerun pass `-p buckwal --lib`
+```
+
+A different valid key gave Corrupt("integrity: t/head") (and the paging ERROR record); a key on a format 1 head gave the old Corrupt text; the head had no key_check to edit.
+
+### After (16 of 16 pass)
+
+```
+test db::tests::integrity::a_key_on_a_plaintext_bucket_has_no_integrity_codes ... ok
+test db::tests::integrity::an_older_generations_page_put_back_fails_the_read ... ok
+test db::tests::integrity::after_a_good_open_an_edited_head_or_key_check_is_tampering ... ok
+test db::tests::integrity::an_encrypted_bucket_has_a_format_3_head_and_a_keyless_open_is_refused ... ok
+test db::tests::integrity::gc_over_a_tampered_manifest_fails ... ok
+test db::tests::integrity::an_edited_head_fails_the_read ... ok
+test db::tests::integrity::a_format_3_head_without_its_integrity_field_fails_the_read ... ok
+test db::tests::integrity::an_edited_manifest_fails_the_read ... ok
+test db::tests::integrity::an_encrypted_open_refuses_a_head_written_before_integrity_codes ... ok
+test db::tests::integrity::a_page_object_shorter_than_a_code_fails_without_a_panic ... ok
+test db::tests::integrity::a_record_replayed_at_another_seq_fails_the_read ... ok
+test db::tests::integrity::a_different_valid_key_is_the_wrong_key_and_not_tampering ... ok
+test db::tests::integrity::swapped_pages_fail_the_read ... ok
+test db::tests::integrity::untouched_encrypted_bucket_restores_and_verifies ... ok
+test db::tests::integrity::verify_fails_over_tampered_objects ... ok
+test db::tests::integrity::an_edited_key_check_is_the_wrong_key_error_and_nothing_is_restored ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 535 filtered out; finished in 4.66s
+```
+
+Also: format::tests::integrity_codes::key_check_is_compared_at_open_before_the_integrity_code (open vs later read, no record on wrong key, key_check never in an error). Reconciled: open_with_wrong_key_is_refused, takeover_with_a_mismatched_key_is_refused_before_the_claim, takeover_with_a_key_on_a_plaintext_database_is_refused, encrypted_open_refuses_heads_written_before_integrity_codes (format and db tests).
+
+`./scripts/test.sh unit`: exit 0.

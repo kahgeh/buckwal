@@ -15,6 +15,8 @@ use std::sync::Arc;
 pub(crate) struct Keys {
     prefix: String,
     integrity: Option<Arc<IntegrityKey>>,
+    /// Whether `decode_head` is an open's first read of the bucket (`for_open`).
+    opening: bool,
 }
 
 /// Parse exactly `width` ASCII digits.
@@ -30,6 +32,7 @@ impl Keys {
         Keys {
             prefix: prefix.to_string(),
             integrity: None,
+            opening: false,
         }
     }
 
@@ -37,6 +40,15 @@ impl Keys {
     pub(crate) fn with_integrity(mut self, ik: Option<IntegrityKey>) -> Self {
         self.integrity = ik.map(Arc::new);
         self
+    }
+
+    /// These keys for a process's first read of the bucket (an open, a standalone GC): its head
+    /// read compares `key_check` as an open does (`Head::decode_checked`).
+    pub(crate) fn for_open(&self) -> Self {
+        Keys {
+            opening: true,
+            ..self.clone()
+        }
     }
 
     /// Whether this database is encrypted (its objects carry integrity codes).
@@ -61,9 +73,17 @@ impl Keys {
         }
     }
 
-    /// The head object `body`, checked (`Head::decode_checked`).
+    /// The head object `body` as a read after a good open sees it: a failing `key_check` or
+    /// integrity code is tampering (`Head::decode_checked`). Under `for_open` keys, as
+    /// `decode_head_open`.
     pub(crate) fn decode_head(&self, body: &[u8]) -> Result<Head> {
-        Head::decode_checked(body, &self.head(), self.integrity.as_deref())
+        Head::decode_checked(body, &self.head(), self.integrity.as_deref(), self.opening)
+    }
+
+    /// The head object `body` as an open reads it: `key_check` is compared first, and a
+    /// different one is the wrong-key `Encryption` error and no record.
+    pub(crate) fn decode_head_open(&self, body: &[u8]) -> Result<Head> {
+        Head::decode_checked(body, &self.head(), self.integrity.as_deref(), true)
     }
 
     /// The bytes of the log record at `log/<generation>/<seq>`.

@@ -85,7 +85,7 @@ pub fn gc_with_store(config: &Config, store: Arc<dyn ObjectStore>) -> Result<GcR
     let start = Instant::now();
     config.validate()?;
     let min_age = config.engine(false).gc_min_age();
-    let pass = gc_once(&*store, &config.keys()?, min_age, None)?;
+    let pass = gc_once(&*store, &config.keys()?.for_open(), min_age, None)?;
     Ok(GcReport {
         generation: pass.generation,
         trimmed_against: pass.trimmed_against,
