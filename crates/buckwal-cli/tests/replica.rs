@@ -472,7 +472,7 @@ enum Kill {
 /// same directory: its first reading is not below the last count the matrix saw (rows never
 /// step back across a resume), it reaches the writer's rows (count and id sum),
 /// `integrity_check` is ok, and the store sent no PUT or DELETE. The test fails when fewer
-/// than 5 of the 7 seal-trigger rounds (all but the mid-apply round) were caught after up to 4
+/// than 6 of the 7 seal-trigger rounds (all but the mid-apply round) were caught after up to 4
 /// attempts each.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
@@ -628,10 +628,10 @@ fn replica_kill_matrix() {
             }
         }
     }
-    // With the retries every trigger is normally caught; 5 of the 7 seal-trigger rounds (all
-    // but the mid-apply round) tolerate two stubborn ones.
+    // With the retries every trigger is normally caught; 6 of the 7 seal-trigger rounds (all
+    // but the mid-apply round) tolerate one stubborn one.
     assert!(
-        caught >= 5,
+        caught >= 6,
         "only {caught} of the 7 seal-trigger rounds were caught"
     );
     w.close().expect("close writer");

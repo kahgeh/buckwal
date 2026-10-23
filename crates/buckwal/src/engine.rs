@@ -71,7 +71,7 @@ pub(crate) struct Prefetch {
 }
 
 impl Engine {
-    /// Ask the prefetch thread to stop; `drop` still joins it.
+    /// SIGNAL the prefetch thread to stop. It does not join: `Engine::drop` does.
     pub(crate) fn stop_prefetch(&self) {
         if let Some(p) = &self.prefetch {
             p.stop.store(true, SeqCst);

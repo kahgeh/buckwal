@@ -923,7 +923,8 @@ impl Runner {
                 }
                 let old = std::mem::replace(&mut self.data, copy);
                 let old_db = self.current.swap(db);
-                // Readers still on the old copy keep its engine; its prefetch need not go on
+                // Readers still on the old copy keep its engine; signal its prefetch thread to
+                // stop (no join: the engine's drop joins it) rather than go on fetching pages
                 // fetching pages for a copy whose files are about to be removed.
                 old_db.shared.stop_prefetch();
                 // The old apply connection goes first, then the handle; readers still on the

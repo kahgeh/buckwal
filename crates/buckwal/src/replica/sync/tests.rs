@@ -1014,6 +1014,19 @@ fn kill_inside_a_deferred_checkpoint_resumes_to_the_writers_rows() {
 }
 
 #[test]
+fn conflict_frame_parses_the_message_the_applier_builds() {
+    use crate::replica::apply::conflict_message;
+    let e = Error::Corrupt(conflict_message(7, 42));
+    assert_eq!(conflict_frame(&e), Some(42));
+    assert!(is_conflict(&e));
+    assert_eq!(
+        conflict_frame(&Error::Corrupt("no number here".into())),
+        None
+    );
+    assert_eq!(conflict_frame(&Error::Config("x frame 3".into())), None);
+}
+
+#[test]
 fn a_hole_in_the_log_holds_back_the_deferred_checkpoint() {
     let (mut f, r2) = deferred_fixture();
     let before = f.position();

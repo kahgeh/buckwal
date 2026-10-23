@@ -16,6 +16,11 @@ use crate::{
 /// The start of the message of a `Conflict` (the follower stops and re-restores on it).
 pub(crate) const CONFLICT_PREFIX: &str = "replica conflict: ";
 
+/// The message of a conflict at `frame` of `generation`; `sync::conflict_frame` parses it.
+pub(crate) fn conflict_message(generation: u64, frame: u64) -> String {
+    format!("{CONFLICT_PREFIX}generation {generation} frame {frame}")
+}
+
 /// True for the error `apply_commit` returns when a frame already in the local WAL differs.
 pub(crate) fn is_conflict(e: &Error) -> bool {
     matches!(e, Error::Corrupt(m) if m.starts_with(CONFLICT_PREFIX))
@@ -161,10 +166,9 @@ impl Applier {
             match self.conn.wal_insert_frame(n, &bytes) {
                 Ok(_) => {}
                 Err(LimboError::Conflict(_)) => {
-                    return Err(Error::Corrupt(format!(
-                        "{CONFLICT_PREFIX}generation {} frame {}",
+                    return Err(Error::Corrupt(conflict_message(
                         self.generation.load(Ordering::Relaxed),
-                        f.no
+                        f.no,
                     )))
                 }
                 Err(e) => return Err(engine(e)),

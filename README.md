@@ -768,6 +768,8 @@ How the suite was run:
 
 A *replica* is a local copy of the database on another machine that follows the bucket and only reads. It is fed from the bucket alone: no server, no Turso Cloud, and nothing is written to the bucket. The one writer keeps writing exactly as before. Seals, new generations, takeovers and GC on the writer's side do not break a replica. Decisions: [ADR 0006](docs/adr/0006-a-third-io-mode-for-replicas.md) (the replica IO mode) and [ADR 0007](docs/adr/0007-the-notification-listener-reuses-the-server-crates-listener.md) (the notification listener).
 
+**Prefetch.** A replica always fetches every sealed page in the background after the restore, whatever `BUCKWAL_PREFETCH` says: that variable governs only the writer and read-only opens.
+
 **Using one.**
 - From Rust: `buckwal::open_replica(config)` returns a `Replica`. `Replica::connect()` gives a read-only `ReadConnection` (queries and read transactions; open one per thread), `Replica::stats()` a `ReplicaStats`, `Replica::waker()` a handle whose `wake()` starts a sync pass, and `Replica::close()` stops it (close the connections first). Apps read in the replica's own process: a second process cannot open the directory (D4, `durable.lock`). Serving a replica over the network is not built.
 - From the command line: `buckwal follow --dir DIR [--poll-ms N]` runs a replica until SIGTERM or SIGINT and prints one status line per event: `notify listening addr=… tls=… auth=…` (when the listener runs), `following generation=… seq=…`, `applied generation=… seq=…`, `notified received=…`, `checkpoint deferred count=…`, `skipped fenced_records=…`, `re-restored count=… reason=…` and `stopped reason=…` (the command then exits 1). `DIR` must be missing, empty or a replica's own directory; a directory that holds a writer's database is refused with `Config`.
@@ -824,6 +826,7 @@ An idle replica costs about US$0.22 a month, against US$14 polling every second.
 
 **Limits.**
 - `conn_raw_api` is not a public turso_core API. It is stable only because the repo pins `turso_core =0.8.3`, and the probes of `docs/read-replicas-recon.md` must be re-run on an upgrade.
+- Until the background prefetch completes, a reader fault or a deferred-checkpoint page write can wait about one page-GET latency per prefetch step (up to the retry deadline under S3 degradation), because the lazy page store holds its local-pages lock across each GET. WAL frame apply and position-file writes are not affected. Prefetch stays on for replicas.
 - A long-open reader keeps the replica's WAL from restarting, so the local WAL grows until it finishes. New data is held back only at a seal, for up to the checkpoint's retry budget (two slow-poll intervals).
 - The writer ships the frames of a large transaction it later rolls back. Replicas download them and drop them. There is no cap: it grows with the transaction.
 - A replica directory copied without its position file must re-restore.
