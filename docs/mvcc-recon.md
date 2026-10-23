@@ -1,7 +1,7 @@
 # MVCC durability, stage 1 finding (mvcc-recon)
 
 Base `main` at 1c357f8, turso_core =0.8.3. Cites are `turso_core-0.8.3/<path>:<line>` (the
-crate source in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`) and
+crate source in `<cargo registry>/`) and
 `crates/<crate>/<path>:<line>` (this repo). Probes P1-P8g ran in a scratchpad crate
 against local temp dirs, with the library's turso_core features and lock (nothing merged).
 "Pn: `...`" quotes their printed output.

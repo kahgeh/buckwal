@@ -4,7 +4,7 @@ frame headers readable in the log as stored: page numbers [2, 1, 2, 3, 4, 5]...,
 a commit frame: page 2 db_size 2 body starts [31, 03, 0d, 33, aa, a2, 44, ed] (plain zero pages would be 00..)
 A replica before: rows=10 integrity=[[Text(Text { value: "ok", subtype: Text })]]
 
-thread 'main' (85104956) panicked at /Users/kahgeh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/turso_core-0.8.3/storage/encryption.rs:748:13:
+thread 'main' (85104956) panicked at <cargo registry>/turso_core-0.8.3/storage/encryption.rs:748:13:
 last reserved bytes must be empty/zero, but found non-zero bytes
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 A outcome: PANIC inside wal_insert_frame (message above)

@@ -1,7 +1,7 @@
 # Read replicas, stage 1: can a replica follow the bucket through turso_core's frame API?
 
 Spec: `.superpowers/specs/read-replicas.md` (approved 2026-10-18). Base: `main` at 0aaabcd.
-turso_core 0.8.3 (`~/.cargo/registry/src/*/turso_core-0.8.3`, read only). Probe sources and
+turso_core 0.8.3 (`<cargo registry>/turso_core-0.8.3`, read only). Probe sources and
 outputs are in `docs/read-replicas-recon/` and are cited by file name below.
 
 ## Finding: go, with seven conditions

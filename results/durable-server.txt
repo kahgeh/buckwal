@@ -124,19 +124,19 @@
 #   libsql-client-go).
 #
 # Logs (scratch, outside the repo, not kept):
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before-serial.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-before.log (parallel)
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-serial.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-t2b-parallel.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-before.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-t2b.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-final.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-final-serial.log (c5ad4c5)
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-final-parallel.log (c5ad4c5)
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-10e62fb-serial.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/conformance-10e62fb-parallel.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/go-10e62fb.log
-#   /private/tmp/claude-502/-Users-kahgeh-Dev-p-buckwal-durable-server/2f999de7-706d-465b-98ce-1aa8bd784735/scratchpad/logs/named-probe-before.log, named-probe-after.log (c5ad4c5 and 10e62fb, over HTTP)
+#   <scratch>/logs/conformance-before-serial.log
+#   <scratch>/logs/conformance-before.log (parallel)
+#   <scratch>/logs/conformance-t2b-serial.log
+#   <scratch>/logs/conformance-t2b-parallel.log
+#   <scratch>/logs/go-before.log
+#   <scratch>/logs/go-t2b.log
+#   <scratch>/logs/go-final.log
+#   <scratch>/logs/conformance-final-serial.log (c5ad4c5)
+#   <scratch>/logs/conformance-final-parallel.log (c5ad4c5)
+#   <scratch>/logs/conformance-10e62fb-serial.log
+#   <scratch>/logs/conformance-10e62fb-parallel.log
+#   <scratch>/logs/go-10e62fb.log
+#   <scratch>/logs/named-probe-before.log, named-probe-after.log (c5ad4c5 and 10e62fb, over HTTP)
 #
 # ---------------------------------------------------------------------------------------------
 # Round 3: full test command run (canonical; supersedes the 4621d4e figures at the top)
@@ -147,7 +147,7 @@
 #   after this run: its unit run (fmt, clippy -D warnings, cargo test --workspace --locked) gave
 #   588 passed (buckwal-server lib 81); the full command has not been run at 10e62fb.
 # Command: ./scripts/test.sh, run by the controller. exit 0; wall time 12:15.
-# Log (scratch, outside the repo): /private/tmp/claude-502/round3/full-run.log
+# Log (scratch, outside the repo): <scratch>/full-run.log
 #
 # unit (fmt, clippy -D warnings, cargo test --workspace --locked): 587 passed
 #   buckwal (cli bin) 28; buckwal-hrana-client 6; buckwal-server lib 80,

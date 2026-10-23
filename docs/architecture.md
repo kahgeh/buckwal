@@ -158,7 +158,7 @@ Newest last. "Spec" is the id of the work that made it: `durable-library` stages
 
 ## Departures from the standards
 
-None found. The organisation's standards file is `/Users/kahgeh/Dev/p/personal-chief/vault/knowledge/standards.md`. Section by section:
+None found. The organisation's standards file is kept outside this repository. Section by section:
 
 - **Glossary.** Followed. `docs/glossary.md` gives every term a one-line meaning and the words not to use, and lists the older text that still uses such a word under "Not yet consistent". The `mvcc-durability` work added its new terms in the same change.
 - **Architecture decisions.** Followed from this work on. `docs/adr/` holds ADRs 0001 to 0004 in Nygard's form (see Decisions). The earlier stages' decisions stay in the README, Decisions (D1 to D29), and are not back-filled. `docs/architecture.md` stays alongside the ADRs, as the standard says.
