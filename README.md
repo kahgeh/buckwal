@@ -1,8 +1,60 @@
 # buckwal
 
-Make a tursodb database durable in an S3 bucket. A Rust library (`buckwal`) and a CLI (`buckwal`).
+Your app keeps a small SQL database in a folder on its own disk. buckwal copies every change to cloud storage (an S3 bucket) before it tells your app the change is saved. If the machine dies, nothing your app was told is saved is lost: a new machine rebuilds the database from the bucket and carries on.
 
-Your app keeps a normal local database directory. Every commit is uploaded to the bucket before it returns, so the commit survives the loss of the machine. A new machine can restore the database from the bucket alone.
+buckwal is a Rust library and a command-line tool, both called `buckwal`, built on tursodb, a rewrite in Rust of SQLite (the small database built into most phones and web browsers).
+
+## What you can do with it
+
+A *commit* is one saved change to the database, such as an insert. A *bucket* is a named container for files in cloud storage; buckwal keeps one database under a *prefix*, a name at the start of its file names, so one bucket can hold many databases.
+
+- Use it from Rust: open a database, run SQL, and each commit is in the bucket when the call returns.
+- Run SQL from the command line (`buckwal sql`).
+- Serve the database over HTTP to apps in other languages, through tursodb's own drivers (`buckwal serve`).
+- Move the database to another machine (`buckwal takeover`). The new machine becomes the only one allowed to write, and the old machine is stopped from writing if it is still running.
+- Restore a copy anywhere (`buckwal restore`) and check that it is sound (`buckwal verify`).
+- Keep the bucket's copy encrypted with a key that stays on your machine, and reach the bucket over HTTPS.
+- Group commits that arrive together into one upload, to cut the number of requests to the bucket (*batching*).
+
+## What to know first
+
+- One machine writes at a time. Another machine takes over with `buckwal takeover`; two machines cannot write together.
+- It has been tested only against RustFS, a local store that speaks the same protocol as S3. It has not been tested on AWS S3.
+- The library is not on crates.io yet; add it by path or git (see Use).
+- Which tursodb drivers have been tested against the server, and which have not, is listed under Server.
+
+## Quick start
+
+This walk-through saves a table, throws away the machine's copy, and gets the table back from the bucket. It needs a local RustFS (`scripts/rustfs.sh up`), which stands in for the bucket.
+
+```sh
+cargo build --release --locked -p buckwal-cli
+export PATH="$PWD/target/release:$PATH"
+
+# Where the bucket is, and which database in it is yours (the prefix).
+export BUCKWAL_ENDPOINT=http://127.0.0.1:9290
+export BUCKWAL_BUCKET=buckwal
+export BUCKWAL_ACCESS_KEY=buckwal-admin
+export BUCKWAL_SECRET_KEY=buckwal-local-secret-not-real
+export BUCKWAL_PREFIX=quickstart
+
+# Make the database in folder ./shop (--claim: this folder is new) and save a row.
+buckwal sql --dir shop --claim "CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT)" "INSERT INTO orders (item) VALUES ('book')"
+
+# The machine dies: its folder is gone.
+rm -rf shop
+
+# A new machine rebuilds the database from the bucket and becomes its writer.
+buckwal takeover --dir shop2
+# took over generation=2 epoch=2 fence_seq=2 writer_id=… quiet_ms=0 ms=87
+
+buckwal sql --dir shop2 "SELECT id, item FROM orders"
+# 1	book
+```
+
+The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The `takeover` line reports the new writer's numbers (see CLI). Use a new `BUCKWAL_PREFIX` to start another database; settings are listed under Settings.
+
+## What it covers
 
 This is stage 4: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export. Stage 4 adds transport and encryption: HTTPS with a CA bundle you name (`BUCKWAL_CA_BUNDLE`) or the platform's trust store, and encryption of the database with a key from a local file (`BUCKWAL_ENCRYPTION_KEY_FILE`), so the bucket holds ciphertext. A server, `buckwal serve`, serves the database over tursodb's SQL over HTTP v3 to tursodb's serverless drivers, so apps in other languages and several processes can use it (see Server). A database created new in MVCC mode (concurrent writers with `BEGIN CONCURRENT`) is durable too, with limits (see MVCC mode). It is tested against RustFS on a laptop, over plain HTTP and over HTTPS with encryption (not on AWS S3, see Not tested until real use).
 
