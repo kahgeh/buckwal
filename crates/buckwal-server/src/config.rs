@@ -56,9 +56,6 @@ impl ServeConfig {
         listen_flag: Option<&str>,
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<ServeConfig, String> {
-        if let Some(m) = buckwal::config::legacy_env_refusal(&get) {
-            return Err(m);
-        }
         let get = |k: &str| get(k).filter(|v| !v.is_empty());
         let (listen_src, listen_text) = match listen_flag.filter(|v| !v.is_empty()) {
             Some(v) => ("--listen", v.to_string()),
@@ -205,33 +202,6 @@ mod tests {
             c.token_file = Some("t".into());
         }
         c
-    }
-
-    #[test]
-    fn serve_config_from_lookup_refuses_old_token_file() {
-        let e = ServeConfig::from_lookup(None, |k| {
-            (k == "DURABLE_SERVE_TOKEN_FILE").then(|| "/t".to_string())
-        })
-        .unwrap_err();
-        assert_eq!(
-            e,
-            "DURABLE_SERVE_TOKEN_FILE is no longer read, set BUCKWAL_SERVE_TOKEN_FILE instead"
-        );
-    }
-
-    #[test]
-    fn serve_twins_of_legacy_names_are_read() {
-        // Setting only a BUCKWAL_SERVE_* twin is no refusal, and the value is read.
-        for old in buckwal::config::LEGACY_ENV {
-            let Some(rest) = old.strip_prefix("DURABLE_SERVE_") else {
-                continue;
-            };
-            let new = format!("BUCKWAL_SERVE_{rest}");
-            let r = ServeConfig::from_lookup(None, |k| (k == new).then(|| "1".to_string()));
-            if let Err(e) = r {
-                assert!(!e.contains("no longer read"), "{e}");
-            }
-        }
     }
 
     #[test]

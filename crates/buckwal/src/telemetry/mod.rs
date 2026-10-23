@@ -91,7 +91,6 @@ impl TelemetryConfig {
     }
 
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<TelemetryConfig> {
-        crate::config::refuse_legacy_env(&get)?;
         let mut c = TelemetryConfig::default();
         if let Some(v) = get("BUCKWAL_OTEL") {
             c.enabled = parse_bool("BUCKWAL_OTEL", &v)?;

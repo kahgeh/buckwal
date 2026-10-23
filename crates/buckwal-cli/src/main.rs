@@ -489,7 +489,6 @@ mod tests {
     #[test]
     fn writer_config_reads_buckwal_journal_mode() {
         assert!(journal_mode_in_env(|k| k == "BUCKWAL_JOURNAL_MODE"));
-        assert!(!journal_mode_in_env(|k| k == "DURABLE_JOURNAL_MODE"));
         assert!(!journal_mode_in_env(|_| false));
     }
 

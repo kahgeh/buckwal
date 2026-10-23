@@ -1287,17 +1287,6 @@ fn failed_gc_exports_error_outcome() {
     assert_eq!(gcs[0].field("buckwal.outcome"), Some("error"));
 }
 
-#[test]
-fn telemetry_from_lookup_refuses_old_otel() {
-    let e = TelemetryConfig::from_lookup(|k| (k == "DURABLE_OTEL").then(|| "1".to_string()))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        e.contains("DURABLE_OTEL is no longer read, set BUCKWAL_OTEL instead"),
-        "{e}"
-    );
-}
-
 /// Open a database under a test provider and return the finished span names and the
 /// resource the exporter was given.
 fn spans_and_resource_of_a_takeover() -> (Vec<String>, Resource) {

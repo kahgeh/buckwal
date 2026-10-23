@@ -38,8 +38,8 @@ pub fn run(
     run_lookup(dir, listen, claim, batching, |k| std::env::var(k).ok())
 }
 
-/// [`run`] reading settings through `get`. The settings are read, and an old `DURABLE_*` name
-/// refused, before the directory, the bucket or the port is touched.
+/// [`run`] reading settings through `get`. The settings are read before the directory, the
+/// bucket or the port is touched.
 fn run_lookup(
     dir: &Path,
     listen: Option<&str>,
@@ -109,25 +109,6 @@ mod tests {
     /// A config from no environment at all, so the tests do not depend on the shell.
     fn cfg(listen: &str) -> ServeConfig {
         ServeConfig::from_lookup(Some(listen), |_| None).unwrap()
-    }
-
-    #[test]
-    fn serve_refuses_old_name_before_binding() {
-        let t = tempfile::tempdir().unwrap();
-        // An unclaimed directory would give exit 1 from the claim check; the old name is
-        // refused first (exit 2), before the directory, the bucket or the port is touched.
-        let e = run_lookup(t.path(), Some("127.0.0.1:0"), false, None, |k| {
-            (k == "DURABLE_SERVE_TOKEN_FILE").then(|| "/t".to_string())
-        })
-        .unwrap_err();
-        assert_eq!(e.exit_code(), 2, "{e:?}");
-        assert!(
-            e.message().contains(
-                "DURABLE_SERVE_TOKEN_FILE is no longer read, set BUCKWAL_SERVE_TOKEN_FILE instead"
-            ),
-            "{}",
-            e.message()
-        );
     }
 
     #[test]

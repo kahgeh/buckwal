@@ -219,62 +219,6 @@ impl fmt::Debug for Config {
     }
 }
 
-/// The names the programs read before the rename to `BUCKWAL_*`. They are no longer read:
-/// [`refuse_legacy_env`] turns one that is set into an error that names its replacement, so a
-/// deployment that still sets an old name fails at start instead of running on defaults.
-pub const LEGACY_ENV: &[&str] = &[
-    "DURABLE_ACCESS_KEY",
-    "DURABLE_BATCHING",
-    "DURABLE_BUCKET",
-    "DURABLE_CA_BUNDLE",
-    "DURABLE_ENCRYPTION_CIPHER",
-    "DURABLE_ENCRYPTION_KEY_FILE",
-    "DURABLE_ENDPOINT",
-    "DURABLE_GC_AFTER_SEAL",
-    "DURABLE_JOURNAL_MODE",
-    "DURABLE_LEASE_MS",
-    "DURABLE_MAINTENANCE_GATE_WAIT_MS",
-    "DURABLE_MAINTENANCE_LOG_OBJECTS",
-    "DURABLE_MAINTENANCE_WAL_MIB",
-    "DURABLE_OTEL",
-    "DURABLE_OTEL_ENDPOINT",
-    "DURABLE_OTEL_LEVEL",
-    "DURABLE_PATH_STYLE",
-    "DURABLE_PREFETCH",
-    "DURABLE_PREFIX",
-    "DURABLE_REGION",
-    "DURABLE_REQUEST_TIMEOUT_MS",
-    "DURABLE_RETRY_DEADLINE_MS",
-    "DURABLE_SECRET_KEY",
-    "DURABLE_SERVE_BUSY_TIMEOUT_MS",
-    "DURABLE_SERVE_LISTEN",
-    "DURABLE_SERVE_MAX_STREAMS",
-    "DURABLE_SERVE_SHUTDOWN_MS",
-    "DURABLE_SERVE_STREAM_TIMEOUT_MS",
-    "DURABLE_SERVE_TLS_CERT",
-    "DURABLE_SERVE_TLS_KEY",
-    "DURABLE_SERVE_TOKEN_FILE",
-    "DURABLE_SERVE_WORKERS",
-    "DURABLE_TRIM_GRACE_SECS",
-    "DURABLE_UPLOAD_CONCURRENCY",
-];
-
-/// The message for the first name in [`LEGACY_ENV`] that `get` finds set (an empty value
-/// counts as set), or `None`. The value is never read into the message.
-pub fn legacy_env_refusal(get: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let old = LEGACY_ENV.iter().find(|k| get(k).is_some())?;
-    let new = old.replacen("DURABLE_", "BUCKWAL_", 1);
-    Some(format!("{old} is no longer read, set {new} instead"))
-}
-
-/// [`legacy_env_refusal`] as a `Config` error.
-pub fn refuse_legacy_env(get: impl Fn(&str) -> Option<String>) -> Result<()> {
-    match legacy_env_refusal(get) {
-        Some(m) => Err(Error::Config(m)),
-        None => Ok(()),
-    }
-}
-
 /// Every environment variable [`Config::from_env`] reads.
 const ENV_VARS: [&str; 22] = [
     "BUCKWAL_ENDPOINT",
@@ -394,7 +338,6 @@ impl Config {
         dir: impl Into<PathBuf>,
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<Config> {
-        refuse_legacy_env(&get)?;
         debug_assert!(ENV_VARS.iter().all(|v| v.starts_with("BUCKWAL_")));
         let required = |k: &str| {
             get(k)
@@ -697,69 +640,6 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn refuses_every_legacy_name() {
-        for old in LEGACY_ENV {
-            let e = refuse_legacy_env(|k| (k == *old).then(|| "SECRETVALUE".to_string()))
-                .unwrap_err()
-                .to_string();
-            let new = old.replacen("DURABLE_", "BUCKWAL_", 1);
-            assert!(e.contains(old) && e.contains(&new), "{e}");
-            assert!(
-                e.contains(&format!("{old} is no longer read, set {new} instead")),
-                "{e}"
-            );
-            assert!(!e.contains("SECRETVALUE"), "{e}");
-        }
-        assert!(refuse_legacy_env(|_| None).is_ok());
-    }
-
-    #[test]
-    fn refuses_legacy_name_with_empty_value() {
-        let e = refuse_legacy_env(|k| (k == "DURABLE_BUCKET").then(String::new));
-        assert!(e.is_err());
-    }
-
-    #[test]
-    fn legacy_env_matches_current_names() {
-        // Every old name has a BUCKWAL_ twin that Config, TelemetryConfig or ServeConfig reads
-        // (the serve ones are checked in buckwal-server), and the twin alone is no refusal.
-        let mut read: Vec<&str> = ENV_VARS.to_vec();
-        read.extend([
-            "BUCKWAL_OTEL",
-            "BUCKWAL_OTEL_ENDPOINT",
-            "BUCKWAL_OTEL_LEVEL",
-        ]);
-        for old in LEGACY_ENV {
-            let new = old.replacen("DURABLE_", "BUCKWAL_", 1);
-            if new.starts_with("BUCKWAL_SERVE_") {
-                continue;
-            }
-            assert!(read.contains(&new.as_str()), "{new} is not read");
-            assert!(refuse_legacy_env(|k| (k == new).then(|| "x".to_string())).is_ok());
-        }
-        for v in ENV_VARS {
-            let old = v.replacen("BUCKWAL_", "DURABLE_", 1);
-            assert!(
-                LEGACY_ENV.contains(&old.as_str()),
-                "{old} missing from LEGACY_ENV"
-            );
-        }
-    }
-
-    #[test]
-    fn config_from_lookup_refuses_old_encryption_key_file() {
-        let mut env = required();
-        env.insert("DURABLE_ENCRYPTION_KEY_FILE", "/k");
-        let e = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string()))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("DURABLE_ENCRYPTION_KEY_FILE is no longer read, set BUCKWAL_ENCRYPTION_KEY_FILE instead"),
-            "{e}"
-        );
-    }
 
     #[test]
     fn gc_after_seal_from_env() {
