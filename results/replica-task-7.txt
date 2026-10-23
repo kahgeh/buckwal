@@ -31,3 +31,8 @@ test replica::sync::tests::rolled_back_large_transaction_never_visible ... ok
 test replica::sync::tests::second_fence_moves_rule_to_its_writer ... ok
 test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.09s
 == ./scripts/test.sh unit: exit 0, lib 611 passed (flaky db::tests::close_stops_prefetch_before_releasing_the_dir failed once in an earlier run, passed on rerun) ==
+
+== Fix round 1 ==
+$ cargo test --locked -p buckwal --lib replica::
+test result: ok. 45 passed; 0 failed
+== ./scripts/test.sh unit after fix round 1: exit 0, lib 615 passed ==

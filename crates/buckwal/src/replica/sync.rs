@@ -41,6 +41,9 @@ pub(crate) enum StopReason {
     Mvcc,
     /// A record or the head failed its integrity check; carries the object key.
     Integrity(String),
+    /// A record or the head is malformed in a way that is not an integrity failure (bad
+    /// encoding, ops that cannot be applied to the image).
+    Corrupt(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,8 +136,24 @@ pub(crate) struct Follower {
     fence: FenceRule,
 }
 
-fn integrity_key(e: &Error, key: &str) -> Option<String> {
-    matches!(e, Error::Corrupt(_)).then(|| key.to_string())
+/// True for the error the library's integrity check returns (`integrity: <key>`).
+fn is_integrity(e: &Error) -> bool {
+    matches!(e, Error::Corrupt(m) if m.starts_with("integrity: "))
+}
+
+/// Which outcome a failed decode of the object at `key` is.
+fn decode_failure(e: &Error, key: &str) -> Outcome {
+    match e {
+        _ if is_integrity(e) => {
+            tracing::error!(target: "buckwal", key, error = %e, "replica: object failed its integrity check");
+            Outcome::Stopped(StopReason::Integrity(key.to_string()))
+        }
+        Error::Corrupt(m) => {
+            tracing::error!(target: "buckwal", key, error = %e, "replica: malformed object");
+            Outcome::Stopped(StopReason::Corrupt(m.clone()))
+        }
+        _ => Outcome::Failed(e.to_string()),
+    }
 }
 
 impl Follower {
@@ -167,6 +186,11 @@ impl Follower {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Frames of the generation applied (or already in `app.db`).
+    pub(crate) fn applied_frames(&self) -> u64 {
+        self.applied
     }
 
     pub(crate) fn last_seq(&self) -> u64 {
@@ -252,13 +276,11 @@ impl Follower {
                 let rec = match self.keys.decode_record(&body, self.generation, s) {
                     Ok(r) => r,
                     Err(e) => {
-                        let k = integrity_key(&e, &key).unwrap_or(key);
-                        tracing::error!(target: "buckwal", key = %k, error = %e, "replica: record failed its check");
                         t.detail = Some(e.to_string());
-                        return Outcome::Stopped(StopReason::Integrity(k));
+                        return decode_failure(&e, &key);
                     }
                 };
-                if let Some(o) = self.take_record(rec, &key, t) {
+                if let Some(o) = self.take_record(rec, &key, s, t) {
                     return o;
                 }
                 self.last_seq = s;
@@ -313,12 +335,17 @@ impl Follower {
     }
 
     /// Fold one record into the image. `Some` stops the pass.
-    fn take_record(&mut self, rec: LogRecord, key: &str, t: &mut Tally) -> Option<Outcome> {
+    fn take_record(
+        &mut self,
+        rec: LogRecord,
+        key: &str,
+        seq: u64,
+        t: &mut Tally,
+    ) -> Option<Outcome> {
         match rec {
             LogRecord::Fence { writer_id, epoch } => {
-                if !self.fence.on_fence(&writer_id, epoch) {
-                    t.skipped += 1;
-                }
+                // A stale fence changes nothing and is not counted.
+                self.fence.on_fence(&writer_id, epoch);
                 None
             }
             LogRecord::Extents {
@@ -332,13 +359,23 @@ impl Follower {
                 writer_id, syncs, ..
             } => {
                 if !self.fence.admits(&writer_id) {
-                    t.skipped += 1;
+                    // Empty records (seal-start) carry nothing to skip.
+                    if syncs.iter().any(|ops| !ops.is_empty()) {
+                        t.skipped += 1;
+                        tracing::info!(
+                            target: "buckwal",
+                            generation = self.generation,
+                            seq,
+                            writer_id = %writer_id,
+                            "fenced writer's record skipped"
+                        );
+                    }
                     return None;
                 }
                 for ops in &syncs {
                     if let Err(e) = self.image.apply_sync(ops) {
                         t.detail = Some(e.to_string());
-                        return Some(Outcome::Stopped(StopReason::Integrity(key.to_string())));
+                        return Some(Outcome::Stopped(StopReason::Corrupt(e.to_string())));
                     }
                 }
                 None
@@ -411,13 +448,7 @@ impl Follower {
             Ok(h) => h,
             Err(e) => {
                 t.detail = Some(e.to_string());
-                return Err(match integrity_key(&e, &key) {
-                    Some(k) => {
-                        tracing::error!(target: "buckwal", key = %k, error = %e, "replica: head failed its check");
-                        Outcome::Stopped(StopReason::Integrity(k))
-                    }
-                    None => Outcome::Failed(e.to_string()),
-                });
+                return Err(decode_failure(&e, &key));
             }
         };
         let view = (head.generation, head.journal_mode == JournalMode::Mvcc);

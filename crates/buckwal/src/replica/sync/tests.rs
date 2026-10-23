@@ -256,6 +256,104 @@ fn fenced_writer_late_record_is_skipped_and_counted() {
 }
 
 #[test]
+fn skipped_fenced_record_logs_info_with_generation_seq_and_writer() {
+    use crate::telemetry::testing::Capture;
+    let cap = Capture::new();
+    let mut f = Fx::new();
+    let (a, b) = (f.commit(2), f.commit(3));
+    f.put(1, &ext("w1", a));
+    f.put(2, &fence("w2", 2));
+    f.put(3, &ext("w1", b));
+    let r = tracing::subscriber::with_default(cap.subscriber(), || f.pass());
+    assert_eq!(r.skipped, 1);
+    let snap = cap.spans();
+    let ev: Vec<_> = snap
+        .events
+        .iter()
+        .filter(|e| e.field("message") == Some("fenced writer's record skipped"))
+        .collect();
+    assert_eq!(ev.len(), 1, "{:?}", snap.events);
+    assert_eq!(ev[0].level, tracing::Level::INFO);
+    assert_eq!(ev[0].target, "buckwal");
+    assert_eq!(ev[0].field("generation"), Some("1"));
+    assert_eq!(ev[0].field("seq"), Some("3"));
+    assert_eq!(ev[0].field("writer_id"), Some("w1"));
+}
+
+#[test]
+fn stale_fence_and_empty_records_of_a_fenced_writer_are_not_counted() {
+    let mut f = Fx::new();
+    let a = f.commit(2);
+    f.put(1, &ext("w1", a));
+    f.put(2, &fence("w2", 5));
+    f.put(3, &fence("w1", 1)); // stale
+    f.put(4, &ext("w1", vec![])); // seal-start of the fenced writer
+    let r = f.pass();
+    assert_eq!(r.skipped, 0, "{r:?}");
+    assert_eq!(f.follower.last_seq(), 4);
+}
+
+#[test]
+fn malformed_ops_and_non_integrity_decode_errors_are_not_integrity() {
+    let mut f = Fx::new();
+    // a body that is not a record at all (plain keys: sha trailer fails to verify)
+    f.mem.put(&f.keys.log(1, 1), b"garbage").unwrap();
+    let r = f.pass();
+    assert!(
+        matches!(r.outcome, Outcome::Stopped(StopReason::Corrupt(_))),
+        "{r:?}"
+    );
+    // ops the image cannot hold
+    let mut f = Fx::new();
+    f.put(
+        1,
+        &ext(
+            "w1",
+            vec![Op::Write {
+                off: u64::MAX - 2,
+                bytes: vec![1; 8],
+            }],
+        ),
+    );
+    let r = f.pass();
+    assert!(
+        matches!(
+            r.outcome,
+            Outcome::Stopped(StopReason::Corrupt(_)) | Outcome::Failed(_)
+        ),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn two_commits_in_one_record_advance_by_each_transactions_frames() {
+    let mut f = Fx::new();
+    let _ = f.commit(2);
+    let _ = f.commit(3);
+    let b = std::fs::read(&f.wal).unwrap();
+    let frames = (b.len() - 32) / FL;
+    assert!(frames >= 2);
+    let one = vec![Op::Write { off: 0, bytes: b }];
+    f.put(1, &ext("w1", one));
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::Applied);
+    assert_eq!(f.rows(), 3);
+    assert_eq!(f.follower.applied_frames(), frames as u64);
+    // re-reading from seq 1 (a restart) skips what is local and advances the same way
+    let mut again = Follower::new(
+        f.fault.clone(),
+        f.keys.clone(),
+        retry(),
+        Applier::new(f.reader.clone(), None),
+        PS,
+        1,
+        0,
+    );
+    assert_eq!(again.pass(Trigger::Start).outcome, Outcome::Applied);
+    assert_eq!(again.applied_frames(), frames as u64);
+}
+
+#[test]
 fn fence_then_new_writer_records_applied() {
     let mut f = Fx::new();
     let (a, b) = (f.commit(2), f.commit(3));
@@ -479,5 +577,6 @@ fn redelivered_history_after_restart_is_harmless_and_conflict_stops() {
     let r = again.pass(Trigger::Start);
     assert_eq!(r.outcome, Outcome::Stopped(StopReason::Conflict), "{r:?}");
     assert_eq!(r.outcome.re_restore(), Some(Reason::Conflict));
-    assert!(r.detail.unwrap().contains("generation 1"));
+    let d = r.detail.unwrap();
+    assert!(d.contains("generation 1 frame 1"), "{d}");
 }
