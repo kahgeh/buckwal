@@ -12,6 +12,8 @@ use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, WAL_FILE};
 use crate::io::BucketDbStorage;
 use crate::restore::wal_page_one;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -32,6 +34,110 @@ pub(crate) struct Encryption {
     pub cipher: CipherMode,
     /// Debug-redacted and zeroed on drop by turso (storage/encryption.rs:143-170).
     pub key: EncryptionKey,
+    integrity: IntegrityKey,
+}
+
+impl Encryption {
+    /// The integrity key is derived here, once, from the page key.
+    pub(crate) fn new(cipher: CipherMode, key: EncryptionKey) -> Self {
+        let integrity = IntegrityKey::derive(key.as_slice());
+        Self {
+            cipher,
+            key,
+            integrity,
+        }
+    }
+
+    /// The key integrity codes are made with: HKDF of the page key, never the page key itself.
+    /// Unused outside tests until the codes are wired in (Task 5).
+    #[allow(dead_code)]
+    pub(crate) fn integrity_key(&self) -> IntegrityKey {
+        self.integrity.clone()
+    }
+}
+
+/// HKDF info label of the integrity key.
+const INTEGRITY_LABEL: &[u8] = b"buckwal integrity v1";
+
+/// A 32-byte HMAC-SHA256 key for integrity codes. Wiped on drop; `Debug` prints no bytes.
+#[derive(Clone)]
+pub(crate) struct IntegrityKey([u8; 32]);
+
+// Unused outside tests until the codes are wired in (Task 5).
+#[allow(dead_code)]
+impl IntegrityKey {
+    fn derive(page_key: &[u8]) -> Self {
+        let mut okm = hkdf_sha256(&[], page_key, INTEGRITY_LABEL, 32);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&okm);
+        wipe(&mut okm);
+        Self(k)
+    }
+
+    fn mac(&self, parts: &[&[u8]]) -> Hmac<Sha256> {
+        let mut m =
+            <Hmac<Sha256> as KeyInit>::new_from_slice(&self.0).expect("hmac takes any key length");
+        for p in parts {
+            m.update(p);
+        }
+        m
+    }
+
+    /// The integrity code over `parts` in order (they are hashed as one concatenation, so
+    /// callers use fixed-width fields).
+    pub(crate) fn code(&self, parts: &[&[u8]]) -> [u8; 32] {
+        self.mac(parts).finalize().into_bytes().into()
+    }
+
+    /// Whether `code` is the integrity code over `parts`; constant time, false for any
+    /// length but 32.
+    pub(crate) fn verify(&self, parts: &[&[u8]], code: &[u8]) -> bool {
+        self.mac(parts).verify_slice(code).is_ok()
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for IntegrityKey {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+impl fmt::Debug for IntegrityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// HKDF-SHA256 (RFC 5869): extract with `salt` (empty means 32 zero bytes), expand `info`
+/// to `len` bytes. `len` is at most 255 * 32.
+pub(crate) fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    assert!(len <= 255 * 32, "hkdf output is at most 255 blocks");
+    let zero = [0u8; 32];
+    let salt = if salt.is_empty() { &zero[..] } else { salt };
+    let mut ext = <Hmac<Sha256> as KeyInit>::new_from_slice(salt).expect("any key length");
+    ext.update(ikm);
+    let mut prk: [u8; 32] = ext.finalize().into_bytes().into();
+    let mut okm = Vec::with_capacity(len + 32);
+    let mut t: Vec<u8> = Vec::new();
+    let mut counter = 1u8;
+    while okm.len() < len {
+        let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(&prk).expect("any key length");
+        m.update(&t);
+        m.update(info);
+        m.update(&[counter]);
+        t = m.finalize().into_bytes().to_vec();
+        okm.extend_from_slice(&t);
+        counter = counter.wrapping_add(1);
+    }
+    wipe(&mut prk);
+    wipe(&mut t);
+    okm.truncate(len);
+    okm
 }
 
 /// The cipher only, never the key.
@@ -73,7 +179,7 @@ pub(crate) fn load(cfg: &Config) -> Result<Option<Arc<Encryption>>> {
             2 * n
         ))
     })?;
-    Ok(Some(Arc::new(Encryption { cipher, key })))
+    Ok(Some(Arc::new(Encryption::new(cipher, key))))
 }
 
 /// `text` without its surrounding ASCII whitespace, as hex of exactly the cipher's key size.
@@ -221,6 +327,91 @@ mod tests {
         }
     }
 
+    // RFC 5869 appendix A, test cases 1-3 (SHA-256).
+    fn rfc_bytes(from: u8, n: usize) -> Vec<u8> {
+        (0..n).map(|i| from.wrapping_add(i as u8)).collect()
+    }
+
+    #[test]
+    fn hkdf_rfc5869_case_1() {
+        let okm = hkdf_sha256(&rfc_bytes(0, 13), &[0x0b; 22], &rfc_bytes(0xf0, 10), 42);
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+    }
+
+    #[test]
+    fn hkdf_rfc5869_case_2() {
+        let okm = hkdf_sha256(
+            &rfc_bytes(0x60, 80),
+            &rfc_bytes(0, 80),
+            &rfc_bytes(0xb0, 80),
+            82,
+        );
+        assert_eq!(
+            hex::encode(okm),
+            "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87"
+        );
+    }
+
+    #[test]
+    fn hkdf_rfc5869_case_3() {
+        let okm = hkdf_sha256(&[], &[0x0b; 22], &[], 42);
+        assert_eq!(
+            hex::encode(okm),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+        );
+    }
+
+    #[test]
+    fn hkdf_max_length_and_zero() {
+        assert_eq!(hkdf_sha256(b"s", b"k", b"i", 255 * 32).len(), 255 * 32);
+        assert!(hkdf_sha256(b"s", b"k", b"i", 0).is_empty());
+    }
+
+    #[test]
+    fn integrity_key_differs_from_page_key_and_ignores_newline() {
+        let hex_key = "ab".repeat(32);
+        let (_t, c) = with_key_file(hex_key.as_bytes());
+        let a = load(&c).unwrap().unwrap();
+        let (_t2, c2) = with_key_file(format!(" {hex_key}\r\n").as_bytes());
+        let b = load(&c2).unwrap().unwrap();
+        assert_eq!(
+            a.integrity_key().code(&[b"x"]),
+            b.integrity_key().code(&[b"x"])
+        );
+        assert_ne!(a.integrity_key().bytes(), a.key.as_slice());
+        let (_t3, c3) = with_key_file("cd".repeat(32).as_bytes());
+        let other = load(&c3).unwrap().unwrap();
+        assert_ne!(
+            a.integrity_key().code(&[b"x"]),
+            other.integrity_key().code(&[b"x"])
+        );
+    }
+
+    #[test]
+    fn integrity_code_covers_parts_and_verifies() {
+        let (_t, c) = with_key_file("ab".repeat(32).as_bytes());
+        let ik = load(&c).unwrap().unwrap().integrity_key();
+        let code = ik.code(&[&b"ab"[..], &b"c"[..]]);
+        assert!(ik.verify(&[&b"ab"[..], &b"c"[..]], &code));
+        assert!(ik.verify(&[&b"a"[..], &b"bc"[..]], &code)); // concatenation: callers fix field widths
+        assert!(!ik.verify(&[b"abd"], &code));
+        assert!(!ik.verify(&[b"abc"], &code[..31]));
+        assert!(!ik.verify(&[b"abc"], &[]));
+        let mut bad = code;
+        bad[0] ^= 1;
+        assert!(!ik.verify(&[b"abc"], &bad));
+    }
+
+    #[test]
+    fn integrity_key_debug_is_redacted() {
+        let (_t, c) = with_key_file("ab".repeat(32).as_bytes());
+        let ik = load(&c).unwrap().unwrap().integrity_key();
+        assert_eq!(format!("{ik:?}"), "<redacted>");
+    }
+
     #[test]
     fn key_file_hex_round_trip() {
         for text in [
@@ -310,10 +501,7 @@ mod tests {
     #[test]
     fn check_page_one_follows_the_table() {
         let key = EncryptionKey::new_256([0x11; 32]);
-        let on = Encryption {
-            cipher: CipherMode::Aegis256,
-            key: key.clone(),
-        };
+        let on = Encryption::new(CipherMode::Aegis256, key.clone());
         let (plain, enc) = pages(4096, CipherMode::Aegis256, &key);
         assert!(enc.starts_with(b"Turso"));
         assert_eq!(check_page_one(None, None), Ok(()));
@@ -329,18 +517,12 @@ mod tests {
             encryption_err(check_page_one(Some(&enc), None)),
             "the database is encrypted (cipher aegis256): set BUCKWAL_ENCRYPTION_KEY_FILE"
         );
-        let other = Encryption {
-            cipher: CipherMode::Aes256Gcm,
-            key: key.clone(),
-        };
+        let other = Encryption::new(CipherMode::Aes256Gcm, key.clone());
         assert_eq!(
             encryption_err(check_page_one(Some(&enc), Some(&other))),
             "the database uses cipher aegis256, not BUCKWAL_ENCRYPTION_CIPHER aes256gcm"
         );
-        let wrong = Encryption {
-            cipher: CipherMode::Aegis256,
-            key: EncryptionKey::new_256([0x22; 32]),
-        };
+        let wrong = Encryption::new(CipherMode::Aegis256, EncryptionKey::new_256([0x22; 32]));
         let wrong_key = "the key in BUCKWAL_ENCRYPTION_KEY_FILE does not decrypt this database \
                          (wrong key, or page 1 is damaged)";
         assert_eq!(
