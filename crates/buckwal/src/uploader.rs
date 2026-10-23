@@ -630,6 +630,7 @@ impl Worker {
             buckwal.pages = Empty,
             buckwal.retries = Empty,
             s3.status = Empty,
+            buckwal.skipped_generation = Empty,
         );
         let g = span.in_scope(|| self.bucket.seal_generation(pages, page_size, page_count))?;
         drop(span);

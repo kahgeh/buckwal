@@ -7,6 +7,9 @@
 # and BUCKWAL_CH_PASSWORD; without it, the password is read at run time from the users SQL
 # file that BUCKWAL_CH_USERS_SQL names. With neither set, it prints
 # `otel check SKIPPED: no ClickHouse password` and exits 0.
+# Also checked (read-only SELECTs): a `buckwal.takeover` span of the run carries
+# `buckwal.quiet_ms` (and `buckwal.next_generation_floor`), and the encrypted tamper tests left
+# at least one ERROR record `integrity check failed` with no data or code field.
 # The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
@@ -83,18 +86,29 @@ while :; do
   query "SELECT count() $LOGS AND Timestamp < '2000-01-01'"
   untimed="$OUT"
 
+  query "SELECT count() $TRACES AND SpanName = 'buckwal.takeover' AND Timestamp > now() - INTERVAL 1 DAY AND SpanAttributes['buckwal.quiet_ms'] != '' AND SpanAttributes['buckwal.next_generation_floor'] != ''"
+  quiet_spans="$OUT"
+  query "SELECT count() $LOGS AND toDate(Timestamp) = today() AND Body = 'integrity check failed' AND SeverityText = 'ERROR'"
+  integrity="$OUT"
+  # An integrity record carries the object key, kind, generation and seq, never bytes.
+  query "SELECT count() $LOGS AND toDate(Timestamp) = today() AND Body = 'integrity check failed' AND mapContains(LogAttributes, 'data')"
+  integrity_data="$OUT"
+
   missing=""
   for s in $SPANS; do
     awk -F'\t' -v s="$s" '$1 == s && $2 > 0 { found = 1 } END { exit !found }' <<<"$spans" \
       || missing="$missing $s"
   done
   counts="$(awk -F'\t' 'NF == 2 { printf "%s%s=%s", sep, $1, $2; sep = " " }' <<<"$spans")"
+  [[ "$quiet_spans" -gt 0 ]] || missing="$missing buckwal.takeover(buckwal.quiet_ms)"
+  [[ "$integrity" -gt 0 ]] || missing="$missing log:integrity-check-failed"
+  [[ "$integrity_data" -eq 0 ]] || missing="$missing no-data-in-integrity-records(found $integrity_data)"
   if [[ -z "$missing" && "$logs" -gt 0 && "$untimed" -eq 0 ]]; then
-    echo "otel check PASSED: $counts logs=$logs"
+    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity"
     exit 0
   fi
   if (( SECONDS - start >= DEADLINE )); then
-    fail "run $RUN_ID after ${DEADLINE}s: missing spans:${missing:- none}; logs=$logs; logs before 2000-01-01=$untimed; spans: ${counts:-none}"
+    fail "run $RUN_ID after ${DEADLINE}s: missing:${missing:- none}; logs=$logs; logs before 2000-01-01=$untimed; spans: ${counts:-none}"
   fi
   sleep 3
 done

@@ -32,7 +32,10 @@ impl Kind {
 /// The failure of every integrity check, from one place: `Corrupt("integrity: <object key>")`
 /// (the key only, never data or code bytes) and the ERROR record `integrity check failed`
 /// (target `buckwal`) with the object key, its kind, generation and seq (0 for an object
-/// without one). The telemetry task attaches `buckwal.outcome = integrity` here.
+/// without one). It also records `buckwal.outcome = integrity` on the innermost enclosing span
+/// that declares the field (`telemetry::record_enclosing_outcome`: the engine's own spans
+/// around a lazy page read have none); `restore`, `gc` and `takeover` also set it from the
+/// error when they end (`Error::outcome`).
 pub(crate) fn integrity_failed(key: &str, kind: Kind, generation: u64, seq: u64) -> Error {
     tracing::error!(
         target: "buckwal",
@@ -42,6 +45,7 @@ pub(crate) fn integrity_failed(key: &str, kind: Kind, generation: u64, seq: u64)
         seq,
         "integrity check failed"
     );
+    crate::telemetry::record_enclosing_outcome("integrity");
     Error::Corrupt(format!("integrity: {key}"))
 }
 

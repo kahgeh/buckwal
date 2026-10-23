@@ -687,3 +687,134 @@ fn after_a_good_open_an_edited_head_or_key_check_is_tampering() {
         }
     }
 }
+
+/// Task 6: what a failed read leaves in telemetry: one ERROR record, nothing but the object's
+/// key, kind, generation and seq in it, and `buckwal.outcome = integrity` on the reading span.
+mod telemetry_signals {
+    use super::*;
+    use crate::telemetry::testing::Capture;
+    use tracing::info_span;
+
+    /// `f` inside a `caller` span that declares `buckwal.outcome`, under a capture.
+    fn in_caller<T>(f: impl FnOnce() -> T) -> (T, crate::telemetry::testing::Spans) {
+        let cap = Capture::new();
+        let out = tracing::subscriber::with_default(cap.subscriber(), || {
+            let caller = info_span!("caller", buckwal.outcome = tracing::field::Empty);
+            caller.in_scope(f)
+        });
+        (out, cap.spans())
+    }
+
+    fn records(
+        spans: &crate::telemetry::testing::Spans,
+    ) -> Vec<&crate::telemetry::testing::EventRec> {
+        spans
+            .events
+            .iter()
+            .filter(|e| e.field("message") == Some("integrity check failed"))
+            .collect()
+    }
+
+    #[test]
+    fn a_tampered_page_yields_one_record_and_an_integrity_outcome() {
+        for mode in MODES {
+            let store = mem();
+            let k = tempdir();
+            let _w = writer(mode, &store, &k);
+            let (_, m) = current_manifest(&store);
+            let mut top: Vec<u32> = m.pages.keys().copied().collect();
+            top.sort_unstable();
+            let (p, q) = (top[top.len() - 1], top[top.len() - 2]);
+            let (a, b) = (keys().page(m.pages[&p], p), keys().page(m.pages[&q], q));
+            let (ba, bb) = (body(&store, &a), body(&store, &b));
+            put(&store, &a, &bb);
+            put(&store, &b, &ba);
+            let (got, spans) = in_caller(|| read_with(Reader::ReadOnly, mode, &store, &k));
+            assert_integrity(got, &[a.clone(), b.clone()], &format!("{mode:?}"));
+            let recs = records(&spans);
+            assert_eq!(recs.len(), 1, "{mode:?}: {recs:?}");
+            let r = recs[0];
+            assert_eq!(r.level, tracing::Level::ERROR);
+            assert_eq!(r.target, "buckwal");
+            assert_eq!(r.field("kind"), Some("page"));
+            assert!([&a, &b].iter().any(|k| r.field("key") == Some(k.as_str())));
+            let mut names: Vec<&str> = r.fields.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["generation", "key", "kind", "message", "seq"],
+                "{r:?}"
+            );
+            for v in r.fields.values() {
+                assert!(v.len() < 200, "{v}");
+            }
+            let c = spans.last_named("caller");
+            assert_eq!(
+                c.field("buckwal.outcome"),
+                Some("integrity"),
+                "{mode:?}: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_and_gc_spans_end_with_outcome_integrity() {
+        for mode in MODES {
+            let store = mem();
+            let k = tempdir();
+            let w = writer(mode, &store, &k);
+            // Not the head: a manifest edited in place (the readers below all read it).
+            let g = head(&*store).manifest.expect("sealed");
+            let mk = keys().manifest(g);
+            let mut forged = body(&store, &mk);
+            let n = forged.len();
+            forged[n - 1] ^= 1;
+            put(&store, &mk, &forged);
+            // GC reads a manifest once it is old enough.
+            let min_age = cfg_for(mode, w.path(), &k).engine(false).gc_min_age();
+            store.advance_clock(min_age + Duration::from_secs(1));
+            // A takeover restores first, so its restore span is the one that fails.
+            for (reader, span) in [
+                (Reader::Restore, "buckwal.restore"),
+                (Reader::Takeover, "buckwal.restore"),
+                (Reader::Gc, "buckwal.gc"),
+            ] {
+                let (got, spans) = in_caller(|| read_with(reader, mode, &store, &k));
+                assert!(
+                    matches!(&got, Err(Error::Corrupt(m)) if m.starts_with("integrity: ")),
+                    "{mode:?} {reader:?}: {got:?}"
+                );
+                assert_eq!(records(&spans).len(), 1, "{mode:?} {reader:?}");
+                let s = spans.last_named(span);
+                assert_eq!(
+                    s.field("buckwal.outcome"),
+                    Some("integrity"),
+                    "{mode:?} {reader:?}: {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrong_key_yields_no_record_and_no_integrity_outcome() {
+        for mode in MODES {
+            let store = mem();
+            let k = tempdir();
+            let _w = writer(mode, &store, &k);
+            let other = tempdir();
+            for r in ALL_READERS {
+                let (got, spans) =
+                    in_caller(|| read_with_key(r, mode, &store, &other, &"22".repeat(32)));
+                assert_encryption(got, WRONG_KEY, &format!("{mode:?} {r:?}"));
+                assert!(records(&spans).is_empty(), "{mode:?} {r:?}");
+                assert!(
+                    spans
+                        .spans
+                        .iter()
+                        .all(|s| s.field("buckwal.outcome") != Some("integrity")),
+                    "{mode:?} {r:?}"
+                );
+            }
+        }
+    }
+}

@@ -425,7 +425,8 @@ pub(crate) fn local_format(head: &Head) -> u32 {
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
 /// writes nothing to the bucket. Runs in a `buckwal.restore` span, and logs the finished
 /// restore. The span's `buckwal.seq` is the highest log seq replayed (0 for an empty log), and
-/// `buckwal.retries` the extra attempts of the restore's requests. Also returns page 1 as the
+/// `buckwal.retries` the extra attempts of the restore's requests, and `buckwal.outcome`
+/// `ok`, `integrity` (a failed integrity check) or `error`. Also returns page 1 as the
 /// restore saw it: the sealed page 1 it fetched for the MVCC check, or the WAL's page-1 frame
 /// it seeded `app.db` with; None when it saw neither.
 fn restore_into_seen(
@@ -444,12 +445,20 @@ fn restore_into_seen(
         buckwal.seq = Empty,
         buckwal.retries = Empty,
         s3.status = Empty,
+        buckwal.outcome = Empty,
     );
     let _in = span.enter();
     let retries = AtomicU64::new(0);
     let r = restore_files(store, keys, dir, cfg, &retries);
     span.record("buckwal.retries", retries.load(Relaxed));
-    let (r, page1) = r?;
+    let (r, page1) = match r {
+        Ok(r) => r,
+        Err(e) => {
+            span.record("buckwal.outcome", e.outcome());
+            return Err(e);
+        }
+    };
+    span.record("buckwal.outcome", "ok");
     span.record("buckwal.generation", r.generation);
     span.record("buckwal.log_objects", r.log_objects);
     // The seqs replayed run 1..=log_objects.

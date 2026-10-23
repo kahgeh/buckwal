@@ -102,7 +102,7 @@ fn bucket_err(what: &str, e: impl std::fmt::Display) -> Error {
 
 /// One pass, in a `buckwal.gc` span (`buckwal.generation`, `buckwal.manifest`,
 /// `buckwal.age_ms`, `buckwal.deleted`, `buckwal.outcome`: `trimmed`, `too_young`,
-/// `nothing` or `error`):
+/// `nothing`, `integrity` (a failed integrity check) or `error`):
 ///
 /// 1. GET the head; none, or no manifest yet: `Nothing`.
 /// 2. LIST `manifest/`; the candidates are the manifests up to the head's, newest first, and (a
@@ -140,8 +140,8 @@ pub(crate) fn gc_once(
             span.record("buckwal.deleted", p.deleted);
             span.record("buckwal.outcome", p.outcome.as_str());
         }
-        Err(_) => {
-            span.record("buckwal.outcome", "error");
+        Err(e) => {
+            span.record("buckwal.outcome", e.outcome());
         }
     }
     r

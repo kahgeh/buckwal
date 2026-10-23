@@ -41,6 +41,17 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// The `buckwal.outcome` of a span that ended with this error: `integrity` for a failed
+    /// integrity check (`format::integrity::integrity_failed`), else `error`.
+    pub(crate) fn outcome(&self) -> &'static str {
+        match self {
+            Error::Corrupt(m) if m.starts_with("integrity: ") => "integrity",
+            _ => "error",
+        }
+    }
+}
+
 impl std::error::Error for Error {}
 
 #[cfg(test)]

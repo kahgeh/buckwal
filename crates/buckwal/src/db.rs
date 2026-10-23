@@ -847,7 +847,8 @@ fn raise_at_open(
     }
     tracing::info!(
         target: "buckwal",
-        generation = bucket.head().generation + 1,
+        // The head the landed seal published: the stale head's seal target.
+        generation = bucket.seal_target(),
         "a seal of an earlier process landed during the open; attaching again"
     );
     *bucket = attach(store, keys, cfg, state)?;
@@ -858,7 +859,11 @@ fn raise_at_open(
 
 /// A takeover of a restored copy, in a `buckwal.takeover` span (`buckwal.generation`,
 /// `buckwal.epoch`, `buckwal.seq` (the fence's), `buckwal.retries`, `s3.status`,
-/// `buckwal.outcome`):
+/// `buckwal.outcome` (`ok`, `integrity` for a failed integrity check, else `error`), and the
+/// takeover quiet and the floor: `buckwal.quiet_ms` (the quiet this takeover sets, 0 when the
+/// old writer had no seal in flight), `buckwal.quiet_old_ms` (the replaced head's
+/// `lease_ms + request_timeout_ms`, absent when it had none), `buckwal.quiet_own_ms` (this
+/// writer's sum) and `buckwal.next_generation_floor` (the floor the takeover head carries)):
 ///
 /// 1. The claim id: `state.claim_id`, an interrupted claim's, or a new id persisted as
 ///    `claim_id` before anything is sent, so a crash after the head write resumes under the
@@ -882,6 +887,16 @@ fn claim(
     let retries = AtomicU64::new(0);
     let r = span.in_scope(|| claim_in_span(dir, store, keys, cfg, state, &retries, &span));
     span.record("buckwal.retries", retries.load(SeqCst));
+    if let Ok((_, fence)) = &r {
+        // What `set_quiet` will set: the provisional quiet when the old writer's seal may
+        // still be uploading, else none.
+        let quiet = if fence.seal_may_be_in_flight {
+            state.seal_quiet_ms
+        } else {
+            0
+        };
+        span.record("buckwal.quiet_ms", quiet);
+    }
     let ended = r.as_ref().map(|(bucket, fence)| (bucket, fence));
     took_over(&span, cfg, &state.writer_id, ended);
     r
@@ -899,6 +914,10 @@ fn takeover_span(generation: u64) -> tracing::Span {
         buckwal.retries = Empty,
         s3.status = Empty,
         buckwal.outcome = Empty,
+        buckwal.quiet_ms = Empty,
+        buckwal.quiet_old_ms = Empty,
+        buckwal.quiet_own_ms = Empty,
+        buckwal.next_generation_floor = Empty,
     )
 }
 
@@ -910,9 +929,12 @@ fn took_over(
     writer_id: &str,
     ended: std::result::Result<(&Bucket, &FenceOutcome), &Error>,
 ) {
-    let Ok((bucket, fence)) = ended else {
-        span.record("buckwal.outcome", "error");
-        return;
+    let (bucket, fence) = match ended {
+        Ok(ok) => ok,
+        Err(e) => {
+            span.record("buckwal.outcome", e.outcome());
+            return;
+        }
     };
     let (generation, epoch) = (bucket.head().generation, bucket.head().epoch);
     span.record("buckwal.seq", fence.pos.seq);
@@ -949,6 +971,10 @@ fn resume_takeover(
 ) -> Result<FenceOutcome> {
     let span = takeover_span(bucket.head().generation);
     span.record("buckwal.epoch", bucket.head().epoch);
+    span.record("buckwal.quiet_own_ms", duration_ms(timeouts_of(cfg).sum()));
+    if let Some(floor) = bucket.head().next_generation_floor {
+        span.record("buckwal.next_generation_floor", floor);
+    }
     let r = span.in_scope(|| bucket.append_fence());
     span.record("buckwal.retries", bucket.counters().retries.load(SeqCst));
     took_over(&span, cfg, writer_id, r.as_ref().map(|f| (&*bucket, f)));
@@ -978,6 +1004,16 @@ fn claim_in_span(
         retries,
     )?;
     span.record("buckwal.epoch", head.epoch);
+    span.record("buckwal.quiet_own_ms", duration_ms(timeouts_of(cfg).sum()));
+    if let Some(old) = replaced
+        .as_ref()
+        .and_then(|h| Some((h.lease_ms?, h.request_timeout_ms?)))
+    {
+        span.record("buckwal.quiet_old_ms", old.0.saturating_add(old.1));
+    }
+    if let Some(floor) = head.next_generation_floor {
+        span.record("buckwal.next_generation_floor", floor);
+    }
     #[cfg(test)]
     if FAIL_AFTER_CLAIM_HEAD.with(|f| f.get()) {
         return Err(Error::Io(

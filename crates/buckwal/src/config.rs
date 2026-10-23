@@ -551,9 +551,12 @@ pub enum Event {
     /// confirmed in the bucket. `batching` is the setting the commit was made with, even when
     /// a degraded uploader made a Window commit take the blocking `Off` path.
     CommitAcked { commit: u64, batching: Batching },
-    /// Sealing `generation` began with `pages` dirty pages to upload.
+    /// Sealing `generation` began with `pages` dirty pages to upload. `generation` is the
+    /// generation being sealed, the head's before the seal (the one `log/<generation>` holds).
     SealStarted { generation: u64, pages: u64 },
-    /// `generation` is sealed: the head now points at generation + 1.
+    /// `generation` is sealed: the same number `SealStarted` reported. The head now points at
+    /// generation + 1, or at generation + 2 for the first seal after a takeover (it skips a
+    /// generation).
     SealFinished { generation: u64, elapsed: Duration },
     /// The trimmer deleted `deleted` objects no head can reach any more.
     Trimmed { deleted: u64 },

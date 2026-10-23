@@ -148,3 +148,22 @@ test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 535 filtered out; f
 Also: format::tests::integrity_codes::key_check_is_compared_at_open_before_the_integrity_code (open vs later read, no record on wrong key, key_check never in an error). Reconciled: open_with_wrong_key_is_refused, takeover_with_a_mismatched_key_is_refused_before_the_claim, takeover_with_a_key_on_a_plaintext_database_is_refused, encrypted_open_refuses_heads_written_before_integrity_codes (format and db tests).
 
 `./scripts/test.sh unit`: exit 0.
+
+## Task 6: telemetry (before the code, then after)
+
+Before (new tests, instrumentation not written; `cargo test --locked -p buckwal --lib -- db::tests::telemetry db::tests::integrity::telemetry_signals`): 7 failed, 1 passed (the wrong-key test: nothing to fail yet).
+
+```
+a_takeover_after_a_commit_reports_a_zero_quiet                      buckwal.quiet_ms: left None, right Some("0")
+the_larger_writer_sets_the_quiet_and_a_head_without_timeouts_...    buckwal.quiet_own_ms: left None, right Some("800")
+takeover_span_carries_the_quiet_and_the_next_generation_floor       buckwal.quiet_ms: left None, right Some("800")
+only_the_first_seal_after_a_takeover_has_a_skipped_generation       buckwal.skipped_generation: left None, right Some("3")
+the_mvcc_seal_span_names_the_skipped_generation_too                 buckwal.skipped_generation: left None, right Some("4")
+telemetry_signals::a_tampered_page_yields_one_record_...            caller span buckwal.outcome: left None, right Some("integrity")
+telemetry_signals::restore_..._spans_end_with_outcome_integrity     buckwal.restore buckwal.outcome: left None, right Some("integrity")
+telemetry_signals::a_wrong_key_yields_no_record_...                 ok (no record, no integrity outcome, before and after)
+```
+
+SealStarted/SealFinished after a skip (reverting the fix only, `seal_events_report_the_generation_sealed_after_a_skip_too`): `SealStarted { generation: 2 }`, `SealFinished { generation: 3 }` (left [3], right [2]). After: both report 2, the generation sealed.
+
+After: the same 8 tests, plus the seal-events test: 9 passed. `./scripts/test.sh unit`: see the Task 6 report.

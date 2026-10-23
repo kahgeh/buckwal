@@ -6,15 +6,22 @@
 //!   `buckwal.ack_wait` (`io/wal_file.rs`, `conn.rs`);
 //! - `buckwal.upload` (`buckwal.commits`, `buckwal.bytes`, `buckwal.generation`,
 //!   `buckwal.seq`, `buckwal.retries`, `s3.status`) and `buckwal.checkpoint_upload`
-//!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`),
+//!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`,
+//!   and `buckwal.skipped_generation`, on the first seal after a takeover only),
 //!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);
 //! - `buckwal.restore` (`buckwal.generation`, `buckwal.log_objects`, `buckwal.gets`,
-//!   `buckwal.bytes`, `buckwal.seq`, `buckwal.retries`, `s3.status`) (`restore.rs`);
+//!   `buckwal.bytes`, `buckwal.seq`, `buckwal.retries`, `s3.status`, `buckwal.outcome`)
+//!   (`restore.rs`);
 //! - `buckwal.takeover` (`buckwal.generation`, `buckwal.epoch`, `buckwal.seq` (the fence's),
-//!   `buckwal.retries`, `s3.status`, `buckwal.outcome`), around a takeover's head write and
+//!   `buckwal.retries`, `s3.status`, `buckwal.outcome`, `buckwal.quiet_ms`,
+//!   `buckwal.quiet_old_ms` (absent for a head without timeouts), `buckwal.quiet_own_ms`,
+//!   `buckwal.next_generation_floor`), around a takeover's head write and
 //!   fence, or around the fence of a takeover an `open` resumes (`db.rs`), and
 //!   `buckwal.fence` (`buckwal.generation`, `buckwal.seq`, `buckwal.epoch`,
 //!   `buckwal.retries`, `s3.status`) around each fence record (`bucket.rs`).
+//!
+//! `buckwal.outcome = integrity` marks a span whose read failed an integrity check, next to
+//! the ERROR record `integrity check failed` (`format/integrity.rs`).
 //!
 //! Log events have the target `buckwal` exactly.
 //!
@@ -29,6 +36,33 @@
 //! as disabled for every thread (standard tracing behaviour). A global subscriber avoids it.
 
 mod pipeline;
+
+/// Record `buckwal.outcome = outcome` on the innermost span enclosing the caller that declares
+/// that field (a `buckwal.restore`, `buckwal.gc` or `buckwal.takeover` span, or a caller's
+/// own). Spans of the engine (`turso_core`) in between do not declare it and are skipped.
+/// Does nothing without a `tracing_subscriber` registry (no subscriber, or another kind).
+pub(crate) fn record_enclosing_outcome(outcome: &str) {
+    use tracing_subscriber::registry::{LookupSpan, Registry};
+    tracing::Span::current().with_subscriber(|(id, dispatch)| {
+        let Some(registry) = dispatch.downcast_ref::<Registry>() else {
+            return;
+        };
+        let Some(span) = registry.span(id) else {
+            return;
+        };
+        for s in span.scope() {
+            let fields = s.metadata().fields();
+            let Some(field) = fields.field("buckwal.outcome") else {
+                continue;
+            };
+            let value: &dyn tracing::field::Value = &outcome;
+            let pairs = [(&field, Some(value))];
+            let values = fields.value_set(&pairs);
+            dispatch.record(&s.id(), &tracing::span::Record::new(&values));
+            return;
+        }
+    });
+}
 
 use crate::config::{defaults, parse_bool};
 use crate::error::{Error, Result};

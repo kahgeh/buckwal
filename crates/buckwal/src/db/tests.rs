@@ -4087,6 +4087,7 @@ fn create_mvcc_encrypted_has_no_plaintext() {
 
 mod integrity;
 mod mvcc;
+mod telemetry;
 
 /// `quiet_config` with the lease and request timeout (ms) given.
 fn timeouts_config(dir: &Path, lease_ms: u64, request_timeout_ms: u64) -> Config {

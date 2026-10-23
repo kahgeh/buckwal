@@ -239,8 +239,9 @@ pub(crate) struct Bucket {
     /// The seq the next log object of `head.generation` goes to.
     seq: u64,
     in_doubt: Option<InDoubt>,
-    /// Set while a seal's head write has no definite answer: the head may already name
-    /// generation + 1, so nothing may go to this generation until that is known.
+    /// Set while a seal's head write has no definite answer: the head may already name the
+    /// seal target (generation + 1, or the floor after a takeover), so nothing may go to this
+    /// generation until that is known.
     pending_seal: Option<PendingSeal>,
     fenced: bool,
     /// The lease (`check_lease`): when the request behind the last confirmation was sent, on
@@ -1523,7 +1524,8 @@ impl Bucket {
     /// out (`wait_quiet`); its retry deadline starts after the wait. That includes the
     /// close-time TRUNCATE seal: closing during the quiet waits too.
     ///
-    /// It records `buckwal.generation` (G), `buckwal.pages` and `buckwal.retries` on the
+    /// It records `buckwal.generation` (G), `buckwal.pages`, `buckwal.skipped_generation` (the
+    /// first seal after a takeover only: T - 1, which has no log) and `buckwal.retries` on the
     /// current span, and `buckwal.seq`: the seq of the seal-start record (written now, or by
     /// the earlier attempt whose head this seal adopts) once the seal reaches it. It logs the
     /// finished seal.
@@ -1542,6 +1544,9 @@ impl Bucket {
         let span = Span::current();
         span.record("buckwal.generation", generation);
         span.record("buckwal.pages", n);
+        if let Some(skipped) = self.skipped_generation() {
+            span.record("buckwal.skipped_generation", skipped);
+        }
         let r = self.check_fenced().and_then(|()| {
             self.seal(start, pages, page_size, page_count)
                 .map_err(upload_error)
@@ -1562,9 +1567,19 @@ impl Bucket {
         r
     }
 
+    /// The skipped generation the next seal writes under: the number between this generation
+    /// and the seal target, which has no log (its pages and manifest are the new writer's, so
+    /// the old writer's late PUTs cannot reach them). `None` when the seal moves to G + 1.
+    fn skipped_generation(&self) -> Option<u64> {
+        let target = self.seal_target();
+        (target > self.head.generation + 1).then(|| target - 1)
+    }
+
     /// The new head is published: adopt it, its ETag and manifest. Returns its generation.
     fn finish_seal(&mut self, start: Instant, head: Head, etag: String, manifest: Manifest) -> u64 {
         let gen = head.generation;
+        // `SealStarted`'s number: the generation sealed, not the new head's.
+        let sealed = self.head.generation;
         self.head = head;
         self.head_etag = etag;
         self.manifest = Some(manifest);
@@ -1574,7 +1589,7 @@ impl Bucket {
         self.seal_etags.get_mut().unwrap().clear();
         self.counters.seals.fetch_add(1, Relaxed);
         self.emit(Event::SealFinished {
-            generation: gen - 1,
+            generation: sealed,
             elapsed: start.elapsed(),
         });
         gen
