@@ -56,7 +56,15 @@ The `sql` command prints rows, so `CREATE TABLE` and `INSERT` print nothing. The
 
 ## What it covers
 
-This is stage 4: one writer process at a time, with manual takeover (a fence record and an epoch in the head), lease self-fencing and garbage collection on the bucket's clock. It keeps stage 2's runtime batching setting and OpenTelemetry export. Stage 4 adds transport and encryption: HTTPS with a CA bundle you name (`BUCKWAL_CA_BUNDLE`) or the platform's trust store, and encryption of the database with a key from a local file (`BUCKWAL_ENCRYPTION_KEY_FILE`), so the bucket holds ciphertext. A server, `buckwal serve`, serves the database over tursodb's SQL over HTTP v3 to tursodb's serverless drivers, so apps in other languages and several processes can use it (see Server). A database created new in MVCC mode (concurrent writers with `BEGIN CONCURRENT`) is durable too, with limits (see MVCC mode). It is tested against RustFS on a laptop, over plain HTTP and over HTTPS with encryption (not on AWS S3, see Not tested until real use).
+- **One writer at a time, and moving it.** Only one process writes to a database. To move the database, you run `buckwal takeover` on the new machine. It rebuilds the database from the bucket, then writes a marker into the bucket's log that stops the old writer, so the old writer's next write fails instead of mixing in. Details are under How it works and in `docs/glossary.md`.
+- **A writer that has lost its place stops itself.** A writer trusts its last check of the bucket for 30 seconds. After that it checks again before its next write, and stops if another machine has taken over.
+- **Clean-up on the bucket's clock.** Files in the bucket that the database no longer needs are deleted once the bucket's own clock says they have sat unused for 10 minutes. The clean-up is called garbage collection (GC).
+- **Batching.** The setting that groups commits into one upload can be changed while the database runs (see Batching).
+- **Telemetry.** buckwal can send traces and metrics in the OpenTelemetry format, a standard one for monitoring tools (see Telemetry).
+- **HTTPS and encryption.** `https://` endpoints are checked against the platform's trust store, or against a list of certificate authorities you name in `BUCKWAL_CA_BUNDLE`. With a key file named in `BUCKWAL_ENCRYPTION_KEY_FILE`, the database is encrypted before it leaves the machine, so the bucket holds only ciphertext.
+- **A server for other languages.** `buckwal serve` serves the database over tursodb's SQL over HTTP v3, so apps in other languages and several processes can use it through tursodb's serverless drivers (see Server).
+- **Concurrent writers.** A database created new in a mode that lets several writes run at once (`BEGIN CONCURRENT`, called MVCC mode) is durable too, with limits (see MVCC mode).
+- **What it was tested on.** A laptop, against RustFS, over plain HTTP and over HTTPS with encryption. It was not tested on AWS S3 (see Not tested until real use).
 
 ## How it works
 
