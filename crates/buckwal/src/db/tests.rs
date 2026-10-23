@@ -3507,6 +3507,9 @@ fn refuse_mode_mismatch_table() {
         writer_id: "w".into(),
         epoch: 1,
         journal_mode: mode,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     let wal_page = Some([2, 2]);
     let mvcc_page = Some([255, 255]);

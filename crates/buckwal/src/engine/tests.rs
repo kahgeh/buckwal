@@ -96,6 +96,7 @@ pub(crate) fn writer_trimmed(
                 claim_id: String::new(),
                 seal_not_before_ms: 0,
                 seal_quiet_ms: 0,
+                next_generation_floor: 0,
             };
             s.write_atomic(dir).unwrap();
             (b, s)
@@ -607,6 +608,9 @@ fn restore_with_manifest_missing_page_one_is_corrupt() {
         manifest: Some(1),
         writer_id: "ab".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     mem.put(&k.head(), &h.encode()).unwrap();
     let r = tempfile::tempdir().unwrap();

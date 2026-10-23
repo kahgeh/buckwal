@@ -553,6 +553,7 @@ fn create_new(
         claim_id: String::new(),
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
+        next_generation_floor: 0,
     };
     state.write_atomic(dir)?;
     Ok((bucket, state))
@@ -594,6 +595,7 @@ fn create_new_mvcc(
         claim_id: String::new(),
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
+        next_generation_floor: 0,
     };
     state.write_atomic(&staging)?;
     create::move_created(&staging, dir)?;

@@ -1,6 +1,6 @@
 //! `head` object (bucket) and `app.db-durable` (local state): flat JSON.
 use super::json::{escape, Obj};
-use super::{FORMAT, FORMAT_V2};
+use super::{FORMAT, FORMAT_V2, FORMAT_V3};
 use crate::config::defaults;
 use crate::config::JournalMode;
 use crate::error::{Error, Result};
@@ -16,7 +16,7 @@ fn corrupt(m: &str) -> Error {
 }
 
 /// The formats a decoder of this build accepts.
-const ACCEPTED: &[u32] = &[FORMAT, FORMAT_V2];
+const ACCEPTED: &[u32] = &[FORMAT, FORMAT_V2, FORMAT_V3];
 
 fn check_format(o: &Obj, what: &str, accepted: &[u32]) -> Result<u32> {
     let f = o.num("format")?;
@@ -36,6 +36,13 @@ pub(crate) struct Head {
     pub epoch: u64,
     /// Encoded (as `"journal_mode"`) only when `format` is 2; a format 1 head is always `Wal`.
     pub journal_mode: JournalMode,
+    /// The writer's lease, in ms; encoded only when `Some` (a head without it reads as `None`).
+    pub lease_ms: Option<u64>,
+    /// The writer's request timeout, in ms; encoded only when `Some`.
+    pub request_timeout_ms: Option<u64>,
+    /// The lowest generation the writer will seal next (a takeover skips past `G+1`); encoded
+    /// only when `Some`.
+    pub next_generation_floor: Option<u64>,
 }
 
 impl Head {
@@ -44,19 +51,23 @@ impl Head {
             Some(g) => format!("\"manifest/{g:010}\""),
             None => "null".to_string(),
         };
-        let mode = if self.format == FORMAT_V2 {
+        let mode = if self.format != FORMAT {
             format!(",\"journal_mode\":\"{}\"", self.journal_mode.as_str())
         } else {
             String::new()
         };
+        let opt = |k: &str, v: Option<u64>| v.map_or(String::new(), |v| format!(",\"{k}\":{v}"));
         format!(
-            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{},\"epoch\":{}{}}}",
+            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{},\"epoch\":{}{}{}{}{}}}",
             self.format,
             self.generation,
             manifest,
             escape(&self.writer_id),
             self.epoch,
-            mode
+            mode,
+            opt("lease_ms", self.lease_ms),
+            opt("request_timeout_ms", self.request_timeout_ms),
+            opt("next_generation_floor", self.next_generation_floor)
         )
         .into_bytes()
     }
@@ -69,7 +80,11 @@ impl Head {
     pub(crate) fn decode_accepting(b: &[u8], accepted: &[u32]) -> Result<Head> {
         let o = Obj::parse(b)?;
         let format = check_format(&o, "head", accepted)?;
-        let journal_mode = if format == FORMAT_V2 {
+        let journal_mode = if format == FORMAT_V3 {
+            let m = o.str("journal_mode")?;
+            JournalMode::parse(m)
+                .ok_or_else(|| corrupt(&format!("head: unknown journal_mode {m:?}")))?
+        } else if format == FORMAT_V2 {
             let m = o.str("journal_mode")?;
             let mode = JournalMode::parse(m)
                 .ok_or_else(|| corrupt(&format!("head: unknown journal_mode {m:?}")))?;
@@ -97,6 +112,21 @@ impl Head {
                 )
             }
         };
+        let opt = |k: &str| -> Result<Option<u64>> {
+            if o.has(k) {
+                o.num(k).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        let lease_ms = opt("lease_ms")?;
+        let request_timeout_ms = opt("request_timeout_ms")?;
+        let quiet = u128::from(lease_ms.unwrap_or(0)) + u128::from(request_timeout_ms.unwrap_or(0));
+        if quiet > defaults::MAX_SEAL_QUIET.as_millis() {
+            return Err(corrupt(&format!(
+                "head: lease_ms + request_timeout_ms {quiet} is over a day"
+            )));
+        }
         Ok(Head {
             format,
             generation: o.num("generation")?,
@@ -104,6 +134,9 @@ impl Head {
             writer_id: o.str("writer_id")?.to_string(),
             epoch: if o.has("epoch") { o.num("epoch")? } else { 0 },
             journal_mode,
+            lease_ms,
+            request_timeout_ms,
+            next_generation_floor: opt("next_generation_floor")?,
         })
     }
 }
@@ -132,12 +165,14 @@ pub(crate) struct LocalState {
     /// existed: a pending quiet then reads as the reopening process's `lease +
     /// request_timeout`).
     pub seal_quiet_ms: u64,
+    /// The lowest generation the next seal may use (0 before the key existed: none).
+    pub next_generation_floor: u64,
 }
 
 impl LocalState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         format!(
-            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{},\"seal_quiet_ms\":{}}}",
+            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{},\"seal_quiet_ms\":{}{}}}",
             self.format,
             escape(&self.writer_id),
             self.generation,
@@ -147,7 +182,13 @@ impl LocalState {
             self.epoch,
             escape(&self.claim_id),
             self.seal_not_before_ms,
-            self.seal_quiet_ms
+            self.seal_quiet_ms,
+            // Encoded only when set, so a state without a floor keeps its old bytes.
+            if self.next_generation_floor == 0 {
+                String::new()
+            } else {
+                format!(",\"next_generation_floor\":{}", self.next_generation_floor)
+            }
         )
         .into_bytes()
     }
@@ -191,6 +232,11 @@ impl LocalState {
                 0
             },
             seal_quiet_ms,
+            next_generation_floor: if o.has("next_generation_floor") {
+                o.num("next_generation_floor")?
+            } else {
+                0
+            },
         })
     }
 

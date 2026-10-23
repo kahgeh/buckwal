@@ -163,6 +163,9 @@ fn head_json_round_trip_and_null_manifest() {
             manifest: Some(2),
             writer_id: "0123456789abcdef0123456789abcdef".into(),
             epoch: 0,
+            lease_ms: None,
+            request_timeout_ms: None,
+            next_generation_floor: None,
         }
     );
     // A head without `epoch` reads as 0 and is written back with it.
@@ -179,6 +182,9 @@ fn head_json_round_trip_and_null_manifest() {
         manifest: None,
         writer_id: "w".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     assert_eq!(
         String::from_utf8(n.encode()).unwrap(),
@@ -242,6 +248,7 @@ fn local_state_atomic_write() {
         claim_id: String::new(),
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
+        next_generation_floor: 0,
     };
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s.clone()));
@@ -285,6 +292,7 @@ fn local_state_refuses_absurd_seal_quiet() {
         claim_id: String::new(),
         seal_not_before_ms: 1,
         seal_quiet_ms: ms,
+        next_generation_floor: 0,
     };
     assert!(is_corrupt(LocalState::decode(&with(u64::MAX).encode())));
     assert!(is_corrupt(LocalState::decode(&with(86_400_001).encode())));
@@ -480,6 +488,9 @@ fn json_escapes_decode_and_encode() {
         manifest: None,
         writer_id: "q\"\\\u{0}\u{1f}\n\t\u{7f}é😀".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     let enc = nasty.encode();
     assert!(enc.iter().all(|b| *b >= 0x20));
@@ -495,6 +506,9 @@ fn head_encodes_epoch_last() {
         manifest: Some(2),
         writer_id: "ab".into(),
         epoch: 7,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     let want =
         br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab","epoch":7}"#;
@@ -577,6 +591,7 @@ fn stage2_local_state_reads_with_defaults() {
         claim_id: "c1".into(),
         seal_not_before_ms: 99,
         seal_quiet_ms: 800,
+        next_generation_floor: 0,
     };
     assert_eq!(
         String::from_utf8(full.encode()).unwrap(),
@@ -603,6 +618,9 @@ fn v1_head_bytes_are_unchanged() {
         writer_id: "w1".into(),
         epoch: 5,
         journal_mode: JournalMode::Wal,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     // Golden: exactly today's encoding, no journal_mode key.
     assert_eq!(
@@ -626,6 +644,9 @@ fn v2_head_roundtrip_has_journal_mode_mvcc() {
         writer_id: "w1".into(),
         epoch: 1,
         journal_mode: JournalMode::Mvcc,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     assert_eq!(
         String::from_utf8(h.encode()).unwrap(),
@@ -639,9 +660,9 @@ fn v2_head_roundtrip_has_journal_mode_mvcc() {
     assert!(is_corrupt(Head::decode(
         br#"{"format":2,"generation":1,"manifest":null,"writer_id":"w1","epoch":1,"journal_mode":"x"}"#
     )));
-    // Format 3 is still unknown.
+    // Format 4 is unknown.
     assert!(is_corrupt(Head::decode(
-        br#"{"format":3,"generation":1,"manifest":null,"writer_id":"w1","journal_mode":"mvcc"}"#
+        br#"{"format":4,"generation":1,"manifest":null,"writer_id":"w1","journal_mode":"mvcc"}"#
     )));
 }
 
@@ -665,6 +686,9 @@ fn v1_decoder_style_refusal() {
         writer_id: "w1".into(),
         epoch: 1,
         journal_mode: JournalMode::Mvcc,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     assert_eq!(
         Head::decode_accepting(&h.encode(), &[FORMAT]),
@@ -749,6 +773,7 @@ fn local_state_v2_roundtrip() {
         claim_id: String::new(),
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
+        next_generation_floor: 0,
     };
     assert_eq!(LocalState::decode(&s.encode()).unwrap(), s);
     assert!(String::from_utf8(s.encode())
@@ -758,6 +783,108 @@ fn local_state_v2_roundtrip() {
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s));
     assert!(is_corrupt(LocalState::decode(
-        br#"{"format":3,"writer_id":"w1","generation":3,"complete":true}"#
+        br#"{"format":4,"writer_id":"w1","generation":3,"complete":true}"#
     )));
+}
+
+fn head_v1(lease: Option<u64>, rt: Option<u64>, floor: Option<u64>) -> Head {
+    Head {
+        format: FORMAT,
+        generation: 3,
+        manifest: Some(2),
+        writer_id: "ab".into(),
+        epoch: 7,
+        journal_mode: JournalMode::Wal,
+        lease_ms: lease,
+        request_timeout_ms: rt,
+        next_generation_floor: floor,
+    }
+}
+
+#[test]
+fn head_round_trips_lease_timeout_and_floor() {
+    let h = head_v1(Some(30_000), Some(5_000), Some(9));
+    assert_eq!(
+        String::from_utf8(h.encode()).unwrap(),
+        r#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab","epoch":7,"lease_ms":30000,"request_timeout_ms":5000,"next_generation_floor":9}"#
+    );
+    assert_eq!(Head::decode(&h.encode()).unwrap(), h);
+    let mut v2 = h.clone();
+    v2.format = FORMAT_V2;
+    v2.journal_mode = JournalMode::Mvcc;
+    assert_eq!(Head::decode(&v2.encode()).unwrap(), v2);
+}
+
+#[test]
+fn head_without_the_new_fields_decodes_to_none_and_keeps_main_bytes() {
+    let main = br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab","epoch":7}"#;
+    let h = Head::decode(main).unwrap();
+    assert_eq!(h, head_v1(None, None, None));
+    assert_eq!(h.encode(), main.to_vec());
+    let main2 = br#"{"format":2,"generation":1,"manifest":null,"writer_id":"w1","epoch":1,"journal_mode":"mvcc"}"#;
+    assert_eq!(Head::decode(main2).unwrap().encode(), main2.to_vec());
+}
+
+#[test]
+fn head_with_a_huge_lease_is_corrupt() {
+    let h = head_v1(Some(u64::MAX / 2), Some(5_000), None);
+    assert!(is_corrupt(Head::decode(&h.encode())));
+    // Each alone is under a day, the sum is over.
+    let day = crate::config::defaults::MAX_SEAL_QUIET.as_millis() as u64;
+    assert!(is_corrupt(Head::decode(
+        &head_v1(Some(day), Some(1), None).encode()
+    )));
+    assert!(Head::decode(&head_v1(Some(day - 1), Some(1), None).encode()).is_ok());
+}
+
+#[test]
+fn format_3_head_is_accepted_by_decode_only_for_a_v3_decoder() {
+    for mode in [JournalMode::Wal, JournalMode::Mvcc] {
+        let h = Head {
+            format: FORMAT_V3,
+            journal_mode: mode,
+            ..head_v1(Some(1), Some(2), Some(5))
+        };
+        let enc = String::from_utf8(h.encode()).unwrap();
+        assert!(
+            enc.contains(&format!(",\"journal_mode\":\"{}\"", mode.as_str())),
+            "{enc}"
+        );
+        assert_eq!(Head::decode(enc.as_bytes()).unwrap(), h);
+        assert_eq!(
+            Head::decode_accepting(enc.as_bytes(), &[FORMAT]),
+            Err(Error::Corrupt("head: unsupported format 3".into()))
+        );
+        assert_eq!(
+            Head::decode_accepting(enc.as_bytes(), &[FORMAT, FORMAT_V2]),
+            Err(Error::Corrupt("head: unsupported format 3".into()))
+        );
+    }
+    // A format 3 head without journal_mode is corrupt.
+    assert!(is_corrupt(Head::decode(
+        br#"{"format":3,"generation":1,"manifest":null,"writer_id":"w1","epoch":1}"#
+    )));
+}
+
+#[test]
+fn local_state_round_trips_the_floor_and_defaults_to_zero() {
+    let old = br#"{"format":1,"writer_id":"w","generation":3,"complete":true}"#;
+    assert_eq!(LocalState::decode(old).unwrap().next_generation_floor, 0);
+    let s = LocalState {
+        format: FORMAT,
+        writer_id: "w".into(),
+        generation: 3,
+        complete: true,
+        claimed: true,
+        head_etag: "e".into(),
+        epoch: 4,
+        claim_id: "c1".into(),
+        seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
+        next_generation_floor: 12,
+    };
+    assert!(String::from_utf8(s.encode())
+        .unwrap()
+        .ends_with(r#","next_generation_floor":12}"#));
+    assert_eq!(LocalState::decode(&s.encode()).unwrap(), s);
 }

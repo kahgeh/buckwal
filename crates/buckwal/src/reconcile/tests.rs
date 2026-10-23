@@ -699,6 +699,9 @@ mod fence_image {
             manifest: None,
             writer_id: head_writer.to_string(),
             epoch: 0,
+            lease_ms: None,
+            request_timeout_ms: None,
+            next_generation_floor: None,
         };
         generation_image(&mem, &keys(), &head, &cfg()).map(|i| (i.wal, i.records))
     }

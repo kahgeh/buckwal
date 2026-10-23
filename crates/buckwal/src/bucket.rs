@@ -479,6 +479,9 @@ impl Bucket {
             writer_id,
             epoch: 1,
             journal_mode: JournalMode::Wal,
+            lease_ms: None,
+            request_timeout_ms: None,
+            next_generation_floor: None,
         };
         Bucket::create_head(store, keys, retry, concurrency, head)
     }
@@ -535,6 +538,9 @@ impl Bucket {
             writer_id,
             epoch: 1,
             journal_mode: JournalMode::Mvcc,
+            lease_ms: None,
+            request_timeout_ms: None,
+            next_generation_floor: None,
         };
         let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
         b.manifest = Some(manifest);
@@ -1283,6 +1289,9 @@ impl Bucket {
             writer_id: self.head.writer_id.clone(),
             epoch: self.head.epoch,
             journal_mode: self.head.journal_mode,
+            lease_ms: None,
+            request_timeout_ms: None,
+            next_generation_floor: None,
         }
     }
 

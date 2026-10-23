@@ -122,6 +122,9 @@ fn create_then_attach_round_trip() {
         manifest: None,
         writer_id: "w1".into(),
         epoch: 1,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     assert_eq!(b.head(), &want);
     assert_eq!(f.stored_head(), want);
@@ -345,6 +348,9 @@ fn seal_start_with_moved_head_fences_before_any_upload() {
         manifest: Some(1),
         writer_id: "w2".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -377,6 +383,9 @@ fn seal_start_accepts_our_own_late_head() {
         manifest: Some(1),
         writer_id: "w1".into(),
         epoch: 1,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
@@ -475,6 +484,9 @@ fn a_record_landing_past_the_lease_checks_the_head() {
         manifest: None,
         writer_id: "w2".into(),
         epoch: 2,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     f.fault.only_keys_containing("/log/");
@@ -554,6 +566,9 @@ fn a_writer_that_slept_checks_the_head() {
         manifest: None,
         writer_id: "w2".into(),
         epoch: 1,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     b.age_lease(Duration::ZERO, Duration::from_secs(1));
@@ -866,6 +881,9 @@ fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
         manifest: Some(1),
         writer_id: "w2".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     f.mem.delete(&keys().log(1, 1)).unwrap();
@@ -920,6 +938,9 @@ fn lapsed_append_with_our_head_proceeds() {
         manifest: Some(2),
         writer_id: "w1".into(),
         epoch: 1,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(
@@ -1362,6 +1383,9 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
         manifest: None,
         writer_id: "w2".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -1494,6 +1518,9 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
         manifest: None,
         writer_id: "w2".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&k.head(), &other.encode()).unwrap();
     let before = f.fault.events().len();
@@ -1573,6 +1600,9 @@ fn head_conflict_fences() {
         manifest: None,
         writer_id: "w2".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -2035,6 +2065,9 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
         manifest: None,
         writer_id: "w2".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     mem.put(&keys().head(), &other.encode()).unwrap();
     let f = b.append_log(LogFile::Wal, vec![op(1)]).unwrap_err();

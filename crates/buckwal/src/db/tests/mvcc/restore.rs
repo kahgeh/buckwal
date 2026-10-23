@@ -700,6 +700,9 @@ fn restore_wal_bucket_bytes_identical_to_before() {
         manifest: None,
         writer_id: "w".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     };
     store.put(&keys().head(), &h.encode()).unwrap();
 

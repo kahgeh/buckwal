@@ -10,6 +10,8 @@ mod record;
 pub(crate) const FORMAT: u32 = 1;
 /// Bucket format v2: MVCC buckets only (head `"format":2` plus `"journal_mode":"mvcc"`).
 pub(crate) const FORMAT_V2: u32 = 2;
+/// Bucket format v3: encrypted buckets (WAL or MVCC; the head's `journal_mode` says which).
+pub(crate) const FORMAT_V3: u32 = 3;
 
 pub(crate) use head::{Head, LocalState};
 pub(crate) use keys::Keys;

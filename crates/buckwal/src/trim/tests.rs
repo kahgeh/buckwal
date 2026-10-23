@@ -20,6 +20,9 @@ fn head(generation: u64, manifest: Option<u64>) -> Head {
         manifest,
         writer_id: "w".into(),
         epoch: 0,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
     }
 }
 
