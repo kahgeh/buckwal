@@ -22,6 +22,25 @@ A *commit* is one saved change to the database, such as an insert. A *bucket* is
 - It has been tested only against RustFS, a local store that speaks the same protocol as S3. It has not been tested on AWS S3.
 - The library is not on crates.io yet; add it by path or git (see Use).
 - Which tursodb drivers have been tested against the server, and which have not, is listed under Server.
+- Which settings change latency, cost and durability, and by how much, is in the next section. None of them weakens an acked commit.
+
+## Settings that change latency, cost and durability
+
+**No setting weakens an acked commit.** With every setting, in both journal modes, an ack waits for that commit's own log record in the bucket, and the log is uploaded in order, so every earlier commit is durable too. Where a setting changes something about durability, the row says what happens before the ack or after an error.
+
+| Setting (default) | Latency | Cost | Durability |
+|---|---|---|---|
+| [**Batching**](#batching) `BUCKWAL_BATCHING` (`off`; `window <max_wait> <max_commits> <max_bytes>`, `max_wait` at most 60 s, counts at least 1, refused in MVCC mode) | Off: 1.19 ms commit p50 on one connection. A window adds about its own length: 2.59, 16.8 and 63.0 ms p50 at 1, 10 and 50 ms. | Off: one log PUT per commit. A window shares a PUT only between connections committing at once: 3.1, 6.0 and 7.9 commits per PUT at 1, 10 and 50 ms with 8 connections. One connection gains nothing. | An acked commit is unchanged. In WAL mode, other connections of the same process can read a Window commit up to one window before it is durable; Off never allows that. An error after a Window commit means outcome unknown, not rolled back. |
+| [**Journal mode**](#mvcc-mode) `BUCKWAL_JOURNAL_MODE` (`wal`; `mvcc` for a new database only) | Not measured side by side. | Not measured side by side. | An acked commit is unchanged. A read inside a transaction can see another connection's commit before it is acked, and a failed commit stays in the local database and ships with the next one (outcome unknown). |
+| [**Retry deadline and request timeout**](#settings) `BUCKWAL_RETRY_DEADLINE_MS` (30 s), `BUCKWAL_REQUEST_TIMEOUT_MS` (10 s) | How long a commit can wait during a bucket outage before it returns an error: up to about `max_wait` + 2 × the retry deadline for a Window commit. | No effect while the bucket answers. | No effect. A commit that runs out of time returns an error, never an ack. |
+| [**Maintenance checkpoint**](#maintenance-checkpoint) `BUCKWAL_MAINTENANCE_LOG_OBJECTS` (1000), `BUCKWAL_MAINTENANCE_WAL_MIB` (64), `BUCKWAL_MAINTENANCE_GATE_WAIT_MS` (500 ms) | With the defaults under Off it ran 0 to 2 times per 6000 commits. A threshold of 200 under Off raised commit p99 to 565 to 647 ms. Under a 1 ms window a run raised the slowest commit by 103 to 196 ms. | Bounds a restore to about 3 + 1000 GETs. | No effect. |
+| [**Prefetch**](#settings) `BUCKWAL_PREFETCH` (off) | On: first reads after a restore find their pages local, but until the prefetch finishes a read can wait about one page GET behind it ([Replicas, Limits](#replicas)). Off: each first read of a page waits for its GET. Not measured. | On: one GET per sealed page after open. Off: a GET only for each page read. Not measured. | No effect. |
+| [**GC**](#takeover-lease-and-gc) `BUCKWAL_TRIM_GRACE_SECS` (10 min), `BUCKWAL_GC_AFTER_SEAL` (on) | No effect on commits (GC runs on its own thread). | How long unreferenced objects stay in the bucket. With `BUCKWAL_GC_AFTER_SEAL` off, only `gc` deletes anything and storage grows. One measured pass deleted 5095 objects in 7 s. | No effect. `Config` refuses a grace too short to be safe. |
+| [**Lease**](#takeover-lease-and-gc) `BUCKWAL_LEASE_MS` (30 s) | A takeover can hold the new writer's first seal for `lease` + `request_timeout` (40 s with the defaults). | The first commit after a pause longer than the lease makes one extra head GET (measured). | No effect. |
+| [**Encryption**](#https-and-encryption) `BUCKWAL_ENCRYPTION_KEY_FILE` (unset), `BUCKWAL_ENCRYPTION_CIPHER` (`aegis256`) | No difference measured at this size: 1.21 ms commit p50 against 1.27 ms plain. | No difference measured at this size. | An acked commit is unchanged, but the bucket's copy can be read only with the key, which never leaves the machine. Losing the key file loses the database. |
+| [**Replica slow poll**](#replicas) `BUCKWAL_REPLICA_POLL_MS` (60 s) | How far a replica can fall behind when no notification arrives. | An estimate, not measured: about US$0.22 a month per idle replica, against US$14 polling every second. | No effect (a replica writes nothing). |
+
+The figures are laptop runs (Apple M4 Max, RustFS on the same Mac, one run per figure), not S3 or production; see [Costs (measured)](#costs-measured).
 
 ## Quick start
 
