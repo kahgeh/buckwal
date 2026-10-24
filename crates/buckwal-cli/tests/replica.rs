@@ -1190,9 +1190,10 @@ fn fenced_late_record(name: &str, seal_first: bool) {
     });
     rep.waker().wake();
     let want_skipped = u64::from(plain);
-    wait_until(
+    wait_until_waking(
         "the late record to be skipped",
         Duration::from_secs(60),
+        || rep.waker().wake(),
         || {
             (rep.stats().fenced_records_skipped >= want_skipped
                 && rep.count() == (20 + b.acked.len()) as i64)
@@ -1201,16 +1202,20 @@ fn fenced_late_record(name: &str, seal_first: bool) {
     );
     let mut expected = (a.acked.len() + b.acked.len()) as i64;
     if seal_first {
-        wait_until("the replica's generation", Duration::from_secs(30), || {
-            (rep.stats().generation == head.generation).then_some(())
-        });
+        wait_until_waking(
+            "the replica's generation",
+            Duration::from_secs(30),
+            || rep.waker().wake(),
+            || (rep.stats().generation == head.generation).then_some(()),
+        );
         b.insert_range(109..=110);
         expected += 2;
         rep.waker().wake();
     }
-    wait_until(
+    wait_until_waking(
         "the replica to equal A plus B",
         Duration::from_secs(60),
+        || rep.waker().wake(),
         || (rep.count() == expected && rep.sum() == a.sum() + b.sum()).then_some(()),
     );
     let st = rep.stats();

@@ -148,6 +148,9 @@ pub(crate) struct PassResult {
     pub detail: Option<String>,
     /// The head generation the pass last saw (`None`: it never got that far).
     pub head_generation: Option<u64>,
+    /// The pass ended because readers held a seal's checkpoint, inside the busy budget. Only
+    /// the span value reads it (`checkpoint_busy`); the pass counts as any other.
+    pub checkpoint_busy: bool,
 }
 
 #[derive(Default)]
@@ -162,6 +165,8 @@ struct Tally {
     deferred: bool,
     /// The last log read of the pass ended on a hole.
     hole: bool,
+    /// The checkpoint was `Busy` inside the budget (`PassResult::checkpoint_busy`).
+    checkpoint_busy: bool,
     detail: Option<String>,
     head_generation: Option<u64>,
 }
@@ -469,6 +474,7 @@ impl Follower {
             lag_ms: None,
             detail: t.detail,
             head_generation: t.head_generation,
+            checkpoint_busy: t.checkpoint_busy,
         }
     }
 
@@ -486,6 +492,7 @@ impl Follower {
             lag_ms: None,
             detail: t.detail,
             head_generation: t.head_generation,
+            checkpoint_busy: t.checkpoint_busy,
         }
     }
 
@@ -696,6 +703,7 @@ impl Follower {
                 let first = *task.first_busy.get_or_insert(now);
                 let waited = now.saturating_duration_since(first);
                 if waited < budget {
+                    t.checkpoint_busy = true;
                     t.detail = Some(format!(
                         "checkpoint busy: readers hold the local WAL (pass {}, {} ms of {} ms)",
                         task.passes,

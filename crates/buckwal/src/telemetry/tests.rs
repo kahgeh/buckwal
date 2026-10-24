@@ -1391,6 +1391,7 @@ fn every_other_outcome_ends_the_span_with_status_unset() {
         "sealed",
         "applied",
         "nothing",
+        "checkpoint_busy",
         "checkpoint_deferred",
         "re_restore",
         "stopped",

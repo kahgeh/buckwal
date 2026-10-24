@@ -1543,6 +1543,7 @@ fn check_sync_span(s: &SpanRec) {
         [
             "applied",
             "nothing",
+            "checkpoint_busy",
             "checkpoint_deferred",
             "re_restore",
             "error"
@@ -1709,13 +1710,14 @@ fn sync_span_outcome_checkpoint_deferred() {
     });
     let all = sync_spans(&spans);
     all.iter().for_each(|s| check_sync_span(s));
+    let outcomes: Vec<_> = all.iter().map(|s| s.field("buckwal.outcome")).collect();
     assert!(
-        all.iter()
-            .any(|s| s.field("buckwal.outcome") == Some("checkpoint_deferred")),
-        "{:?}",
-        all.iter()
-            .map(|s| s.field("buckwal.outcome"))
-            .collect::<Vec<_>>()
+        outcomes.contains(&Some("checkpoint_deferred")),
+        "after the budget: {outcomes:?}"
+    );
+    assert!(
+        outcomes.contains(&Some("checkpoint_busy")),
+        "inside the budget, before it: {outcomes:?}"
     );
 }
 

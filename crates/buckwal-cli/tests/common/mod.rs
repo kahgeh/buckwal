@@ -451,6 +451,26 @@ pub fn wait_until<T>(what: &str, limit: Duration, mut f: impl FnMut() -> Option<
     }
 }
 
+/// [`wait_until`], and `wake` runs about once a second while it waits, as a writer's
+/// notifications would in real use. After a seal the replica's pass can end on a busy local
+/// checkpoint (readers hold the local WAL, here the polls of `f` itself); without a new wake
+/// the retry comes at the next slow poll, which can be as long as the wait.
+pub fn wait_until_waking<T>(
+    what: &str,
+    limit: Duration,
+    wake: impl Fn(),
+    mut f: impl FnMut() -> Option<T>,
+) -> T {
+    let mut last_wake = Instant::now();
+    wait_until(what, limit, || {
+        if last_wake.elapsed() >= Duration::from_secs(1) {
+            wake();
+            last_wake = Instant::now();
+        }
+        f()
+    })
+}
+
 /// `cfg` with the short lease and grace the takeover tests use (`short_lease_ctx` in
 /// `system.rs`): a 1 s lease, 2 s retry deadline and request timeout, 6 s grace.
 pub fn short_lease(mut cfg: Config) -> Config {

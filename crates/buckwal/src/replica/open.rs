@@ -775,7 +775,14 @@ impl Runner {
         span.record("buckwal.gets", r.gets);
         span.record("buckwal.found_new", r.found_new);
         span.record("buckwal.skipped", r.skipped);
-        span.record("buckwal.outcome", r.outcome.span_value(r.found_new));
+        span.record(
+            "buckwal.outcome",
+            if r.checkpoint_busy {
+                "checkpoint_busy"
+            } else {
+                r.outcome.span_value(r.found_new)
+            },
+        );
         // The pass is over; a re-restore or a stop that follows is not part of its duration.
         drop(entered);
         drop(span);
