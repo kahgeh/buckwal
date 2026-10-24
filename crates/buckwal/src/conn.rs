@@ -226,8 +226,8 @@ impl Connection {
                     batching,
                     span,
                 } => {
-                    // Its outcome was recorded when its blocking wait returned; it closes
-                    // at its ack.
+                    // Its outcome was recorded when its blocking wait returned, and its span ended
+                    // with that sync's `local_fsync`; dropping it here changes neither.
                     drop(span);
                     acked.push((commit, waited, batching));
                 }

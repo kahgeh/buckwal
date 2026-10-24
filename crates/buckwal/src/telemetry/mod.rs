@@ -1,7 +1,7 @@
 //! Telemetry: the library reports through `tracing` only. Spans (all INFO, target
 //! `buckwal`) and log events are a contract with the HyperDX searches:
 //!
-//! - `buckwal.commit` (`buckwal.batching`, `buckwal.commit_no`, `buckwal.bytes`,
+//! - `buckwal.commit` (`buckwal.batching`, `buckwal.journal_mode`, `buckwal.commit_no`, `buckwal.bytes`,
 //!   `buckwal.outcome`), with children `buckwal.local_write`, `buckwal.local_fsync` and
 //!   `buckwal.ack_wait` (`io/wal_file.rs`, `conn.rs`);
 //! - `buckwal.upload` (`buckwal.commits`, `buckwal.bytes`, `buckwal.generation`,

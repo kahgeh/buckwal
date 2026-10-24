@@ -65,9 +65,13 @@ impl Ticket {
         self.rx.recv().unwrap_or_else(|_| Err(stopped()))
     }
 
-    /// [`Ticket::wait`] inside a `buckwal.ack_wait` child of `commit`.
+    /// [`Ticket::wait`] inside a `buckwal.ack_wait` child of `commit`; `commit` is entered
+    /// around it, so it is last exited after its ack wait ends.
     pub(crate) fn wait_in(self, commit: &Span) -> Result<LogPos> {
-        info_span!(target: "buckwal", parent: commit, "buckwal.ack_wait").in_scope(|| self.wait())
+        commit.in_scope(|| {
+            info_span!(target: "buckwal", parent: commit, "buckwal.ack_wait")
+                .in_scope(|| self.wait())
+        })
     }
 }
 
@@ -101,9 +105,13 @@ impl LogTicket {
         })
     }
 
-    /// [`LogTicket::wait`] inside a `buckwal.ack_wait` child of `commit`.
+    /// [`LogTicket::wait`] inside a `buckwal.ack_wait` child of `commit`; `commit` is entered
+    /// around it, so it is last exited after its ack wait ends.
     pub(crate) fn wait_in(self, commit: &Span) -> std::result::Result<LogPos, LogFailure> {
-        info_span!(target: "buckwal", parent: commit, "buckwal.ack_wait").in_scope(|| self.wait())
+        commit.in_scope(|| {
+            info_span!(target: "buckwal", parent: commit, "buckwal.ack_wait")
+                .in_scope(|| self.wait())
+        })
     }
 }
 

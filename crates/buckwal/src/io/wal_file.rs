@@ -76,6 +76,7 @@ impl CommitSpans {
             target: "buckwal",
             "buckwal.commit",
             buckwal.batching = Empty,
+            buckwal.journal_mode = Empty,
             buckwal.commit_no = Empty,
             buckwal.bytes = Empty,
             buckwal.outcome = Empty,
@@ -148,6 +149,15 @@ impl ShippingFile {
         })
     }
 
+    /// The `buckwal.journal_mode` of this file's commits.
+    fn journal_mode(&self) -> &'static str {
+        if self.mvcc {
+            "mvcc"
+        } else {
+            "wal"
+        }
+    }
+
     /// The `-wal` of an MVCC database: it never seals (the module doc).
     pub(crate) fn in_mvcc(mut self) -> Self {
         self.mvcc = true;
@@ -159,6 +169,7 @@ impl ShippingFile {
     /// are: the checkpoint fails and the engine discards its frames.
     fn ship_checkpoint_frames(&self, ops: Vec<Op>, span: &Span) -> Result<()> {
         span.record("buckwal.batching", display(Batching::Off));
+        span.record("buckwal.journal_mode", self.journal_mode());
         span.record("buckwal.bytes", op_bytes(&ops));
         let ticket = span.in_scope(|| self.uploader.submit_log_file(LogFile::Wal, ops, 0));
         span.record("buckwal.commit_no", ticket.commit);
@@ -185,6 +196,7 @@ impl ShippingFile {
     /// which shows `made_with`: the setting the commit was made with.
     fn submit(&self, commit: &Span, ops: Vec<Op>, b: Batching, made_with: Batching) -> Ticket {
         commit.record("buckwal.batching", display(made_with));
+        commit.record("buckwal.journal_mode", self.journal_mode());
         commit.record("buckwal.bytes", op_bytes(&ops));
         let ticket = commit.in_scope(|| self.uploader.submit_log(ops, b));
         commit.record("buckwal.commit_no", ticket.commit);
@@ -212,7 +224,7 @@ impl ShippingFile {
     /// on its ticket after the engine returns (`Connection::await_acks`).
     ///
     /// Returns the commit's span (`None` with nothing to ship), which goes with its ack. A
-    /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`, which closes it).
+    /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`); the span then ends with this sync's `local_fsync`.
     fn ship_commit(&self) -> Result<Option<Span>> {
         let (ops, span) = self.take_pending();
         if ops.is_empty() {
@@ -242,7 +254,7 @@ impl ShippingFile {
             ctx::push(PendingAck::Waiting {
                 ticket: self.submit(&span, ops, b, b),
                 batching: b,
-                span: span.clone(),
+                span: span.clone().into(),
             });
         }
         Ok(Some(span))
@@ -383,8 +395,11 @@ impl File for ShippingFile {
         // `Err`, which rolls the commit back, never a failed completion (which would panic,
         // D3). A queued Window commit is fsynced locally now and acked by its call later.
         match self.ship_commit().map_err(stash)? {
-            Some(commit) => info_span!(target: "buckwal", parent: &commit, "buckwal.local_fsync")
-                .in_scope(|| self.inner.sync(c, sync_type)),
+            // The commit is entered around its fsync, so it is last exited after it.
+            Some(commit) => commit.in_scope(|| {
+                info_span!(target: "buckwal", parent: &commit, "buckwal.local_fsync")
+                    .in_scope(|| self.inner.sync(c, sync_type))
+            }),
             None => self.inner.sync(c, sync_type),
         }
     }

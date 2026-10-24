@@ -947,7 +947,7 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 
 | Span | Parent | Attributes |
 |---|---|---|
-| `buckwal.commit` | the caller's span | `buckwal.batching` (the setting's text), `buckwal.commit_no`, `buckwal.bytes`, `buckwal.outcome` (`ok`, or `error`, which also sets status Error) |
+| `buckwal.commit` | the caller's span | From the commit's first write (MVCC: from its sync) until its record is in the bucket (acked), or until it fails; its `buckwal.ack_wait` ends inside it. A Window commit's length includes the wait for its batch. A Window commit the caller drops before the ack ends at the drop, with no outcome. `buckwal.batching` (the setting's text), `buckwal.journal_mode` (`wal` or `mvcc`), `buckwal.commit_no`, `buckwal.bytes`, `buckwal.outcome` (`ok`, or `error`, which also sets status Error) |
 | `buckwal.local_write` | `buckwal.commit` | |
 | `buckwal.local_fsync` | `buckwal.commit` | |
 | `buckwal.ack_wait` | `buckwal.commit` | The wait for the commit's log record: inside the WAL sync for an Off commit (or a Window commit on the Off path), after the engine returns for a Window commit. |
@@ -962,6 +962,23 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `buckwal.gc` | the caller's span for `gc`; none on a writer's GC thread | One per GC pass: `buckwal.generation` (the head's), `buckwal.manifest` (the manifest trimmed against; absent otherwise), `buckwal.age_ms` (as `GcReport::age`), `buckwal.deleted`, `buckwal.outcome` (`trimmed`, `too_young`, `nothing`, `integrity` or `error`) |
 | `buckwal.replica.sync` | none (the follower thread) | One per sync pass: `buckwal.replica_id` (a random id kept in the position file), `buckwal.generation`, `buckwal.head_generation` (the head generation the pass saw; absent when it failed before the head check), `buckwal.seq` (the last applied), `buckwal.trigger` (`notification`, `slow_poll` or `start`), `buckwal.lag_ms` (as in `stats()`), `buckwal.objects` (log objects fetched), `buckwal.lists`, `buckwal.gets` (the GETs of log objects and the head; not the lag HEAD of a pass that took in new data), `buckwal.found_new` (`true` or `false`), `buckwal.skipped` (fenced records skipped) and `buckwal.outcome` (`applied`, `nothing`, `checkpoint_deferred`, `re_restore` or `error`) |
 | `buckwal.replica.re_restore` | none | One per re-restore: `buckwal.replica_id`, `buckwal.generation` and `buckwal.seq` (before), `buckwal.generation_after` and `buckwal.seq_after` (after), `buckwal.behind_ms`, `buckwal.reason` (`trimmed` or `conflict`). Its restore has the existing `buckwal.restore` span as a child. |
+
+**Commit length card.** Commit p95 per hour, per `buckwal.batching` and `buckwal.journal_mode`, over 24 h (info only, no alert):
+
+```sql
+SELECT toStartOfHour(Timestamp) AS hour,
+       SpanAttributes['buckwal.batching'] AS batching,
+       SpanAttributes['buckwal.journal_mode'] AS journal_mode,
+       quantile(0.95)(Duration) / 1e6 AS p95_ms
+FROM otel.otel_traces
+WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.commit'
+  AND ResourceAttributes['deployment.environment.name'] != 'test'
+  AND Timestamp > now() - INTERVAL 24 HOUR
+GROUP BY hour, batching, journal_mode ORDER BY hour
+```
+
+For an Off commit, a p95 above 2 s means look today: the bucket is slow but still taking records. For a Window setting, read the p95 against its `max_wait`: a p95 well above `max_wait` plus the Off p95 means look today. The `deployment.environment.name` filter leaves out test runs, which carry `deployment.environment.name = test`. The children show where the time went: `buckwal.local_write`, `buckwal.local_fsync`, `buckwal.ack_wait`, then the `buckwal.upload` of its batch (`buckwal.retries`, `s3.status`).
+
 
 Every span and log record also carries `test_run_id` when one is set (`BUCKWAL_TEST_RUN_ID`), and the resource attributes above.
 

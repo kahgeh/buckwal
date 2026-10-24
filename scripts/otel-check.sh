@@ -15,6 +15,8 @@
 # Also checked: the run's spans carry the marking (`deployment.environment.name = test`,
 # `host.name`, `service.instance.id` as resource attributes), and at least one span of the run
 # has status Error (a failed commit, restore or takeover of the fault tests).
+# A WAL `buckwal.commit` of the run carries `buckwal.journal_mode = wal` and ends at or after its
+# `buckwal.ack_wait` child.
 # The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
@@ -114,10 +116,15 @@ while :; do
   query "SELECT count() $TRACES AND Timestamp > now() - INTERVAL 1 DAY AND StatusCode = 'Error'"
   errors="$OUT"
 
+  # One WAL commit of the run: journal mode `wal`, and its ack wait ends inside it.
+  query "SELECT count() FROM otel.otel_traces AS c INNER JOIN otel.otel_traces AS a ON a.TraceId = c.TraceId AND a.ParentSpanId = c.SpanId WHERE c.ServiceName = 'buckwal' AND c.SpanName = 'buckwal.commit' AND c.SpanAttributes['test_run_id'] = '$RUN_ID' AND c.Timestamp > now() - INTERVAL 1 DAY AND c.SpanAttributes['buckwal.journal_mode'] = 'wal' AND a.ServiceName = 'buckwal' AND a.SpanName = 'buckwal.ack_wait' AND a.SpanAttributes['test_run_id'] = '$RUN_ID' AND a.Timestamp > now() - INTERVAL 1 DAY AND toUnixTimestamp64Nano(c.Timestamp) + c.Duration >= toUnixTimestamp64Nano(a.Timestamp) + a.Duration"
+  wal_commits="$OUT"
+
   missing=""
   [[ "$marked" -gt 0 ]] || missing="$missing resource-marking(deployment.environment.name,host.name,service.instance.id)"
   [[ "$unmarked" -eq 0 ]] || missing="$missing every-span-marked(unmarked $unmarked)"
   [[ "$errors" -gt 0 ]] || missing="$missing span-with-status-Error"
+  [[ "$wal_commits" -gt 0 ]] || missing="$missing buckwal.commit(buckwal.journal_mode=wal,ends-after-ack_wait)"
   [[ "$replica_all" -eq 0 || "$replica_sync" -gt 0 ]] || missing="$missing buckwal.replica.sync(buckwal.lag_ms,buckwal.trigger)(of $replica_all)"
   for s in $SPANS; do
     awk -F'\t' -v s="$s" '$1 == s && $2 > 0 { found = 1 } END { exit !found }' <<<"$spans" \

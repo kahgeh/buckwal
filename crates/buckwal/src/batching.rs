@@ -175,10 +175,36 @@ impl Batching {
     }
 }
 
+/// A Window commit's `buckwal.commit` span, held until its ack. The exporter stamps a span's end
+/// at its last exit, not at its close (tracing-opentelemetry), so dropping this enters the
+/// span once more: the span then ends when its ack is collected, or when the caller drops
+/// the commit unacked, and never earlier.
+pub(crate) struct AckSpan(tracing::Span);
+
+impl From<tracing::Span> for AckSpan {
+    fn from(span: tracing::Span) -> Self {
+        AckSpan(span)
+    }
+}
+
+impl std::ops::Deref for AckSpan {
+    type Target = tracing::Span;
+    fn deref(&self) -> &tracing::Span {
+        &self.0
+    }
+}
+
+impl Drop for AckSpan {
+    fn drop(&mut self) {
+        let _end = self.0.enter();
+    }
+}
+
 /// One commit of a `Connection` call, for the call to ack before it returns. `batching` is
 /// the setting the commit was made with, even when a degraded uploader made a Window commit
-/// take the blocking `Off` path (`Done`). `span` is the commit's `buckwal.commit` span,
-/// which closes when the ack resolves.
+/// take the blocking `Off` path (`Done`). `span` is the commit's `buckwal.commit` span. A
+/// `Done` commit's span ended with its WAL sync (its record was in the bucket by then); a
+/// `Waiting` commit's ends when the call collects its ack, or drops it.
 pub(crate) enum PendingAck {
     /// Uploaded inside the WAL sync (`Off`, or a Window commit while the uploader is
     /// degraded): `waited` is how long the upload took.
@@ -192,7 +218,7 @@ pub(crate) enum PendingAck {
     Waiting {
         ticket: crate::uploader::Ticket,
         batching: Batching,
-        span: tracing::Span,
+        span: AckSpan,
     },
 }
 

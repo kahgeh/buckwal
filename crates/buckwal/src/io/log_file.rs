@@ -213,6 +213,7 @@ impl LogShippingFile {
             target: "buckwal",
             "buckwal.commit",
             buckwal.batching = %Batching::Off,
+            buckwal.journal_mode = "mvcc",
             buckwal.commit_no = Empty,
             buckwal.bytes = op_bytes(&ops),
             buckwal.outcome = Empty,
@@ -343,8 +344,11 @@ impl File for LogShippingFile {
         // Upload before any completion exists: a failure is a synchronous `Err` (the commit
         // fails, the engine keeps its frame), never a failed completion.
         match self.ship().map_err(stash)? {
-            Some(commit) => info_span!(target: "buckwal", parent: &commit, "buckwal.local_fsync")
-                .in_scope(|| self.inner.sync(c, sync_type)),
+            // The commit is entered around its fsync, so it is last exited after it.
+            Some(commit) => commit.in_scope(|| {
+                info_span!(target: "buckwal", parent: &commit, "buckwal.local_fsync")
+                    .in_scope(|| self.inner.sync(c, sync_type))
+            }),
             None => self.inner.sync(c, sync_type),
         }
     }

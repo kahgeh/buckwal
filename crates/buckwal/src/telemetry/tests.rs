@@ -1532,3 +1532,213 @@ fn host_name_is_the_machines_unless_the_environment_gives_one() {
     let r = resource_of(None);
     assert_ne!(res_attr(&r, "service.instance.id").as_deref(), Some("mine"));
 }
+
+// ---- the commit span's length and mode (commit-span-truth) ----
+
+/// The finished spans of `f` under the OTel pipeline's in-memory exporter.
+fn exported(f: impl FnOnce()) -> Vec<SpanData> {
+    let (sub, p, spans, _logs) = test_pipeline(None);
+    tracing::subscriber::with_default(sub, f);
+    p.force_flush();
+    spans.get_finished_spans().unwrap()
+}
+
+fn attr(s: &SpanData, key: &str) -> Option<String> {
+    s.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.to_string())
+}
+
+/// Every `buckwal.commit` of `spans` with a `buckwal.commit_no` (the creating DDL included),
+/// each with the `buckwal.ack_wait` children it has.
+fn commits_with_acks(spans: &[SpanData]) -> Vec<(&SpanData, Vec<&SpanData>)> {
+    spans
+        .iter()
+        .filter(|s| s.name == "buckwal.commit" && attr(s, "buckwal.commit_no").is_some())
+        .map(|c| {
+            let acks = spans
+                .iter()
+                .filter(|a| {
+                    a.name == "buckwal.ack_wait" && a.parent_span_id == c.span_context.span_id()
+                })
+                .collect();
+            (c, acks)
+        })
+        .collect()
+}
+
+/// Open on a MemStore with `b` and `mode`, create `t` and insert three rows, all under the
+/// OTel pipeline; return its finished spans.
+fn exported_commits(b: Batching, mode: crate::config::JournalMode) -> Vec<SpanData> {
+    let dir = tempfile::tempdir().unwrap();
+    exported(|| {
+        let mut c = config(dir.path());
+        c.journal_mode = mode;
+        c.batching = b;
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 0..3 {
+            insert(&conn, i).unwrap();
+        }
+    })
+}
+
+fn assert_commit_outlasts_its_ack(spans: &[SpanData], mode: &str) {
+    let commits = commits_with_acks(spans);
+    assert!(commits.len() >= 3, "{} commits", commits.len());
+    for (c, acks) in commits {
+        assert_eq!(acks.len(), 1, "one ack wait per commit");
+        assert!(
+            c.end_time >= acks[0].end_time,
+            "commit {:?} ended before its ack wait",
+            attr(c, "buckwal.commit_no")
+        );
+        assert!(c.start_time <= acks[0].start_time);
+        for child in spans
+            .iter()
+            .filter(|s| s.parent_span_id == c.span_context.span_id() && s.name != "buckwal.upload")
+        {
+            assert!(
+                c.end_time >= child.end_time,
+                "{} ends after its commit",
+                child.name
+            );
+        }
+        assert_eq!(attr(c, "buckwal.journal_mode").as_deref(), Some(mode));
+    }
+}
+
+#[test]
+fn off_wal_commit_span_outlasts_its_ack_and_names_the_mode() {
+    let spans = exported_commits(Batching::Off, crate::config::JournalMode::Wal);
+    assert_commit_outlasts_its_ack(&spans, "wal");
+}
+
+#[test]
+fn off_mvcc_commit_span_outlasts_its_ack_and_names_the_mode() {
+    let spans = exported_commits(Batching::Off, crate::config::JournalMode::Mvcc);
+    assert_commit_outlasts_its_ack(&spans, "mvcc");
+}
+
+#[test]
+fn window_wal_commit_span_outlasts_its_ack_and_names_the_mode() {
+    let spans = exported_commits(window_50ms(), crate::config::JournalMode::Wal);
+    assert_commit_outlasts_its_ack(&spans, "wal");
+    // The span includes the wait for the batch: a lone Window commit waits out the window.
+    let waited = commits_with_acks(&spans)
+        .into_iter()
+        .filter(|(c, _)| attr(c, "buckwal.batching").is_some_and(|b| b.starts_with("window")))
+        .map(|(c, _)| c.end_time.duration_since(c.start_time).unwrap())
+        .collect::<Vec<_>>();
+    assert!(waited.len() >= 3, "{waited:?}");
+    assert!(
+        waited.iter().all(|d| *d >= Duration::from_millis(40)),
+        "a Window commit's span includes the batch wait: {waited:?}"
+    );
+}
+
+#[test]
+fn a_commit_whose_ack_fails_ends_after_its_ack_wait_with_outcome_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let spans = exported(|| {
+        let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
+        let mut c = config(dir.path());
+        c.retry_deadline = Duration::from_millis(200);
+        c.request_timeout = Duration::from_millis(50);
+        let db = crate::open_with_store(c, fault.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        fault.only_keys_containing("log/");
+        fault.fail_puts_after(0);
+        assert!(insert(&conn, 1).is_err());
+    });
+    let (c, acks) = commits_with_acks(&spans)
+        .into_iter()
+        .find(|(c, _)| attr(c, "buckwal.outcome").as_deref() == Some("error"))
+        .expect("a commit with outcome error");
+    assert_eq!(acks.len(), 1);
+    assert!(c.end_time >= acks[0].end_time);
+}
+
+#[test]
+fn a_window_commit_dropped_before_its_ack_ends_at_the_drop_with_no_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let spans = exported(|| {
+        let mut c = config(dir.path());
+        c.batching = window_50ms();
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        // The insert commits and queues; the failing statement returns the call early, and
+        // its commit's ack is dropped uncollected.
+        assert!(conn
+            .execute_batch("INSERT INTO t VALUES (7); SELECT * FROM missing")
+            .is_err());
+    });
+    let (c, acks) = commits_with_acks(&spans)
+        .into_iter()
+        .find(|(c, _)| attr(c, "buckwal.outcome").is_none())
+        .expect("a commit span with no outcome");
+    assert!(acks.is_empty(), "nothing waited for the dropped ack");
+    for child in spans
+        .iter()
+        .filter(|s| s.parent_span_id == c.span_context.span_id() && s.name != "buckwal.upload")
+    {
+        assert!(
+            c.end_time >= child.end_time,
+            "{} ends after its commit",
+            child.name
+        );
+    }
+    assert!(c.end_time >= c.start_time);
+    assert!(
+        c.end_time.duration_since(c.start_time).unwrap() < Duration::from_millis(40),
+        "ended at the drop, not at the batch"
+    );
+}
+
+#[test]
+fn off_commits_of_one_call_each_end_with_their_own_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let spans = exported(|| {
+        let db = crate::open_with_store(config(dir.path()), Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        let batch: String = (0..20)
+            .map(|i| format!("INSERT INTO t VALUES ({i});"))
+            .collect();
+        conn.execute_batch(&batch).unwrap();
+    });
+    let mut commits: Vec<&SpanData> = commits_with_acks(&spans)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    commits.sort_by_key(|c| c.start_time);
+    assert!(commits.len() >= 20);
+    for pair in commits.windows(2) {
+        assert!(
+            pair[0].end_time <= pair[1].start_time,
+            "an Off commit ends with its own sync, not with the call"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_ack_span_ends_the_span_at_the_drop() {
+    use tracing::info_span;
+    let spans = exported(|| {
+        let span = info_span!(target: "buckwal", "buckwal.commit");
+        span.in_scope(|| ());
+        let held: crate::batching::AckSpan = span.into();
+        std::thread::sleep(Duration::from_millis(30));
+        drop(held);
+    });
+    let c = spans.iter().find(|s| s.name == "buckwal.commit").unwrap();
+    assert!(c.end_time.duration_since(c.start_time).unwrap() >= Duration::from_millis(30));
+}
