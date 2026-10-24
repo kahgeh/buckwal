@@ -990,7 +990,7 @@ The library reports only through `tracing`. `telemetry::init(TelemetryConfig)` e
 | `buckwal.local_write` | `buckwal.commit` | |
 | `buckwal.local_fsync` | `buckwal.commit` | |
 | `buckwal.ack_wait` | `buckwal.commit` | The wait for the commit's log record: inside the WAL sync for an Off commit (or a Window commit on the Off path), after the engine returns for a Window commit. |
-| `buckwal.upload` | the first commit's `buckwal.commit` | One per log PUT: `buckwal.commits`, `buckwal.commit_first` and `buckwal.commit_last` (the lowest and highest commit number it carried), `buckwal.bytes`, `buckwal.generation`, `buckwal.seq`, `buckwal.retries`, `buckwal.behind_ms` (the age of the oldest background commit still waiting after this PUT, from its return; 0 when none waits), `s3.status`. A root span when its first commit is a background one: that commit's span has closed by then. |
+| `buckwal.upload` | the first commit's `buckwal.commit` | One per log PUT: `buckwal.commits`, `buckwal.commit_first` and `buckwal.commit_last` (the lowest and highest commit number it carried), `buckwal.bytes`, `buckwal.generation`, `buckwal.seq`, `buckwal.retries`, `buckwal.oldest_behind_ms` (the age of the oldest background commit still waiting after this PUT, from its return; 0 when none waits), `s3.status`. A root span when its first commit is a background one: that commit's span has closed by then. |
 | `buckwal.checkpoint_upload` | the caller's span | One per seal: `buckwal.generation`, `buckwal.seq` (the seal-start record's), `buckwal.pages`, `buckwal.retries`, `s3.status`, and `buckwal.skipped_generation` on the first seal after a takeover (WAL and MVCC alike): the number of the skipped generation, the one with no log under which that seal wrote its pages and manifest; absent on every other seal |
 | `buckwal.restore` | the caller's span | `buckwal.generation`, `buckwal.seq` (the highest log seq replayed, 0 when the log is empty), `buckwal.log_objects`, `buckwal.gets`, `buckwal.bytes`, `buckwal.retries`, `s3.status`, `buckwal.outcome` (`ok`, `integrity` or `error`) |
 | `buckwal.maintenance` | none (the maintenance thread) | One per maintenance run: `buckwal.generation`, `buckwal.log_objects`, `buckwal.wal_bytes` (the measures that made it due), `buckwal.gate_wait_ms` (the drain; absent when the run did not start), `buckwal.outcome` (`sealed`, `bucket_failing`, `takeover_quiet`, `gate_timeout`, `busy`, `closed` or `error`; a failed or panicked run is `error`). The seal's `buckwal.checkpoint_upload` is its descendant. |
@@ -1019,7 +1019,7 @@ GROUP BY hour, batching, journal_mode ORDER BY hour
 
 For an Off commit, a p95 above 2 s means look today: the bucket is slow but still taking records. For a Window setting, read the p95 against its `max_wait`: a p95 well above `max_wait` plus the Off p95 means look today. The `deployment.environment.name` filter leaves out test runs, which carry `deployment.environment.name = test`. The children show where the time went: `buckwal.local_write`, `buckwal.local_fsync`, `buckwal.ack_wait`, then the `buckwal.upload` of its batch (`buckwal.retries`, `s3.status`). The card leaves out background commits, whose spans end with the local fsync.
 
-**Background commit card.** What the app waited per commit, p50 and p95 per hour, `background` against `off`, over 24 h (info only, no alert). Both are the time the caller waited, which is the gain the setting is judged by. The time until a background commit is durable is read from `buckwal.behind_ms`, not from this span:
+**Background commit card.** What the app waited per commit, p50 and p95 per hour, `background` against `off`, over 24 h (info only, no alert). Both are the time the caller waited, which is the gain the setting is judged by. The time until a background commit is durable is read from `buckwal.oldest_behind_ms`, not from this span:
 
 ```sql
 SELECT toStartOfHour(Timestamp) AS hour,
@@ -1034,12 +1034,12 @@ WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.commit'
 GROUP BY hour, batching ORDER BY hour
 ```
 
-**Behind card.** How long background commits stay at risk: `buckwal.behind_ms` p95 and max per hour over 24 h (info only, no alert):
+**Behind card.** How long background commits stay at risk: `buckwal.oldest_behind_ms` p95 and max per hour over 24 h (info only, no alert):
 
 ```sql
 SELECT toStartOfHour(Timestamp) AS hour,
-       quantile(0.95)(toFloat64OrZero(SpanAttributes['buckwal.behind_ms'])) AS p95_ms,
-       max(toFloat64OrZero(SpanAttributes['buckwal.behind_ms'])) AS max_ms
+       quantile(0.95)(toFloat64OrZero(SpanAttributes['buckwal.oldest_behind_ms'])) AS p95_ms,
+       max(toFloat64OrZero(SpanAttributes['buckwal.oldest_behind_ms'])) AS max_ms
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.upload'
   AND ResourceAttributes['deployment.environment.name'] != 'test'
@@ -1047,7 +1047,7 @@ WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.upload'
 GROUP BY hour ORDER BY hour
 ```
 
-`buckwal.behind_ms` is recorded only when a PUT ends, so the card is blind while a PUT is stalled, until it ends or fails. The `log upload failed` WARN and the errors of degraded commits cover that window. A max above `max_wait` + `retry_deadline` (30 s with the defaults) means look today: the bucket is failing or much slower than the app. A bucket that is down needs no alert of its own here: the uploader is degraded, so background commits take the blocking path and return errors at once, and `log upload failed` is logged, as for Off. No upload-failure alert exists today.
+`buckwal.oldest_behind_ms` is recorded only when a PUT ends, so the card is blind while a PUT is stalled, until it ends or fails. The `log upload failed` WARN and the errors of degraded commits cover that window. A max above `max_wait` + `retry_deadline` (30 s with the defaults) means look today: the bucket is failing or much slower than the app. A bucket that is down needs no alert of its own here: the uploader is degraded, so background commits take the blocking path and return errors at once, and `log upload failed` is logged, as for Off. No upload-failure alert exists today.
 
 
 Every span and log record also carries `test_run_id` when one is set (`BUCKWAL_TEST_RUN_ID`), and the resource attributes above.
@@ -1530,7 +1530,7 @@ The tests cannot show these. Treat each as unproven until it has run in real use
 - **Real S3's notification delay**, and the replica lag it gives, which are only estimated (Replicas, Lag), as are the replica cost figures.
 - **The fenced late-record skip path in an encrypted bucket (pass 2).** An encrypted late record of a fenced writer cannot be planted without a hook in production code, so the skip rule is exercised on plaintext buckets only.
 - **Paging of `start-after` on a real S3.** The paging of `ListObjectsV2` with `start-after` against real RustFS, beyond 1000 keys, is tested by `s3_list_after_start_after_and_paging`. Real S3 was not tried.
-- **Background commits on real S3.** The gain and the gap (`commits_behind`, `buckwal.behind_ms`) were measured only against RustFS on one laptop (`results/background-commit.txt`). With an S3 PUT of tens of milliseconds, both are larger. That is not measured. The how-to's catch-up steps ran against RustFS, with the soak's ids standing in for an app's messages and its own log.
+- **Background commits on real S3.** The gain and the gap (`commits_behind`, `buckwal.oldest_behind_ms`) were measured only against RustFS on one laptop (`results/background-commit.txt`). With an S3 PUT of tens of milliseconds, both are larger. That is not measured. The how-to's catch-up steps ran against RustFS, with the soak's ids standing in for an app's messages and its own log.
 
 ## Costs (measured)
 

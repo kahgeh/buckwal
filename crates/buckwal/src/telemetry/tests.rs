@@ -1824,7 +1824,12 @@ fn a_background_commit_span_ends_at_its_return_and_its_upload_is_a_root_span() {
     assert_eq!(attr(up, "buckwal.commit_first"), Some(first.to_string()));
     assert_eq!(attr(up, "buckwal.commit_last"), Some(last.to_string()));
     assert_eq!(
-        attr(up, "buckwal.behind_ms").as_deref(),
+        attr(up, "buckwal.behind_ms"),
+        None,
+        "that name is the replica's"
+    );
+    assert_eq!(
+        attr(up, "buckwal.oldest_behind_ms").as_deref(),
         Some("0"),
         "none waits after it"
     );
@@ -1847,7 +1852,7 @@ fn an_off_commits_upload_names_its_commit_and_keeps_its_parent() {
             .find(|s| s.span_context.span_id() == up.parent_span_id)
             .expect("an Off upload hangs from its commit");
         assert_eq!(attr(parent, "buckwal.commit_no"), Some(first));
-        assert_eq!(attr(up, "buckwal.behind_ms").as_deref(), Some("0"));
+        assert_eq!(attr(up, "buckwal.oldest_behind_ms").as_deref(), Some("0"));
     }
 }
 

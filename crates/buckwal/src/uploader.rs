@@ -612,7 +612,7 @@ impl Worker {
             buckwal.generation = Empty,
             buckwal.seq = Empty,
             buckwal.retries = Empty,
-            buckwal.behind_ms = Empty,
+            buckwal.oldest_behind_ms = Empty,
             s3.status = Empty,
         );
         let mut syncs = Vec::with_capacity(items.len());
@@ -653,7 +653,7 @@ impl Worker {
                 // How long the commits still behind have waited: what a lost machine would
                 // lose now. The span closes before any reply.
                 span.record(
-                    "buckwal.behind_ms",
+                    "buckwal.oldest_behind_ms",
                     self.durable.behind().1.as_millis() as u64,
                 );
                 drop(span);
@@ -810,7 +810,7 @@ impl Worker {
             buckwal.generation = Empty,
             buckwal.seq = Empty,
             buckwal.retries = Empty,
-            buckwal.behind_ms = Empty,
+            buckwal.oldest_behind_ms = Empty,
             s3.status = Empty,
         );
         let r = span.in_scope(|| self.bucket.append_log(file, vec![ops]));

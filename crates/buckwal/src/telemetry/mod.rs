@@ -8,7 +8,7 @@
 //!   `buckwal.outcome`;
 //! - `buckwal.upload` (`buckwal.commits`, `buckwal.commit_first`, `buckwal.commit_last`,
 //!   `buckwal.bytes`, `buckwal.generation`, `buckwal.seq`, `buckwal.retries`,
-//!   `buckwal.behind_ms`, `s3.status`; a root span when its first commit is a background
+//!   `buckwal.oldest_behind_ms`, `s3.status`; a root span when its first commit is a background
 //!   one) and `buckwal.checkpoint_upload`
 //!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`,
 //!   and `buckwal.skipped_generation`, on the first seal after a takeover only),
