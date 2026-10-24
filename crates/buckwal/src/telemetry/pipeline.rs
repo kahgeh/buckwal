@@ -74,8 +74,9 @@ fn instance_id() -> &'static str {
 ///
 /// The builder reads `OTEL_RESOURCE_ATTRIBUTES` first, and a later attribute replaces an
 /// earlier one of the same key. So `host.name` is set from `gethostname` only when the
-/// environment does not give one: the operator's value wins. `service.instance.id` and
-/// `deployment.environment.name` are always the code's.
+/// environment does not give one: the operator's value wins. `service.instance.id` is always
+/// the code's; `deployment.environment.name` is the code's (`test`) only in a test run, and
+/// otherwise the environment's when it gives one.
 fn resource(test_run: bool) -> Resource {
     let env_has_host = Resource::builder()
         .build()
