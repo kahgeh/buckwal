@@ -8,7 +8,7 @@ and `docs/glossary.md` defines the terms.
 ## Purpose
 
 buckwal makes a tursodb (turso_core 0.8.3) database durable in an S3 bucket for
-the app that owns it. A commit returns `Ok` only when it is in the bucket, so a new machine can
+the app that owns it. A commit returns `Ok` only when it is in the bucket (except a background commit, which returns after the local fsync and is acked when it lands), so a new machine can
 restore every acknowledged commit from the bucket alone. One writer process owns a database at
 a time (fenced by an epoch and a lease, with manual takeover), either embedded as a Rust library
 or behind `buckwal serve`, which speaks tursodb's SQL over HTTP v3 to any language. A
@@ -93,7 +93,7 @@ flowchart LR
 | BucketDbStorage | `app.db`: tracks dirty pages, lazy page fetch, and the seal | `crates/buckwal/src/io/db_storage.rs` |
 | LogShippingFile | `app.db-log` (MVCC): records every write as an op, and at `sync` uploads the unconfirmed ops as one kind 3 record before the local fsync (the confirmed-sync rule) | `crates/buckwal/src/io/log_file.rs` |
 | LogDurableStorage | The `DurableStorage` wrapper given to the engine: delegates to the engine's own `Storage`, seals in `truncate`, poisons on a checkpoint failure after a seal | `crates/buckwal/src/io/log_storage.rs` |
-| Uploader and Bucket | The one upload at a time per database: log records, in-doubt settling, the seal (seal-start, pages, manifest, head), the lease and the fence checks | `crates/buckwal/src/uploader.rs`, `uploader/batch.rs`, `bucket.rs`, `clock.rs` |
+| Uploader and Bucket | The one upload at a time per database: log records, in-doubt settling, the seal (seal-start, pages, manifest, head), the lease and the fence checks. The uploader also keeps the durable position and the background commits behind it (`uploader/durable.rs`); the Bucket calls a fence report hook when its writer is fenced, so the `writer fenced` record names the dropped background commits | `crates/buckwal/src/uploader.rs`, `uploader/batch.rs`, `uploader/durable.rs`, `bucket.rs`, `clock.rs` |
 | Format codec | Bytes of the head (its fields, format 3 with `key_check` and the integrity code), local state, log records (kinds 1 to 3), manifests and keys, and the integrity codes of an encrypted bucket's objects | `crates/buckwal/src/format/` |
 | Object store | The S3 client (SigV4, conditional PUTs, HTTPS), retry, and the in-memory and fault stores the tests use. `ObjectStore::list_after(prefix, start_after)` lists the keys strictly after a key: S3 sends `start-after` on `ListObjectsV2`, the in-memory and fault stores use a default method that filters the sorted list. The replica's sync pass uses it | `crates/buckwal/src/store/` (`mod.rs`, `s3.rs`, `mem.rs`, `fault.rs`) |
 | Encryption and telemetry | The key file, the integrity key and page-1 checks, and OTLP export through `tracing` | `crates/buckwal/src/encryption.rs`, `telemetry/` |
@@ -267,6 +267,7 @@ Newest last. "Spec" is the id of the work that made it: `durable-library` stages
 - 2026-10-23, `durable-hardening`: a takeover's first seal skips a generation number and the head keeps a next generation floor that GC honours, the takeover quiet is the larger of both writers' timeouts, and an encrypted bucket carries integrity codes in a format 3 head ([ADR 0005](adr/0005-takeover-generation-floor-quiet-and-integrity-codes.md)). Why: a late PUT from the fenced writer could replace a key the new writer relies on, and an encrypted page was bound to neither its number nor its version.
 - 2026-10-23, `read-replicas`: a third IO mode for replicas (local writes for the follower only, nothing to the bucket), with the follower inside `buckwal` and the frame calls of turso_core's `conn_raw_api` ([ADR 0006](adr/0006-a-third-io-mode-for-replicas.md)). Why: a replica must apply frames and checkpoint locally but never write to the bucket.
 - 2026-10-23, `read-replicas`: the notification listener lives in `buckwal-server` and reuses its listener, bind check and token ([ADR 0007](adr/0007-the-notification-listener-reuses-the-server-crates-listener.md)). Why: one listener and one set of security rules, and no async runtime in the library.
+- 2026-10-25, `background-commit`: a commit can return after the local fsync and upload behind the call, as a batching setting with a bound, `max_behind` (D32, [ADR 0008](adr/0008-background-commits.md)). The commit path gains a background case: the WAL sync fsyncs locally and queues the record, the call waits only while more than `max_behind` such commits wait, and the uploader acks the commit when its record lands. Why: an app with its own replayable log gains nothing from the wait.
 
 ## Departures from the standards
 

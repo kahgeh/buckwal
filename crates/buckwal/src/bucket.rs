@@ -757,11 +757,15 @@ impl Bucket {
         };
         if let Some(m) = refused {
             let e = Error::Fenced(m);
+            // Before any commit exists, so none is dropped.
             tracing::error!(
                 target: "buckwal",
                 generation = head.generation,
                 writer_id,
                 error = %e,
+                dropped_commits = 0u64,
+                first_dropped_commit = 0u64,
+                last_dropped_commit = 0u64,
                 "writer fenced"
             );
             return Err(e);

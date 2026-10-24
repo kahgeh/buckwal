@@ -1,0 +1,172 @@
+# buckwal background-commit measurements
+# date: 2026-10-25
+# git: 9884abf8da3ba0073e8c000c8561970da38449bb (background-commit; the measured code, before this file was committed)
+# engine: turso_core 0.8.3 (features fs, json, uuid, encryption, conn_raw_api)
+# RustFS: the buckwal-rustfs container of scripts/rustfs.sh (plain HTTP, no encryption)
+# build: cargo build --release --locked -p buckwal-cli (rustc 1.97.1), target/release/buckwal
+# machine: Apple M4 Max, macOS 27.0.1
+# laptop (Apple M4 Max, RustFS in podman on the same Mac), not production
+# telemetry: BUCKWAL_OTEL unset (off), so no span or log record was exported during these runs.
+# One run per configuration; no repeats, so treat small differences as noise.
+#
+# Workload (bench): as results/batching-knob.txt. CREATE TABLE bench(id INTEGER PRIMARY KEY,
+# payload BLOB) on one connection, which is then closed; then 2000 autocommit INSERT OR REPLACE
+# statements of a 1024-byte blob shared by --connections threads (one connection each); each
+# thread closes its connection when the ids run out; then the database is closed. Default
+# settings otherwise. --batching is set with Database::set_batching after open.
+#
+# Keys: as results/batching-knob.txt, plus
+# - commits_behind, oldest_behind_ms: Database::upload_stats() right after the commit threads
+#   finished (before the close): the background commits that had returned and were not yet in
+#   the bucket, and how long ago the oldest returned. 0 means the uploader had caught up.
+# - ack_wait_*: "none" for a background run. A background commit does not wait for its ack, and
+#   the histogram holds only the library's own Off commits (a close-time checkpoint's).
+# - commit_p50/p95/p99_ms: what the caller waited for each INSERT. For a background commit that
+#   is the time to the local fsync. It is not the time until the commit is in the bucket.
+#
+# Commands (BUCKWAL_* from scripts/rustfs.sh env; BUCKWAL_OTEL and BUCKWAL_BATCHING unset;
+# run id 1792857092; <tmp> from mktemp -d, removed afterwards):
+#   for C in 1 8; for B in off 'background 5ms 64 1MiB 1000':
+#     BUCKWAL_PREFIX=bench/background/c<C>-<off|background>-1792857092 \
+#       buckwal bench --dir <tmp>/<tag> --commits 2000 --connections C --batching B
+
+## c1-off: --connections 1 --batching 'off' (raw)
+commits=2000
+commit_p50_ms=1.322
+commit_p95_ms=1.695
+commit_p99_ms=2.189
+commit_max_ms=76.080
+commit_max_at=503
+busy_retries=0
+commits_per_sec=659.4
+commits_acked=2005
+commits_uploaded=2005
+log_puts=2005
+log_put_bytes=16696626
+commits_per_log_put=1.000
+bytes_per_log_put=8327.5
+ack_wait_p50_ms=1.152
+ack_wait_p95_ms=1.408
+ack_wait_p99_ms=1.856
+commits_behind=0
+oldest_behind_ms=0.000
+log_puts_per_commit=1.002
+bucket_puts=2706
+page_puts=682
+seals=5
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=7.121 seal_1_pages=2
+seal_2_ms=46.961 seal_2_pages=170
+seal_3_ms=46.623 seal_3_pages=170
+seal_4_ms=46.922 seal_4_pages=170
+seal_5_ms=49.481 seal_5_pages=170
+
+## c1-background: --connections 1 --batching 'background 5ms 64 1MiB 1000' (raw)
+commits=2000
+commit_p50_ms=0.049
+commit_p95_ms=0.130
+commit_p99_ms=0.181
+commit_max_ms=142.233
+commit_max_at=502
+busy_retries=0
+commits_per_sec=2195.6
+commits_acked=2005
+commits_uploaded=2005
+log_puts=35
+log_put_bytes=16542966
+commits_per_log_put=57.286
+bytes_per_log_put=472656.2
+ack_wait_p50_ms=none
+ack_wait_p95_ms=none
+ack_wait_p99_ms=none
+commits_behind=0
+oldest_behind_ms=0.000
+log_puts_per_commit=0.018
+bucket_puts=735
+page_puts=682
+seals=5
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=11
+seal_1_ms=5.308 seal_1_pages=2
+seal_2_ms=45.385 seal_2_pages=170
+seal_3_ms=44.947 seal_3_pages=170
+seal_4_ms=49.168 seal_4_pages=170
+seal_5_ms=44.893 seal_5_pages=170
+
+## c8-off: --connections 8 --batching 'off' (raw)
+commits=2000
+commit_p50_ms=1.412
+commit_p95_ms=1.789
+commit_p99_ms=3.519
+commit_max_ms=3338.498
+commit_max_at=8
+busy_retries=0
+commits_per_sec=593.9
+commits_acked=2006
+commits_uploaded=2006
+log_puts=2006
+log_put_bytes=16787688
+commits_per_log_put=1.000
+bytes_per_log_put=8368.7
+ack_wait_p50_ms=1.280
+ack_wait_p95_ms=1.536
+ack_wait_p99_ms=1.856
+commits_behind=0
+oldest_behind_ms=0.000
+log_puts_per_commit=1.003
+bucket_puts=2729
+page_puts=701
+seals=6
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=505
+seal_1_ms=7.887 seal_1_pages=2
+seal_2_ms=49.741 seal_2_pages=170
+seal_3_ms=50.253 seal_3_pages=172
+seal_4_ms=44.124 seal_4_pages=170
+seal_5_ms=47.265 seal_5_pages=181
+seal_6_ms=6.129 seal_6_pages=6
+
+## c8-background: --connections 8 --batching 'background 5ms 64 1MiB 1000' (raw)
+commits=2000
+commit_p50_ms=0.053
+commit_p95_ms=0.161
+commit_p99_ms=0.343
+commit_max_ms=668.511
+commit_max_at=1
+busy_retries=0
+commits_per_sec=2679.1
+commits_acked=2004
+commits_uploaded=2004
+log_puts=39
+log_put_bytes=16658944
+commits_per_log_put=51.385
+bytes_per_log_put=427152.4
+ack_wait_p50_ms=none
+ack_wait_p95_ms=none
+ack_wait_p99_ms=none
+commits_behind=0
+oldest_behind_ms=0.000
+log_puts_per_commit=0.019
+bucket_puts=743
+page_puts=689
+seals=4
+maintenance_runs=0
+maintenance_sealed=0
+maintenance_skipped=0
+maintenance_gate_wait_max_ms=0.000
+generation_log_objects_max=18
+seal_1_ms=6.029 seal_1_pages=2
+seal_2_ms=83.162 seal_2_pages=336
+seal_3_ms=53.593 seal_3_pages=170
+seal_4_ms=49.530 seal_4_pages=181
+
