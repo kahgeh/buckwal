@@ -65,12 +65,14 @@ while let Some(&(commit, message_id)) = pending.front() {
 - `Database::wait_durable(commit, timeout)` blocks until a commit is durable. It returns `Timeout`, `UploadFailed` while the bucket fails, or `Fenced`.
 - Commit numbers belong to one open. The app forgets the commit numbers it holds at every start, and trims the older messages once a later commit is durable.
 
-Over HTTP, `PRAGMA buckwal_durable_commit` returns one row, `open_id`, `last_commit` and `durable_commit`. The client reads it in the same pipeline as a write, so it costs no extra request, and `last_commit` is always that write's.
+Over HTTP, `PRAGMA buckwal_durable_commit` returns one row, `open_id`, `last_commit` and `durable_commit`. The client reads it in the same pipeline as a write, so it costs no extra request, and `last_commit` is always that write's. The data and the message id commit together, in one transaction.
 
 ```json
 {"requests": [
+  {"type": "execute", "stmt": {"sql": "BEGIN"}},
   {"type": "execute", "stmt": {"sql": "INSERT INTO orders(id, item) VALUES (7, 'book')"}},
   {"type": "execute", "stmt": {"sql": "UPDATE replay SET last_message = 7 WHERE id = 1"}},
+  {"type": "execute", "stmt": {"sql": "COMMIT"}},
   {"type": "execute", "stmt": {"sql": "PRAGMA buckwal_durable_commit"}},
   {"type": "close"}
 ]}

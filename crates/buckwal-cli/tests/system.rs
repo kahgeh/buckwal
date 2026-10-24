@@ -1322,12 +1322,11 @@ fn background_killed_and_disk_lost_restores_a_prefix_and_catch_up_replays_the_re
         count, max,
         "the bucket holds a prefix: ids 1..={max}, no gap"
     );
+    // A commit queued just before the kill can land before its ack line is printed, so the
+    // bucket may hold a few ids beyond the last ack line, never more than `max_behind`.
+    assert!(max <= acked + BEHIND, "{max} restored, {acked} acked");
     assert!(
-        max <= acked,
-        "nothing beyond what was acked: {max} > {acked}"
-    );
-    assert!(
-        acked - max <= BEHIND,
+        acked.saturating_sub(max) <= BEHIND,
         "at most max_behind ({BEHIND}) acked commits were lost: acked {acked}, restored {max}"
     );
     // App catch-up: replay every message after the last one in the database.
@@ -1342,11 +1341,8 @@ fn background_killed_and_disk_lost_restores_a_prefix_and_catch_up_replays_the_re
         ctx.ok(&["sql", "--dir", d, "--claim", &insert]);
     }
     let (count, max) = soak_rows(&ctx, &restored, false);
-    assert_eq!(
-        (count, max),
-        (acked, acked),
-        "every acked id is present once"
-    );
+    assert_eq!(count, max, "no gap after the replay");
+    assert!(max >= acked, "every acked id is present: {max} < {acked}");
     eprintln!(
         "background_killed_and_disk_lost: acked={acked} lost_and_replayed={}",
         missing.len()

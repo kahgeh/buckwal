@@ -705,7 +705,11 @@ impl Worker {
                     // In doubt at its seq (the bucket settles it), or fenced.
                     None => {
                         if !matches!(error, Error::Fenced(_)) {
-                            self.doubt = Some(waiters.iter().map(|(b, c, _)| (*b, *c)).collect());
+                            // An earlier record settled before this append, and its
+                            // commits are still to be confirmed, so the new ones join them.
+                            self.doubt
+                                .get_or_insert_with(Vec::new)
+                                .extend(waiters.iter().map(|(b, c, _)| (*b, *c)));
                         }
                     }
                 }
