@@ -200,6 +200,7 @@ impl Uploader {
             stats: stats.clone(),
             events,
             trim_tx,
+            doubt: None,
         };
         // The thread reports to the subscriber of the thread that opened the database.
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -447,6 +448,9 @@ struct Worker {
     stats: Arc<StatsCell>,
     events: Option<EventHook>,
     trim_tx: Option<Sender<TrimSnapshot>>,
+    /// The commits of a record whose PUT went in doubt: the bucket settles it at its seq,
+    /// and when it has, they are in the bucket (`settled`).
+    doubt: Option<Vec<(Batching, u64)>>,
 }
 
 impl Worker {
@@ -516,12 +520,35 @@ impl Worker {
 
     /// Publish `degraded`, the generation's log object count and its takeover quiet (every
     /// append and seal goes through here before its replies).
-    fn publish_degraded(&self) {
+    fn publish_degraded(&mut self) {
+        if !self.bucket.degraded() {
+            self.settled();
+        }
         let d = self.bucket.degraded() || !self.owed.is_empty();
         self.degraded.store(d, SeqCst);
         self.log_objects
             .store(self.bucket.next_seq().saturating_sub(1), SeqCst);
         *crate::db::lock(&self.quiet_until) = self.bucket.quiet_until();
+    }
+
+    /// The bucket has nothing left to settle. A record that went in doubt is in the bucket
+    /// now (the settle put it at its seq): its commits are durable, and background ones are
+    /// acked here. An earlier failure no longer holds once nothing is owed either.
+    fn settled(&mut self) {
+        if let Some(doubt) = self.doubt.take() {
+            if let Some(last) = doubt.iter().map(|(_, c)| *c).max() {
+                self.durable.confirmed(last);
+            }
+            for (batching, commit) in doubt {
+                if matches!(batching, Batching::Background { .. }) {
+                    self.stats.record_background_ack();
+                    self.emit(Event::CommitAcked { commit, batching });
+                }
+            }
+        }
+        if self.owed.is_empty() && !self.last_failed.load(SeqCst) {
+            self.durable.recovered();
+        }
     }
 
     fn log(&mut self, item: Pending) {
@@ -676,7 +703,11 @@ impl Worker {
                         }
                     }
                     // In doubt at its seq (the bucket settles it), or fenced.
-                    None => {}
+                    None => {
+                        if !matches!(error, Error::Fenced(_)) {
+                            self.doubt = Some(waiters.iter().map(|(b, c, _)| (*b, *c)).collect());
+                        }
+                    }
                 }
                 drop(commit_spans);
                 self.last_failed.store(true, SeqCst);

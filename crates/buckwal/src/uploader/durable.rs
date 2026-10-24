@@ -66,15 +66,30 @@ impl Durable {
         self.changed.notify_all();
     }
 
-    /// A record failed with `e`. A fenced writer stays fenced.
+    /// A record failed with `e`. A fenced writer stays fenced. A waiter gets `Fenced` or
+    /// `UploadFailed`, never the store's own kind (a retry give-up is `Timeout`, which a
+    /// caller could not tell from its own `wait_durable` timeout).
     pub(crate) fn failed(&self, e: &Error) {
         let mut s = self.lock();
-        if matches!(e, Error::Fenced(_)) {
+        let e = if matches!(e, Error::Fenced(_)) {
             s.fenced = true;
-        }
-        s.failure = Some(e.clone());
+            e.clone()
+        } else {
+            Error::UploadFailed(e.to_string())
+        };
+        s.failure = Some(e);
         drop(s);
         self.changed.notify_all();
+    }
+
+    /// The bucket answers again and nothing is owed: an earlier failure no longer holds.
+    pub(crate) fn recovered(&self) {
+        let mut s = self.lock();
+        if s.failure.is_some() && !s.fenced {
+            s.failure = None;
+            drop(s);
+            self.changed.notify_all();
+        }
     }
 
     /// The uploader thread ended: nobody waits for a record any more.
@@ -188,6 +203,25 @@ mod tests {
         d.confirmed(4);
         assert_eq!((d.durable(), d.behind().0), (4, 0));
         assert_eq!(d.behind().1, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_failure_reaches_waiters_as_upload_failed_and_recovery_clears_it() {
+        let d = Durable::default();
+        d.add_behind(1, Instant::now());
+        d.failed(&Error::Timeout("gave up".into()));
+        let r = d.wait_durable(1, Duration::from_secs(1));
+        assert!(matches!(r, Err(Error::UploadFailed(_))), "{r:?}");
+        d.recovered();
+        let r = d.wait_durable(1, Duration::from_millis(10));
+        assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
+        d.failed(&Error::Fenced("taken".into()));
+        d.recovered();
+        let r = d.wait_durable(1, Duration::from_millis(10));
+        assert!(
+            matches!(r, Err(Error::Fenced(_))),
+            "a fence never recovers: {r:?}"
+        );
     }
 
     #[test]

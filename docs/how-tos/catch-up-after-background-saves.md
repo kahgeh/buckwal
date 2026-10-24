@@ -51,7 +51,7 @@ With the library, the app takes the commit number from `Connection::last_commit(
 ```rust
 conn.transaction(|tx| { /* step 1 */ Ok(()) })?;
 let commit = conn.last_commit().expect("the transaction made a commit");
-pending.push((commit, message_id));            // numbers belong to this open
+pending.push_back((commit, message_id));            // numbers belong to this open
 
 // Later, on any thread:
 let durable = db.durable_commit();
@@ -70,6 +70,7 @@ Over HTTP, `PRAGMA buckwal_durable_commit` returns one row, `open_id`, `last_com
 ```json
 {"requests": [
   {"type": "execute", "stmt": {"sql": "INSERT INTO orders(id, item) VALUES (7, 'book')"}},
+  {"type": "execute", "stmt": {"sql": "UPDATE replay SET last_message = 7 WHERE id = 1"}},
   {"type": "execute", "stmt": {"sql": "PRAGMA buckwal_durable_commit"}},
   {"type": "close"}
 ]}

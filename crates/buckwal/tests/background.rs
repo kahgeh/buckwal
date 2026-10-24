@@ -306,7 +306,7 @@ fn a_degraded_uploader_makes_a_background_commit_an_off_commit() {
     let t = Instant::now();
     let r = db.wait_durable(first, GENEROUS);
     assert!(
-        matches!(r, Err(Error::UploadFailed(_) | Error::Timeout(_))) && t.elapsed() < GENEROUS / 2,
+        matches!(r, Err(Error::UploadFailed(_))) && t.elapsed() < GENEROUS / 2,
         "{r:?} after {:?}",
         t.elapsed()
     );
@@ -329,6 +329,55 @@ fn a_degraded_uploader_makes_a_background_commit_an_off_commit() {
     c.close().unwrap();
     db.close().unwrap();
     assert_eq!(restore_rows(mem), vec![1, 3, 4]);
+}
+
+/// A record whose PUT went in doubt (stored, the reply lost) is settled at its seq when the
+/// bucket answers again: the position then moves past its commits, the commits are acked
+/// (counted, and `CommitAcked` from the uploader), and the stale error is gone.
+#[test]
+fn a_record_settled_after_doubt_moves_the_position_and_clears_the_error() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let rec = Recorder::default();
+    let (_d, db) = open(fault.clone(), &rec);
+    let c = db.connect().unwrap();
+    create(&c);
+    fault.only_keys_containing("log/");
+    c.set_batching(Some(bg(5, 64, 1000))).unwrap();
+    let acked_before = db.upload_stats().commits_acked;
+    // Every PUT of the next record is stored and then reports an error.
+    fault.store_then_fail_next_puts(1000);
+    insert(&c, 1).unwrap();
+    let first = c.last_commit().unwrap();
+    let r = db.wait_durable(first, GENEROUS);
+    assert!(matches!(r, Err(Error::UploadFailed(_))), "{r:?}");
+    assert!(db.durable_commit() < first);
+    // The bucket answers again: the next tick settles the record at its seq.
+    fault.store_then_fail_next_puts(0);
+    // The error holds until the settle lands (a tick every 2 s), then the wait succeeds.
+    let until = Instant::now() + GENEROUS;
+    while db.wait_durable(first, Duration::from_millis(50)).is_err() {
+        assert!(
+            Instant::now() < until,
+            "the settled record never became durable"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(db.durable_commit(), first);
+    let s = db.upload_stats();
+    assert_eq!((s.commits_behind, s.oldest_behind), (0, Duration::ZERO));
+    assert_eq!(s.commits_acked, acked_before + 1);
+    let acked = rec
+        .events()
+        .into_iter()
+        .any(|(_, e)| matches!(e, Event::CommitAcked { commit, .. } if commit == first));
+    assert!(acked, "CommitAcked for the settled commit");
+    // A new commit waits for its own record, with no stale error.
+    insert(&c, 2).unwrap();
+    db.wait_durable(c.last_commit().unwrap(), GENEROUS).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restore_rows(mem), vec![1, 2]);
 }
 
 #[test]
