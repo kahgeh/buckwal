@@ -100,6 +100,20 @@ fn since(before: &UploadStats, after: &UploadStats) -> UploadStats {
     }
 }
 
+/// Background commits do not wait for their ack, and the histogram holds only the library's
+/// own Off commits (a close-time checkpoint's), so a background run reports its ack-wait
+/// columns as `none`.
+fn ack_waits_none(lines: &mut [String]) {
+    for l in lines {
+        if let Some((key, _)) = l
+            .split_once('=')
+            .filter(|(k, _)| k.starts_with("ack_wait_"))
+        {
+            *l = format!("{key}=none");
+        }
+    }
+}
+
 /// The engine refused the statement as busy: with several Off writers it sometimes does
 /// so before its busy timeout (with or without maintenance). Nothing was committed; the
 /// statement is retried.
@@ -240,7 +254,11 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
         "commits_per_sec={:.1}",
         commits as f64 / total.as_secs_f64()
     ));
-    say_all("", &stats_lines(&stats));
+    let mut lines = stats_lines(&stats);
+    if matches!(a.batching, Some(buckwal::Batching::Background { .. })) {
+        ack_waits_none(&mut lines);
+    }
+    say_all("", &lines);
     say(&format!(
         "log_puts_per_commit={:.3}",
         stats.log_puts as f64 / commits as f64
@@ -264,6 +282,26 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_run_reports_its_ack_waits_as_none() {
+        let mut lines = vec![
+            "commits_acked=5".to_string(),
+            "ack_wait_p50_ms=1.152".to_string(),
+            "ack_wait_p99_ms=2.000".to_string(),
+            "commits_behind=0".to_string(),
+        ];
+        ack_waits_none(&mut lines);
+        assert_eq!(
+            lines,
+            [
+                "commits_acked=5",
+                "ack_wait_p50_ms=none",
+                "ack_wait_p99_ms=none",
+                "commits_behind=0"
+            ]
+        );
+    }
 
     #[test]
     fn only_the_engine_busy_refusal_is_retried() {
