@@ -11,6 +11,7 @@ use buckwal::{Connection, Database};
 use rustls::crypto::ring::default_provider;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -71,6 +72,9 @@ pub struct Streams {
     anchor: Mutex<Option<Connection>>,
     /// Set under the slot lock by `close_all`; read under it.
     closing: AtomicBool,
+    /// This open's id, new at every `Streams::new` and never stored
+    /// (`PRAGMA buckwal_durable_commit`).
+    open_id: Arc<str>,
 }
 
 fn new_secret() -> String {
@@ -156,6 +160,7 @@ impl Streams {
             next_id: AtomicU64::new(1),
             anchor: Mutex::new(Some(anchor)),
             closing: AtomicBool::new(false),
+            open_id: new_secret().into(),
         })
     }
 
@@ -204,7 +209,7 @@ impl Streams {
         if INJECT_OPEN_PANIC.with(|c| c.replace(false)) {
             panic!("injected panic in open_new");
         }
-        match open_stream(&self.db, self.cfg.busy) {
+        match open_stream(&self.db, self.cfg.busy, &self.open_id) {
             Ok(state) => {
                 reservation.armed = false;
                 Checkout::Stream(Leased { id, state })
@@ -372,6 +377,23 @@ mod tests {
         _dir: TempDir,
         store: Arc<MemStore>,
         streams: Streams,
+    }
+
+    /// The open id is new at every `Streams::new` (a server restart) and shared by its streams.
+    #[test]
+    fn the_open_id_changes_with_each_open_and_is_shared_by_streams() {
+        let a = fx_with(1000, 4);
+        let b = fx_with(1000, 4);
+        assert_eq!(a.streams.open_id.len(), 32);
+        assert_ne!(a.streams.open_id, b.streams.open_id);
+        let Checkout::Stream(one) = a.streams.checkout(None) else {
+            panic!("a stream")
+        };
+        let Checkout::Stream(two) = a.streams.checkout(None) else {
+            panic!("a stream")
+        };
+        assert_eq!(one.state.open_id, a.streams.open_id);
+        assert_eq!(two.state.open_id, a.streams.open_id);
     }
 
     fn fx_with(timeout_ms: u64, max: usize) -> Fx {

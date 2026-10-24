@@ -641,6 +641,55 @@ fn serve_client_writes_off_window_and_txn_batching() {
     );
 }
 
+/// `PRAGMA buckwal_durable_commit` on a stream: (open_id, last_commit, durable_commit).
+fn durable_row(st: &mut Stream<'_>, with: Vec<Value>) -> (String, Option<i64>, i64) {
+    let mut requests = with;
+    requests.push(execute("PRAGMA buckwal_durable_commit", &[]));
+    let at = requests.len() - 1;
+    let r = must_ok(st, requests);
+    let row = &r.body["results"][at]["response"]["result"]["rows"][0];
+    let int = |v: &Value| v["value"].as_str().map(|s| s.parse::<i64>().unwrap());
+    (
+        row[0]["value"].as_str().expect("open_id").to_string(),
+        int(&row[1]),
+        int(&row[2]).expect("durable_commit"),
+    )
+}
+
+/// `serve` with a background setting: the position is read in the same request as a write and
+/// is that write's; it becomes durable; and `open_id` changes with a server restart.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn serve_background_commit_position_and_open_id() {
+    let (ctx, access) = serve_ctx("serve_background_commit_position_and_open_id");
+    let dir = ctx.dir("db");
+    let setting = "background 20ms 8 1MiB 20";
+    let mut server = ServerProc::spawn(&ctx, &access, &dir, &["--claim", "--batching", setting]);
+    let c = server.client();
+    create_table(&c);
+    let mut st = c.stream(Proto::V3);
+    let (open_id, fresh_last, _) = durable_row(&mut c.stream(Proto::V3), vec![]);
+    assert_eq!(fresh_last, None, "a new stream has made no commit");
+    let write = execute(INSERT, &[Arg::Int(1), Arg::Blob(payload(1))]);
+    let (id1, last, _) = durable_row(&mut st, vec![write]);
+    let last = last.expect("that write's commit number");
+    assert_eq!(id1, open_id, "one open, one id");
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, _, durable) = durable_row(&mut st, vec![]);
+        if durable >= last {
+            break;
+        }
+        assert!(Instant::now() < until, "commit {last} never became durable");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.stop_clean();
+    let server = ServerProc::spawn(&ctx, &access, &dir, &["--batching", setting]);
+    let (second, last2, _) = durable_row(&mut server.client().stream(Proto::V3), vec![]);
+    assert_ne!(second, open_id, "a restart is a new open");
+    assert_eq!(last2, None);
+}
+
 /// Four client threads (two streams Off, two Window) insert until 300 acks, at least 5 on
 /// each stream; the server is SIGKILLed and its disk lost. Every ack restores.
 #[test]

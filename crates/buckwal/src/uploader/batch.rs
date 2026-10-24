@@ -63,13 +63,9 @@ impl Batch {
     /// among the items, or the item's `max_wait` is zero.
     pub(crate) fn push(&mut self, item: Pending, now: Instant) -> bool {
         self.bytes = self.bytes.saturating_add(item.bytes());
-        let due = match item.batching {
-            Batching::Off => true,
-            Batching::Window {
-                max_wait,
-                max_commits,
-                max_bytes,
-            } => {
+        let due = match item.batching.limits() {
+            None => true,
+            Some((max_wait, max_commits, max_bytes)) => {
                 self.max_commits = self.max_commits.min(u64::from(max_commits));
                 self.max_bytes = self.max_bytes.min(max_bytes);
                 // A wait too long to represent never comes due.
@@ -177,6 +173,37 @@ mod tests {
             t0 + Duration::from_millis(1),
         );
         assert_eq!(b.deadline(), Some(t0 + Duration::from_millis(10)));
+    }
+
+    /// A background setting limits the count by `max_behind` too: with a long `max_wait` the
+    /// batch is due at `min(max_commits, max_behind)` commits.
+    #[test]
+    fn background_flushes_at_the_smaller_of_max_commits_and_max_behind() {
+        let bgd = |commits, behind| Batching::Background {
+            max_wait: Duration::from_secs(60),
+            max_commits: commits,
+            max_bytes: 1 << 20,
+            max_behind: behind,
+        };
+        let t0 = Instant::now();
+        let mut b = Batch::default();
+        assert!(!b.push(item(bgd(64, 3), 1), t0));
+        assert!(!b.push(item(bgd(64, 3), 1), t0));
+        assert!(
+            b.push(item(bgd(64, 3), 1), t0),
+            "max_behind 3 is the smaller"
+        );
+        assert_eq!(b.take().len(), 3);
+        assert!(!b.push(item(bgd(2, 1000), 1), t0));
+        assert!(
+            b.push(item(bgd(2, 1000), 1), t0),
+            "max_commits 2 is the smaller"
+        );
+        b.take();
+        assert!(
+            b.push(item(bgd(64, 1), 1), t0),
+            "max_behind 1 flushes at once"
+        );
     }
 
     #[test]

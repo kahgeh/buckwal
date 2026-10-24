@@ -1742,3 +1742,161 @@ fn a_dropped_ack_span_ends_the_span_at_the_drop() {
     let c = spans.iter().find(|s| s.name == "buckwal.commit").unwrap();
     assert!(c.end_time.duration_since(c.start_time).unwrap() >= Duration::from_millis(30));
 }
+
+fn background(wait_ms: u64) -> Batching {
+    Batching::Background {
+        max_wait: Duration::from_millis(wait_ms),
+        max_commits: 64,
+        max_bytes: 1 << 20,
+        max_behind: 1000,
+    }
+}
+
+/// A background commit's span closes at its call's return, has no `buckwal.ack_wait`, and its
+/// upload is a root span that names the commits it carried and how far behind the bucket runs.
+#[test]
+fn a_background_commit_span_ends_at_its_return_and_its_upload_is_a_root_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let spans = exported(|| {
+        let mut c = config(dir.path());
+        c.batching = background(200);
+        let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 0..3 {
+            insert(&conn, i).unwrap();
+        }
+        db.wait_durable(conn.last_commit().unwrap(), Duration::from_secs(20))
+            .unwrap();
+    });
+    let commits: Vec<&_> = spans
+        .iter()
+        .filter(|s| {
+            s.name == "buckwal.commit"
+                && attr(s, "buckwal.batching").is_some_and(|b| b.starts_with("background"))
+        })
+        .collect();
+    assert!(
+        commits.len() >= 4,
+        "the DDL and three inserts: {}",
+        commits.len()
+    );
+    let uploads: Vec<&_> = spans
+        .iter()
+        .filter(|s| s.name == "buckwal.upload")
+        .collect();
+    // The first record carries every background commit; a later one is the close-time seal's.
+    let up = *uploads
+        .iter()
+        .min_by_key(|u| u.start_time)
+        .expect("an upload");
+    assert_eq!(
+        up.parent_span_id,
+        opentelemetry::trace::SpanId::INVALID,
+        "an upload whose first commit is a background one is a root span"
+    );
+    for c in &commits {
+        assert!(
+            !spans
+                .iter()
+                .any(|a| a.name == "buckwal.ack_wait"
+                    && a.parent_span_id == c.span_context.span_id()),
+            "a background commit has no ack wait"
+        );
+        assert!(
+            c.end_time <= up.start_time,
+            "commit {:?} ended at its return, before the upload started",
+            attr(c, "buckwal.commit_no")
+        );
+        assert_eq!(attr(c, "buckwal.journal_mode").as_deref(), Some("wal"));
+        assert_eq!(
+            attr(c, "buckwal.outcome"),
+            None,
+            "its record is not in the bucket yet"
+        );
+    }
+    let nos: Vec<u64> = commits
+        .iter()
+        .map(|c| attr(c, "buckwal.commit_no").unwrap().parse().unwrap())
+        .collect();
+    let (first, last) = (nos.iter().min().unwrap(), nos.iter().max().unwrap());
+    assert_eq!(attr(up, "buckwal.commit_first"), Some(first.to_string()));
+    assert_eq!(attr(up, "buckwal.commit_last"), Some(last.to_string()));
+    assert_eq!(
+        attr(up, "buckwal.behind_ms").as_deref(),
+        Some("0"),
+        "none waits after it"
+    );
+}
+
+/// Every upload names its commits; an Off commit's upload keeps its commit as parent.
+#[test]
+fn an_off_commits_upload_names_its_commit_and_keeps_its_parent() {
+    let spans = exported_commits(Batching::Off, crate::config::JournalMode::Wal);
+    let ups: Vec<&_> = spans
+        .iter()
+        .filter(|s| s.name == "buckwal.upload")
+        .collect();
+    assert!(ups.len() >= 3);
+    for up in ups {
+        let first = attr(up, "buckwal.commit_first").expect("commit_first");
+        assert_eq!(attr(up, "buckwal.commit_last"), Some(first.clone()));
+        let parent = spans
+            .iter()
+            .find(|s| s.span_context.span_id() == up.parent_span_id)
+            .expect("an Off upload hangs from its commit");
+        assert_eq!(attr(parent, "buckwal.commit_no"), Some(first));
+        assert_eq!(attr(up, "buckwal.behind_ms").as_deref(), Some("0"));
+    }
+}
+
+/// The `writer fenced` record names the background commits the fence drops.
+#[test]
+fn the_fence_record_counts_the_dropped_background_commits() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mem = Arc::new(MemStore::new());
+        let db = crate::open_with_store(config(dir.path()), mem.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        conn.set_batching(Some(background(10_000))).unwrap();
+        insert(&conn, 1).unwrap();
+        let first = conn.last_commit().unwrap();
+        insert(&conn, 2).unwrap();
+        let last = conn.last_commit().unwrap();
+        let next = mem
+            .list("log/0000000001/")
+            .unwrap()
+            .iter()
+            .map(|k| k.rsplit('/').next().unwrap().parse::<u64>().unwrap())
+            .max()
+            .unwrap()
+            + 1;
+        mem.put(&format!("log/0000000001/{next:020}"), b"another writer")
+            .unwrap();
+        let other = db.connect().unwrap();
+        other.set_batching(Some(Batching::Off)).unwrap();
+        assert!(matches!(insert(&other, 3), Err(crate::Error::Fenced(_))));
+        (cap.spans(), first, last)
+    });
+    let (spans, first, last) = spans;
+    let fenced: Vec<_> = spans
+        .events
+        .iter()
+        .filter(|e| e.field("message") == Some("writer fenced"))
+        .collect();
+    assert_eq!(fenced.len(), 1, "logged once: {fenced:?}");
+    // The Off commit is not a background commit: only the two background ones are dropped.
+    assert_eq!(fenced[0].field("dropped_commits"), Some("2"));
+    assert_eq!(
+        fenced[0].field("first_dropped_commit"),
+        Some(first.to_string().as_str())
+    );
+    assert_eq!(
+        fenced[0].field("last_dropped_commit"),
+        Some(last.to_string().as_str())
+    );
+}

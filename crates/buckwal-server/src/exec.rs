@@ -28,6 +28,10 @@ pub enum Version {
 /// One stream: its connection, its stored SQL and whether it is over.
 pub struct StreamState {
     pub conn: Connection,
+    /// The database, for `PRAGMA buckwal_durable_commit`.
+    db: Database,
+    /// This server open's id (`PRAGMA buckwal_durable_commit`).
+    pub(crate) open_id: Arc<str>,
     pub sql: HashMap<i32, String>,
     pub closed: bool,
 }
@@ -51,12 +55,18 @@ impl Fence {
     }
 }
 
-/// A new stream on `db` with the given busy timeout.
-pub fn open_stream(db: &Database, busy: Duration) -> buckwal::Result<StreamState> {
+/// A new stream on `db` with the given busy timeout, in the server open `open_id`.
+pub fn open_stream(
+    db: &Database,
+    busy: Duration,
+    open_id: &Arc<str>,
+) -> buckwal::Result<StreamState> {
     let conn = db.connect()?;
     conn.execute(&format!("PRAGMA busy_timeout = {}", busy.as_millis()), &[])?;
     Ok(StreamState {
         conn,
+        db: db.clone(),
+        open_id: open_id.clone(),
         sql: HashMap::new(),
         closed: false,
     })
@@ -210,6 +220,10 @@ fn run_stmt(st: &mut StreamState, stmt: &Stmt, fence: &Fence) -> Result<StmtResu
     }
     let sql = resolve_sql(st, stmt.sql.clone(), stmt.sql_id)?;
     let want_rows = stmt.want_rows.unwrap_or(true);
+
+    if stmt.args.is_empty() && stmt.named_args.is_empty() && durable_commit_read(&sql) {
+        return Ok(durable_commit_result(st));
+    }
 
     // With arguments the statement goes to the library, which refuses it.
     if st.conn.is_autocommit() && stmt.args.is_empty() && stmt.named_args.is_empty() {
@@ -437,6 +451,54 @@ fn eval_cond(c: &BatchCond, outcome: &[Option<bool>], st: &StreamState) -> bool 
     }
 }
 
+/// `sql` is exactly one read of `PRAGMA [main.]buckwal_durable_commit` (no value).
+fn durable_commit_read(sql: &str) -> bool {
+    if !mentions(sql, b"buckwal_durable_commit") {
+        return false;
+    }
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(Ok(Cmd::Stmt(SqlStmt::Pragma { name, body }))) = parser.next() else {
+        return false;
+    };
+    name.name
+        .as_str()
+        .eq_ignore_ascii_case("buckwal_durable_commit")
+        && name
+            .db_name
+            .as_ref()
+            .is_none_or(|db| db.as_str().eq_ignore_ascii_case("main"))
+        && body.is_none()
+        && parser.next().is_none()
+}
+
+/// The one row of `PRAGMA buckwal_durable_commit`: this server open's `open_id`, the last
+/// commit of the stream's connection (null before it made one) and the database's durable
+/// commit. Read in the same batch as a write, `last_commit` is that write's.
+fn durable_commit_result(st: &StreamState) -> StmtResult {
+    let start = Instant::now();
+    let col = |name: &str, decltype: &str| buckwal::Column {
+        name: name.into(),
+        decltype: Some(decltype.into()),
+    };
+    let out = buckwal::StmtOutput {
+        columns: vec![
+            col("open_id", "TEXT"),
+            col("last_commit", "INTEGER"),
+            col("durable_commit", "INTEGER"),
+        ],
+        rows: vec![vec![
+            Value::from_text(st.open_id.to_string()),
+            st.conn
+                .last_commit()
+                .map_or(Value::Null, |n| Value::from_i64(n as i64)),
+            Value::from_i64(st.db.durable_commit() as i64),
+        ]],
+        changes: 0,
+        last_insert_rowid: 0,
+    };
+    stmt_result(out, true, false, start.elapsed())
+}
+
 /// `sql` is exactly one `PRAGMA [main.]buckwal_batching = value` or `(value)`: the batching
 /// it asks for (or the error for a value that is not text). `None` for anything else, which
 /// then goes to the library (including a read of the setting).
@@ -457,7 +519,8 @@ fn batching_set(sql: &str) -> Option<buckwal::Result<Batching>> {
     Some(match pragma_value(value) {
         Some(text) => Batching::from_str(&text),
         None => Err(Error::Config(
-            "PRAGMA buckwal_batching takes off or 'window <max_wait> <max_commits> <max_bytes>'"
+            "PRAGMA buckwal_batching takes off, 'window <max_wait> <max_commits> <max_bytes>' \
+             or 'background <max_wait> <max_commits> <max_bytes> <max_behind>'"
                 .into(),
         )),
     })
@@ -529,7 +592,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemStore::new());
         let db = open_with_store(config(&dir.path().join("db")), store).unwrap();
-        let st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let st = open_stream(&db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         Fx {
             _dir: dir,
             db,
@@ -1045,7 +1108,7 @@ mod tests {
         let mem = Arc::new(MemStore::new());
         let dir_a = tempfile::tempdir().unwrap();
         let db = open_with_store(config(&dir_a.path().join("db")), mem.clone()).unwrap();
-        let mut st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let mut st = open_stream(&db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         let fence = Fence::new();
         st.conn.execute("CREATE TABLE t(id INTEGER)", &[]).unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -1056,7 +1119,8 @@ mod tests {
             panic!("the insert is fenced")
         };
         assert_eq!(error.code.as_deref(), Some("FENCED"));
-        let mut fresh = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let mut fresh =
+            open_stream(&db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         let describe = json!({"type":"describe","sql":"SELECT id FROM t"});
         match req(&mut fresh, describe) {
             StreamResult::Error { error } => assert_eq!(error.code.as_deref(), Some("FENCED")),
@@ -1096,7 +1160,7 @@ mod tests {
         let mem = Arc::new(MemStore::new());
         let dir_a = tempfile::tempdir().unwrap();
         let db = open_with_store(config(&dir_a.path().join("db")), mem.clone()).unwrap();
-        let mut st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let mut st = open_stream(&db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         let fence = Fence::new();
         st.conn.execute("CREATE TABLE t(id INTEGER)", &[]).unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -1158,7 +1222,8 @@ mod tests {
         let r = f.sql("PRAGMA buckwal_batching = 'window 20ms 64 1MiB'");
         assert_eq!(r["rows"], json!([]));
         assert_eq!(setting(&mut f), "window 20ms 64 1MiB");
-        let mut other = open_stream(&f.db, Duration::from_millis(100)).unwrap();
+        let mut other =
+            open_stream(&f.db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         let fence = Fence::new();
         let read = execute_request(
             &mut other,
@@ -1177,6 +1242,56 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn durable_commit_pragma_names_the_open_this_streams_last_commit_and_the_durable_one() {
+        let mut f = fx();
+        f.sql("CREATE TABLE t(x)");
+        f.sql("PRAGMA buckwal_batching = 'background 5ms 64 1MiB 1000'");
+        // In the same batch as a write: the row is that write's.
+        let r = f.ok(json!({"type":"batch","batch":{"steps":[
+            {"stmt":{"sql":"INSERT INTO t VALUES (1)"}},
+            {"condition":{"type":"ok","step":0},"stmt":{"sql":"PRAGMA buckwal_durable_commit"}}
+        ]}}));
+        let read = &r["result"]["step_results"][1];
+        let names: Vec<&str> = read["cols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["open_id", "last_commit", "durable_commit"]);
+        let row = &read["rows"][0];
+        assert_eq!(row[0]["value"], "test-open");
+        let last = f.st.conn.last_commit().unwrap();
+        assert_eq!(
+            row[1]["value"],
+            last.to_string(),
+            "that write's commit number"
+        );
+        f.db.wait_durable(last, Duration::from_secs(20)).unwrap();
+        let row = f.sql("PRAGMA buckwal_durable_commit")["rows"][0].clone();
+        assert_eq!(row[1]["value"], last.to_string());
+        assert_eq!(
+            row[2]["value"],
+            last.to_string(),
+            "durable once its record landed"
+        );
+        // A new stream has made no commit; and a value or a second statement is not intercepted.
+        let mut fresh =
+            open_stream(&f.db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
+        let r = execute_request(
+            &mut fresh,
+            Version::V3,
+            json!({"type":"execute","stmt":{"sql":"PRAGMA buckwal_durable_commit"}}),
+            &f.fence,
+        );
+        let StreamResult::Ok { response } = r else {
+            panic!("{r:?}")
+        };
+        let j = serde_json::to_value(&response).unwrap();
+        assert_eq!(j["result"]["rows"][0][1]["type"], "null");
     }
 
     #[test]
@@ -1229,7 +1344,7 @@ mod tests {
         let fault = Arc::new(FaultStore::new(mem.clone()));
         let dir_a = tempfile::tempdir().unwrap();
         let db = open_with_store(config(&dir_a.path().join("db")), fault).unwrap();
-        let mut st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let mut st = open_stream(&db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         let fence = Fence::new();
         let run = |st: &mut StreamState, sql: &str| {
             execute_request(
@@ -1263,7 +1378,7 @@ mod tests {
         let fault = Arc::new(FaultStore::new(mem));
         let dir = tempfile::tempdir().unwrap();
         let db = open_with_store(config(&dir.path().join("db")), fault.clone()).unwrap();
-        let mut st = open_stream(&db, Duration::from_millis(100)).unwrap();
+        let mut st = open_stream(&db, Duration::from_millis(100), &Arc::from("test-open")).unwrap();
         let fence = Fence::new();
         let mut run = |sql: &str| {
             execute_request(

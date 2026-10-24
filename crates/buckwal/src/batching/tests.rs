@@ -24,6 +24,67 @@ fn parses_the_spec_examples() {
 }
 
 #[test]
+fn parses_displays_and_validates_the_background_setting() {
+    let b: Batching = "background 5ms 64 1MiB 1000".parse().unwrap();
+    assert_eq!(
+        b,
+        Batching::Background {
+            max_wait: Duration::from_millis(5),
+            max_commits: 64,
+            max_bytes: 1 << 20,
+            max_behind: 1000
+        }
+    );
+    assert_eq!(b.to_string(), "background 5ms 64 1MiB 1000");
+    assert_eq!(
+        "BACKGROUND 1s 1 512 1"
+            .parse::<Batching>()
+            .unwrap()
+            .to_string(),
+        "background 1s 1 512 1"
+    );
+    assert!(b.validate().is_ok());
+    for bad in [
+        "background 5ms 64 1MiB",
+        "background 5ms 64 1MiB x",
+        "background 5ms 64 1MiB 1000 extra",
+        "background 5 64 1MiB 1000",
+    ] {
+        assert!(
+            matches!(bad.parse::<Batching>(), Err(Error::Config(_))),
+            "{bad}"
+        );
+    }
+    for zero in [
+        "background 5ms 64 1MiB 0",
+        "background 5ms 0 1MiB 1",
+        "background 5ms 64 0 1",
+    ] {
+        let b: Batching = zero.parse().unwrap();
+        assert!(matches!(b.validate(), Err(Error::Config(_))), "{zero}");
+    }
+    match "background 61s 1 1 1"
+        .parse::<Batching>()
+        .unwrap()
+        .validate()
+    {
+        Err(Error::Config(m)) => assert!(m.contains("60s"), "{m}"),
+        r => panic!("{r:?}"),
+    }
+}
+
+#[test]
+fn only_mvcc_refuses_the_background_setting() {
+    use crate::config::JournalMode::{Mvcc, Wal};
+    let b: Batching = "background 5ms 64 1MiB 10".parse().unwrap();
+    assert!(b.check_mode(Wal).is_ok());
+    assert!(matches!(
+        b.check_mode(Mvcc),
+        Err(Error::Unsupported("MVCC: Background batching"))
+    ));
+}
+
+#[test]
 fn display_round_trips() {
     for s in [
         "off",
@@ -121,6 +182,7 @@ fn commits(acks: &[PendingAck]) -> Vec<u64> {
         .map(|a| match a {
             PendingAck::Done { commit, .. } => *commit,
             PendingAck::Waiting { ticket, .. } => ticket.commit,
+            PendingAck::Background { .. } => 0,
         })
         .collect()
 }

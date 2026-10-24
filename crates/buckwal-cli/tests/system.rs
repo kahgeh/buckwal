@@ -1279,6 +1279,104 @@ fn writer_killed_and_restarted_on_own_disk() {
     );
 }
 
+/// The background setting the two tests below run under: at most 20 commits behind the bucket.
+const BACKGROUND: &str = "background 20ms 8 1MiB 20";
+/// Its `max_behind`.
+const BEHIND: usize = 20;
+
+/// `SELECT count(*), max(id) FROM soak` through `sql`, as (count, max).
+fn soak_rows(ctx: &Ctx, dir: &Path, claim: bool) -> (usize, usize) {
+    let d = dir.to_str().unwrap();
+    let mut args = vec!["sql", "--dir", d];
+    if claim {
+        args.push("--claim");
+    }
+    args.push("SELECT count(*), max(id) FROM soak");
+    let out = ctx.ok(&args);
+    let line = out.stdout.trim().to_string();
+    let (n, max) = line.split_once('\t').unwrap_or_else(|| panic!("{line:?}"));
+    (n.parse().unwrap(), max.parse().unwrap_or(0))
+}
+
+/// Background commits, SIGKILL and the loss of the disk: the bucket holds a prefix (every id
+/// from 1 to some k, none after), at most `max_behind` commits short of the last ack. App
+/// catch-up (the how-to's steps, with the ids as the app's messages) replays exactly the
+/// missing ones, and then every acked id is present.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn background_killed_and_disk_lost_restores_a_prefix_and_catch_up_replays_the_rest() {
+    let ctx = Ctx::new("background_killed_and_disk_lost");
+    let dir = ctx.dir("db");
+    let mut soak = Soak::spawn(&ctx, &dir, &["--batching", BACKGROUND]);
+    soak.wait_acks(400);
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let acked = soak.last_ack() as usize;
+    fs::remove_dir_all(&dir).unwrap();
+    // Restore, then read what the bucket holds.
+    let restored = ctx.dir("restored");
+    let d = restored.to_str().unwrap();
+    ctx.ok(&["restore", "--dir", d]);
+    let (count, max) = soak_rows(&ctx, &restored, true);
+    assert_eq!(
+        count, max,
+        "the bucket holds a prefix: ids 1..={max}, no gap"
+    );
+    assert!(
+        max <= acked,
+        "nothing beyond what was acked: {max} > {acked}"
+    );
+    assert!(
+        acked - max <= BEHIND,
+        "at most max_behind ({BEHIND}) acked commits were lost: acked {acked}, restored {max}"
+    );
+    // App catch-up: replay every message after the last one in the database.
+    let missing: Vec<String> = (max + 1..=acked)
+        .map(|id| format!("({id}, zeroblob(1024))"))
+        .collect();
+    if !missing.is_empty() {
+        let insert = format!(
+            "INSERT INTO soak(id, payload) VALUES {}",
+            missing.join(", ")
+        );
+        ctx.ok(&["sql", "--dir", d, "--claim", &insert]);
+    }
+    let (count, max) = soak_rows(&ctx, &restored, false);
+    assert_eq!(
+        (count, max),
+        (acked, acked),
+        "every acked id is present once"
+    );
+    eprintln!(
+        "background_killed_and_disk_lost: acked={acked} lost_and_replayed={}",
+        missing.len()
+    );
+}
+
+/// Background commits and SIGKILL, with the disk kept: nothing is lost. The next writer open
+/// finds the commits in the local `-wal` and uploads them, so app catch-up replays nothing.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn background_killed_with_the_disk_kept_loses_nothing_and_catch_up_replays_nothing() {
+    let ctx = Ctx::new("background_killed_disk_kept");
+    let dir = ctx.dir("db");
+    let mut soak = Soak::spawn(&ctx, &dir, &["--batching", BACKGROUND]);
+    soak.wait_acks(400);
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let acked = soak.last_ack() as usize;
+    // The reopen on the same disk reconciles (Ahead) before it answers.
+    let (count, max) = soak_rows(&ctx, &dir, false);
+    assert_eq!(count, max, "no gap");
+    assert!(
+        max >= acked,
+        "catch-up finds nothing to replay: {max} < {acked}"
+    );
+    // Close uploaded everything: a restore into a fresh directory holds it all.
+    let v = restore_verify(&ctx, &soak.lines);
+    assert_eq!(v.present, v.acked);
+}
+
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn mvcc_pragma_refused_then_all_acks_restore() {

@@ -50,6 +50,15 @@ pub fn ms(d: Duration) -> String {
 
 /// The upload stats as `key=value` lines, in a fixed order.
 pub fn stats_lines(s: &UploadStats) -> Vec<String> {
+    // Background commits do not wait for their ack, so the ack-wait quantiles are empty (a
+    // real wait is never zero) when only they were acked.
+    let wait = |d: Duration| {
+        if s.ack_wait_p99.is_zero() {
+            "none".to_string()
+        } else {
+            ms(d)
+        }
+    };
     vec![
         format!("commits_acked={}", s.commits_acked),
         format!("commits_uploaded={}", s.commits_uploaded),
@@ -57,9 +66,11 @@ pub fn stats_lines(s: &UploadStats) -> Vec<String> {
         format!("log_put_bytes={}", s.log_put_bytes),
         format!("commits_per_log_put={:.3}", s.commits_per_log_put),
         format!("bytes_per_log_put={:.1}", s.bytes_per_log_put),
-        format!("ack_wait_p50_ms={}", ms(s.ack_wait_p50)),
-        format!("ack_wait_p95_ms={}", ms(s.ack_wait_p95)),
-        format!("ack_wait_p99_ms={}", ms(s.ack_wait_p99)),
+        format!("ack_wait_p50_ms={}", wait(s.ack_wait_p50)),
+        format!("ack_wait_p95_ms={}", wait(s.ack_wait_p95)),
+        format!("ack_wait_p99_ms={}", wait(s.ack_wait_p99)),
+        format!("commits_behind={}", s.commits_behind),
+        format!("oldest_behind_ms={}", ms(s.oldest_behind)),
     ]
 }
 
@@ -340,6 +351,7 @@ fn stats(
         conn.execute(s, &[]).map_err(err)?;
     }
     say_all("", &stats_lines(&db.upload_stats()));
+    say(&format!("durable_commit={}", db.durable_commit()));
     conn.close().map_err(err)?;
     db.close().map_err(err)
 }
@@ -496,6 +508,8 @@ mod tests {
             ack_wait_p50: Duration::from_micros(1500),
             ack_wait_p95: Duration::from_millis(20),
             ack_wait_p99: Duration::from_nanos(20_123_456),
+            commits_behind: 4,
+            oldest_behind: Duration::from_micros(2500),
         };
         assert_eq!(
             stats_lines(&s),
@@ -509,7 +523,23 @@ mod tests {
                 "ack_wait_p50_ms=1.500",
                 "ack_wait_p95_ms=20.000",
                 "ack_wait_p99_ms=20.123",
+                "commits_behind=4",
+                "oldest_behind_ms=2.500",
             ]
+        );
+        // Only background commits acked: no ack was waited for.
+        let s = buckwal::UploadStats {
+            commits_acked: 5,
+            ..buckwal::UploadStats::default()
+        };
+        let lines = stats_lines(&s);
+        assert!(
+            lines.contains(&"ack_wait_p50_ms=none".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"ack_wait_p99_ms=none".to_string()),
+            "{lines:?}"
         );
     }
 

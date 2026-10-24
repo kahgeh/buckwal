@@ -228,6 +228,9 @@ impl Timeouts {
     }
 }
 
+/// What a fence asks the uploader: the background commits it drops, as (count, first, last).
+pub(crate) type FenceReport = Box<dyn Fn() -> Option<(u64, u64, u64)> + Send + Sync>;
+
 pub(crate) struct Bucket {
     store: Arc<dyn ObjectStore>,
     keys: Keys,
@@ -244,6 +247,9 @@ pub(crate) struct Bucket {
     /// generation until that is known.
     pending_seal: Option<PendingSeal>,
     fenced: bool,
+    /// The fence report hook, asked when this writer fences: the background commits that never reached the bucket
+    /// (count, first and last commit number), for the `writer fenced` record.
+    fence_report: Option<FenceReport>,
     /// The lease (`check_lease`): when the request behind the last confirmation was sent, on
     /// both clocks. It is renewed by a confirmed log record (`put_log`, the fence; one that
     /// landed `lease` + retry deadline after it only through a head GET, `confirm_landed`), a
@@ -518,6 +524,7 @@ impl Bucket {
             in_doubt: None,
             pending_seal: None,
             fenced: false,
+            fence_report: None,
             counters: Arc::default(),
             events: None,
         }
@@ -893,6 +900,12 @@ impl Bucket {
         self.last_confirmed.back(instant_by, wall_by);
     }
 
+    /// `report` is the fence report hook: the commits a fence drops (see `fence`). Not `probe`,
+    /// which is a head GET.
+    pub(crate) fn set_fence_report(&mut self, report: FenceReport) {
+        self.fence_report = Some(report);
+    }
+
     pub(crate) fn set_event_hook(&mut self, events: Option<EventHook>) {
         self.events = events;
     }
@@ -909,11 +922,19 @@ impl Bucket {
         if std::mem::replace(&mut self.fenced, true) {
             return e;
         }
+        let (dropped, first, last) = self
+            .fence_report
+            .as_ref()
+            .and_then(|report| report())
+            .unwrap_or((0, 0, 0));
         tracing::error!(
             target: "buckwal",
             generation = self.head.generation,
             writer_id = %self.head.writer_id,
             error = %e,
+            dropped_commits = dropped,
+            first_dropped_commit = first,
+            last_dropped_commit = last,
             "writer fenced"
         );
         e

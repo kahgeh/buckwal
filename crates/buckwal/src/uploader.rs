@@ -18,6 +18,7 @@ use crate::format::{Head, LogFile, Manifest, Op};
 use crate::stats::StatsCell;
 pub(crate) use batch::op_bytes;
 use batch::{Batch, Pending};
+pub(crate) use durable::Durable;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -160,6 +161,8 @@ pub(crate) struct Uploader {
     /// deadline the seal waits for), `None` for none; set by the worker after every job.
     quiet_until: Arc<Mutex<Option<Instant>>>,
     stats: Arc<StatsCell>,
+    /// The durable position and the background commits behind it.
+    durable: Arc<Durable>,
     #[cfg_attr(not(test), allow(dead_code))]
     counters: Arc<Counters>,
 }
@@ -179,7 +182,13 @@ impl Uploader {
         let quiet_until = Arc::new(Mutex::new(bucket.quiet_until()));
         let counters = bucket.counters();
         let (tx, rx) = mpsc::channel();
+        let durable = Arc::new(Durable::default());
+        let report = durable.clone();
+        bucket.set_fence_report(Box::new(move || {
+            report.dropped().map(|d| (d.count, d.first, d.last))
+        }));
         let worker = Worker {
+            durable: durable.clone(),
             bucket,
             batch: Batch::default(),
             owed: VecDeque::new(),
@@ -208,6 +217,7 @@ impl Uploader {
             last_failed,
             quiet_until,
             stats,
+            durable,
             counters,
         })
     }
@@ -221,7 +231,9 @@ impl Uploader {
     }
 
     /// Queue one sync's ops, committed with `batching`, and return at once. `Off` ships them
-    /// (with any waiting Window syncs) as the next log record; a Window waits for its limits.
+    /// (with any waiting Window or background syncs) as the next log record; a Window or
+    /// background sync waits for its limits. A background sync counts as behind until its
+    /// record is in the bucket.
     /// The current span is the sync's commit span.
     pub(crate) fn submit_log(&self, ops: Vec<Op>, batching: Batching) -> Ticket {
         let (reply, rx) = mpsc::channel();
@@ -229,12 +241,21 @@ impl Uploader {
         let commit = self.commits.fetch_add(1, SeqCst) + 1;
         let submitted = Instant::now();
         if let Some(tx) = jobs.as_ref() {
+            if matches!(batching, Batching::Background { .. }) {
+                self.durable.add_behind(commit, submitted);
+            }
             let _ = tx.send(Job::Log(Pending {
                 ops,
                 batching,
                 commit,
                 reply,
-                span: Span::current(),
+                // A queued background commit holds no handle on its span: the span closes
+                // when its call returns, and its upload is a root span.
+                span: if matches!(batching, Batching::Background { .. }) {
+                    Span::none()
+                } else {
+                    Span::current()
+                },
             }));
         }
         Ticket {
@@ -344,6 +365,26 @@ impl Uploader {
         self.stats.clone()
     }
 
+    /// The highest commit number whose record is in the bucket (0 before the first).
+    pub(crate) fn durable_commit(&self) -> u64 {
+        self.durable.durable()
+    }
+
+    /// Block until the commit is durable ([`Durable::wait_durable`]).
+    pub(crate) fn wait_durable(&self, commit: u64, timeout: Duration) -> Result<()> {
+        self.durable.wait_durable(commit, timeout)
+    }
+
+    /// Block until at most `max_behind` background commits wait for the bucket.
+    pub(crate) fn wait_behind(&self, max_behind: u32) -> Result<()> {
+        self.durable.wait_behind(max_behind)
+    }
+
+    /// Background commits waiting for the bucket, and how long ago the oldest returned.
+    pub(crate) fn behind(&self) -> (u64, Duration) {
+        self.durable.behind()
+    }
+
     #[cfg(test)]
     pub(crate) fn counters(&self) -> UploaderCounters {
         use std::sync::atomic::Ordering::Relaxed;
@@ -380,8 +421,18 @@ impl Drop for Uploader {
     }
 }
 
+/// Tells the waiters that the uploader thread has ended.
+struct StopOnDrop(Arc<Durable>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// The uploader thread's state.
 struct Worker {
+    durable: Arc<Durable>,
     bucket: Bucket,
     /// Window syncs waiting for their limits.
     batch: Batch,
@@ -410,6 +461,8 @@ impl Worker {
     /// (`catch_up`), one GET every 2 s, until that seal. That is rare (an ambiguous head PUT
     /// that landed) and ends at the next seal.
     fn run(mut self, rx: Receiver<Job>) {
+        // Whatever ends the thread, a panic included, wakes everyone who waits on a record.
+        let _stop = StopOnDrop(self.durable.clone());
         loop {
             let next = if let Some(mut deadline) = self.batch.deadline() {
                 if !self.owed.is_empty() {
@@ -526,10 +579,13 @@ impl Worker {
             parent: &items[0].span,
             "buckwal.upload",
             buckwal.commits = items.len() as u64,
+            buckwal.commit_first = items.first().map_or(0, |p| p.commit),
+            buckwal.commit_last = items.iter().map(|p| p.commit).max().unwrap_or(0),
             buckwal.bytes = Empty,
             buckwal.generation = Empty,
             buckwal.seq = Empty,
             buckwal.retries = Empty,
+            buckwal.behind_ms = Empty,
             s3.status = Empty,
         );
         let mut syncs = Vec::with_capacity(items.len());
@@ -557,7 +613,6 @@ impl Worker {
                 );
             }),
         }
-        drop(span);
         match r {
             Ok(a) => {
                 drop(commit_spans);
@@ -566,12 +621,31 @@ impl Worker {
                 let commits: Vec<u64> = waiters.iter().map(|(_, c, _)| *c).collect();
                 self.stats.record_put(commits.len() as u64, a.bytes);
                 self.last_failed.store(false, SeqCst);
+                self.durable
+                    .confirmed(commits.iter().copied().max().unwrap_or(0));
+                // How long the commits still behind have waited: what a lost machine would
+                // lose now. The span closes before any reply.
+                span.record(
+                    "buckwal.behind_ms",
+                    self.durable.behind().1.as_millis() as u64,
+                );
+                drop(span);
                 self.emit(Event::LogUploaded {
                     generation: a.pos.generation,
                     seq: a.pos.seq,
                     bytes: a.bytes,
                     commits,
                 });
+                // A background commit's call has returned: it is acked here, when it is durable.
+                for (batching, commit, _) in &waiters {
+                    if matches!(batching, Batching::Background { .. }) {
+                        self.stats.record_background_ack();
+                        self.emit(Event::CommitAcked {
+                            commit: *commit,
+                            batching: *batching,
+                        });
+                    }
+                }
                 self.publish_degraded();
                 for (_, _, reply) in waiters {
                     // A dropped ticket is fine: the object is uploaded either way.
@@ -580,6 +654,7 @@ impl Worker {
                 Ok(())
             }
             Err(AppendFailure { error, unsent }) => {
+                drop(span);
                 match unsent {
                     // A fenced writer never sends again: nothing stays owed.
                     _ if matches!(error, Error::Fenced(_)) => {}
@@ -605,6 +680,7 @@ impl Worker {
                 }
                 drop(commit_spans);
                 self.last_failed.store(true, SeqCst);
+                self.durable.failed(&error);
                 self.publish_degraded();
                 for (_, _, reply) in waiters {
                     let _ = reply.send(Err(error.clone()));
@@ -693,10 +769,13 @@ impl Worker {
             parent: &commit_span,
             "buckwal.upload",
             buckwal.commits = commits,
+            buckwal.commit_first = commit,
+            buckwal.commit_last = commit,
             buckwal.bytes = Empty,
             buckwal.generation = Empty,
             buckwal.seq = Empty,
             buckwal.retries = Empty,
+            buckwal.behind_ms = Empty,
             s3.status = Empty,
         );
         let r = span.in_scope(|| self.bucket.append_log(file, vec![ops]));
@@ -720,6 +799,7 @@ impl Worker {
                 // Counted, reported and published before the reply, as in `flush`.
                 self.stats.record_put(commits, a.bytes);
                 self.last_failed.store(false, SeqCst);
+                self.durable.confirmed(commit);
                 self.emit(Event::LogUploaded {
                     generation: a.pos.generation,
                     seq: a.pos.seq,
@@ -737,6 +817,7 @@ impl Worker {
                     None => None,
                 };
                 self.last_failed.store(true, SeqCst);
+                self.durable.failed(&error);
                 self.publish_degraded();
                 let _ = reply.send(Err(LogFailure { error, unsent }));
             }
@@ -745,6 +826,7 @@ impl Worker {
 }
 
 mod batch;
+mod durable;
 
 #[cfg(test)]
 mod tests;

@@ -398,6 +398,7 @@ mod tests {
             ack_wait_p50: Duration::from_millis(3),
             ack_wait_p95: Duration::from_millis(7),
             ack_wait_p99: Duration::from_millis(9),
+            ..UploadStats::default()
         };
         let d = since(&before, &after);
         assert_eq!(

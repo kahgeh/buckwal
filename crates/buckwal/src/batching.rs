@@ -1,6 +1,7 @@
 //! The batching setting: how long and how much the uploader gathers before it ships a log
-//! object. Parsed from and shown as the PRAGMA text, `off` or `window <max_wait>
-//! <max_commits> <max_bytes>`, e.g. `window 50ms 64 1MiB`.
+//! object. Parsed from and shown as the PRAGMA text, `off`, `window <max_wait> <max_commits>
+//! <max_bytes>` (e.g. `window 50ms 64 1MiB`) or `background <max_wait> <max_commits>
+//! <max_bytes> <max_behind>` (e.g. `background 5ms 64 1MiB 1000`).
 use crate::config::defaults;
 use crate::error::{Error, Result};
 use std::fmt;
@@ -19,6 +20,17 @@ pub enum Batching {
         max_wait: Duration,
         max_commits: u32,
         max_bytes: u64,
+    },
+    /// Like `Window`, but the commit returns once it is fsynced locally, before its upload.
+    /// Its record is uploaded in commit order with every other commit's. Once `max_behind`
+    /// commits wait for the bucket, the next commit waits until one is durable
+    /// ([`crate::Database::durable_commit`]). Refused in MVCC mode. Every limit must be at
+    /// least 1, and `max_wait` at most 60 s ([`Batching::validate`]).
+    Background {
+        max_wait: Duration,
+        max_commits: u32,
+        max_bytes: u64,
+        max_behind: u32,
     },
 }
 
@@ -78,9 +90,9 @@ fn parse_bytes(text: &str, tok: &str) -> Result<u64> {
 impl FromStr for Batching {
     type Err = Error;
 
-    /// `off` or `window <max_wait> <max_commits> <max_bytes>`; keywords are case-insensitive
-    /// and any whitespace separates the words. Zero limits parse; [`Batching::validate`]
-    /// refuses them.
+    /// `off`, `window <max_wait> <max_commits> <max_bytes>` or `background <max_wait>
+    /// <max_commits> <max_bytes> <max_behind>`; keywords are case-insensitive and any
+    /// whitespace separates the words. Zero limits parse; [`Batching::validate`] refuses them.
     fn from_str(text: &str) -> Result<Batching> {
         let words: Vec<&str> = text.split_whitespace().collect();
         match words.as_slice() {
@@ -95,9 +107,24 @@ impl FromStr for Batching {
                     max_bytes: parse_bytes(text, bytes)?,
                 })
             }
+            [w, wait, commits, bytes, behind] if w.eq_ignore_ascii_case("background") => {
+                let max_commits = commits.parse::<u32>().map_err(|_| {
+                    bad(text, &format!("max_commits {commits:?} is not an integer"))
+                })?;
+                let max_behind = behind
+                    .parse::<u32>()
+                    .map_err(|_| bad(text, &format!("max_behind {behind:?} is not an integer")))?;
+                Ok(Batching::Background {
+                    max_wait: parse_wait(text, wait)?,
+                    max_commits,
+                    max_bytes: parse_bytes(text, bytes)?,
+                    max_behind,
+                })
+            }
             _ => Err(bad(
                 text,
-                "expected `off` or `window <max_wait> <max_commits> <max_bytes>`",
+                "expected `off`, `window <max_wait> <max_commits> <max_bytes>` or \
+                 `background <max_wait> <max_commits> <max_bytes> <max_behind>`",
             )),
         }
     }
@@ -106,13 +133,19 @@ impl FromStr for Batching {
 impl fmt::Display for Batching {
     /// The canonical text: the largest unit that divides the value evenly.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Batching::Window {
-            max_wait,
-            max_commits,
-            max_bytes,
-        } = *self
-        else {
-            return f.write_str("off");
+        let (word, max_wait, max_commits, max_bytes) = match *self {
+            Batching::Off => return f.write_str("off"),
+            Batching::Window {
+                max_wait,
+                max_commits,
+                max_bytes,
+            } => ("window", max_wait, max_commits, max_bytes),
+            Batching::Background {
+                max_wait,
+                max_commits,
+                max_bytes,
+                ..
+            } => ("background", max_wait, max_commits, max_bytes),
         };
         let us = max_wait.as_micros();
         let wait = if us == 0 {
@@ -129,31 +162,60 @@ impl fmt::Display for Batching {
             .find(|&(shift, _)| max_bytes != 0 && max_bytes % (1u64 << shift) == 0)
             .map(|(shift, unit)| format!("{}{unit}", max_bytes >> shift))
             .unwrap_or_else(|| max_bytes.to_string());
-        write!(f, "window {wait} {max_commits} {bytes}")
+        write!(f, "{word} {wait} {max_commits} {bytes}")?;
+        if let Batching::Background { max_behind, .. } = *self {
+            write!(f, " {max_behind}")?;
+        }
+        Ok(())
     }
 }
 
 impl Batching {
-    /// Window batching acks followers before their upload is confirmed, which an MVCC
-    /// database never does (`MVCC: Window batching`).
+    /// Window batching acks followers before their upload is confirmed, and background
+    /// batching returns before it, which an MVCC database never does (`MVCC: Window
+    /// batching`, `MVCC: Background batching`).
     pub(crate) fn check_mode(&self, mode: crate::config::JournalMode) -> Result<()> {
         match (self, mode) {
             (Batching::Window { .. }, crate::config::JournalMode::Mvcc) => {
                 Err(Error::Unsupported("MVCC: Window batching"))
             }
+            (Batching::Background { .. }, crate::config::JournalMode::Mvcc) => {
+                Err(Error::Unsupported("MVCC: Background batching"))
+            }
             _ => Ok(()),
         }
     }
 
+    /// The gathering limits of a setting that gathers: `max_wait`, `max_commits`, `max_bytes`.
+    /// A background setting also limits the count by `max_behind`, so the uploader ships when
+    /// that many wait and the commit that waits for them does not sit out `max_wait`.
+    pub(crate) fn limits(&self) -> Option<(Duration, u32, u64)> {
+        match *self {
+            Batching::Off => None,
+            Batching::Window {
+                max_wait,
+                max_commits,
+                max_bytes,
+            } => Some((max_wait, max_commits, max_bytes)),
+            Batching::Background {
+                max_wait,
+                max_commits,
+                max_bytes,
+                max_behind,
+            } => Some((max_wait, max_commits.min(max_behind), max_bytes)),
+        }
+    }
+
     /// A window needs room for at least one commit and one byte, and may wait at most
-    /// [`defaults::MAX_BATCH_WAIT`] (60 s).
+    /// [`defaults::MAX_BATCH_WAIT`] (60 s). A background setting also needs `max_behind` of
+    /// at least 1.
     pub fn validate(&self) -> Result<()> {
-        if let Batching::Window {
-            max_wait,
-            max_commits,
-            max_bytes,
-        } = *self
-        {
+        if let Batching::Background { max_behind: 0, .. } = *self {
+            return Err(Error::Config(
+                "batching max_behind must be at least 1".into(),
+            ));
+        }
+        if let Some((max_wait, max_commits, max_bytes)) = self.limits() {
             if max_wait > defaults::MAX_BATCH_WAIT {
                 return Err(Error::Config(format!(
                     "batching max_wait must be at most {}s",
@@ -220,6 +282,10 @@ pub(crate) enum PendingAck {
         batching: Batching,
         span: AckSpan,
     },
+    /// A background commit: fsynced locally, queued with the uploader, and acked by it when
+    /// its record is in the bucket. The call waits only until at most `max_behind` background
+    /// commits wait. `span` ended with the local fsync.
+    Background { max_behind: u32 },
 }
 
 /// Record a commit's `buckwal.outcome`: `ok` when its record is in the bucket, else `error`.
@@ -238,6 +304,8 @@ pub(crate) mod ctx {
     struct CommitCtx {
         batching: Batching,
         acks: Vec<PendingAck>,
+        /// The number of the last commit the call made.
+        last_commit: Option<u64>,
     }
 
     thread_local! {
@@ -266,6 +334,7 @@ pub(crate) mod ctx {
         let fresh = CommitCtx {
             batching: b,
             acks: Vec::new(),
+            last_commit: None,
         };
         CtxGuard {
             prev: CTX.with(|c| c.borrow_mut().replace(fresh)),
@@ -296,6 +365,20 @@ pub(crate) mod ctx {
                 c.acks.push(ack);
             }
         });
+    }
+
+    /// The current call made commit number `n`.
+    pub(crate) fn note_commit(n: u64) {
+        CTX.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                c.last_commit = Some(n);
+            }
+        });
+    }
+
+    /// The number of the last commit the current call made, if any.
+    pub(crate) fn last_commit() -> Option<u64> {
+        CTX.with(|c| c.borrow().as_ref().and_then(|c| c.last_commit))
     }
 
     /// The current call's acks, in commit order; clears them.

@@ -18,7 +18,9 @@ use std::time::Duration;
 /// acked by a later sync is not counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UploadStats {
-    /// Commits whose ack returned `Ok`.
+    /// Commits acked: a call's ack returned `Ok`, or a background commit's record landed.
+    /// A background commit counts when it becomes durable, not when it returns, and the
+    /// ack-wait quantiles leave it out (its call did not wait).
     pub commits_acked: u64,
     /// Commits in log records confirmed in the bucket.
     pub commits_uploaded: u64,
@@ -36,6 +38,10 @@ pub struct UploadStats {
     pub ack_wait_p50: Duration,
     pub ack_wait_p95: Duration,
     pub ack_wait_p99: Duration,
+    /// Background commits that returned and wait for the bucket now.
+    pub commits_behind: u64,
+    /// How long ago the oldest of them returned; zero when none waits.
+    pub oldest_behind: Duration,
 }
 
 const BUCKETS: usize = 64;
@@ -125,6 +131,13 @@ impl StatsCell {
         self.commits_acked.fetch_add(1, Relaxed);
     }
 
+    /// A background commit became durable. Its call did not wait, so the histogram skips it.
+    pub(crate) fn record_background_ack(&self) {
+        self.commits_acked.fetch_add(1, Relaxed);
+    }
+
+    /// The counters. `commits_behind` and `oldest_behind` are the uploader's
+    /// ([`crate::Database::upload_stats`] fills them in).
     pub(crate) fn snapshot(&self) -> UploadStats {
         let acks = self.acks.lock().unwrap().clone();
         let log_puts = self.log_puts.load(Relaxed);
@@ -147,6 +160,8 @@ impl StatsCell {
             ack_wait_p50: acks.quantile(0.50),
             ack_wait_p95: acks.quantile(0.95),
             ack_wait_p99: acks.quantile(0.99),
+            commits_behind: 0,
+            oldest_behind: Duration::ZERO,
         }
     }
 }

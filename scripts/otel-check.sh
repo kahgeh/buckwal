@@ -16,7 +16,8 @@
 # `host.name`, `service.instance.id` as resource attributes), and at least one span of the run
 # has status Error (a failed commit, restore or takeover of the fault tests).
 # A WAL `buckwal.commit` of the run carries `buckwal.journal_mode = wal` and ends at or after its
-# `buckwal.ack_wait` child.
+# `buckwal.ack_wait` child. A background commit (`buckwal.batching` starting `background`) has no
+# ack wait: it ends with its local fsync, so this check leaves it out.
 # The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
@@ -117,7 +118,7 @@ while :; do
   errors="$OUT"
 
   # One WAL commit of the run: journal mode `wal`, and its ack wait ends inside it.
-  query "SELECT count() FROM otel.otel_traces AS c INNER JOIN otel.otel_traces AS a ON a.TraceId = c.TraceId AND a.ParentSpanId = c.SpanId WHERE c.ServiceName = 'buckwal' AND c.SpanName = 'buckwal.commit' AND c.SpanAttributes['test_run_id'] = '$RUN_ID' AND c.Timestamp > now() - INTERVAL 1 DAY AND c.SpanAttributes['buckwal.journal_mode'] = 'wal' AND a.ServiceName = 'buckwal' AND a.SpanName = 'buckwal.ack_wait' AND a.SpanAttributes['test_run_id'] = '$RUN_ID' AND a.Timestamp > now() - INTERVAL 1 DAY AND toUnixTimestamp64Nano(c.Timestamp) + c.Duration >= toUnixTimestamp64Nano(a.Timestamp) + a.Duration"
+  query "SELECT count() FROM otel.otel_traces AS c INNER JOIN otel.otel_traces AS a ON a.TraceId = c.TraceId AND a.ParentSpanId = c.SpanId WHERE c.ServiceName = 'buckwal' AND c.SpanName = 'buckwal.commit' AND c.SpanAttributes['test_run_id'] = '$RUN_ID' AND c.Timestamp > now() - INTERVAL 1 DAY AND c.SpanAttributes['buckwal.journal_mode'] = 'wal' AND c.SpanAttributes['buckwal.batching'] NOT LIKE 'background%' AND a.ServiceName = 'buckwal' AND a.SpanName = 'buckwal.ack_wait' AND a.SpanAttributes['test_run_id'] = '$RUN_ID' AND a.Timestamp > now() - INTERVAL 1 DAY AND toUnixTimestamp64Nano(c.Timestamp) + c.Duration >= toUnixTimestamp64Nano(a.Timestamp) + a.Duration"
   wal_commits="$OUT"
 
   missing=""

@@ -1172,7 +1172,25 @@ impl Database {
 
     /// How many commits each log PUT carried and how long acks waited, since open.
     pub fn upload_stats(&self) -> UploadStats {
-        self.shared.stats.snapshot()
+        let (commits_behind, oldest_behind) = self.shared.uploader.behind();
+        UploadStats {
+            commits_behind,
+            oldest_behind,
+            ..self.shared.stats.snapshot()
+        }
+    }
+
+    /// The highest commit number whose log record is in the bucket, in this open. Every lower
+    /// commit is in the bucket too. 0 before the first. Commit numbers are
+    /// [`Connection::last_commit`]'s; they restart at 1 with every open.
+    pub fn durable_commit(&self) -> u64 {
+        self.shared.uploader.durable_commit()
+    }
+
+    /// Block until [`Database::durable_commit`] reaches `commit`. `Timeout` after `timeout`,
+    /// `UploadFailed` while the bucket fails, `Fenced` once another writer took over.
+    pub fn wait_durable(&self, commit: u64, timeout: Duration) -> Result<()> {
+        self.shared.uploader.wait_durable(commit, timeout)
     }
 
     /// Commit with `b` from the next commit of every connection without a setting of its

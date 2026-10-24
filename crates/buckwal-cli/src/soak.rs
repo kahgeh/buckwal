@@ -213,6 +213,10 @@ impl Soak<'_> {
         let pool = self.write();
         let stats = pool.as_ref().expect("open").db.upload_stats();
         say_all("stats ", &stats_lines(&stats));
+        say(&format!(
+            "stats durable_commit={}",
+            pool.as_ref().expect("open").db.durable_commit()
+        ));
     }
 
     /// Checkpoint on connection `i`, or close everything and reopen, with no commit running.

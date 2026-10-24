@@ -3,9 +3,13 @@
 //!
 //! - `buckwal.commit` (`buckwal.batching`, `buckwal.journal_mode`, `buckwal.commit_no`, `buckwal.bytes`,
 //!   `buckwal.outcome`), with children `buckwal.local_write`, `buckwal.local_fsync` and
-//!   `buckwal.ack_wait` (`io/wal_file.rs`, `conn.rs`);
-//! - `buckwal.upload` (`buckwal.commits`, `buckwal.bytes`, `buckwal.generation`,
-//!   `buckwal.seq`, `buckwal.retries`, `s3.status`) and `buckwal.checkpoint_upload`
+//!   `buckwal.ack_wait` (`io/wal_file.rs`, `conn.rs`); with `buckwal.batching` starting
+//!   `background` the span ends with its `buckwal.local_fsync`, has no `buckwal.ack_wait` and no
+//!   `buckwal.outcome`;
+//! - `buckwal.upload` (`buckwal.commits`, `buckwal.commit_first`, `buckwal.commit_last`,
+//!   `buckwal.bytes`, `buckwal.generation`, `buckwal.seq`, `buckwal.retries`,
+//!   `buckwal.behind_ms`, `s3.status`; a root span when its first commit is a background
+//!   one) and `buckwal.checkpoint_upload`
 //!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`,
 //!   and `buckwal.skipped_generation`, on the first seal after a takeover only),
 //!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);

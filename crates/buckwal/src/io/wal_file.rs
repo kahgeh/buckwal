@@ -221,10 +221,16 @@ impl ShippingFile {
     /// A commit's ops, with the setting of the `Connection` call it runs in (`Off` outside
     /// any). `Off`, or any commit while the uploader is degraded, blocks until its record is
     /// in the bucket, so a failure rolls it back. A Window commit only queues: the call waits
-    /// on its ticket after the engine returns (`Connection::await_acks`).
+    /// on its ticket after the engine returns (`Connection::await_acks`). A background commit
+    /// queues too, and the call returns once it is fsynced: it waits only while more than
+    /// `max_behind` background commits wait (`Connection::await_acks`), and the uploader acks
+    /// it when its record lands.
     ///
     /// Returns the commit's span (`None` with nothing to ship), which goes with its ack. A
-    /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`); the span then ends with this sync's `local_fsync`.
+    /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`). The span then ends
+    /// with this sync's `local_fsync` on `ok`, and with the failed `ack_wait` on `error` (the
+    /// fsync does not run). A background commit's span ends with its `local_fsync` and has
+    /// no outcome: its record is not in the bucket yet.
     fn ship_commit(&self) -> Result<Option<Span>> {
         let (ops, span) = self.take_pending();
         if ops.is_empty() {
@@ -239,6 +245,7 @@ impl ShippingFile {
         if b == Batching::Off || self.uploader.degraded() {
             let ticket = self.submit(&span, ops, Batching::Off, b);
             let (commit, submitted) = (ticket.commit, ticket.submitted);
+            ctx::note_commit(commit);
             let r = ticket.wait_in(&span);
             // Either way it is decided now: `Done` means its record is in the bucket, so the
             // span says `ok` even if the call fails later and its ack is never collected.
@@ -250,9 +257,18 @@ impl ShippingFile {
                 batching: b,
                 span: span.clone(),
             });
+        } else if let Batching::Background { max_behind, .. } = b {
+            // Fsynced by the caller of this sync, then queued: the call returns before the
+            // upload, and the uploader acks the commit when its record lands. The ticket is
+            // dropped; the uploader does not need it.
+            let ticket = self.submit(&span, ops, b, b);
+            ctx::note_commit(ticket.commit);
+            ctx::push(PendingAck::Background { max_behind });
         } else {
+            let ticket = self.submit(&span, ops, b, b);
+            ctx::note_commit(ticket.commit);
             ctx::push(PendingAck::Waiting {
-                ticket: self.submit(&span, ops, b, b),
+                ticket,
                 batching: b,
                 span: span.clone().into(),
             });

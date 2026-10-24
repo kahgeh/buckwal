@@ -24,6 +24,7 @@ use crate::io::db_storage::READ_ONLY;
 use crate::io::stash;
 use crate::maintenance::GateGuard;
 use std::num::NonZero;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use turso_core::{QueryMode, Statement, StepResult, SyncMode, Value, IO};
@@ -101,6 +102,8 @@ pub struct Connection {
     /// to the call that ends it (or the close): maintenance never checkpoints under it, and
     /// its statements pass a closed gate.
     txn_gate: Mutex<Option<GateGuard>>,
+    /// The number of this connection's last commit in this open (0 for none).
+    last_commit: AtomicU64,
     /// Declared last, so dropped last: when this holds the last `Arc<Shared>`, its drop
     /// releases `durable.lock` and the process registry, and every engine file handle (the
     /// connection's, and the IO's `app.db` and `-wal` through its storage) must be closed
@@ -127,6 +130,7 @@ impl Connection {
             batching: Mutex::new(None),
             txn_batching: Mutex::new(None),
             txn_gate: Mutex::new(None),
+            last_commit: AtomicU64::new(0),
             shared,
         }
     }
@@ -141,6 +145,13 @@ impl Connection {
         }
         *lock(&self.batching) = b;
         Ok(())
+    }
+
+    /// The number of this connection's last commit in this open, if it made one. Commit
+    /// numbers restart at 1 with every open; compare this with
+    /// [`crate::Database::durable_commit`].
+    pub fn last_commit(&self) -> Option<u64> {
+        Some(self.last_commit.load(SeqCst)).filter(|&n| n != 0)
     }
 
     /// This connection's own setting ([`Connection::set_batching`]).
@@ -180,6 +191,9 @@ impl Connection {
         let entered = self.enter_gate();
         let _ctx = ctx::enter(b);
         let r = f();
+        if let Some(n) = ctx::last_commit() {
+            self.last_commit.store(n, SeqCst);
+        }
         self.end_txn_batching();
         self.leave_gate(entered);
         self.shared.poke_maintenance();
@@ -230,6 +244,15 @@ impl Connection {
                     // with that sync's `local_fsync`; dropping it here changes neither.
                     drop(span);
                     acked.push((commit, waited, batching));
+                }
+                PendingAck::Background { max_behind } => {
+                    // Its record is acked by the uploader when it lands. The call waits only
+                    // while more than `max_behind` such commits wait. An error here comes
+                    // after the local fsync: the commit stays in the local database, and a
+                    // later upload carries it (outcome unknown, as a Window commit's error).
+                    if let Err(e) = self.shared.uploader.wait_behind(max_behind) {
+                        first_err.get_or_insert(e);
+                    }
                 }
                 PendingAck::Waiting {
                     ticket,
