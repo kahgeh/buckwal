@@ -13,20 +13,35 @@
 #             (crates/buckwal-cli/tests/server.rs): plain HTTP without a token in pass 1,
 #             HTTPS with a token in pass 2.
 #             The passes run side by side, each split in two: four groups, each with its own
-#             RustFS container, volume and port (plain-sys 9290, plain-rest 9291, tls-sys
-#             9292, tls-rest 9293; scripts/rustfs.sh, BUCKWAL_RUSTFS_*). `sys` is the
+#             RustFS container, volume and port (scripts/rustfs.sh, BUCKWAL_RUSTFS_*). `sys` is the
 #             `system` test binary of buckwal-cli, `rest` is every other ignored test. The
 #             script first checks that the four groups name exactly the tests the two passes
 #             would. Each group's output goes to its own log, printed when the group ends.
-#             The four containers are removed on exit, pass or fail; the default container
-#             (buckwal-rustfs) is removed at the start, because plain-sys needs port 9290.
-#             Do not run two full runs at once: the ports are shared.
+#             The four containers are removed on exit, pass or fail.
+#             Run slots: a full run first takes a free run slot, a directory that `mkdir`
+#             makes under the repository's shared git directory (buckwal-test-slots/<N>, the
+#             same for every worktree), with the run's pid and run id in it. Slot N owns the
+#             containers buckwal-rustfs-s<N>-<group>, the volumes buckwal-objects-s<N>-<group> and
+#             the ports 9300 + 10N to 9303 + 10N (serial mode: buckwal-rustfs-s<N>, port
+#             9304 + 10N). BUCKWAL_TEST_SLOTS (default 2) sets how many slots exist; with all
+#             taken, a run prints which runs hold them and waits. A slot whose pid is gone
+#             is stale: the next run removes that slot's containers and takes it. The default
+#             container (buckwal-rustfs) is never touched. SIGINT, SIGTERM and SIGHUP stop the
+#             run, clean up and exit 128 + the signal number.
 #   unit      fmt, clippy, unit tests only
 # BUCKWAL_TEST_SERIAL=1 ./scripts/test.sh runs the two passes one after the other on the
-# default container, the way this script ran before the groups: for a failure that might
-# come from load. The container is emptied (rustfs.sh reset) before each pass and on exit.
+# run slot's single container, the way this script ran before the groups: for a failure that might
+# come from load. The container is emptied (rustfs.sh reset) before each pass and removed on
+# exit. Its cargo runs in the foreground, so a SIGTERM takes effect when the running pass
+# ends (Ctrl-C reaches cargo too and is immediate).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# The number of run slots, checked before anything runs.
+case "${BUCKWAL_TEST_SLOTS:-2}" in
+  [1-9] | [1-9][0-9]) ;;
+  *) echo "test.sh: BUCKWAL_TEST_SLOTS must be a number from 1 to 99, not '${BUCKWAL_TEST_SLOTS}'" >&2; exit 2 ;;
+esac
 
 if [[ "$(uname)" == "Darwin" && -z "${SDKROOT:-}" ]]; then
   # The newest Command Line Tools SDK cannot be linked by Xcode's linker.
@@ -49,6 +64,78 @@ TLS_DIR=""
 SAMPLER=""
 PASS=""
 PEAK_DONE=""
+RUN_ID="buckwal-$(date +%Y%m%d%H%M%S)-$$"
+SLOTS="${BUCKWAL_TEST_SLOTS:-2}"
+SLOT=""
+SLOT_ROOT="$(cd "$(git rev-parse --git-common-dir)" && pwd)/buckwal-test-slots"
+
+# Remove every container buckwal-rustfs-s<n>[-group] and volume buckwal-objects-s<n>[-group]:
+# the names of run slot $1, and no others (the patterns are anchored, so s1 never matches s10).
+slot_remove_containers() {
+  local n="$1" c v
+  for c in $(podman ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^buckwal-rustfs-s${n}(-|\$)" || true); do
+    podman rm -f "$c" >/dev/null 2>&1 || echo "test.sh: could not remove container $c" >&2
+  done
+  for v in $(podman volume ls --format '{{.Name}}' 2>/dev/null | grep -E "^buckwal-objects-s${n}(-|\$)" || true); do
+    podman volume rm -f "$v" >/dev/null 2>&1 || echo "test.sh: could not remove volume $v" >&2
+  done
+}
+
+# Take the first free run slot, waiting while all are taken. A slot whose pid no longer runs
+# is stale: it is renamed away (one run wins the rename), its containers are removed, and the
+# slot is taken.
+take_slot() {
+  mkdir -p "$SLOT_ROOT"
+  local n d pid ids waited=60
+  while :; do
+    for ((n = 1; n <= SLOTS; n++)); do
+      d="$SLOT_ROOT/$n"
+      if ! mkdir "$d" 2>/dev/null; then
+        pid="$(cat "$d/pid" 2>/dev/null || true)"
+        [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null || continue
+        mv "$d" "$SLOT_ROOT/$n.stale.$$" 2>/dev/null || continue
+        if [[ "$(cat "$SLOT_ROOT/$n.stale.$$/pid" 2>/dev/null || true)" != "$pid" ]]; then
+          # Another run took the slot between the check and the move: give it back.
+          mv "$SLOT_ROOT/$n.stale.$$" "$d" 2>/dev/null || true
+          continue
+        fi
+        # The dead run's groups may still run (SIGKILL reaches only the script): stop them
+        # before their containers go, or their tests would stop and pause the next run's.
+        for g in $(cat "$SLOT_ROOT/$n.stale.$$/groups" 2>/dev/null || true); do
+          kill -TERM -- "-$g" 2>/dev/null || true
+        done
+        echo "test.sh: run slot $n is stale (pid $pid is gone); removing its containers"
+        slot_remove_containers "$n"
+        rm -rf "$SLOT_ROOT/$n.stale.$$"
+        mkdir "$d" 2>/dev/null || continue
+      fi
+      SLOT="$n"
+      echo "$$" >"$d/pid"
+      echo "$RUN_ID" >"$d/run"
+      echo "run slot $n of $SLOTS"
+      return 0
+    done
+    if [[ "$waited" -ge 60 ]]; then
+      ids="$(cat "$SLOT_ROOT"/*/run 2>/dev/null | paste -sd, - | sed 's/,/, /g' || true)"
+      echo "test.sh: all $SLOTS run slots are taken (${ids:-no run id yet}); waiting"
+      waited=0
+    fi
+    sleep 5 &
+    wait $! || true
+    waited=$((waited + 5))
+  done
+}
+
+# Stop the run when a port of its slot is already in use (before any test starts).
+check_ports() {
+  local p
+  for p in "$@"; do
+    if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "test.sh: port $p of run slot $SLOT is in use; free it first" >&2
+      exit 1
+    fi
+  done
+}
 
 # The peak of the volume samples taken during pass $1, as one line.
 peak_line() {
@@ -66,7 +153,7 @@ peak() {
 # stopped or paused).
 sample() {
   local mb
-  mb="$(podman exec buckwal-rustfs du -sm /data 2>/dev/null | awk '{ print $1 }')" || true
+  mb="$(podman exec "$BUCKWAL_RUSTFS_NAME" du -sm /data 2>/dev/null | awk '{ print $1 }')" || true
   [[ -n "$mb" ]] && echo "$(cat "$WORK0/pass" 2>/dev/null) $mb" >>"$WORK0/disk"
   return 0
 }
@@ -78,14 +165,15 @@ remove_dir() {
   rm -rf "$1" || echo "test.sh: could not remove $1" >&2
 }
 
-# One EXIT trap: stop the sampler, remove the workload's directory, empty RustFS's storage
-# in plain mode (after otel-check.sh; telemetry is in ClickHouse, not the bucket), remove
-# the TLS material, and only then print the running pass's peak. Every step runs even when
+# One EXIT trap: stop the sampler, remove the workload's directory, remove the run slot's
+# containers and volumes (after otel-check.sh; telemetry is in ClickHouse, not the bucket),
+# remove the TLS material, free the slot, and only then print the running pass's peak. Every step runs even when
 # an earlier one fails or stdout/stderr is a closed pipe (`| tee` after Ctrl-C, `| head`):
 # no errexit, SIGPIPE ignored, so a failed write is just a failed write. A failed cleanup is
 # reported on stderr and the tests' exit code is kept.
 cleanup() {
   local rc=$? pending=""
+  trap '' INT TERM HUP
   if [[ "${BUCKWAL_TEST_SERIAL:-}" != 1 ]]; then cleanup_parallel "$rc"; exit "$rc"; fi
   set +e
   trap '' PIPE
@@ -98,25 +186,29 @@ cleanup() {
   fi
   [[ -n "$WORK" ]] && remove_dir "$WORK"
   unset BUCKWAL_TLS_DIR BUCKWAL_ENCRYPTION_KEY_FILE
-  scripts/rustfs.sh reset || echo "test.sh: emptying RustFS storage (rustfs.sh reset) failed" >&2
+  [[ -n "$SLOT" ]] && slot_remove_containers "$SLOT"
   [[ -n "$TLS_DIR" ]] && remove_dir "$TLS_DIR"
   [[ -n "$WORK0" ]] && remove_dir "$WORK0"
   [[ -n "$pending" ]] && echo "$pending"
+  [[ -n "$SLOT" ]] && rm -rf "${SLOT_ROOT:?}/$SLOT"
+  echo "full run: $SECONDS s in all (exit $rc)"
   exit "$rc"
 }
 
 serial_main() {
-  trap cleanup EXIT
+  export BUCKWAL_RUSTFS_NAME="buckwal-rustfs-s$SLOT" BUCKWAL_RUSTFS_VOLUME="buckwal-objects-s$SLOT" \
+    BUCKWAL_RUSTFS_PORT="$((9304 + 10 * SLOT))"
+  check_ports "$BUCKWAL_RUSTFS_PORT"
   WORK0="$(mktemp -d "$TMP/buckwal-test.XXXXXX")"
   TLS_DIR="$(mktemp -d "$TMP/buckwal-tls.XXXXXX")"
   : >"$WORK0/disk"
   # Every 15 s, the volume's size in MB, tagged with the pass.
-  (while sleep 15; do sample; done) &
+  (while kill -0 $$ 2>/dev/null && sleep 15; do sample; done) &
   SAMPLER=$!
 
   # Only this run exports; the run id marks every record `deployment.environment.name = test`.
   export BUCKWAL_OTEL=1
-  export BUCKWAL_TEST_RUN_ID="buckwal-$(date +%Y%m%d%H%M%S)-$$"
+  export BUCKWAL_TEST_RUN_ID="$RUN_ID"
   echo "test run id: $BUCKWAL_TEST_RUN_ID"
   cli() { BUCKWAL_PREFIX="otel/$BUCKWAL_TEST_RUN_ID" cargo run -q --locked -p buckwal-cli -- "$@"; }
 
@@ -161,9 +253,15 @@ serial_main() {
 # Parallel run: four groups, each with its own RustFS container, volume and port.
 # ---------------------------------------------------------------------------------------
 GROUPS_ALL=(plain-sys plain-rest tls-sys tls-rest)
-group_port() { case "$1" in plain-sys) echo 9290 ;; plain-rest) echo 9291 ;; tls-sys) echo 9292 ;; tls-rest) echo 9293 ;; esac; }
-group_name() { echo "buckwal-rustfs-$1"; }
-group_volume() { echo "buckwal-objects-$1"; }
+# Run slot N's ports are 9300 + 10N to 9303 + 10N (serial mode: 9304 + 10N).
+group_port() {
+  case "$1" in
+    plain-sys) echo $((9300 + 10 * SLOT)) ;; plain-rest) echo $((9301 + 10 * SLOT)) ;;
+    tls-sys) echo $((9302 + 10 * SLOT)) ;; tls-rest) echo $((9303 + 10 * SLOT)) ;;
+  esac
+}
+group_name() { echo "buckwal-rustfs-s$SLOT-$1"; }
+group_volume() { echo "buckwal-objects-s$SLOT-$1"; }
 # rustfs.sh for group $1: scripts/rustfs.sh "$1" with the group's container, volume and port.
 rustfs_of() {
   local g="$1"; shift
@@ -266,24 +364,22 @@ cleanup_parallel() {
   # `buckwal` children all stop with it.
   for pid in ${GROUP_PIDS[@]+"${GROUP_PIDS[@]}"}; do kill -TERM -- "-$pid" 2>/dev/null; done
   wait 2>/dev/null
-  for g in "${GROUPS_ALL[@]}"; do
-    rustfs_of "$g" down || echo "test.sh: removing $(group_name "$g") failed" >&2
-  done
+  [[ -n "$SLOT" ]] && slot_remove_containers "$SLOT"
   [[ -n "$WORK" ]] && remove_dir "$WORK"
   [[ -n "$TLS_DIR" ]] && remove_dir "$TLS_DIR"
   [[ -n "$WORK0" ]] && remove_dir "$WORK0"
+  [[ -n "$SLOT" ]] && rm -rf "${SLOT_ROOT:?}/$SLOT"
   echo "full run: $SECONDS s in all (exit $rc)"
 }
 
 parallel_main() {
   GROUP_PIDS=()
-  trap 'cleanup' EXIT
   WORK0="$(mktemp -d "$TMP/buckwal-test.XXXXXX")"
   TLS_DIR="$(mktemp -d "$TMP/buckwal-tls.XXXXXX")"
   : >"$WORK0/disk"
 
   export BUCKWAL_OTEL=1
-  export BUCKWAL_TEST_RUN_ID="buckwal-$(date +%Y%m%d%H%M%S)-$$"
+  export BUCKWAL_TEST_RUN_ID="$RUN_ID"
   echo "test run id: $BUCKWAL_TEST_RUN_ID"
   cli() { BUCKWAL_PREFIX="otel/$BUCKWAL_TEST_RUN_ID" cargo run -q --locked -p buckwal-cli -- "$@"; }
 
@@ -291,16 +387,16 @@ parallel_main() {
   cargo test --workspace --locked --no-run
   check_test_lists
 
-  # plain-sys takes the default container's port.
-  scripts/rustfs.sh down
+  check_ports "$(group_port plain-sys)" "$(group_port plain-rest)" "$(group_port tls-sys)" "$(group_port tls-rest)"
   scripts/tls-material.sh "$TLS_DIR/m"
-  (while sleep 15; do sample_parallel; done) &
+  (while kill -0 $$ 2>/dev/null && sleep 15; do sample_parallel; done) &
   SAMPLER=$!
 
   local g
   set -m
   for g in "${GROUPS_ALL[@]}"; do start_group "$g"; done
   set +m
+  echo "${GROUP_PIDS[*]}" >"$SLOT_ROOT/$SLOT/groups"
   local rc=0 i=0 status
   for g in "${GROUPS_ALL[@]}"; do
     status=0
@@ -312,6 +408,8 @@ parallel_main() {
     sed "s/^/[$g] /" "$WORK0/$g.log"
     [[ "$status" -ne 0 && "$rc" -eq 0 ]] && rc="$status"
   done
+  # The groups have ended: their pids may be used again, so a stale takeover must not kill them.
+  rm -f "$SLOT_ROOT/$SLOT/groups"
   sample_parallel
   [[ "$rc" -ne 0 ]] && exit "$rc"
 
@@ -361,6 +459,11 @@ peak_pass() {
   echo "peak buckwal-objects: $mb MB ($1, its two volumes together)"
 }
 
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+take_slot
 if [[ "${BUCKWAL_TEST_SERIAL:-}" == 1 ]]; then
   serial_main
 else
