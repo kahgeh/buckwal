@@ -100,12 +100,14 @@ fn block_count(total: u64) -> u64 {
 
 impl PackCodes {
     /// The length of the encoded codes object of a pack of `total` bytes.
+    #[cfg(test)]
     pub(crate) fn encoded_len(total: u64) -> usize {
         (block_count(total) as usize + 1) * CODE_LEN
     }
 
     /// The codes of `blocks`, in order. They must be the whole pack: all of `BLOCK_SIZE` bytes
     /// but the last, and `total` bytes together (`Corrupt` otherwise).
+    #[cfg(test)]
     pub(crate) fn build<'a, B: AsRef<[u8]> + 'a>(
         keys: &Keys,
         pack_key: &str,

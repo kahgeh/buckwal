@@ -41,6 +41,9 @@ pub use error::{Error, Result};
 pub use gc::gc_with_store;
 pub use gc::{gc, GcOutcome, GcReport};
 #[doc(hidden)]
+pub use pack::pack_with_store;
+pub use pack::{pack, PackOutcome, PackReport};
+#[doc(hidden)]
 pub use replica::open_replica_with_store;
 pub use replica::{
     open_replica, ReadConnection, ReadTransaction, Replica, ReplicaStats, ReplicaWaker,

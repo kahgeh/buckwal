@@ -223,7 +223,7 @@ impl Keys {
     /// The head `format` a new packed bucket is created with. It is 5, coded or not. The writer
     /// uses `new_format` until it writes packs (a format 5 head has no manifest, which the seal
     /// path of formats 1 to 4 needs).
-    #[allow(dead_code)] // used from task 5 on
+    #[allow(dead_code)] // the writer makes format 5 heads from the generation switch on
     pub(crate) fn new_format_packed(&self) -> u32 {
         FORMAT_V5
     }
@@ -368,33 +368,29 @@ impl Keys {
     }
 
     /// The pack `pack/<generation>/<run id>`.
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn pack(&self, gen: u64, run_id: &str) -> String {
         debug_assert!(valid_run_id(run_id), "bad run id");
         self.join(&format!("pack/{gen:010}/{run_id}"))
     }
 
     /// The codes object of the pack `pack/<generation>/<run id>`.
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn pack_codes(&self, gen: u64, run_id: &str) -> String {
         debug_assert!(valid_run_id(run_id), "bad run id");
         self.join(&format!("pack/{gen:010}/{run_id}.codes"))
     }
 
     /// The pack pointer.
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn pack_pointer(&self) -> String {
         self.join("pack-latest")
     }
 
     /// Every pack's key, and every pack codes object's, starts with this.
-    #[allow(dead_code)] // used from task 5 on
+    #[cfg_attr(not(test), allow(dead_code))] // GC lists packs with it
     pub(crate) fn pack_root(&self) -> String {
         self.join("pack/")
     }
 
     /// The generation and run id of a pack key (not of a codes key).
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn parse_pack(&self, key: &str) -> Option<(u64, String)> {
         let rest = self.strip(key)?.strip_prefix("pack/")?;
         let (g, run) = rest.split_once('/')?;
@@ -405,7 +401,6 @@ impl Keys {
 
     /// The pack pointer's bytes: with an integrity key its fields and their code, made under the
     /// database integrity key (the code covers every field of the pointer).
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn encode_pointer(&self, p: &PackPointer) -> Vec<u8> {
         let mut out = p.encode_fields();
         if let Some(ik) = self.object_key() {
@@ -422,7 +417,6 @@ impl Keys {
     /// `Encryption`. In every bucket the pointer must be consistent: `codes_key` is `pack_key`
     /// plus `.codes`, `pack_key` parses under the prefix and `pack_generation` is its
     /// generation, else `Corrupt("pack pointer: ...")`.
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn decode_pointer(&self, body: &[u8]) -> Result<PackPointer> {
         let (p, code) = PackPointer::decode_fields(body)?;
         let key = self.pack_pointer();
@@ -451,7 +445,6 @@ impl Keys {
     }
 
     /// The database id these keys know (a format 4 or 5 head read or made).
-    #[allow(dead_code)] // used from task 5 on
     pub(crate) fn known_database_id(&self) -> Option<String> {
         match &*self.identity.lock().unwrap_or_else(|e| e.into_inner()) {
             Identity::Format4 { id, .. } => Some(id.clone()),
@@ -460,7 +453,6 @@ impl Keys {
     }
 
     /// The checks of a pointer that hold in every bucket.
-    #[allow(dead_code)] // used from task 5 on
     fn check_pointer_fields(&self, p: &PackPointer) -> Result<()> {
         let bad = |m: &str| Err(crate::error::Error::Corrupt(format!("pack pointer: {m}")));
         let Some((generation, _)) = self.parse_pack(&p.pack_key) else {

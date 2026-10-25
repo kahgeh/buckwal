@@ -1,0 +1,785 @@
+//! One pack run ([`pack`]), in the steps of the spec ("Packs and the packer"):
+//!
+//! 1. Read the head (its database id is then known), then the pack pointer.
+//! 2. List the log from the pointer's pack generation and find the ended generations.
+//! 3. Download the newest pack in ranges and check each block against its codes.
+//! 4. Apply each ended generation with a local checkpoint, the code a restore uses
+//!    (`restore::apply_generation`), in `<config.dir>/pack-work-<run id>`.
+//! 5. Upload the database file as `pack/<G>/<run id>` in 16 MiB parts, 8 at once.
+//! 6. Check the upload: the HEAD size and the SHA-256 of each part. Then upload the codes.
+//! 7. HEAD the pack and its codes, then move the pointer with `If-Match` on its ETag
+//!    (`If-None-Match` for the first pointer). A 412 or an unknown result reads the pointer
+//!    again and goes on as it names this run's pack, an equal or higher one, the old one, or
+//!    a lower one.
+//!
+//! The run never writes the head or the log. It deletes its own pack and codes when it does
+//! not move the pointer, but never a pack the pointer names.
+use super::codes::{CodesBuilder, PackCodes, BLOCK_SIZE};
+use super::pointer::{PackPointer, POINTER_FORMAT};
+use crate::bucket::Timeouts;
+use crate::clock::Stamp;
+use crate::config::{defaults, Config, JournalMode};
+use crate::encryption::{self, Encryption};
+use crate::error::{Error, Result};
+use crate::files::{io_err, DB_FILE};
+use crate::format::{Head, Keys, LogRecord};
+use crate::replica::fence::FenceRule;
+use crate::restore::{apply_generation, db_facts, fetch_generation_upto, replay};
+use crate::store::{
+    part_size_for, sha256_of, with_retry, CondPut, ObjectStore, PartSource, RetryPolicy,
+};
+use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// The size of each part of a pack's multipart upload (it grows only above 10,000 parts), and
+/// of each range a run downloads.
+pub(crate) const PART_SIZE: usize = 16 << 20;
+/// How many parts go up at once, and how many ranges come down at once.
+pub(crate) const PART_CONCURRENCY: usize = 8;
+/// The most pointer writes one run sends before it gives up.
+const MAX_POINTER_WRITES: u32 = 10;
+
+/// How a pack run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackOutcome {
+    /// The pointer names the run's new pack.
+    Packed,
+    /// No generation ended since the newest pack: the run made no pack.
+    NothingToDo,
+    /// Another run moved the pointer to a pack of an equal or higher pack generation. The run
+    /// deleted its own pack and codes.
+    Superseded,
+    /// The run stopped at `step`; `key` is the object it concerns, when there is one. The
+    /// pointer does not name the run's pack, and the run deleted its pack and codes, except
+    /// when it could not read the pointer to make sure (`pointer read`): GC then deletes them
+    /// as an orphan.
+    Failed { step: String, key: Option<String> },
+}
+
+/// What one pack run did.
+#[derive(Debug, Clone)]
+pub struct PackReport {
+    pub outcome: PackOutcome,
+    /// The pack generation of the run's pack: the first generation it does not hold. With
+    /// `NothingToDo`, the pointer's (0 when there is no pointer).
+    pub pack_generation: u64,
+    /// The key of the run's pack, once it has one.
+    pub pack_key: Option<String>,
+    /// Bytes downloaded and uploaded, by the store's counters.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    /// The time of each step the run made, in order.
+    pub step_times: Vec<(&'static str, Duration)>,
+    /// The share of the new pack's pages that are on the database's free list (0 without a
+    /// new pack): `buckwal vacuum` gives them back.
+    pub free_page_share: f64,
+    pub elapsed: Duration,
+}
+
+/// A generation that a pack can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EndedGeneration {
+    pub generation: u64,
+    /// The seq of its terminal record: the run applies seqs 1 to it. 0 for a skipped
+    /// generation (a takeover left it with no log).
+    pub last_seq_to_apply: u64,
+}
+
+/// What a scan of the log needs.
+pub(crate) struct LogReader<'a> {
+    pub store: &'a dyn ObjectStore,
+    pub keys: &'a Keys,
+    pub retry: &'a RetryPolicy,
+    /// Parallel log GETs.
+    pub concurrency: usize,
+    /// The takeover quiet: how old a terminal fence record must be, by the bucket's clock.
+    pub quiet: Duration,
+}
+
+/// The ended generations from `from` on, in order: a prefix of `from..head.generation`.
+///
+/// A generation `g` has ended when the head names a later generation and its log holds a
+/// terminal record (`terminal_seq`). After a terminal fence record the run also waits out the
+/// takeover quiet. A generation with no log is a skipped generation when a takeover left it
+/// (`skipped`), else the log the pack needs is gone: `Corrupt`. The scan stops at the first
+/// generation that has not ended: a later run takes it.
+#[cfg_attr(not(test), allow(dead_code))] // the packer loop asks it before a run
+pub(crate) fn ended_generations(
+    r: &LogReader,
+    from: u64,
+    head: &Head,
+) -> Result<Vec<EndedGeneration>> {
+    scan_generations(r, from, head, &mut |_, _| Ok(()))
+}
+
+/// [`ended_generations`], calling `visit` with each ended generation that has a log and its
+/// records up to the terminal record, in order, as it finds them.
+fn scan_generations(
+    r: &LogReader,
+    from: u64,
+    head: &Head,
+    visit: &mut dyn FnMut(EndedGeneration, &[LogRecord]) -> Result<()>,
+) -> Result<Vec<EndedGeneration>> {
+    let root = r.keys.log_root();
+    // Every key of the generations below `from` sorts before this one.
+    let after = format!("{}~", r.keys.log_prefix(from.saturating_sub(1)));
+    let listed = with_retry(r.retry, &root, |_| r.store.list_after(&root, &after))?;
+    let with_log: BTreeSet<u64> = listed
+        .iter()
+        .filter_map(|k| r.keys.parse_log(k))
+        .map(|(g, _)| g)
+        .filter(|g| *g >= from)
+        .collect();
+    let mut out = Vec::new();
+    // Whether the nearest lower generation this scan read holds a fence record.
+    let mut fence_below = false;
+    for g in from..head.generation {
+        if !with_log.contains(&g) {
+            if !skipped(g, head, &with_log, fence_below) {
+                return Err(Error::Corrupt(format!(
+                    "{} holds no record and no takeover skipped generation {g}: the log a \
+                     pack needs is gone",
+                    r.keys.log_prefix(g)
+                )));
+            }
+            out.push(EndedGeneration {
+                generation: g,
+                last_seq_to_apply: 0,
+            });
+            continue;
+        }
+        let records = fetch_generation_upto(
+            r.store,
+            r.keys,
+            g,
+            None,
+            r.concurrency,
+            r.retry,
+            &AtomicU64::new(0),
+        )?;
+        let Some(t) = terminal_seq(&records) else {
+            break;
+        };
+        if matches!(records[t as usize - 1], LogRecord::Fence { .. }) && !quiet_passed(r, g, t)? {
+            break;
+        }
+        fence_below = records.iter().any(|x| matches!(x, LogRecord::Fence { .. }));
+        let e = EndedGeneration {
+            generation: g,
+            last_seq_to_apply: t,
+        };
+        visit(e, &records[..t as usize])?;
+        out.push(e);
+    }
+    Ok(out)
+}
+
+/// The seq of the terminal record of a generation's log (`records`, from seq 1), when the
+/// generation has ended. The terminal record is the last seal-start record (an Extents record
+/// with no syncs) or fence record after which the log holds no Extents record the fence rule
+/// admits: only late records of a writer a fence shut out may follow it. A writer that goes
+/// on writing after it (the fencer, after its fence) means the generation has not ended.
+fn terminal_seq(records: &[LogRecord]) -> Option<u64> {
+    let mut rule = FenceRule::default();
+    let mut terminal = None;
+    for (i, rec) in records.iter().enumerate() {
+        match rec {
+            LogRecord::Fence { writer_id, epoch } => {
+                if rule.on_fence(writer_id, *epoch) {
+                    terminal = Some(i as u64 + 1);
+                }
+            }
+            LogRecord::Extents {
+                writer_id, syncs, ..
+            } => {
+                if !rule.admits(writer_id) {
+                    continue;
+                }
+                terminal = syncs.is_empty().then_some(i as u64 + 1);
+            }
+        }
+    }
+    terminal
+}
+
+/// Whether the terminal fence record `log/<g>/<t>` is older than the takeover quiet by the
+/// bucket's clock (1 s more for the resolution of the age, `ObjectStore::stat`).
+fn quiet_passed(r: &LogReader, g: u64, t: u64) -> Result<bool> {
+    let key = r.keys.log(g, t);
+    let st = with_retry(r.retry, &key, |_| r.store.stat(&key))?;
+    Ok(st.is_some_and(|s| s.age >= r.quiet.saturating_add(Duration::from_secs(1))))
+}
+
+/// Whether generation `g` (no log, below the head's generation) is one a takeover skipped
+/// (ADR 0005). A takeover of generation G writes the floor `max(G + 1, old floor) + 1`, and the
+/// generations from G + 1 up to the floor never get a log. So `g` is skipped when the head's
+/// `next_generation_floor` is above it and no generation from `g` up to the floor has a log,
+/// or when the nearest lower generation this run read holds a fence record (the generations
+/// between are skipped too). Any other missing log is not a skip.
+fn skipped(g: u64, head: &Head, with_log: &BTreeSet<u64>, fence_below: bool) -> bool {
+    let under_floor = head
+        .next_generation_floor
+        .is_some_and(|f| g < f && with_log.range(g..f).next().is_none());
+    under_floor || fence_below
+}
+
+/// The takeover quiet a terminal fence record waits out: the larger of this configuration's
+/// `lease + request_timeout` and the head's, at most `MAX_SEAL_QUIET`.
+fn takeover_quiet(config: &Config, head: &Head) -> Duration {
+    let own = Timeouts {
+        lease: config.lease,
+        request_timeout: config.request_timeout,
+    };
+    own.quiet_for(Some(head)).min(defaults::MAX_SEAL_QUIET)
+}
+
+/// How long ago the run's clock started; tests move it by hand.
+pub(crate) type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+/// Run one pack run against the bucket `config` names. A run that finds no ended generation
+/// returns `NothingToDo`. Errors before the upload (the log the pack needs is gone, a record
+/// fails its check, the store fails) are `Err`; once the upload started, the run cleans up and
+/// returns a `Failed` outcome instead.
+pub fn pack(config: &Config) -> Result<PackReport> {
+    let store = config.s3_store()?;
+    pack_with_store(config, store)
+}
+
+#[doc(hidden)]
+pub fn pack_with_store(config: &Config, store: Arc<dyn ObjectStore>) -> Result<PackReport> {
+    let origin = Stamp::now();
+    pack_run(config, store, Arc::new(move || origin.age()))
+}
+
+/// [`pack_with_store`] with the clock that measures the run's time limit.
+pub(crate) fn pack_run(
+    config: &Config,
+    store: Arc<dyn ObjectStore>,
+    clock: Clock,
+) -> Result<PackReport> {
+    config.validate()?;
+    let enc = encryption::load(config)?;
+    let run_id = crate::db::new_writer_id()?;
+    let work = WorkDir::create(config.dir.join(format!("pack-work-{run_id}")))?;
+    let mut run = Run {
+        store: &*store,
+        keys: config.keys_for(enc.as_deref()),
+        retry: config.engine(crate::io::IoMode::Writer).retry,
+        enc: enc.as_deref(),
+        clock,
+        limit: config.pack_orphan_grace / 2,
+        run_id,
+        work: work.0.clone(),
+        steps: Vec::new(),
+        step_start: Instant::now(),
+    };
+    let start = Instant::now();
+    let before = store.stats();
+    let r = run.run(config);
+    let delta = store.stats().since(&before);
+    let (outcome, pack_generation, pack_key, free_page_share) = r?;
+    let report = PackReport {
+        outcome,
+        pack_generation,
+        pack_key,
+        bytes_down: delta.bytes_down,
+        bytes_up: delta.bytes_up,
+        step_times: run.steps,
+        free_page_share,
+        elapsed: start.elapsed(),
+    };
+    tracing::info!(
+        target: "buckwal",
+        outcome = ?report.outcome,
+        pack_generation = report.pack_generation,
+        bytes_down = report.bytes_down,
+        bytes_up = report.bytes_up,
+        ms = report.elapsed.as_millis() as u64,
+        "pack run finished"
+    );
+    Ok(report)
+}
+
+/// The run's working directory, removed when the run ends, whatever the outcome.
+struct WorkDir(PathBuf);
+
+impl WorkDir {
+    fn create(path: PathBuf) -> Result<WorkDir> {
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|e| io_err("remove pack working dir", e))?;
+        }
+        fs::create_dir_all(&path).map_err(|e| io_err("create pack working dir", e))?;
+        Ok(WorkDir(path))
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        // A directory left behind holds only a local copy of the database.
+        if let Err(e) = fs::remove_dir_all(&self.0) {
+            tracing::warn!(target: "buckwal", error = %e, "pack run: cannot remove its working dir");
+        }
+    }
+}
+
+/// What the run returns before the report: outcome, pack generation, pack key, free share.
+type Ran = (PackOutcome, u64, Option<String>, f64);
+
+struct Run<'a> {
+    store: &'a dyn ObjectStore,
+    keys: Keys,
+    retry: RetryPolicy,
+    enc: Option<&'a Encryption>,
+    clock: Clock,
+    /// Half the orphan grace: the longest a run may take from its upload start to its pointer
+    /// write.
+    limit: Duration,
+    run_id: String,
+    work: PathBuf,
+    steps: Vec<(&'static str, Duration)>,
+    step_start: Instant,
+}
+
+/// The pack this run uploads.
+struct NewPack {
+    pointer: PackPointer,
+    /// When the upload started, on the run's clock.
+    upload_start: Duration,
+}
+
+fn failed(step: &str, key: Option<&str>) -> PackOutcome {
+    PackOutcome::Failed {
+        step: step.to_string(),
+        key: key.map(str::to_string),
+    }
+}
+
+impl Run<'_> {
+    /// End the current step as `name` and start the next.
+    fn step(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.steps.push((name, now - self.step_start));
+        self.step_start = now;
+    }
+
+    fn req<T>(
+        &self,
+        what: &str,
+        mut op: impl FnMut() -> std::result::Result<T, crate::store::StoreError>,
+    ) -> Result<T> {
+        with_retry(&self.retry, what, |_| op())
+    }
+
+    /// The pointer and its ETag; `None` when there is none.
+    fn read_pointer(&self) -> Result<Option<(PackPointer, String)>> {
+        let key = self.keys.pack_pointer();
+        let Some(obj) = self.req(&key, || self.store.get(&key))? else {
+            return Ok(None);
+        };
+        Ok(Some((self.keys.decode_pointer(&obj.body)?, obj.etag)))
+    }
+
+    fn run(&mut self, config: &Config) -> Result<Ran> {
+        // Step 1. The head first: a coded pointer is decoded only once the keys adopted the
+        // head and know its database id.
+        let head_key = self.keys.head();
+        let head_obj = self
+            .req(&head_key, || self.store.get(&head_key))?
+            .ok_or_else(|| Error::NotFound(head_key.clone()))?;
+        let head = self.keys.decode_head_open(&head_obj.body)?;
+        if head.journal_mode == JournalMode::Mvcc {
+            return Err(Error::Unsupported("a pack run of an MVCC database"));
+        }
+        if self.keys.coded() && self.keys.known_database_id().is_none() {
+            return Err(Error::Unsupported(
+                "a pack run of an encrypted bucket without a database id (format 3)",
+            ));
+        }
+        let base = self.read_pointer()?;
+        let from = base.as_ref().map_or(1, |(p, _)| p.pack_generation);
+        self.step("read");
+
+        // Steps 2 to 4: each ended generation, applied as the scan finds it. The newest pack
+        // is downloaded before the first one.
+        let quiet = takeover_quiet(config, &head);
+        let reader = LogReader {
+            store: self.store,
+            keys: &self.keys,
+            retry: &self.retry,
+            concurrency: config.upload_concurrency,
+            quiet,
+        };
+        let db = self.work.join(DB_FILE);
+        let mut base_ready = false;
+        let mut gone: Option<String> = None;
+        let mut applied = 0u64;
+        let (work, enc, store, keys, retry) =
+            (&self.work, self.enc, self.store, &self.keys, &self.retry);
+        let ended = scan_generations(&reader, from, &head, &mut |e, records| {
+            if gone.is_some() {
+                return Ok(());
+            }
+            if !base_ready {
+                base_ready = true;
+                if let Some((p, _)) = &base {
+                    if !download_pack(store, keys, retry, p, &db)? {
+                        gone = Some(p.pack_key.clone());
+                        return Ok(());
+                    }
+                    check_page_size(work, enc, p)?;
+                }
+            }
+            let g = Head {
+                generation: e.generation,
+                ..head.clone()
+            };
+            apply_generation(work, &replay(records, &g)?.wal, &g, enc)?;
+            applied += 1;
+            Ok(())
+        })?;
+        self.step("apply");
+        let current = base.as_ref().map_or(0, |(p, _)| p.pack_generation);
+        if let Some(key) = gone {
+            // A newer pack replaced it and GC deleted it: the next run reads the new pointer.
+            return Ok((failed("download", Some(&key)), current, None, 0.0));
+        }
+        let size = fs::metadata(&db).map_or(0, |m| m.len());
+        if applied == 0 || size == 0 {
+            return Ok((PackOutcome::NothingToDo, current, None, 0.0));
+        }
+        let pack_generation = ended.last().expect("a generation was applied").generation + 1;
+        let facts = db_facts(&self.work, self.enc)?;
+        let free = if facts.page_count == 0 {
+            0.0
+        } else {
+            facts.free_pages as f64 / facts.page_count as f64
+        };
+        let part_size = part_size_for(size, PART_SIZE);
+        let pack_key = self.keys.pack(pack_generation, &self.run_id);
+        let pointer = PackPointer {
+            format: POINTER_FORMAT,
+            codes_key: self.keys.pack_codes(pack_generation, &self.run_id),
+            pack_key: pack_key.clone(),
+            pack_generation,
+            size,
+            page_size: facts.page_size,
+            part_size: part_size as u64,
+            block_size: BLOCK_SIZE,
+            database_id: self.keys.known_database_id(),
+        };
+        let outcome =
+            self.upload_and_publish(pointer, &db, base.map(|(p, etag)| (p.pack_key, etag)));
+        Ok((outcome?, pack_generation, Some(pack_key), free))
+    }
+
+    /// Steps 5 to 7 for the database file `db`. `base` is the pointer the run read: the key
+    /// of the pack it names and its ETag.
+    fn upload_and_publish(
+        &mut self,
+        pointer: PackPointer,
+        db: &Path,
+        base: Option<(String, String)>,
+    ) -> Result<PackOutcome> {
+        let (pack_key, codes_key) = (pointer.pack_key.clone(), pointer.codes_key.clone());
+        let part_size = pointer.part_size as usize;
+        // The run's own part checksums and block codes, from the file it uploads.
+        let (part_sha256, codes) = digest(&self.keys, &pointer, db)?;
+        let codes_body =
+            codes.encode(&self.keys, &pack_key, pointer.pack_generation, pointer.size)?;
+        let source = FileSource::open(db)?;
+        // Step 5. The time limit starts here: a multipart object's Last-Modified time is the
+        // upload start, and GC measures an orphan from it.
+        let new = NewPack {
+            upload_start: (self.clock)(),
+            pointer,
+        };
+        let mut source = source;
+        let up = self
+            .store
+            .put_multipart(&pack_key, &mut source, part_size, PART_CONCURRENCY);
+        self.step("upload");
+        let done = match up {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(target: "buckwal", key = %pack_key, error = %e, "pack upload failed");
+                // The parts of a failed upload stay hidden until an abort; GC aborts them
+                // after the orphan grace in any case.
+                let _ = self.store.abort_incomplete(&pack_key, Duration::ZERO);
+                return Ok(failed("upload", Some(&pack_key)));
+            }
+        };
+        // Step 6. A part reply without a checksum is no proof: compare the store's part
+        // checksums with the run's own, and the HEAD size with the file's.
+        let st = self.req(&pack_key, || self.store.stat(&pack_key));
+        let size_ok = matches!(&st, Ok(Some(s)) if s.size == new.pointer.size);
+        if !size_ok {
+            self.discard(&pack_key, &codes_key);
+            return Ok(failed("verify size", Some(&pack_key)));
+        }
+        if done.part_sha256 != part_sha256 {
+            self.discard(&pack_key, &codes_key);
+            return Ok(failed("verify checksum", Some(&pack_key)));
+        }
+        if self
+            .req(&codes_key, || self.store.put(&codes_key, &codes_body))
+            .is_err()
+        {
+            self.discard(&pack_key, &codes_key);
+            return Ok(failed("upload codes", Some(&codes_key)));
+        }
+        self.step("verify");
+        let outcome = self.publish(&new, base);
+        self.step("publish");
+        Ok(outcome)
+    }
+
+    /// Step 7 and its retries (spec "Step 7 can fail in two ways").
+    fn publish(&self, new: &NewPack, base: Option<(String, String)>) -> PackOutcome {
+        let p = &new.pointer;
+        let (pack_key, codes_key) = (p.pack_key.as_str(), p.codes_key.as_str());
+        let pointer_key = self.keys.pack_pointer();
+        let body = self.keys.encode_pointer(p);
+        let (old_key, mut expect) = match base {
+            Some((k, etag)) => (Some(k), Some(etag)),
+            None => (None, None),
+        };
+        for _ in 0..MAX_POINTER_WRITES {
+            if (self.clock)().saturating_sub(new.upload_start) >= self.limit {
+                self.discard(pack_key, codes_key);
+                return failed("time limit", Some(pack_key));
+            }
+            for key in [pack_key, codes_key] {
+                if !matches!(self.req(key, || self.store.stat(key)), Ok(Some(_))) {
+                    self.discard(pack_key, codes_key);
+                    return failed("head", Some(key));
+                }
+            }
+            let put = match &expect {
+                None => self.req(&pointer_key, || {
+                    self.store.put_if_absent(&pointer_key, &body)
+                }),
+                Some(etag) => self.req(&pointer_key, || {
+                    self.store.put_if_match(&pointer_key, &body, etag)
+                }),
+            };
+            if let Ok(CondPut::Created { .. }) = put {
+                return PackOutcome::Packed;
+            }
+            // A 412, or an unknown result: the pointer says what happened.
+            let now = match self.read_pointer() {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(target: "buckwal", error = %e, "pack run: cannot read the pointer");
+                    return failed("pointer read", Some(&pointer_key));
+                }
+            };
+            match now {
+                Some((now, _)) if now.pack_key == pack_key => return PackOutcome::Packed,
+                Some((now, etag)) if Some(&now.pack_key) == old_key.as_ref() => {
+                    expect = Some(etag);
+                }
+                Some((now, _)) if now.pack_generation >= p.pack_generation => {
+                    self.discard(pack_key, codes_key);
+                    return PackOutcome::Superseded;
+                }
+                // A slower run moved it to a lower pack generation: this pack is the newest.
+                Some((_, etag)) => expect = Some(etag),
+                None => expect = None,
+            }
+        }
+        self.discard(pack_key, codes_key);
+        failed("pointer", Some(&pointer_key))
+    }
+
+    /// Delete the run's pack and codes, unless the pointer names the pack or cannot be read.
+    fn discard(&self, pack_key: &str, codes_key: &str) {
+        match self.read_pointer() {
+            Ok(Some((p, _))) if p.pack_key == pack_key => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        for key in [pack_key, codes_key] {
+            if let Err(e) = self.req(key, || self.store.delete(key)) {
+                tracing::warn!(target: "buckwal", key, error = %e, "pack run: cannot delete its own object");
+            }
+        }
+    }
+}
+
+/// The SHA-256 of each part of `db` (parts of `pointer.part_size`) and its block codes.
+fn digest(keys: &Keys, pointer: &PackPointer, db: &Path) -> Result<(Vec<[u8; 32]>, PackCodes)> {
+    let mut f = File::open(db).map_err(|e| io_err("open pack file", e))?;
+    let mut builder = CodesBuilder::new(
+        keys,
+        &pointer.pack_key,
+        pointer.pack_generation,
+        pointer.size,
+    )?;
+    let mut shas = Vec::new();
+    let mut left = pointer.size;
+    let mut buf = vec![0u8; pointer.part_size as usize];
+    while left > 0 {
+        let n = left.min(pointer.part_size) as usize;
+        f.read_exact(&mut buf[..n])
+            .map_err(|e| io_err("read pack file", e))?;
+        shas.push(sha256_of(&buf[..n]));
+        for block in buf[..n].chunks(BLOCK_SIZE as usize) {
+            builder.block(block)?;
+        }
+        left -= n as u64;
+    }
+    Ok((shas, builder.finish()?))
+}
+
+/// The page size of the downloaded pack, by the database's own header, must be the pointer's.
+fn check_page_size(dir: &Path, enc: Option<&Encryption>, p: &PackPointer) -> Result<()> {
+    let facts = db_facts(dir, enc)?;
+    if facts.page_size != p.page_size || !p.size.is_multiple_of(u64::from(p.page_size)) {
+        return Err(Error::Corrupt(format!(
+            "pack pointer: page_size {} but {} holds {} bytes of {}-byte pages",
+            p.page_size, p.pack_key, p.size, facts.page_size
+        )));
+    }
+    Ok(())
+}
+
+/// Download the pack `p` names into `path`, in ranges of whole blocks, up to
+/// `PART_CONCURRENCY` at once, checking each block against the pack's codes. False when the
+/// pack or its codes are gone.
+fn download_pack(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    p: &PackPointer,
+    path: &Path,
+) -> Result<bool> {
+    let Some(body) = with_retry(retry, &p.codes_key, |_| store.get(&p.codes_key))? else {
+        return Ok(false);
+    };
+    let codes = PackCodes::decode(keys, &body.body, &p.pack_key, p.pack_generation, p.size)?;
+    let file = File::create(path).map_err(|e| io_err("create pack file", e))?;
+    file.set_len(p.size)
+        .map_err(|e| io_err("size pack file", e))?;
+    let file = Mutex::new(file);
+    let range = (p.part_size / BLOCK_SIZE).max(1) * BLOCK_SIZE;
+    let ranges = p.size.div_ceil(range);
+    let next = AtomicU64::new(0);
+    let missing = AtomicBool::new(false);
+    let failed: Mutex<Option<Error>> = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..(PART_CONCURRENCY as u64).min(ranges) {
+            s.spawn(|| loop {
+                if missing.load(Relaxed) || failed.lock().unwrap().is_some() {
+                    return;
+                }
+                let i = next.fetch_add(1, Relaxed);
+                if i >= ranges {
+                    return;
+                }
+                let r = fetch_range(store, keys, retry, p, &codes, i * range, range, &file);
+                match r {
+                    Ok(true) => {}
+                    Ok(false) => missing.store(true, Relaxed),
+                    Err(e) => {
+                        failed.lock().unwrap().get_or_insert(e);
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failed.into_inner().unwrap() {
+        return Err(e);
+    }
+    if missing.load(Relaxed) {
+        return Ok(false);
+    }
+    file.into_inner()
+        .unwrap()
+        .sync_all()
+        .map_err(|e| io_err("fsync pack file", e))?;
+    Ok(true)
+}
+
+/// One range of the pack at `offset`, checked block by block, written to `file`. False when
+/// the pack is gone.
+#[allow(clippy::too_many_arguments)]
+fn fetch_range(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    p: &PackPointer,
+    codes: &PackCodes,
+    offset: u64,
+    len: u64,
+    file: &Mutex<File>,
+) -> Result<bool> {
+    let Some(bytes) = with_retry(retry, &p.pack_key, |_| {
+        store.get_range(&p.pack_key, offset, len)
+    })?
+    else {
+        return Ok(false);
+    };
+    let want = p.size.saturating_sub(offset).min(len) as usize;
+    if bytes.len() != want {
+        return Err(Error::Corrupt(format!(
+            "{}: a range at {offset} came back {} bytes, not {want}",
+            p.pack_key,
+            bytes.len()
+        )));
+    }
+    let first = offset / BLOCK_SIZE;
+    for (i, block) in bytes.chunks(BLOCK_SIZE as usize).enumerate() {
+        codes.verify_block(
+            keys,
+            &p.pack_key,
+            p.pack_generation,
+            p.size,
+            first + i as u64,
+            block,
+        )?;
+    }
+    let mut f = file.lock().unwrap();
+    f.seek(SeekFrom::Start(offset))
+        .and_then(|_| f.write_all(&bytes))
+        .map_err(|e| io_err("write pack file", e))?;
+    Ok(true)
+}
+
+/// A [`PartSource`] over a local file.
+struct FileSource {
+    file: Mutex<File>,
+    len: u64,
+}
+
+impl FileSource {
+    fn open(path: &Path) -> Result<FileSource> {
+        let file = File::open(path).map_err(|e| io_err("open pack file", e))?;
+        let len = file
+            .metadata()
+            .map_err(|e| io_err("stat pack file", e))?
+            .len();
+        Ok(FileSource {
+            file: Mutex::new(file),
+            len,
+        })
+    }
+}
+
+impl PartSource for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut f = self.file.lock().unwrap();
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests;

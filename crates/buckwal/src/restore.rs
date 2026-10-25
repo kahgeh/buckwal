@@ -4,6 +4,7 @@
 
 use crate::config::{Config, EngineConfig, JournalMode};
 use crate::db::{refuse_mode_mismatch, DirGuard};
+use crate::encryption::Encryption;
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
@@ -19,7 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use turso_core::io::FileSyncType;
 use turso_core::mvcc::persistent_storage::{DurableStorage, Storage};
-use turso_core::{Completion, OpenFlags, PlatformIO, IO};
+use turso_core::{
+    Completion, DatabaseOpts, EncryptionOpts, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO,
+};
 
 #[derive(Debug, Clone)]
 pub struct RestoreReport {
@@ -70,6 +73,21 @@ pub(crate) fn fetch_generation(
     retry: &RetryPolicy,
     retries: &AtomicU64,
 ) -> Result<Vec<LogRecord>> {
+    fetch_generation_upto(store, keys, gen, None, concurrency, retry, retries)
+}
+
+/// [`fetch_generation`], but with `upto` only the records of seqs 1 to `upto` (a pack run
+/// applies a generation up to its terminal record). The listing must still run 1, 2, 3, …
+/// with no gap, and reach `upto`.
+pub(crate) fn fetch_generation_upto(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    gen: u64,
+    upto: Option<u64>,
+    concurrency: usize,
+    retry: &RetryPolicy,
+    retries: &AtomicU64,
+) -> Result<Vec<LogRecord>> {
     let prefix = keys.log_prefix(gen);
     let mut seqs: Vec<u64> = counted(retries, retry, &prefix, || store.list(&prefix))?
         .iter()
@@ -85,6 +103,15 @@ pub(crate) fn fetch_generation(
                 "gap in log/{gen}: expected seq {want}, found {s}"
             )));
         }
+    }
+    if let Some(upto) = upto {
+        if upto > seqs.len() as u64 {
+            return Err(Error::Corrupt(format!(
+                "log/{gen} ends at seq {}, before seq {upto}",
+                seqs.len()
+            )));
+        }
+        seqs.truncate(upto as usize);
     }
     let slots: Vec<Mutex<Option<LogRecord>>> = seqs.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -227,6 +254,14 @@ fn generation_image_counted(
         &cfg.retry,
         retries,
     )?;
+    replay(&records, head)
+}
+
+/// The images of `records`, generation `head.generation`'s log from seq 1 in order, under the
+/// rules [`generation_image`] names. A pack run replays an ended generation with it, with
+/// `head` the current head at that generation, so a pack holds exactly the records a restore
+/// applies.
+pub(crate) fn replay(records: &[LogRecord], head: &Head) -> Result<Images> {
     let fenced = |writer_id: &str| {
         Error::Fenced(format!(
             "log/{} holds a record of writer {writer_id:?} after one of {:?}",
@@ -324,6 +359,139 @@ pub(crate) fn page_one_seed(wal: &[u8], head: &Head, mode: JournalMode) -> Resul
         }
         None => Ok(Vec::new()),
     }
+}
+
+/// What a database file's header says, read through the engine (an encrypted file's header is
+/// ciphertext).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DbFacts {
+    pub page_size: u32,
+    pub page_count: u64,
+    /// Pages on the free list.
+    pub free_pages: u64,
+}
+
+fn local_engine(what: &str, e: turso_core::LimboError) -> Error {
+    Error::Engine(format!("{what}: {e}"))
+}
+
+/// Open `<dir>/app.db` (and its `-wal`) with the engine over plain local files, as
+/// `create::build_mvcc_image` does: with `enc`, the database option, the cipher and key at
+/// open, and the key on the connection. Nothing goes to a bucket.
+fn open_local(
+    dir: &Path,
+    enc: Option<&Encryption>,
+) -> Result<(Arc<turso_core::Database>, Arc<turso_core::Connection>)> {
+    let db_path = dir.join(DB_FILE);
+    let path = db_path
+        .to_str()
+        .ok_or_else(|| Error::Config(format!("{} is not UTF-8", db_path.display())))?;
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| io_err("platform IO", e))?);
+    let mut opts = OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::Create);
+    if let Some(enc) = enc {
+        opts = opts
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(EncryptionOpts {
+                cipher: enc.cipher.to_string(),
+                hexkey: hex::encode(enc.key.as_slice()),
+            });
+    }
+    let db = turso_core::Database::open(io, path, opts)
+        .map_err(|e| local_engine("open the local database", e))?;
+    let conn = db
+        .connect_with_encryption(enc.map(|e| e.key.clone()))
+        .map_err(|e| local_engine("connect to the local database", e))?;
+    Ok((db, conn))
+}
+
+fn pragma_int(conn: &Arc<turso_core::Connection>, sql: &str) -> Result<i64> {
+    let rows = conn
+        .query(sql)
+        .map_err(|e| local_engine(sql, e))?
+        .ok_or_else(|| Error::Engine(format!("{sql} returned no statement")))?
+        .run_collect_rows()
+        .map_err(|e| local_engine(sql, e))?;
+    rows.first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_int())
+        .ok_or_else(|| Error::Engine(format!("{sql} returned no integer")))
+}
+
+/// The header facts of the database file `<dir>/app.db`.
+pub(crate) fn db_facts(dir: &Path, enc: Option<&Encryption>) -> Result<DbFacts> {
+    let (db, conn) = open_local(dir, enc)?;
+    let n = |sql: &str| -> Result<u64> {
+        u64::try_from(pragma_int(&conn, sql)?)
+            .map_err(|_| Error::Engine(format!("{sql} returned a negative value")))
+    };
+    let facts = DbFacts {
+        page_size: u32::try_from(n("PRAGMA page_size")?)
+            .map_err(|_| Error::Engine("PRAGMA page_size is too large".into()))?,
+        page_count: n("PRAGMA page_count")?,
+        free_pages: n("PRAGMA freelist_count")?,
+    };
+    conn.close()
+        .map_err(|e| local_engine("close the local database", e))?;
+    drop(db);
+    Ok(facts)
+}
+
+/// Apply one ended generation of a WAL database, its `-wal` image `wal`, to the database file
+/// `<dir>/app.db` with a local checkpoint of the engine: write the image as `<dir>/app.db-wal`,
+/// open the engine over the two local files (`open_local`), run a TRUNCATE checkpoint and
+/// close. Afterwards `app.db` holds every commit of the generation and the `-wal` is empty. A
+/// missing or empty `app.db` (no pack yet) is seeded with the image's page 1
+/// (`page_one_seed`, as a restore of a bucket with no page does). An image with no whole frame
+/// changes nothing. `head` is the head at that generation (its journal mode is checked
+/// against page 1).
+pub(crate) fn apply_generation(
+    dir: &Path,
+    wal: &[u8],
+    head: &Head,
+    enc: Option<&Encryption>,
+) -> Result<()> {
+    let wal_path = dir.join(WAL_FILE);
+    let db_path = dir.join(DB_FILE);
+    if !wal_image_holds_frames(wal) {
+        return Ok(());
+    }
+    if file_len(&db_path)? == 0 {
+        let seed = page_one_seed(wal, head, JournalMode::Wal)?;
+        if seed.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "log/{}: the first generation of a database without a pack has no page 1",
+                head.generation
+            )));
+        }
+        write_synced(&db_path, &seed)?;
+    }
+    write_synced(&wal_path, wal)?;
+    {
+        let (db, conn) = open_local(dir, enc)?;
+        conn.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .map_err(|e| local_engine("local checkpoint", e))?;
+        conn.close()
+            .map_err(|e| local_engine("close the local database", e))?;
+        drop(db);
+    }
+    let left = file_len(&wal_path)?;
+    if left != 0 {
+        return Err(Error::Engine(format!(
+            "the local TRUNCATE checkpoint left a {left}-byte app.db-wal"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a `-wal` image holds at least one whole frame (`wal_holds_frames` on bytes).
+fn wal_image_holds_frames(wal: &[u8]) -> bool {
+    let Some(ps) = wal.get(8..12) else {
+        return false;
+    };
+    let ps = u64::from(u32::from_be_bytes(ps.try_into().unwrap()));
+    ps > 0 && wal.len() as u64 >= WAL_HEADER_LEN + WAL_FRAME_HEADER_LEN + ps
 }
 
 /// The engine's logical-log header size (`LOG_HDR_SIZE`).

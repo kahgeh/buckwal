@@ -17,7 +17,6 @@ pub(crate) enum Kind {
     Record,
     Manifest,
     Head,
-    #[allow(dead_code)] // used from task 5 on
     Pointer,
     /// A block of a pack.
     Pack,
@@ -204,7 +203,6 @@ pub(crate) fn pointer_code(ik: &IntegrityKey, p: &PackPointer) -> [u8; 32] {
     ik.code(&refs)
 }
 
-#[allow(dead_code)] // used from task 5 on
 pub(crate) fn pointer_verifies(ik: &IntegrityKey, p: &PackPointer, code: &[u8]) -> bool {
     let parts = pointer_parts(p);
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
