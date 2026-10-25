@@ -82,6 +82,17 @@ pub mod defaults {
     /// `CipherMode::try_from` accepts.
     pub const ENCRYPTION_CIPHER: &str = "aegis256";
 
+    /// The packer thread runs in the writer (`BUCKWAL_PACK`).
+    pub const PACK: bool = true;
+    /// A pack run starts once the log since the newest pack passes this share of the pack's
+    /// size, in percent (`BUCKWAL_PACK_LOG_PERCENT`).
+    pub const PACK_LOG_PERCENT: u64 = 10;
+    /// ... or once the newest pack is older than this (`BUCKWAL_PACK_MAX_AGE_SECS`).
+    pub const PACK_MAX_AGE: Duration = Duration::from_secs(3600);
+    /// How long an orphan pack stays, from its upload start, before GC deletes it
+    /// (`BUCKWAL_PACK_ORPHAN_GRACE_SECS`). A pack run gives up at half of it.
+    pub const PACK_ORPHAN_GRACE: Duration = Duration::from_secs(6 * 3600);
+
     /// Export traces and logs over OTLP (`BUCKWAL_OTEL`): off in the library.
     pub const OTEL: bool = false;
     /// Where OTLP/gRPC goes (`BUCKWAL_OTEL_ENDPOINT`); plain `http://` only, no TLS.
@@ -189,6 +200,17 @@ pub struct Config {
     pub encryption_cipher: String,
     /// The journal mode a new database is created in (`BUCKWAL_JOURNAL_MODE` = `wal` | `mvcc`).
     pub journal_mode: JournalMode,
+    /// The packer thread runs in the writer (`BUCKWAL_PACK`).
+    pub pack: bool,
+    /// A pack run starts once the log since the newest pack passes this share of the pack's
+    /// size, in percent (`BUCKWAL_PACK_LOG_PERCENT`).
+    pub pack_log_percent: u64,
+    /// ... or once the newest pack is older than this (`BUCKWAL_PACK_MAX_AGE_SECS`).
+    pub pack_max_age: Duration,
+    /// How long GC keeps an orphan pack (a complete pack that no pointer named), from its
+    /// upload start, by the bucket's clock (`BUCKWAL_PACK_ORPHAN_GRACE_SECS`). A pack run gives
+    /// up at half of it, so it never moves the pointer to a pack GC can delete. Above 0.
+    pub pack_orphan_grace: Duration,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -221,13 +243,17 @@ impl fmt::Debug for Config {
             .field("encryption_key_file", &self.encryption_key_file)
             .field("encryption_cipher", &self.encryption_cipher)
             .field("journal_mode", &self.journal_mode)
+            .field("pack", &self.pack)
+            .field("pack_log_percent", &self.pack_log_percent)
+            .field("pack_max_age", &self.pack_max_age)
+            .field("pack_orphan_grace", &self.pack_orphan_grace)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 23] = [
+const ENV_VARS: [&str; 27] = [
     "BUCKWAL_ENDPOINT",
     "BUCKWAL_CA_BUNDLE",
     "BUCKWAL_REGION",
@@ -251,6 +277,10 @@ const ENV_VARS: [&str; 23] = [
     "BUCKWAL_ENCRYPTION_CIPHER",
     "BUCKWAL_JOURNAL_MODE",
     "BUCKWAL_REPLICA_POLL_MS",
+    "BUCKWAL_PACK",
+    "BUCKWAL_PACK_LOG_PERCENT",
+    "BUCKWAL_PACK_MAX_AGE_SECS",
+    "BUCKWAL_PACK_ORPHAN_GRACE_SECS",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -332,6 +362,10 @@ impl Config {
             encryption_key_file: None,
             encryption_cipher: defaults::ENCRYPTION_CIPHER.to_string(),
             journal_mode: JournalMode::default(),
+            pack: defaults::PACK,
+            pack_log_percent: defaults::PACK_LOG_PERCENT,
+            pack_max_age: defaults::PACK_MAX_AGE,
+            pack_orphan_grace: defaults::PACK_ORPHAN_GRACE,
             on_event: None,
         }
     }
@@ -417,6 +451,19 @@ impl Config {
             c.replica_poll_interval =
                 Duration::from_millis(parse_num("BUCKWAL_REPLICA_POLL_MS", &v)?);
         }
+        if let Some(v) = get("BUCKWAL_PACK") {
+            c.pack = parse_bool("BUCKWAL_PACK", &v)?;
+        }
+        if let Some(v) = get("BUCKWAL_PACK_LOG_PERCENT") {
+            c.pack_log_percent = parse_num("BUCKWAL_PACK_LOG_PERCENT", &v)?;
+        }
+        if let Some(v) = get("BUCKWAL_PACK_MAX_AGE_SECS") {
+            c.pack_max_age = Duration::from_secs(parse_num("BUCKWAL_PACK_MAX_AGE_SECS", &v)?);
+        }
+        if let Some(v) = get("BUCKWAL_PACK_ORPHAN_GRACE_SECS") {
+            let var = "BUCKWAL_PACK_ORPHAN_GRACE_SECS";
+            c.pack_orphan_grace = Duration::from_secs(parse_num(var, &v)?);
+        }
         if let Some(v) = get("BUCKWAL_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
             c.encryption_key_file = Some(PathBuf::from(v));
         }
@@ -492,6 +539,11 @@ impl Config {
                 "BUCKWAL_ENCRYPTION_CIPHER is {} but BUCKWAL_ENCRYPTION_KEY_FILE is not set",
                 self.encryption_cipher
             )));
+        }
+        if self.pack_orphan_grace.is_zero() {
+            return Err(Error::Config(
+                "pack_orphan_grace (BUCKWAL_PACK_ORPHAN_GRACE_SECS) must be above 0".into(),
+            ));
         }
         let maintenance = self.maintenance_log_objects > 0 || self.maintenance_wal_bytes > 0;
         if maintenance && self.maintenance_gate_wait.is_zero() {
@@ -915,6 +967,10 @@ mod tests {
             ("BUCKWAL_ENCRYPTION_CIPHER", "aes256gcm"),
             ("BUCKWAL_JOURNAL_MODE", "mvcc"),
             ("BUCKWAL_REPLICA_POLL_MS", "4000"),
+            ("BUCKWAL_PACK", "off"),
+            ("BUCKWAL_PACK_LOG_PERCENT", "30"),
+            ("BUCKWAL_PACK_MAX_AGE_SECS", "90"),
+            ("BUCKWAL_PACK_ORPHAN_GRACE_SECS", "600"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads BUCKWAL_* variables.
@@ -957,6 +1013,10 @@ mod tests {
         assert!(!c.gc_after_seal);
         assert_eq!(c.encryption_key_file, Some(PathBuf::from("/etc/db.key")));
         assert_eq!(c.encryption_cipher, "aes256gcm");
+        assert!(!c.pack);
+        assert_eq!(c.pack_log_percent, 30);
+        assert_eq!(c.pack_max_age, Duration::from_secs(90));
+        assert_eq!(c.pack_orphan_grace, Duration::from_secs(600));
 
         // Only the four required ones: the rest are defaults.
         let env = required();
@@ -1007,6 +1067,46 @@ mod tests {
             max_bytes: 1,
         };
         assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("max_commits")));
+    }
+
+    #[test]
+    fn pack_settings_defaults_env_and_validate() {
+        let c = Config::new("/d", "http://e", "b", "ak", "sk");
+        assert!(c.pack, "the packer thread is on by default");
+        assert_eq!(c.pack_log_percent, 10);
+        assert_eq!(c.pack_max_age, Duration::from_secs(3600));
+        assert_eq!(c.pack_orphan_grace, Duration::from_secs(21600));
+        assert_eq!(c.validate(), Ok(()));
+
+        let mut env = required();
+        env.insert("BUCKWAL_PACK", "0");
+        env.insert("BUCKWAL_PACK_LOG_PERCENT", "25");
+        env.insert("BUCKWAL_PACK_MAX_AGE_SECS", "120");
+        env.insert("BUCKWAL_PACK_ORPHAN_GRACE_SECS", "7200");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert!(!c.pack);
+        assert_eq!(c.pack_log_percent, 25);
+        assert_eq!(c.pack_max_age, Duration::from_secs(120));
+        assert_eq!(c.pack_orphan_grace, Duration::from_secs(7200));
+
+        for var in [
+            "BUCKWAL_PACK",
+            "BUCKWAL_PACK_LOG_PERCENT",
+            "BUCKWAL_PACK_MAX_AGE_SECS",
+            "BUCKWAL_PACK_ORPHAN_GRACE_SECS",
+        ] {
+            let mut env = required();
+            env.insert(var, "soon");
+            match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
+                Err(Error::Config(m)) => assert!(m.contains(var), "{m}"),
+                r => panic!("{var}: {r:?}"),
+            }
+        }
+
+        // A pack run gives up at half the orphan grace: 0 would refuse every pointer move.
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.pack_orphan_grace = Duration::ZERO;
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("pack_orphan_grace")));
     }
 
     #[test]
