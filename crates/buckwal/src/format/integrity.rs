@@ -19,6 +19,10 @@ pub(crate) enum Kind {
     Head,
     #[allow(dead_code)] // used from task 5 on
     Pointer,
+    /// A block of a pack.
+    Pack,
+    /// The pack codes object.
+    PackCodes,
 }
 
 impl Kind {
@@ -29,6 +33,8 @@ impl Kind {
             Kind::Manifest => "manifest",
             Kind::Head => "head",
             Kind::Pointer => "pointer",
+            Kind::Pack => "pack",
+            Kind::PackCodes => "pack_codes",
         }
     }
 }

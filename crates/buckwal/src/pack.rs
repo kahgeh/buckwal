@@ -3,6 +3,9 @@
 // The pack code is used from task 5 on; until then only its tests call it.
 #![allow(dead_code)]
 
+pub(crate) mod codes;
 pub(crate) mod pointer;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use pointer::PackPointer;

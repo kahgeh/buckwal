@@ -1,7 +1,7 @@
 //! Bucket format v1: key layout and byte/JSON codecs.
 
 mod head;
-mod integrity;
+pub(crate) mod integrity;
 pub(crate) mod json;
 mod keys;
 mod manifest;

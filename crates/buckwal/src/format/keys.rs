@@ -113,7 +113,7 @@ impl Keys {
     /// The key page, log record and manifest codes are made under: the database integrity key
     /// once a format 4 head has been read or made, else the integrity key; `None` for a
     /// plaintext database.
-    fn object_key(&self) -> Option<Arc<IntegrityKey>> {
+    pub(crate) fn object_key(&self) -> Option<Arc<IntegrityKey>> {
         let base = self.integrity.as_ref()?;
         match &*self.identity.lock().unwrap_or_else(|e| e.into_inner()) {
             Identity::Format4 { key, .. } => Some(key.clone()),
@@ -452,7 +452,7 @@ impl Keys {
 
     /// The database id these keys know (a format 4 or 5 head read or made).
     #[allow(dead_code)] // used from task 5 on
-    fn known_database_id(&self) -> Option<String> {
+    pub(crate) fn known_database_id(&self) -> Option<String> {
         match &*self.identity.lock().unwrap_or_else(|e| e.into_inner()) {
             Identity::Format4 { id, .. } => Some(id.clone()),
             _ => None,
