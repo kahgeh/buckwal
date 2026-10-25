@@ -650,6 +650,12 @@ impl Worker {
                 self.last_failed.store(false, SeqCst);
                 self.durable
                     .confirmed(commits.iter().copied().max().unwrap_or(0));
+                // If this append settled a record that went in doubt before it (the bucket settles it first),
+                // its commits are older, so their acks come before the new record's.
+                // `confirmed` never moves the position back, so its order here does not matter.
+                if !self.bucket.degraded() {
+                    self.settled();
+                }
                 // How long the commits still behind have waited: what a lost machine would
                 // lose now. The span closes before any reply.
                 span.record(

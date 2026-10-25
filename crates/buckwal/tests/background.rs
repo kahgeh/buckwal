@@ -380,6 +380,55 @@ fn a_record_settled_after_doubt_moves_the_position_and_clears_the_error() {
     assert_eq!(restore_rows(mem), vec![1, 2]);
 }
 
+/// A background record goes in doubt while a second background commit waits behind it. The
+/// next append settles the first record and sends the second: `CommitAcked` comes in commit
+/// order across the two records, from the uploader thread.
+#[test]
+fn acks_stay_in_commit_order_after_a_record_settles() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let rec = Recorder::default();
+    let (_d, db) = open(fault.clone(), &rec);
+    let c = db.connect().unwrap();
+    create(&c);
+    fault.only_keys_containing("log/");
+    c.set_batching(Some(bg(5, 64, 1000))).unwrap();
+    // Every PUT is stored and then reports an error: the first record goes in doubt after
+    // its retries (the 200 ms deadline of `open`).
+    fault.store_then_fail_next_puts(10_000);
+    insert(&c, 1).unwrap();
+    let first = c.last_commit().unwrap();
+    // Queued while the first record is still retrying: it waits behind it.
+    thread::sleep(Duration::from_millis(40));
+    insert(&c, 2).unwrap();
+    let second = c.last_commit().unwrap();
+    assert!(second > first);
+    let r = db.wait_durable(first, GENEROUS);
+    assert!(matches!(r, Err(Error::UploadFailed(_))), "{r:?}");
+    // The bucket answers again: the next flush settles the first record, then sends the second.
+    fault.store_then_fail_next_puts(0);
+    let until = Instant::now() + GENEROUS;
+    while db.wait_durable(second, Duration::from_millis(50)).is_err() {
+        assert!(
+            Instant::now() < until,
+            "the second commit never became durable"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let acked: Vec<u64> = rec
+        .events()
+        .into_iter()
+        .filter_map(|(_, e)| match e {
+            Event::CommitAcked { commit, .. } if commit >= first => Some(commit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acked, vec![first, second], "acks in commit order");
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restore_rows(mem), vec![1, 2]);
+}
+
 #[test]
 fn off_window_and_background_commits_keep_the_log_in_commit_order() {
     for connections in [1usize, 8] {
@@ -483,6 +532,74 @@ fn a_seal_uploads_waiting_background_commits_first_and_numbers_carry_on() {
     c.close().unwrap();
     db.close().unwrap();
     assert_eq!(restore_rows(mem), vec![1, 2, 3, 4]);
+}
+
+/// A seal whose waiting background commits cannot upload fails with their error: the head
+/// does not move and the position does not pass what is not in the bucket. When the bucket
+/// answers again the commits upload, a later seal runs, and a restore holds every row.
+#[test]
+fn a_seal_whose_waiting_commits_cannot_upload_fails_and_a_later_seal_succeeds() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let (_d, db) = open(fault.clone(), &Recorder::default());
+    let c = db.connect().unwrap();
+    create(&c);
+    c.set_batching(Some(bg(10_000, 64, 1000))).unwrap();
+    for x in 1..=3 {
+        insert(&c, x).unwrap();
+    }
+    let last = c.last_commit().unwrap();
+    let durable_before = db.durable_commit();
+    assert!(durable_before < last, "they wait for their window");
+    let generation = db.generation();
+    let head_before = mem.get("head").unwrap().expect("a head").body;
+    fault.only_keys_containing("log/");
+    fault.fail_puts_after(0);
+    let r = truncate_checkpoint(&c);
+    assert!(
+        r.is_err(),
+        "the seal fails with the waiting commits' error: {r:?}"
+    );
+    assert_eq!(db.generation(), generation, "the generation did not move");
+    assert_eq!(
+        mem.get("head").unwrap().expect("a head").body,
+        head_before,
+        "the head did not move"
+    );
+    assert!(
+        db.durable_commit() < last,
+        "the position does not pass commits that are not in the bucket"
+    );
+    // The bucket answers again: the owed commits upload (the uploader retries them), and a
+    // later seal runs.
+    fault.fail_puts_after(u64::MAX);
+    // The error holds until the next retry lands (a tick every 2 s), then the wait succeeds.
+    let until = Instant::now() + GENEROUS;
+    while db.wait_durable(last, Duration::from_millis(50)).is_err() {
+        assert!(Instant::now() < until, "the owed commits never uploaded");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(db.durable_commit() >= last);
+    truncate_checkpoint(&c).unwrap();
+    assert!(db.generation() > generation, "the later seal ran");
+    insert(&c, 4).unwrap();
+    db.wait_durable(c.last_commit().unwrap(), GENEROUS).unwrap();
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restore_rows(mem), vec![1, 2, 3, 4]);
+}
+
+/// `checkpoint(Truncate)`, retried while the engine is busy.
+fn truncate_checkpoint(c: &Connection) -> buckwal::Result<()> {
+    let until = Instant::now() + GENEROUS;
+    loop {
+        match c.checkpoint(CheckpointMode::Truncate) {
+            Err(Error::Engine(m)) if m.contains("busy") && Instant::now() < until => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            r => return r,
+        }
+    }
 }
 
 #[test]

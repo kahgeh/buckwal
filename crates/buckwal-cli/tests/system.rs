@@ -1301,18 +1301,35 @@ fn soak_rows(ctx: &Ctx, dir: &Path, claim: bool) -> (usize, usize) {
 /// Background commits, SIGKILL and the loss of the disk: the bucket holds a prefix (every id
 /// from 1 to some k, none after), at most `max_behind` commits short of the last ack. App
 /// catch-up (the how-to's steps, with the ids as the app's messages) replays exactly the
-/// missing ones, and then every acked id is present.
+/// missing ones, and then every acked id is present. RustFS is paused before the kill, so
+/// some acked commits are certainly not in the bucket (at least one, at most `max_behind`).
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn background_killed_and_disk_lost_restores_a_prefix_and_catch_up_replays_the_rest() {
     let ctx = Ctx::new("background_killed_and_disk_lost");
     let dir = ctx.dir("db");
-    let mut soak = Soak::spawn(&ctx, &dir, &["--batching", BACKGROUND]);
-    soak.wait_acks(400);
+    // The engine's own checkpoint seals near commit 500 (1000 WAL frames), and a seal first
+    // uploads the waiting commits: the pause must land before that. The soak has no end of its
+    // own either.
+    let mut soak = Soak::spawn(&ctx, &dir, &["--batching", BACKGROUND, "--count", "100000"]);
+    soak.wait_acks(50);
+    // Pause RustFS: the uploader's PUT hangs, and background commits keep returning until
+    // `max_behind` of them wait. Those acked commits are not in the bucket when the writer is
+    // killed. (A PUT already sent may land after the unpause; the commits queued behind it
+    // were never sent.)
+    let outage = Outage::start("pause", "unpause");
+    // Two seconds are enough for the soak to reach its stall: `max_behind` commits wait, one
+    // record's PUT hangs, and the rest are queued behind it. (Ack lines that arrive later are
+    // read when the soak is killed.)
+    std::thread::sleep(Duration::from_secs(2));
     soak.kill();
     assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     let acked = soak.last_ack() as usize;
     fs::remove_dir_all(&dir).unwrap();
+    outage.end();
+    // A PUT body already in the frozen container's socket buffer can land just after the
+    // unpause, though its client is dead: let it land before the restore reads the bucket.
+    std::thread::sleep(Duration::from_millis(500));
     // Restore, then read what the bucket holds.
     let restored = ctx.dir("restored");
     let d = restored.to_str().unwrap();
@@ -1328,6 +1345,11 @@ fn background_killed_and_disk_lost_restores_a_prefix_and_catch_up_replays_the_re
     assert!(
         acked.saturating_sub(max) <= BEHIND,
         "at most max_behind ({BEHIND}) acked commits were lost: acked {acked}, restored {max}"
+    );
+    // The pause made some acked commits miss the bucket, and catch-up replays exactly those.
+    assert!(
+        max < acked,
+        "at least one acked commit is not in the bucket: acked {acked}, restored {max}"
     );
     // App catch-up: replay every message after the last one in the database.
     let missing: Vec<String> = (max + 1..=acked)
