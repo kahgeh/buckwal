@@ -199,7 +199,8 @@ impl ObjectStore for MemStore {
     }
 
     /// Parts are read one after the other (`concurrency` is not used). A failed read leaves
-    /// the upload behind, as a crashed run leaves its parts in S3.
+    /// the upload behind, as a crashed run leaves its parts in S3. The object's age (`stat`)
+    /// counts from the upload start, as S3's Last-Modified does.
     fn put_multipart(
         &self,
         key: &str,
@@ -239,11 +240,13 @@ impl ObjectStore for MemStore {
             .ok_or_else(|| {
                 StoreError::Permanent(format!("multipart upload of {key} was aborted"))
             })?;
-        inner.uploads.remove(at);
+        let started = inner.uploads.remove(at).started;
         let mut all = Sha256::new();
         part_sha256.iter().for_each(|h| all.update(h));
         let etag = format!("{}-{n}", &hex::encode(all.finalize())[..32]);
         Self::store_with_etag(&mut inner, key, &body, etag.clone());
+        // As on S3, the Last-Modified time of a multipart object is when its upload started.
+        inner.written.insert(key.to_string(), started);
         status(200);
         Ok(MultipartDone { etag, part_sha256 })
     }

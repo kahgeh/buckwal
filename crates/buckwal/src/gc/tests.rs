@@ -12,11 +12,11 @@ use std::path::Path;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
-/// Defaults (min age 641 s), the test prefix, and no GC of the writer's own: only `gc` trims.
+/// Defaults (min age 641 s) and the test prefix. A writer runs its own GC thread too; it
+/// deletes nothing until the test moves the bucket's clock.
 fn config(dir: &Path) -> Config {
     let mut c = Config::new(dir, "http://127.0.0.1:1", "bucket", "key", "secret");
     c.prefix = PREFIX.to_string();
-    c.gc_after_seal = false;
     c
 }
 
@@ -234,30 +234,22 @@ fn gc_once_skips_the_manifest_it_last_trimmed_against() {
 fn short_lived_writer_trims_at_open() {
     // A seal test of formats 1 to 4 (`bucket::legacy`).
     let _legacy = crate::format::LegacySeal::on();
-    for gc_after_seal in [true, false] {
-        let store = mem();
-        let a = tempdir();
-        let mut cfg = config(a.path());
-        cfg.gc_after_seal = gc_after_seal;
-        sealed_writer(&store, cfg.clone(), 2);
-        store.advance_clock(min_age() + Duration::from_secs(1));
-        let doomed = reachable_no_more(&store);
-        assert!(!doomed.is_empty());
+    let store = mem();
+    let a = tempdir();
+    let mut cfg = config(a.path());
+    sealed_writer(&store, cfg.clone(), 2);
+    store.advance_clock(min_age() + Duration::from_secs(1));
+    let doomed = reachable_no_more(&store);
+    assert!(!doomed.is_empty());
 
-        let (hook, seen) = recorder();
-        cfg.on_event = Some(hook);
-        let db = open_with_store(cfg, store.clone()).unwrap();
-        db.close().unwrap();
-        let now = all_keys(&store);
-        let seen = seen.lock().unwrap().clone();
-        if gc_after_seal {
-            assert!(matches!(seen[..], [n] if n > 0), "{seen:?}");
-            assert!(now.is_disjoint(&doomed), "{:?}", now.intersection(&doomed));
-        } else {
-            assert!(seen.is_empty(), "{seen:?}");
-            assert!(now.is_superset(&doomed));
-        }
-    }
+    let (hook, seen) = recorder();
+    cfg.on_event = Some(hook);
+    let db = open_with_store(cfg, store.clone()).unwrap();
+    db.close().unwrap();
+    let now = all_keys(&store);
+    let seen = seen.lock().unwrap().clone();
+    assert!(matches!(seen[..], [n] if n > 0), "{seen:?}");
+    assert!(now.is_disjoint(&doomed), "{:?}", now.intersection(&doomed));
 }
 
 /// A restore of the current head and a GC of an old enough manifest, interleaved: GC deletes
@@ -572,33 +564,594 @@ fn gc_pause_between_takeover_and_skip_seal_ends() {
     std::mem::forget(db);
 }
 
-/// A format 5 bucket with no pack: its head names no manifest, so a GC pass (the trimmer's, or
-/// `gc`) deletes nothing. The log is the only copy of the database until a pack exists.
-#[test]
-fn gc_of_a_format_5_bucket_without_a_pack_deletes_no_log() {
-    let store = mem();
-    let w = tempdir();
-    let mut cfg = config(w.path());
-    // The writer's own trimmer runs too, after each switch.
-    cfg.gc_after_seal = true;
-    let rows = sealed_writer(&store, cfg, 3);
-    let h = head(&*store);
-    assert_eq!((h.format, h.manifest), (crate::format::FORMAT_V5, None));
-    let before = all_keys(&store);
+// ---- Format 5: packs, the pack pointer, the log and multipart uploads (spec "GC") ----
+
+fn orphan_grace() -> Duration {
+    config(Path::new("/x")).pack_orphan_grace
+}
+
+/// A pass of `gc` over `store`.
+fn gc5(store: &Arc<MemStore>) -> GcReport {
+    gc_with_store(&config(Path::new("/x")), store.clone()).unwrap()
+}
+
+fn exists(store: &MemStore, key: &str) -> bool {
+    store.get(key).unwrap().is_some()
+}
+
+/// The generations that have log objects.
+fn log_gens(store: &MemStore) -> BTreeSet<u64> {
     let k = keys();
-    let r = gc_with_store(&config(Path::new("/x")), store.clone()).unwrap();
-    assert_eq!((r.outcome, r.deleted), (GcOutcome::Nothing, 0));
-    // A pass with no minimum age, as the trimmer of a writer whose grace has passed.
-    let pass = gc_once(&*store, &k.for_open(), Duration::ZERO, None).unwrap();
-    assert_eq!((pass.outcome, pass.deleted), (GcOutcome::Nothing, 0));
-    assert_eq!(all_keys(&store), before);
-    for g in 1..h.generation {
-        assert!(
-            before
-                .iter()
-                .any(|key| k.parse_log(key).map(|(lg, _)| lg) == Some(g)),
-            "log/{g} is gone"
+    all_keys(store)
+        .iter()
+        .filter_map(|key| k.parse_log(key).map(|(g, _)| g))
+        .collect()
+}
+
+/// The keys under `pack/`.
+fn pack_keys(store: &MemStore) -> BTreeSet<String> {
+    store
+        .list(&keys().pack_root())
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+/// A pack `pack/<generation>/<run>` and its codes, by hand: GC reads only their keys and ages.
+fn put_pack(store: &MemStore, generation: u64, run: &str) -> (String, String) {
+    let k = keys();
+    let (p, c) = (k.pack(generation, run), k.pack_codes(generation, run));
+    store.put(&p, b"pack").unwrap();
+    store.put(&c, b"codes").unwrap();
+    (p, c)
+}
+
+fn pointer_body(generation: u64, run: &str, database_id: Option<String>) -> Vec<u8> {
+    let k = keys();
+    k.encode_pointer(&crate::pack::PackPointer {
+        format: crate::pack::pointer::POINTER_FORMAT,
+        pack_key: k.pack(generation, run),
+        codes_key: k.pack_codes(generation, run),
+        write_id: format!("{generation}{run}"),
+        pack_generation: generation,
+        size: 4,
+        page_size: 4096,
+        part_size: 16 << 20,
+        block_size: 1 << 20,
+        database_id,
+    })
+}
+
+/// Move this database's pack pointer to `pack/<generation>/<run>`.
+fn point(store: &MemStore, generation: u64, run: &str) {
+    let id = head(store).database_id;
+    assert!(id.is_some(), "a format 5 head has a database_id");
+    store
+        .put(&keys().pack_pointer(), &pointer_body(generation, run, id))
+        .unwrap();
+}
+
+/// A format 5 writer made `switches` generation switches (10 rows each) and closed: head
+/// generation `switches + 1`, log in every generation below it.
+fn switched(store: &Arc<MemStore>, switches: i64) -> i64 {
+    let a = tempdir();
+    let rows = sealed_writer(store, config(a.path()), switches);
+    let h = head(&**store);
+    assert_eq!(
+        (h.format, h.manifest, h.generation),
+        (crate::format::FORMAT_V5, None, switches as u64 + 1)
+    );
+    for g in 1..=switches as u64 {
+        assert!(log_gens(store).contains(&g), "log/{g}");
+    }
+    rows
+}
+
+/// A source whose every read fails: its multipart upload stays incomplete in the store.
+struct FailingSource;
+
+impl crate::store::PartSource for FailingSource {
+    fn len(&self) -> u64 {
+        10
+    }
+    fn read_at(&self, _: u64, _: &mut [u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("crashed"))
+    }
+}
+
+/// A pack run that crashed during its upload: an incomplete multipart upload under `pack/`.
+fn crashed_upload(store: &MemStore) {
+    let key = keys().pack(9, "crashed");
+    assert!(store.put_multipart(&key, &mut FailingSource, 4, 1).is_err());
+    assert!(!exists(store, &key));
+}
+
+/// A pack `a` that the pointer named, then a newer pack `b` that it names now. `a` goes, with
+/// its codes, only once the trim grace has passed since `b` was uploaded; `b` stays.
+#[test]
+fn gc_deletes_older_pack_and_codes_after_trim_grace() {
+    let store = mem();
+    switched(&store, 3);
+    let (old_p, old_c) = put_pack(&store, 2, "a");
+    point(&store, 2, "a");
+    store.advance_clock(2 * min_age());
+    let (new_p, new_c) = put_pack(&store, 3, "b");
+    point(&store, 3, "b");
+
+    // `a` is old, but `b` is young: `a` stays. `a` held generation 1 long enough, so log/1
+    // goes; log/2 stays (only `b` holds it, and `b` is young).
+    let r = gc5(&store);
+    assert_eq!((r.packs_deleted, r.orphan_packs_deleted), (0, 0), "{r:?}");
+    for key in [&old_p, &old_c, &new_p, &new_c] {
+        assert!(exists(&store, key), "{key}");
+    }
+    assert_eq!(log_gens(&store).first(), Some(&2), "{r:?}");
+
+    store.advance_clock(min_age());
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+    assert_eq!((r.packs_deleted, r.orphan_packs_deleted), (1, 0), "{r:?}");
+    assert!(!exists(&store, &old_p) && !exists(&store, &old_c));
+    assert!(exists(&store, &new_p) && exists(&store, &new_c));
+    assert_eq!(pack_keys(&store), BTreeSet::from([new_c, new_p]));
+    assert_eq!(log_gens(&store).first(), Some(&3), "log below 3 only");
+}
+
+/// The pack the pointer names stays, with its codes, however old it is; another pack of the
+/// same generation that the pointer never named is an orphan.
+#[test]
+fn gc_keeps_the_pack_the_pointer_names() {
+    let store = mem();
+    switched(&store, 3);
+    let (p, c) = put_pack(&store, 3, "named");
+    let (op, oc) = put_pack(&store, 3, "other");
+    point(&store, 3, "named");
+    store.advance_clock(orphan_grace() + min_age());
+    for _ in 0..2 {
+        let r = gc5(&store);
+        assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+        assert!(exists(&store, &p) && exists(&store, &c), "{r:?}");
+    }
+    assert!(!exists(&store, &op) && !exists(&store, &oc));
+    assert_eq!(pack_keys(&store), BTreeSet::from([c, p]));
+}
+
+/// A complete pack of a later pack generation whose run has not moved the pointer yet stays
+/// past the trim grace: it is an orphan only after the orphan grace.
+#[test]
+fn gc_keeps_complete_pack_waiting_for_pointer_move() {
+    let store = mem();
+    switched(&store, 3);
+    put_pack(&store, 2, "named");
+    point(&store, 2, "named");
+    let (p, c) = put_pack(&store, 4, "waiting");
+    store.advance_clock(3 * min_age());
+    assert!(3 * min_age() < orphan_grace());
+    let r = gc5(&store);
+    assert_eq!(r.orphan_packs_deleted, 0, "{r:?}");
+    assert!(exists(&store, &p) && exists(&store, &c));
+    // The run moves the pointer now: the pack is the newest, and stays.
+    point(&store, 4, "waiting");
+    let r = gc5(&store);
+    assert_eq!(r.orphan_packs_deleted, 0, "{r:?}");
+    assert!(exists(&store, &p) && exists(&store, &c));
+}
+
+/// An orphan pack (complete, never named) goes with its codes once its own upload is older
+/// than the orphan grace, with a pointer and without one. A codes object whose pack is gone
+/// goes too.
+#[test]
+fn gc_deletes_orphan_after_orphan_grace() {
+    for with_pointer in [true, false] {
+        let store = mem();
+        switched(&store, 3);
+        if with_pointer {
+            put_pack(&store, 2, "named");
+            point(&store, 2, "named");
+        }
+        let (p, c) = put_pack(&store, 4, "orphan");
+        let (lp, lc) = put_pack(&store, 4, "leftover");
+        store.delete(&lp).unwrap();
+        store.advance_clock(orphan_grace() - Duration::from_secs(60));
+        let r = gc5(&store);
+        assert_eq!(r.orphan_packs_deleted, 0, "{r:?}");
+        assert!(exists(&store, &p) && exists(&store, &c) && exists(&store, &lc));
+        store.advance_clock(Duration::from_secs(120));
+        let r = gc5(&store);
+        assert_eq!(r.orphan_packs_deleted, 1, "{with_pointer}: {r:?}");
+        assert!(!exists(&store, &p) && !exists(&store, &c), "{with_pointer}");
+        assert!(!exists(&store, &lc), "{with_pointer}: the leftover codes");
+        if with_pointer {
+            assert!(exists(&store, &keys().pack(2, "named")));
+        } else {
+            assert!(pack_keys(&store).is_empty());
+            assert_eq!(r.outcome, GcOutcome::Nothing, "{r:?}");
+        }
+    }
+}
+
+/// A part source that, at its second part, moves the bucket's clock past the trim grace and
+/// runs a GC pass: an upload that takes longer than the trim grace while GC runs.
+struct SlowSource {
+    store: Arc<MemStore>,
+    body: Vec<u8>,
+    during: Mutex<Option<GcReport>>,
+}
+
+impl crate::store::PartSource for SlowSource {
+    fn len(&self) -> u64 {
+        self.body.len() as u64
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        if offset > 0 && self.during.lock().unwrap().is_none() {
+            self.store.advance_clock(3 * min_age());
+            *self.during.lock().unwrap() = Some(gc5(&self.store));
+        }
+        let from = offset as usize;
+        buf.copy_from_slice(&self.body[from..from + buf.len()]);
+        Ok(())
+    }
+}
+
+/// A pack upload that outlasts the trim grace while GC runs: GC aborts no upload during it,
+/// and keeps the complete pack after it (its Last-Modified is the upload start, older than
+/// the trim grace and younger than the orphan grace).
+#[test]
+fn slow_upload_outlasting_trim_grace_keeps_its_pack() {
+    let store = mem();
+    switched(&store, 3);
+    put_pack(&store, 2, "named");
+    point(&store, 2, "named");
+    let k = keys();
+    let (p, c) = (k.pack(4, "slow"), k.pack_codes(4, "slow"));
+    let mut src = SlowSource {
+        store: store.clone(),
+        body: vec![7; 12],
+        during: Mutex::new(None),
+    };
+    store.put_multipart(&p, &mut src, 4, 1).unwrap();
+    let during = src.during.lock().unwrap().clone().expect("a pass ran");
+    assert_eq!(during.uploads_aborted, 0, "{during:?}");
+    store.put(&c, b"codes").unwrap();
+    let age = store.stat(&p).unwrap().unwrap().age;
+    assert!(
+        age >= 3 * min_age(),
+        "Last-Modified is the upload start: {age:?}"
+    );
+    let r = gc5(&store);
+    assert_eq!((r.orphan_packs_deleted, r.uploads_aborted), (0, 0), "{r:?}");
+    assert!(exists(&store, &p) && exists(&store, &c));
+    assert_eq!(store.get(&p).unwrap().unwrap().body, vec![7; 12]);
+}
+
+/// The log of every generation below the pointer's pack generation goes, but only after a HEAD
+/// of the pack and of its codes in the same pass; the log at or above it stays.
+#[test]
+fn gc_deletes_log_below_pack_generation_only_after_head_of_pack_and_codes() {
+    let store = mem();
+    switched(&store, 4);
+    let (p, c) = put_pack(&store, 3, "named");
+    point(&store, 3, "named");
+    // Young: no log goes.
+    let r = gc5(&store);
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::TooYoung, 0), "{r:?}");
+    assert_eq!(log_gens(&store).first(), Some(&1));
+
+    store.advance_clock(min_age());
+    let fault = Arc::new(FaultStore::new(store.clone()));
+    let r = gc_with_store(&config(Path::new("/x")), fault.clone()).unwrap();
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+    assert!(r.deleted > 0, "{r:?}");
+    let gens = log_gens(&store);
+    assert_eq!(gens.first(), Some(&3), "{gens:?}");
+    assert!(gens.contains(&4), "{gens:?}");
+    let ev = fault.events();
+    let at = |e: &str| ev.iter().position(|x| x == e);
+    let head_pack = at(&format!("stat {p}")).expect("a HEAD of the pack");
+    let head_codes = at(&format!("stat {c}")).expect("a HEAD of the codes");
+    let first_log_delete = ev
+        .iter()
+        .position(|e| e.starts_with(&format!("delete {}", keys().log_root())))
+        .expect("a log delete");
+    assert!(
+        head_pack < first_log_delete && head_codes < first_log_delete,
+        "{ev:?}"
+    );
+}
+
+/// The pointer names a pack, or a codes object, that is gone: the pass deletes no log (the
+/// log is then the only copy), no pack and nothing else, and logs an error.
+#[test]
+fn gc_with_missing_named_pack_deletes_no_log_and_logs_error() {
+    for missing in ["pack", "codes"] {
+        let store = mem();
+        switched(&store, 3);
+        put_pack(&store, 2, "old");
+        let (p, c) = put_pack(&store, 3, "named");
+        point(&store, 3, "named");
+        store
+            .delete(if missing == "pack" { &p } else { &c })
+            .unwrap();
+        put_pack(&store, 4, "orphan");
+        store.advance_clock(orphan_grace() + min_age());
+        let before = all_keys(&store);
+        let cap = crate::telemetry::testing::Capture::new();
+        let r = tracing::subscriber::with_default(cap.subscriber(), || gc5(&store));
+        assert_eq!(r.outcome, GcOutcome::PackMissing, "{missing}: {r:?}");
+        assert_eq!(r.deleted, 0, "{missing}: {r:?}");
+        assert_eq!(all_keys(&store), before, "{missing}");
+        let spans = cap.spans();
+        let errors: Vec<_> = spans
+            .events
+            .iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .collect();
+        assert_eq!(errors.len(), 1, "{missing}: {errors:?}");
+        let gone = if missing == "pack" { &p } else { &c };
+        assert_eq!(errors[0].field("key"), Some(gone.as_str()), "{errors:?}");
+        assert_eq!(
+            spans.last_named("buckwal.gc").field("buckwal.outcome"),
+            Some("pack_missing")
         );
     }
+}
+
+/// An incomplete multipart upload under `pack/` older than the trim grace but younger than the
+/// orphan grace may be a live pack run: GC leaves it alone.
+#[test]
+fn gc_leaves_multipart_younger_than_orphan_grace() {
+    let store = mem();
+    switched(&store, 2);
+    crashed_upload(&store);
+    store.advance_clock(3 * min_age());
+    assert!(3 * min_age() < orphan_grace());
+    let r = gc5(&store);
+    assert_eq!(r.uploads_aborted, 0, "{r:?}");
+    assert_eq!(
+        store
+            .abort_incomplete(&keys().pack_root(), Duration::ZERO)
+            .unwrap(),
+        1,
+        "the upload is still there"
+    );
+}
+
+/// An incomplete multipart upload under `pack/` that started longer ago than the orphan grace
+/// is aborted.
+#[test]
+fn gc_aborts_multipart_older_than_orphan_grace() {
+    let store = mem();
+    switched(&store, 2);
+    crashed_upload(&store);
+    store.advance_clock(orphan_grace() + Duration::from_secs(2));
+    let r = gc5(&store);
+    assert_eq!(r.uploads_aborted, 1, "{r:?}");
+    assert_eq!(
+        store
+            .abort_incomplete(&keys().pack_root(), Duration::ZERO)
+            .unwrap(),
+        0
+    );
+}
+
+/// A bucket upgraded from a seal format by hand (Choice D): a format 1 bucket with pages and
+/// manifests, then a first pack, its pointer and a format 5 head. While the head is format 1,
+/// GC keeps the seal rules and leaves the pack alone. Once the head is format 5 and the pack
+/// is old enough, every `pages/` and `manifest/` object goes.
+#[test]
+fn gc_deletes_pages_and_manifest_in_upgraded_bucket() {
+    let store = mem();
+    let a = tempdir();
+    {
+        let _legacy = crate::format::LegacySeal::on();
+        sealed_writer(&store, config(a.path()), 2);
+    }
+    let k = keys();
+    let h = head(&*store);
+    assert_eq!((h.format, h.generation, h.manifest), (1, 3, Some(2)));
+    let seal_objects = |s: &MemStore| -> Vec<String> {
+        all_keys(s)
+            .into_iter()
+            .filter(|key| key.starts_with(&k.page_root()) || key.starts_with(&k.manifest_root()))
+            .collect()
+    };
+    // The upgrade's first pack and pointer, while the head is still format 1.
+    let id = "ab".repeat(16);
+    let (p, c) = put_pack(&store, 3, "upgrade");
+    store
+        .put(
+            &k.pack_pointer(),
+            &pointer_body(3, "upgrade", Some(id.clone())),
+        )
+        .unwrap();
+    store.advance_clock(orphan_grace() + min_age());
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "the seal rules: {r:?}");
+    assert_eq!((r.packs_deleted, r.orphan_packs_deleted), (0, 0), "{r:?}");
+    assert!(exists(&store, &p) && exists(&store, &c));
+    let kept = seal_objects(&store);
+    assert!(
+        kept.iter().any(|key| key.starts_with(&k.page_root())),
+        "{kept:?}"
+    );
+    assert!(kept.contains(&k.manifest(2)), "{kept:?}");
+
+    // The upgrade's head write: format 5, no manifest, the pointer's database_id.
+    let h5 = Head {
+        format: crate::format::FORMAT_V5,
+        manifest: None,
+        database_id: Some(id),
+        ..h
+    };
+    store.put(&k.head(), &k.encode_head(&h5)).unwrap();
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+    assert!(
+        seal_objects(&store).is_empty(),
+        "{:?}",
+        seal_objects(&store)
+    );
+    assert_eq!(r.deleted, kept.len() as u64, "{r:?}");
+    assert!(exists(&store, &p) && exists(&store, &c));
+}
+
+/// The same while the first pack is younger than the trim grace: the pages stay.
+#[test]
+fn gc_keeps_pages_of_an_upgraded_bucket_while_its_first_pack_is_young() {
+    let store = mem();
+    let a = tempdir();
+    {
+        let _legacy = crate::format::LegacySeal::on();
+        sealed_writer(&store, config(a.path()), 2);
+    }
+    let k = keys();
+    let h = head(&*store);
+    let h5 = Head {
+        format: crate::format::FORMAT_V5,
+        manifest: None,
+        database_id: Some("cd".repeat(16)),
+        ..h
+    };
+    store.put(&k.head(), &k.encode_head(&h5)).unwrap();
+    put_pack(&store, 3, "upgrade");
+    point(&store, 3, "upgrade");
+    let before = all_keys(&store);
+    let r = gc5(&store);
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::TooYoung, 0), "{r:?}");
+    assert_eq!(all_keys(&store), before);
+}
+
+/// With no packer, a format 5 bucket has no pointer: GC (`gc`, and the trimmer's pass) deletes
+/// no log, however old it is. The log is the only copy of the database until a pack exists.
+#[test]
+fn gc_with_no_packer_deletes_no_log() {
+    let store = mem();
+    let rows = switched(&store, 3);
+    store.advance_clock(orphan_grace() + min_age());
+    let before = all_keys(&store);
+    let r = gc5(&store);
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::Nothing, 0), "{r:?}");
+    let pass = gc_once(&*store, &keys().for_open(), Duration::ZERO, None).unwrap();
+    assert_eq!((pass.outcome, pass.deleted), (GcOutcome::Nothing, 0));
+    let gens = log_gens(&store);
+    for g in 1..=3 {
+        assert!(gens.contains(&g), "log/{g} is gone: {gens:?}");
+    }
+    assert!(before.is_subset(&all_keys(&store)));
     restores_rows(&store, rows);
+}
+
+/// A pointer of another database (another `database_id`) is no pointer: GC deletes no log. The
+/// pack it names is an orphan of this database and goes after the orphan grace.
+#[test]
+fn gc_with_foreign_pointer_deletes_no_log() {
+    let store = mem();
+    let rows = switched(&store, 3);
+    let (p, c) = put_pack(&store, 3, "foreign");
+    store
+        .put(
+            &keys().pack_pointer(),
+            &pointer_body(3, "foreign", Some("ee".repeat(16))),
+        )
+        .unwrap();
+    store.advance_clock(3 * min_age());
+    let r = gc5(&store);
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::Nothing, 0), "{r:?}");
+    assert!(exists(&store, &p) && exists(&store, &c));
+    store.advance_clock(orphan_grace());
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Nothing, "{r:?}");
+    assert_eq!(r.orphan_packs_deleted, 1, "{r:?}");
+    let gens = log_gens(&store);
+    for g in 1..=3 {
+        assert!(gens.contains(&g), "log/{g} is gone: {gens:?}");
+    }
+    assert!(
+        exists(&store, &keys().pack_pointer()),
+        "GC never deletes the pointer"
+    );
+    restores_rows(&store, rows);
+}
+
+/// End to end: a writer, a pack run, two more switches, a second pack run, commits in the
+/// current generation; after the trim grace GC leaves one pack (the newest) with its codes and
+/// the log from its pack generation on, and a restore equals the writer.
+#[test]
+fn gc_after_two_packs_leaves_one_newest_pack_and_needed_log() {
+    let store = mem();
+    let a = tempdir();
+    let packer = tempdir();
+    let db = open_with_store(config(a.path()), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    seal_rows(&c, 1, 10);
+    seal_rows(&c, 11, 20);
+    let first = crate::pack::pack_with_store(&config(packer.path()), store.clone()).unwrap();
+    assert_eq!(
+        (first.outcome.clone(), first.pack_generation),
+        (crate::pack::PackOutcome::Packed, 3)
+    );
+    seal_rows(&c, 21, 30);
+    seal_rows(&c, 31, 40);
+    let second = crate::pack::pack_with_store(&config(packer.path()), store.clone()).unwrap();
+    assert_eq!(
+        (second.outcome.clone(), second.pack_generation),
+        (crate::pack::PackOutcome::Packed, 5)
+    );
+    for id in 41..=45 {
+        insert(&c, id);
+    }
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(pack_keys(&store).len(), 4, "two packs and their codes");
+
+    store.advance_clock(min_age());
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+    assert_eq!((r.packs_deleted, r.orphan_packs_deleted), (1, 0), "{r:?}");
+    let newest = second.pack_key.clone().unwrap();
+    assert_eq!(
+        pack_keys(&store),
+        BTreeSet::from([format!("{newest}.codes"), newest])
+    );
+    let gens = log_gens(&store);
+    assert_eq!(gens.first(), Some(&5), "{gens:?}");
+    restores_rows(&store, 45);
+    // A second pass has nothing more to delete.
+    let again = gc5(&store);
+    assert_eq!((again.outcome, again.deleted), (GcOutcome::Trimmed, 0));
+}
+
+/// The writer's trimmer, after a pass that left nothing to wait for, skips a pass while the
+/// pointer keeps its ETag: the head and the pointer, nothing else. A pointer move ends it.
+#[test]
+fn gc_pass_skips_the_pointer_it_last_trimmed_against() {
+    let store = mem();
+    switched(&store, 3);
+    put_pack(&store, 3, "named");
+    point(&store, 3, "named");
+    store.advance_clock(min_age());
+    let ages = GcAges::new(min_age(), orphan_grace());
+    let first = gc_pass(&*store, &keys().for_open(), ages, None).unwrap();
+    assert_eq!(first.outcome, GcOutcome::Trimmed, "{first:?}");
+    let etag = store.get(&keys().pack_pointer()).unwrap().unwrap().etag;
+    assert_eq!(first.mark, Some(GcMark::Pointer(etag)));
+    let fault = FaultStore::new(store.clone());
+    let again = gc_pass(&fault, &keys().for_open(), ages, first.mark.as_ref()).unwrap();
+    assert_eq!((again.outcome, again.deleted), (GcOutcome::Nothing, 0));
+    let ev = fault.events();
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    // The pointer moves: a whole pass again.
+    put_pack(&store, 4, "next");
+    point(&store, 4, "next");
+    let fault = FaultStore::new(store.clone());
+    let moved = gc_pass(&fault, &keys().for_open(), ages, first.mark.as_ref()).unwrap();
+    // Pack 3 is old enough, pack 4 is not yet: no mark until it is.
+    assert_eq!(moved.outcome, GcOutcome::Trimmed, "{moved:?}");
+    assert!(
+        moved.next_due.is_some() && moved.mark.is_none(),
+        "{moved:?}"
+    );
+    assert!(fault.events().len() > 2);
 }

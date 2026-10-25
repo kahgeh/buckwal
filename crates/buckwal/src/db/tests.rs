@@ -4140,8 +4140,13 @@ fn create_mvcc_makes_pack_pointer_head_and_local_files() {
     created_locally(&dir, &image, &h);
     assert!(!dir.join("app.db-wal").exists());
     assert_eq!(state(&dir), st);
-    // Trim against this head deletes nothing.
-    assert_eq!(crate::trim::trim_once(&*store, &keys(), &h, None), Ok(0));
+    // A seal trim refuses this format 5 head (GC trims it against the pack pointer).
+    let before = bucket_objects(&store);
+    assert!(matches!(
+        crate::trim::trim_once(&*store, &keys(), &h, None),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(bucket_objects(&store), before);
     // The local files are an MVCC database turso opens and writes.
     plain_mvcc_open_works(&image, &log, None);
     // A second machine: the restore reads the head, the pointer and the pack; the pack alone

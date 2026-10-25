@@ -41,9 +41,6 @@ pub mod defaults {
     pub const MAX_ANSWER_ONLY_ROUNDS: u32 = 3;
     /// How long an unreferenced object stays in the bucket before the trimmer deletes it.
     pub const TRIM_GRACE: Duration = Duration::from_secs(10 * 60);
-    /// A writer runs GC itself (`BUCKWAL_GC_AFTER_SEAL`): at open, after each seal and when
-    /// the next manifest comes of age.
-    pub const GC_AFTER_SEAL: bool = true;
     /// Formats 1 to 4: fetch every sealed page in the background after open.
     pub const PREFETCH: bool = false;
     /// Every commit is uploaded on its own.
@@ -163,10 +160,6 @@ pub struct Config {
     /// 1 s` old by the bucket's own clock. It must exceed `lease + retry_deadline +
     /// request_timeout` (`Config` otherwise).
     pub trim_grace: Duration,
-    /// A writer open runs GC itself, on a thread of its own: at open, after each seal and
-    /// when the next manifest comes of age (`BUCKWAL_GC_AFTER_SEAL`). Off, only
-    /// [`crate::gc`] deletes anything.
-    pub gc_after_seal: bool,
     /// How long the writer trusts its last confirmation that the head is still its own: a
     /// confirmed log record or head write, or a head GET that found its head. Past it (on
     /// either the monotonic or the wall clock), the next append, and each page or manifest
@@ -235,7 +228,6 @@ impl fmt::Debug for Config {
             .field("request_timeout", &self.request_timeout)
             .field("upload_concurrency", &self.upload_concurrency)
             .field("trim_grace", &self.trim_grace)
-            .field("gc_after_seal", &self.gc_after_seal)
             .field("lease", &self.lease)
             .field("prefetch", &self.prefetch)
             .field("batching", &self.batching)
@@ -256,7 +248,7 @@ impl fmt::Debug for Config {
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 27] = [
+const ENV_VARS: [&str; 26] = [
     "BUCKWAL_ENDPOINT",
     "BUCKWAL_CA_BUNDLE",
     "BUCKWAL_REGION",
@@ -275,7 +267,6 @@ const ENV_VARS: [&str; 27] = [
     "BUCKWAL_MAINTENANCE_WAL_MIB",
     "BUCKWAL_MAINTENANCE_GATE_WAIT_MS",
     "BUCKWAL_LEASE_MS",
-    "BUCKWAL_GC_AFTER_SEAL",
     "BUCKWAL_ENCRYPTION_KEY_FILE",
     "BUCKWAL_ENCRYPTION_CIPHER",
     "BUCKWAL_JOURNAL_MODE",
@@ -354,7 +345,6 @@ impl Config {
             request_timeout: defaults::REQUEST_TIMEOUT,
             upload_concurrency: defaults::UPLOAD_CONCURRENCY,
             trim_grace: defaults::TRIM_GRACE,
-            gc_after_seal: defaults::GC_AFTER_SEAL,
             lease: defaults::LEASE,
             prefetch: defaults::PREFETCH,
             batching: defaults::BATCHING,
@@ -420,9 +410,6 @@ impl Config {
         }
         if let Some(v) = get("BUCKWAL_TRIM_GRACE_SECS") {
             c.trim_grace = Duration::from_secs(parse_num("BUCKWAL_TRIM_GRACE_SECS", &v)?);
-        }
-        if let Some(v) = get("BUCKWAL_GC_AFTER_SEAL") {
-            c.gc_after_seal = parse_bool("BUCKWAL_GC_AFTER_SEAL", &v)?;
         }
         if let Some(v) = get("BUCKWAL_LEASE_MS") {
             c.lease = Duration::from_millis(parse_num("BUCKWAL_LEASE_MS", &v)?);
@@ -743,26 +730,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gc_after_seal_from_env() {
-        assert!(Config::new("/d", "http://e", "b", "ak", "sk").gc_after_seal);
-        let env = required();
-        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
-        assert!(c.gc_after_seal, "on by default");
-        for (v, want) in [("off", false), ("0", false), ("true", true)] {
-            let mut env = required();
-            env.insert("BUCKWAL_GC_AFTER_SEAL", v);
-            let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
-            assert_eq!(c.gc_after_seal, want, "{v}");
-        }
-        let mut env = required();
-        env.insert("BUCKWAL_GC_AFTER_SEAL", "sometimes");
-        match Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())) {
-            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_GC_AFTER_SEAL"), "{m}"),
-            r => panic!("{r:?}"),
-        }
-    }
-
-    #[test]
     fn replica_poll_defaults_to_60s() {
         let c = Config::new("/d", "http://e", "b", "ak", "sk");
         assert_eq!(c.replica_poll_interval, Duration::from_secs(60));
@@ -976,7 +943,6 @@ mod tests {
             ("BUCKWAL_MAINTENANCE_WAL_MIB", "3"),
             ("BUCKWAL_MAINTENANCE_GATE_WAIT_MS", "75"),
             ("BUCKWAL_LEASE_MS", "2500"),
-            ("BUCKWAL_GC_AFTER_SEAL", "off"),
             ("BUCKWAL_ENCRYPTION_KEY_FILE", "/etc/db.key"),
             ("BUCKWAL_ENCRYPTION_CIPHER", "aes256gcm"),
             ("BUCKWAL_JOURNAL_MODE", "mvcc"),
@@ -1024,7 +990,6 @@ mod tests {
         assert_eq!(c.maintenance_gate_wait, Duration::from_millis(75));
         assert_eq!(c.replica_poll_interval, Duration::from_millis(4000));
         assert_eq!(c.lease, Duration::from_millis(2500));
-        assert!(!c.gc_after_seal);
         assert_eq!(c.encryption_key_file, Some(PathBuf::from("/etc/db.key")));
         assert_eq!(c.encryption_cipher, "aes256gcm");
         assert!(!c.pack);

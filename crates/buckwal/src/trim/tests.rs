@@ -1,12 +1,13 @@
 use super::*;
 use crate::config::Event;
 use crate::config::JournalMode;
+use crate::gc::gc_once;
 use crate::store::{CondPut, MemStore, Object, ObjectStat, StatsSnap, StoreError};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::mpsc;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn keys() -> Keys {
     Keys::new("db")
@@ -137,7 +138,8 @@ fn trimmer(
         })
     };
     let (tx, rx) = mpsc::channel();
-    let t = spawn_trimmer(store, keys(), min_age, rx, Some(hook));
+    let ages = crate::gc::GcAges::new(min_age, crate::config::defaults::PACK_ORPHAN_GRACE);
+    let t = spawn_trimmer(store, keys(), ages, rx, Some(hook));
     (tx, t, seen)
 }
 
@@ -337,4 +339,22 @@ fn trim_reads_format_2_head() {
         trim_once(&mem, &k, &head_v2(3, Some(2)), Some(&m2)).unwrap(),
         0
     );
+}
+
+/// `trim_once` deletes the log below a head's generation: for a format 5 head that would be the
+/// only copy of the database when no pack holds it. It refuses such a head and deletes nothing
+/// (GC of format 5 deletes log against the pack pointer, `gc::pack_pass`).
+#[test]
+fn trim_refuses_a_format_5_head() {
+    let k = keys();
+    let (mem, _) = three_generations();
+    let before = all_keys(&mem);
+    let h5 = Head {
+        format: crate::format::FORMAT_V5,
+        database_id: Some("ab".repeat(16)),
+        ..head(3, None)
+    };
+    let r = trim_once(&mem, &k, &h5, None);
+    assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
+    assert_eq!(all_keys(&mem), before);
 }

@@ -1,15 +1,23 @@
 //! GC on the bucket's own clock: [`gc`], and the pass the writer's trimmer thread runs
 //! (`trim::spawn_trimmer`).
 //!
-//! A pass picks the newest manifest `m` (at most the head's) that the bucket says is at least
-//! `EngineConfig::gc_min_age` old, and deletes what the head `(m + 1, m)` no longer reaches
-//! (`trim::trim_once`). Ages come from the bucket (`ObjectStore::stat`), never from this
-//! process, so a process of any lifetime trims what has been unreferenced long enough.
+//! Formats 1 to 4: a pass picks the newest manifest `m` (at most the head's) that the bucket
+//! says is at least `EngineConfig::gc_min_age` old, and deletes what the head `(m + 1, m)` no
+//! longer reaches (`trim::trim_once`).
+//!
+//! Format 5 (`pack_pass`, spec "GC"): a pass deletes the packs below the pointer's pack
+//! generation and the log below it, orphan packs, multipart uploads under `pack/` that are older
+//! than the orphan grace, and the `pages/` and `manifest/` objects of an upgraded bucket.
+//!
+//! Ages come from the bucket (`ObjectStore::stat`), never from this process, so a process of
+//! any lifetime trims what has been unreferenced long enough.
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::format::{Head, Keys};
-use crate::store::ObjectStore;
+use crate::format::{Head, Keys, FORMAT_V5};
+use crate::pack::PackPointer;
+use crate::store::{ObjectStat, ObjectStore};
 use crate::trim::trim_once;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::field::Empty;
@@ -17,24 +25,63 @@ use tracing::field::Empty;
 /// How a GC pass ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcOutcome {
-    /// It trimmed against an old enough manifest (possibly deleting nothing).
+    /// Formats 1 to 4: it trimmed against an old enough manifest. Format 5: a pack that the
+    /// pointer names, or one below it, is old enough, and the pass deleted what that pack
+    /// holds. Either can delete nothing.
     Trimmed,
-    /// Every manifest of the head is still younger than the minimum age.
+    /// Formats 1 to 4: every manifest of the head is still younger than the minimum age.
+    /// Format 5: the pack that the pointer names, and each pack below it, is still younger.
     TooYoung,
-    /// No head, a head with no manifest yet, or (on the writer's trimmer) the manifest it
-    /// already trimmed against.
+    /// No head, a head with no manifest yet, (on the writer's trimmer) the manifest or
+    /// pointer it already trimmed against, or a format 5 bucket with no pointer of this
+    /// database (a format 5 pass then deletes only orphan packs and old multipart uploads).
     Nothing,
+    /// Format 5: the pointer names a pack or codes object that a HEAD does not find. The pass
+    /// deleted no log, no pack and no page, and logged an error: the log is then the only copy.
+    PackMissing,
 }
 
 impl GcOutcome {
-    /// `trimmed`, `too_young` or `nothing`: the span's `buckwal.outcome` and the CLI's word.
+    /// `trimmed`, `too_young`, `nothing` or `pack_missing`: the span's `buckwal.outcome` and
+    /// the CLI's word.
     pub fn as_str(self) -> &'static str {
         match self {
             GcOutcome::Trimmed => "trimmed",
             GcOutcome::TooYoung => "too_young",
             GcOutcome::Nothing => "nothing",
+            GcOutcome::PackMissing => "pack_missing",
         }
     }
+}
+
+/// The ages a GC pass works with, by the bucket's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GcAges {
+    /// How old a manifest, or (format 5) a pack, must be before GC deletes what it replaced:
+    /// `EngineConfig::gc_min_age`.
+    pub min_age: Duration,
+    /// Format 5: how old an orphan pack (from its upload start) and a multipart upload under
+    /// `pack/` must be before GC deletes or aborts it: `Config::pack_orphan_grace` plus 1 s for
+    /// the resolution of a bucket's age.
+    pub orphan_grace: Duration,
+}
+
+impl GcAges {
+    pub(crate) fn new(min_age: Duration, pack_orphan_grace: Duration) -> GcAges {
+        GcAges {
+            min_age,
+            orphan_grace: pack_orphan_grace.saturating_add(Duration::from_secs(1)),
+        }
+    }
+}
+
+/// What a pass trimmed against, so that the writer's trimmer does not do the same pass again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GcMark {
+    /// Formats 1 to 4: the manifest.
+    Manifest(u64),
+    /// Format 5: the ETag of the pointer, after a pass that left nothing to wait for.
+    Pointer(String),
 }
 
 /// One GC pass.
@@ -48,9 +95,21 @@ pub(crate) struct GcPass {
     /// it asked about.
     pub age: Option<Duration>,
     pub deleted: u64,
-    /// How long until the next younger manifest is old enough, when there is one.
+    pub packs_deleted: u64,
+    pub orphan_packs_deleted: u64,
+    pub uploads_aborted: u64,
+    /// How long until the next younger manifest, pack or orphan is old enough, when there is
+    /// one.
     pub next_due: Option<Duration>,
+    /// What a later pass of the trimmer can skip on (`None`: nothing).
+    pub mark: Option<GcMark>,
     pub outcome: GcOutcome,
+}
+
+impl GcPass {
+    fn due(&mut self, due: Duration) {
+        self.next_due = Some(self.next_due.map_or(due, |d| d.min(due)));
+    }
 }
 
 /// What a [`gc`] did.
@@ -58,23 +117,30 @@ pub(crate) struct GcPass {
 pub struct GcReport {
     /// The head's generation (0 when the bucket holds no database).
     pub generation: u64,
-    /// The manifest it trimmed against: the newest one old enough.
+    /// Formats 1 to 4: the manifest it trimmed against, the newest one old enough.
     pub trimmed_against: Option<u64>,
     /// That manifest's age by the bucket's clock; when none was old enough, the age of the
     /// oldest one it asked about.
     pub age: Option<Duration>,
-    /// How many objects it deleted.
+    /// How many objects it deleted (each pack and each codes object included).
     pub deleted: u64,
+    /// Format 5: how many packs below the pointer's pack generation it deleted, each with its
+    /// codes.
+    pub packs_deleted: u64,
+    /// Format 5: how many orphan packs it deleted, each with its codes.
+    pub orphan_packs_deleted: u64,
+    /// Format 5: how many multipart uploads under `pack/` it aborted.
+    pub uploads_aborted: u64,
     pub outcome: GcOutcome,
     pub elapsed: Duration,
 }
 
-/// Delete what the database `config` names no longer needs: everything an old enough head no
-/// longer reaches. A manifest is old enough once the bucket's own clock says it is
-/// `trim_grace + retry_deadline + request_timeout + 1 s` old; the head trimmed against is the
-/// one that followed the newest such manifest. It writes nothing but DELETEs, and needs no
-/// directory (`config.dir` is ignored). Safe beside a running writer and restores: what a
-/// restore of any head of the last `trim_grace` reads is kept.
+/// Delete what the database `config` names no longer needs. Formats 1 to 4: everything an old
+/// enough head no longer reaches. A manifest is old enough once the bucket's own clock says it
+/// is `trim_grace + retry_deadline + request_timeout + 1 s` old; the head trimmed against is
+/// the one that followed the newest such manifest. Format 5: see the spec's "GC" and
+/// `pack_pass`. It writes nothing but DELETEs (and aborts of multipart uploads), and needs no
+/// directory (`config.dir` is ignored). Safe beside a running writer, pack runs and restores.
 pub fn gc(config: &Config) -> Result<GcReport> {
     let store = config.s3_store()?;
     gc_with_store(config, store)
@@ -84,13 +150,19 @@ pub fn gc(config: &Config) -> Result<GcReport> {
 pub fn gc_with_store(config: &Config, store: Arc<dyn ObjectStore>) -> Result<GcReport> {
     let start = Instant::now();
     config.validate()?;
-    let min_age = config.engine(crate::io::IoMode::Writer).gc_min_age();
-    let pass = gc_once(&*store, &config.keys()?.for_open(), min_age, None)?;
+    let ages = GcAges::new(
+        config.engine(crate::io::IoMode::Writer).gc_min_age(),
+        config.pack_orphan_grace,
+    );
+    let pass = gc_pass(&*store, &config.keys()?.for_open(), ages, None)?;
     Ok(GcReport {
         generation: pass.generation,
         trimmed_against: pass.trimmed_against,
         age: pass.age,
         deleted: pass.deleted,
+        packs_deleted: pass.packs_deleted,
+        orphan_packs_deleted: pass.orphan_packs_deleted,
+        uploads_aborted: pass.uploads_aborted,
         outcome: pass.outcome,
         elapsed: start.elapsed(),
     })
@@ -100,24 +172,38 @@ fn bucket_err(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Bucket(format!("{what}: {e}"))
 }
 
+/// Tests: a pass with `min_age`, the default orphan grace, and the manifest `last` to skip.
+#[cfg(test)]
+pub(crate) fn gc_once(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    min_age: Duration,
+    last: Option<u64>,
+) -> Result<GcPass> {
+    let ages = GcAges::new(min_age, crate::config::defaults::PACK_ORPHAN_GRACE);
+    gc_pass(store, keys, ages, last.map(GcMark::Manifest).as_ref())
+}
+
 /// One pass, in a `buckwal.gc` span (`buckwal.generation`, `buckwal.manifest`,
-/// `buckwal.age_ms`, `buckwal.deleted`, `buckwal.outcome`: `trimmed`, `too_young`,
-/// `nothing`, `integrity` (a failed integrity check) or `error`):
+/// `buckwal.age_ms`, `buckwal.deleted`, `buckwal.packs_deleted`,
+/// `buckwal.orphan_packs_deleted`, `buckwal.uploads_aborted`, `buckwal.outcome`: `trimmed`,
+/// `too_young`, `nothing`, `pack_missing`, `integrity` (a failed integrity check) or `error`):
 ///
-/// 1. GET the head; none, or no manifest yet: `Nothing`.
-/// 2. LIST `manifest/`; the candidates are the manifests up to the head's, newest first, and (a
-///    head carrying `next_generation_floor`) not below `floor - 1`: none left is `Nothing`.
+/// 1. GET the head; none: `Nothing`. A format 5 head: `pack_pass`.
+/// 2. No manifest yet: `Nothing`. LIST `manifest/`; the candidates are the manifests up to the
+///    head's, newest first, and (a head carrying `next_generation_floor`) not below
+///    `floor - 1`: none left is `Nothing`.
 /// 3. Stat each until one is at least `min_age` old: the chosen one. Each younger one
 ///    brings `next_due` forward to when it comes of age; an unknown age (`stat` gave none)
 ///    is never taken as old.
 /// 4. None chosen: `TooYoung`. The one chosen is `last` (this trimmer's previous pass
 ///    trimmed against it): `Nothing`, with no further request.
 /// 5. GET manifest `m`, and trim against the head `(m + 1, m)`: `Trimmed`.
-pub(crate) fn gc_once(
+pub(crate) fn gc_pass(
     store: &dyn ObjectStore,
     keys: &Keys,
-    min_age: Duration,
-    last: Option<u64>,
+    ages: GcAges,
+    last: Option<&GcMark>,
 ) -> Result<GcPass> {
     let span = tracing::info_span!(
         target: "buckwal",
@@ -126,9 +212,12 @@ pub(crate) fn gc_once(
         buckwal.manifest = Empty,
         buckwal.age_ms = Empty,
         buckwal.deleted = Empty,
+        buckwal.packs_deleted = Empty,
+        buckwal.orphan_packs_deleted = Empty,
+        buckwal.uploads_aborted = Empty,
         buckwal.outcome = Empty,
     );
-    let r = span.in_scope(|| pass(store, keys, min_age, last, &span));
+    let r = span.in_scope(|| pass(store, keys, ages, last, &span));
     match &r {
         Ok(p) => {
             if let Some(m) = p.trimmed_against {
@@ -138,6 +227,9 @@ pub(crate) fn gc_once(
                 span.record("buckwal.age_ms", age.as_millis() as u64);
             }
             span.record("buckwal.deleted", p.deleted);
+            span.record("buckwal.packs_deleted", p.packs_deleted);
+            span.record("buckwal.orphan_packs_deleted", p.orphan_packs_deleted);
+            span.record("buckwal.uploads_aborted", p.uploads_aborted);
             span.record("buckwal.outcome", p.outcome.as_str());
         }
         Err(e) => {
@@ -150,16 +242,21 @@ pub(crate) fn gc_once(
 fn pass(
     store: &dyn ObjectStore,
     keys: &Keys,
-    min_age: Duration,
-    last: Option<u64>,
+    ages: GcAges,
+    last: Option<&GcMark>,
     span: &tracing::Span,
 ) -> Result<GcPass> {
+    let min_age = ages.min_age;
     let mut out = GcPass {
         generation: 0,
         trimmed_against: None,
         age: None,
         deleted: 0,
+        packs_deleted: 0,
+        orphan_packs_deleted: 0,
+        uploads_aborted: 0,
         next_due: None,
+        mark: None,
         outcome: GcOutcome::Nothing,
     };
     let head_key = keys.head();
@@ -172,6 +269,10 @@ fn pass(
     let head = keys.decode_head(&obj.body)?;
     out.generation = head.generation;
     span.record("buckwal.generation", head.generation);
+    if head.format == FORMAT_V5 {
+        pack_pass(store, keys, ages, last, &mut out)?;
+        return Ok(out);
+    }
     let Some(head_manifest) = head.manifest else {
         return Ok(out);
     };
@@ -212,14 +313,13 @@ fn pass(
             chosen = Some(m);
             break;
         }
-        let due = min_age - stat.age;
-        out.next_due = Some(out.next_due.map_or(due, |d| d.min(due)));
+        out.due(min_age - stat.age);
     }
     let Some(m) = chosen else {
         out.outcome = GcOutcome::TooYoung;
         return Ok(out);
     };
-    if last == Some(m) {
+    if last == Some(&GcMark::Manifest(m)) {
         return Ok(out);
     }
     let key = keys.manifest(m);
@@ -236,8 +336,224 @@ fn pass(
     };
     out.deleted = trim_once(store, keys, &trim_head, Some(&manifest))?;
     out.trimmed_against = Some(m);
+    out.mark = Some(GcMark::Manifest(m));
     out.outcome = GcOutcome::Trimmed;
     Ok(out)
+}
+
+/// The objects of one pack that the listing of `pack/` shows.
+#[derive(Debug, Default)]
+struct Listed {
+    pack: bool,
+    codes: bool,
+}
+
+fn list(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<String>> {
+    store
+        .list(prefix)
+        .map_err(|e| bucket_err(&format!("list {prefix}"), e))
+}
+
+fn stat(store: &dyn ObjectStore, key: &str) -> Result<Option<ObjectStat>> {
+    store
+        .stat(key)
+        .map_err(|e| bucket_err(&format!("stat {key}"), e))
+}
+
+/// The pass of a format 5 bucket (spec "GC"), every age by the bucket's clock:
+///
+/// 1. GET the pointer. No pointer, or a pointer of another `database_id`, is no pointer: the
+///    pass deletes no log, no pack below a pointer and no page, only orphans (step 5);
+///    `Nothing`. A pointer with the ETag of `last` (the trimmer's previous pass left nothing
+///    to wait for): `Nothing`, with no further request.
+/// 2. Abort every multipart upload under `pack/` that started `orphan_grace` or longer ago. A
+///    live pack run gives up at half the orphan grace, so this never aborts one.
+/// 3. HEAD the pack that the pointer names and its codes. When either is gone, the pointer
+///    names data that is gone, and the log is the only copy: the pass deletes nothing more
+///    and logs an error; `PackMissing`.
+/// 4. LIST `pack/`. The *trim floor* is the pack generation of the newest pack, among the
+///    named one and the ones below it, whose codes are at least `min_age` old. A pack run
+///    writes its codes after its upload and just before its pointer write, so the codes' age
+///    is the time since the pointer could move to that pack. With a floor, the pass deletes the
+///    log of every generation below it, each pack below it with its codes, and every `pages/`
+///    and `manifest/` object (a bucket upgraded from a seal format; the first pack holds them):
+///    `Trimmed`. Without one: `TooYoung`.
+/// 5. Every other pack, at or above the pointer's pack generation (or any, with no pointer),
+///    that the pointer does not name is an orphan: it goes with its codes once its own
+///    Last-Modified time (on S3 the upload start) is `orphan_grace` old.
+///
+/// The pack that the pointer names is never deleted. Every HEAD comes before any DELETE.
+fn pack_pass(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    ages: GcAges,
+    last: Option<&GcMark>,
+    out: &mut GcPass,
+) -> Result<()> {
+    let pointer_key = keys.pack_pointer();
+    let (pointer, etag) = match store
+        .get(&pointer_key)
+        .map_err(|e| bucket_err(&format!("get {pointer_key}"), e))?
+    {
+        Some(o) => (keys.read_pointer(&o.body)?, Some(o.etag)),
+        None => (None, None),
+    };
+    if let (Some(GcMark::Pointer(seen)), Some(_), Some(etag)) = (last, &pointer, &etag) {
+        if seen == etag {
+            return Ok(());
+        }
+    }
+    let root = keys.pack_root();
+    out.uploads_aborted = store
+        .abort_incomplete(&root, ages.orphan_grace)
+        .map_err(|e| bucket_err(&format!("abort uploads under {root}"), e))?;
+    let named = match &pointer {
+        Some(p) => match named_codes_age(store, p)? {
+            Some(age) => Some((p, age)),
+            None => {
+                out.outcome = GcOutcome::PackMissing;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    let mut packs: BTreeMap<(u64, String), Listed> = BTreeMap::new();
+    for key in list(store, &root)? {
+        if let Some(id) = keys.parse_pack(&key) {
+            packs.entry(id).or_default().pack = true;
+        } else if let Some(id) = keys.parse_pack_codes(&key) {
+            packs.entry(id).or_default().codes = true;
+        }
+    }
+    let mut doomed: Vec<String> = Vec::new();
+    let doomed_pack = |doomed: &mut Vec<String>, (g, run): &(u64, String), l: &Listed| {
+        if l.pack {
+            doomed.push(keys.pack(*g, run));
+        }
+        if l.codes {
+            doomed.push(keys.pack_codes(*g, run));
+        }
+        l.pack
+    };
+    let mut orphans_from = 0;
+    let mut named_id = None;
+    if let Some((p, named_age)) = named {
+        let id = keys
+            .parse_pack(&p.pack_key)
+            .expect("read_pointer checks the pack key");
+        orphans_from = p.pack_generation;
+        let floor = trim_floor(store, keys, ages, p, named_age, &packs, out)?;
+        match floor {
+            Some(floor) => {
+                out.outcome = GcOutcome::Trimmed;
+                doomed.extend(
+                    list(store, &keys.log_root())?
+                        .into_iter()
+                        .filter(|k| matches!(keys.parse_log(k), Some((g, _)) if g < floor)),
+                );
+                doomed.extend(list(store, &keys.page_root())?);
+                doomed.extend(list(store, &keys.manifest_root())?);
+                for (id, l) in packs.range(..(floor, String::new())) {
+                    if doomed_pack(&mut doomed, id, l) {
+                        out.packs_deleted += 1;
+                    }
+                }
+            }
+            None => out.outcome = GcOutcome::TooYoung,
+        }
+        named_id = Some(id);
+    }
+    for (id, l) in packs.range((orphans_from, String::new())..) {
+        if Some(id) == named_id.as_ref() {
+            continue;
+        }
+        let (g, run) = id;
+        let key = if l.pack {
+            keys.pack(*g, run)
+        } else {
+            keys.pack_codes(*g, run)
+        };
+        let Some(st) = stat(store, &key)? else {
+            continue;
+        };
+        if st.age < ages.orphan_grace {
+            out.due(ages.orphan_grace - st.age);
+            continue;
+        }
+        if doomed_pack(&mut doomed, id, l) {
+            out.orphan_packs_deleted += 1;
+        }
+    }
+    if let Some(p) = pointer.as_ref() {
+        // Never the pack that the pointer names.
+        doomed.retain(|k| *k != p.pack_key && *k != p.codes_key);
+    }
+    for k in &doomed {
+        store
+            .delete(k)
+            .map_err(|e| bucket_err(&format!("delete {k}"), e))?;
+    }
+    out.deleted = doomed.len() as u64;
+    if out.outcome == GcOutcome::Trimmed && out.next_due.is_none() {
+        out.mark = etag.map(GcMark::Pointer);
+    }
+    Ok(())
+}
+
+/// The age of the codes of the pack that `p` names, after a HEAD of the pack and of its codes.
+/// `None` when either is gone, with an error logged.
+fn named_codes_age(store: &dyn ObjectStore, p: &PackPointer) -> Result<Option<Duration>> {
+    let pack = stat(store, &p.pack_key)?;
+    let codes = stat(store, &p.codes_key)?;
+    match (pack, codes) {
+        (Some(_), Some(codes)) => Ok(Some(codes.age)),
+        (pack, _) => {
+            let key = if pack.is_none() {
+                &p.pack_key
+            } else {
+                &p.codes_key
+            };
+            tracing::error!(
+                target: "buckwal",
+                key = %key,
+                pack_generation = p.pack_generation,
+                "gc: the pack pointer names an object that is gone; no log deleted, the log is \
+                 the only copy"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// The trim floor of `pack_pass` (step 4): the pointer's pack generation when its codes are
+/// `min_age` old, else the pack generation of the newest pack below it with codes that old.
+/// Each younger one brings `next_due` forward.
+fn trim_floor(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    ages: GcAges,
+    p: &PackPointer,
+    named_age: Duration,
+    packs: &BTreeMap<(u64, String), Listed>,
+    out: &mut GcPass,
+) -> Result<Option<u64>> {
+    if named_age >= ages.min_age {
+        return Ok(Some(p.pack_generation));
+    }
+    out.due(ages.min_age - named_age);
+    for ((g, run), l) in packs.range(..(p.pack_generation, String::new())).rev() {
+        if !l.codes {
+            continue;
+        }
+        let Some(st) = stat(store, &keys.pack_codes(*g, run))? else {
+            continue;
+        };
+        if st.age >= ages.min_age {
+            return Ok(Some(*g));
+        }
+        out.due(ages.min_age - st.age);
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

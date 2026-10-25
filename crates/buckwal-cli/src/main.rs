@@ -249,16 +249,21 @@ fn takeover(dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
-/// GC: delete what an old enough head no longer reaches. It needs no directory.
+/// GC: delete what the database no longer needs (old enough heads, packs, log and uploads). It
+/// needs no directory.
 fn gc() -> CliResult<()> {
     let r = buckwal::gc(&config(Path::new("."))?).map_err(err)?;
     let opt = |v: Option<u128>| v.map_or("-".to_string(), |v| v.to_string());
     say(&format!(
-        "gc generation={} trimmed_against={} age_ms={} deleted={} outcome={} ms={}",
+        "gc generation={} trimmed_against={} age_ms={} deleted={} packs_deleted={} \
+         orphan_packs_deleted={} uploads_aborted={} outcome={} ms={}",
         r.generation,
         opt(r.trimmed_against.map(u128::from)),
         opt(r.age.map(|a| a.as_millis())),
         r.deleted,
+        r.packs_deleted,
+        r.orphan_packs_deleted,
+        r.uploads_aborted,
         r.outcome.as_str(),
         r.elapsed.as_millis()
     ));

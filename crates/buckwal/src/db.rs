@@ -361,7 +361,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     };
 
     // GC on the writer's own thread (never a read-only open's, never on a commit's path).
-    let (trim_tx, trim_rx) = if read_only || !config.gc_after_seal {
+    let (trim_tx, trim_rx) = if read_only || crate::trim::no_writer_gc() {
         (None, None)
     } else {
         let (tx, rx) = mpsc::channel();
@@ -379,7 +379,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
         spawn_trimmer(
             store.clone(),
             keys.clone(),
-            cfg.gc_min_age(),
+            crate::gc::GcAges::new(cfg.gc_min_age(), config.pack_orphan_grace),
             rx,
             cfg.events.clone(),
         )

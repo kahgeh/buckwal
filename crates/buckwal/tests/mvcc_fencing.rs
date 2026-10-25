@@ -29,7 +29,6 @@ fn config(dir: &Path, mode: JournalMode) -> Config {
     // Every checkpoint is the test's.
     c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
-    c.gc_after_seal = false;
     c
 }
 

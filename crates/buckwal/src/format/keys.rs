@@ -487,7 +487,6 @@ impl Keys {
     }
 
     /// Every pack's key, and every pack codes object's, starts with this.
-    #[cfg_attr(not(test), allow(dead_code))] // GC lists packs with it
     pub(crate) fn pack_root(&self) -> String {
         self.join("pack/")
     }
@@ -499,6 +498,11 @@ impl Keys {
         let ok = valid_run_id(run);
         let generation = digits(g, 10)?;
         ok.then(|| (generation, run.to_string()))
+    }
+
+    /// The generation and run id of a pack codes key (`pack/<generation>/<run id>.codes`).
+    pub(crate) fn parse_pack_codes(&self, key: &str) -> Option<(u64, String)> {
+        self.parse_pack(key.strip_suffix(".codes")?)
     }
 
     /// The pack pointer's bytes: with an integrity key its fields and their code, made under the

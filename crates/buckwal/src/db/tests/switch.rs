@@ -44,8 +44,8 @@ fn switch_record_names(store: &MemStore, g: u64) -> Option<u64> {
 fn commit_that_restarts_wal_makes_four_small_puts() {
     let store = mem();
     let t = tempdir();
-    let mut cfg = config(t.path());
-    cfg.gc_after_seal = false;
+    let cfg = config(t.path());
+    let _no_gc = crate::trim::NoWriterGc::on();
     let db = open_with_store(cfg, store.clone()).unwrap();
     assert_eq!(head(&*store).format, FORMAT_V5);
     let c = db.connect().unwrap();

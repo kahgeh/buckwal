@@ -970,7 +970,13 @@ fn restore_after_many_checkpoints_reads_only_current_generation() {
     let mut cfg = cfg();
     cfg.events = Some(hook.clone());
     let (tx, rx) = std::sync::mpsc::channel();
-    let _trimmer = crate::trim::spawn_trimmer(mem.clone(), keys(), Duration::ZERO, rx, Some(hook));
+    let _trimmer = crate::trim::spawn_trimmer(
+        mem.clone(),
+        keys(),
+        crate::gc::GcAges::new(Duration::ZERO, crate::config::defaults::PACK_ORPHAN_GRACE),
+        rx,
+        Some(hook),
+    );
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer_trimmed(mem.clone(), d.path(), &cfg, Some(tx));
     create_table(&conn);

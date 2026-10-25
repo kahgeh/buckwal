@@ -1,19 +1,19 @@
 //! The trimmer (D10): deletes the log objects, manifests and page objects that no head can
 //! reach any more. Generations only move forward, so an object unreferenced by one head stays
 //! unreferenced by every later one. Which head is old enough to trim against is GC's choice
-//! (`gc::gc_once`), on the bucket's clock.
+//! (`gc::gc_pass`), on the bucket's clock. A format 5 bucket is trimmed by `gc::pack_pass`
+//! (against the pack pointer), never by `trim_once`.
 
 use crate::config::defaults::MAINTENANCE_RETRY_MAX;
 use crate::config::{Event, EventHook};
 use crate::error::{Error, Result};
-use crate::format::{Head, Keys, Manifest};
-use crate::gc::{gc_once, GcOutcome};
+use crate::format::{Head, Keys, Manifest, FORMAT_V5};
+use crate::gc::{gc_pass, GcAges, GcOutcome};
 use crate::store::ObjectStore;
 use crate::uploader::TrimSnapshot;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 fn list(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<String>> {
     store
@@ -24,13 +24,20 @@ fn list(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<String>> {
 /// Delete what head `{G, manifest M}` no longer reaches: `log/<g < G>/*`, `manifest/<m < M>`
 /// and `pages/<g < M>/<p>` where manifest M maps `p` to a generation other than `g`. Nothing
 /// of a generation ≥ M is touched, except the logs below G. Without a manifest only older logs
-/// go. Returns how many objects were deleted.
+/// go. Returns how many objects were deleted. Formats 1 to 4 only: a format 5 head is
+/// `Unsupported` and nothing is deleted, because its log below the head can be the only copy
+/// of the database (GC of format 5 deletes log against the pack pointer, `gc::pack_pass`).
 pub(crate) fn trim_once(
     store: &dyn ObjectStore,
     keys: &Keys,
     head: &Head,
     manifest: Option<&Manifest>,
 ) -> Result<u64> {
+    if head.format == FORMAT_V5 {
+        return Err(Error::Unsupported(
+            "a seal trim of a format 5 head (GC trims it against the pack pointer)",
+        ));
+    }
     let mut doomed: Vec<String> = list(store, &keys.log_root())?
         .into_iter()
         .filter(|k| matches!(keys.parse_log(k), Some((g, _)) if g < head.generation))
@@ -53,9 +60,48 @@ pub(crate) fn trim_once(
     Ok(doomed.len() as u64)
 }
 
-/// The writer's GC thread (`Config::gc_after_seal`). It runs a GC pass (`gc::gc_once`, with
-/// `min_age`) at start, on every message (the open's, then one per seal; messages queued
-/// together make one pass) and when the next manifest comes of age (the pass's `next_due`).
+#[cfg(test)]
+thread_local! {
+    static NO_WRITER_GC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: while alive, a writer opened on this thread starts no GC thread, so that only
+/// the test's own passes (or none) touch the bucket, and its request counts and spans are the
+/// test's.
+#[cfg(test)]
+pub(crate) struct NoWriterGc;
+
+#[cfg(test)]
+impl NoWriterGc {
+    pub(crate) fn on() -> Self {
+        NO_WRITER_GC.with(|f| f.set(true));
+        NoWriterGc
+    }
+}
+
+#[cfg(test)]
+impl Drop for NoWriterGc {
+    fn drop(&mut self) {
+        NO_WRITER_GC.with(|f| f.set(false));
+    }
+}
+
+/// Whether a writer opened on this thread starts no GC thread (tests: `NoWriterGc`). A
+/// writer always runs one otherwise.
+pub(crate) fn no_writer_gc() -> bool {
+    #[cfg(test)]
+    {
+        NO_WRITER_GC.with(|f| f.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// The writer's GC thread. It runs a GC pass (`gc::gc_pass`, with `ages`) at start, on every
+/// message (the open's, then one per seal or generation switch; messages queued together make
+/// one pass) and when the next manifest, pack or orphan comes of age (the pass's `next_due`).
 /// It emits `Trimmed` after each pass that trimmed. A failed pass is retried on the next
 /// message, or after `MAINTENANCE_RETRY_MAX`; it never ends the thread. It exits when every
 /// sender is gone: a pass in progress finishes first, and the messages of a closing writer
@@ -63,7 +109,7 @@ pub(crate) fn trim_once(
 pub(crate) fn spawn_trimmer(
     store: Arc<dyn ObjectStore>,
     keys: Keys,
-    min_age: Duration,
+    ages: GcAges,
     rx: Receiver<TrimSnapshot>,
     events: Option<EventHook>,
 ) -> JoinHandle<()> {
@@ -73,7 +119,7 @@ pub(crate) fn spawn_trimmer(
         .name("buckwal-trimmer".into())
         .spawn(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                trimmer_loop(&*store, &keys, min_age, &rx, events.as_ref())
+                trimmer_loop(&*store, &keys, ages, &rx, events.as_ref())
             })
         })
         .expect("spawn trimmer thread")
@@ -82,7 +128,7 @@ pub(crate) fn spawn_trimmer(
 fn trimmer_loop(
     store: &dyn ObjectStore,
     keys: &Keys,
-    min_age: Duration,
+    ages: GcAges,
     rx: &Receiver<TrimSnapshot>,
     events: Option<&EventHook>,
 ) {
@@ -90,10 +136,10 @@ fn trimmer_loop(
     while rx.try_recv().is_ok() {}
     let mut last = None;
     loop {
-        let wait = match gc_once(store, keys, min_age, last) {
+        let wait = match gc_pass(store, keys, ages, last.as_ref()) {
             Ok(pass) => {
                 if pass.outcome == GcOutcome::Trimmed {
-                    last = pass.trimmed_against;
+                    last = pass.mark;
                     if let Some(hook) = events {
                         hook(&Event::Trimmed {
                             deleted: pass.deleted,

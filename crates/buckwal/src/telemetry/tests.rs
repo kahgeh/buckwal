@@ -1285,8 +1285,9 @@ fn gc_exports_a_gc_span() {
     let cap = Capture::new();
     let a = tempfile::tempdir().unwrap();
     let mem = Arc::new(MemStore::new());
-    let mut cfg = config(a.path());
-    cfg.gc_after_seal = false;
+    let cfg = config(a.path());
+    // Only the test's own two passes.
+    let _no_gc = crate::trim::NoWriterGc::on();
     let min_age = cfg.engine(crate::io::IoMode::Writer).gc_min_age();
     let (spans, young, old) = tracing::subscriber::with_default(cap.subscriber(), || {
         let db = crate::open_with_store(cfg.clone(), mem.clone()).unwrap();
@@ -1341,8 +1342,8 @@ fn failed_gc_exports_error_outcome() {
     let cap = Capture::new();
     let a = tempfile::tempdir().unwrap();
     let mem = Arc::new(MemStore::new());
-    let mut cfg = config(a.path());
-    cfg.gc_after_seal = false;
+    let cfg = config(a.path());
+    let _no_gc = crate::trim::NoWriterGc::on();
     let (spans, r) = tracing::subscriber::with_default(cap.subscriber(), || {
         let db = crate::open_with_store(cfg.clone(), mem.clone()).unwrap();
         db.close().unwrap();
