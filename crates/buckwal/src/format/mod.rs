@@ -2,7 +2,7 @@
 
 mod head;
 mod integrity;
-mod json;
+pub(crate) mod json;
 mod keys;
 mod manifest;
 mod record;
@@ -18,6 +18,10 @@ pub(crate) const FORMAT_V3: u32 = 3;
 /// Bucket format v4: every encrypted bucket this build makes (WAL or MVCC): the format 3 head
 /// plus `database_id`, with every integrity code made under the database integrity key.
 pub(crate) const FORMAT_V4: u32 = 4;
+/// Bucket format v5: the packer's format. The head has `journal_mode` and no `manifest`; the
+/// pages live in packs (`pack-latest` names the newest). An encrypted bucket's head also has
+/// `database_id`, `key_check` and an integrity code, as format 4.
+pub(crate) const FORMAT_V5: u32 = 5;
 
 pub(crate) use head::{Head, LocalState};
 pub(crate) use keys::Keys;

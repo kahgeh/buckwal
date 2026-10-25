@@ -4,7 +4,7 @@ use super::integrity::{
     no_codes, wrong_key, Kind,
 };
 use super::json::{escape, Obj};
-use super::{FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4};
+use super::{FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5};
 use crate::config::defaults;
 use crate::config::JournalMode;
 use crate::encryption::IntegrityKey;
@@ -21,10 +21,10 @@ fn corrupt(m: &str) -> Error {
 }
 
 /// The formats a decoder of this build accepts.
-const ACCEPTED: &[u32] = &[FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4];
+const ACCEPTED: &[u32] = &[FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5];
 
-/// Whether a head of `format` carries `key_check` and an integrity code (an encrypted
-/// database's).
+/// Whether a head of `format` always carries `key_check` and an integrity code (an encrypted
+/// database's). A format 5 head is coded when it has a `database_id` (`Head::is_coded`).
 fn coded_format(format: u32) -> bool {
     format == FORMAT_V3 || format == FORMAT_V4
 }
@@ -47,6 +47,7 @@ fn check_format(o: &Obj, what: &str, accepted: &[u32]) -> Result<u32> {
 pub(crate) struct Head {
     pub format: u32,
     pub generation: u64,
+    /// Not encoded in a format 5 head (the pages are in packs), where it must be `None`.
     pub manifest: Option<u64>,
     pub writer_id: String,
     /// The writer-lease epoch; a head without the key reads as 0.
@@ -61,27 +62,35 @@ pub(crate) struct Head {
     /// only when `Some`.
     pub next_generation_floor: Option<u64>,
     /// The database's id (16 random bytes, hex), made at its first head write and kept by every
-    /// head after it. Encoded only in a format 4 head, where it is required.
+    /// head after it. Encoded only in a format 4 head, where it is required, and in a format 5 head of an
+    /// encrypted bucket (a plaintext format 5 head has none).
     pub database_id: Option<String>,
 }
 
 impl Head {
+    /// Whether this head carries `key_check` and an integrity code: a format 3 or 4 head
+    /// always, a format 5 head when it has a `database_id`.
+    pub(crate) fn is_coded(&self) -> bool {
+        coded_format(self.format) || (self.format == FORMAT_V5 && self.database_id.is_some())
+    }
+
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let manifest = match self.manifest {
-            Some(g) => format!("\"manifest/{g:010}\""),
-            None => "null".to_string(),
+        let manifest = match (self.format, self.manifest) {
+            (FORMAT_V5, _) => String::new(),
+            (_, Some(g)) => format!(",\"manifest\":\"manifest/{g:010}\""),
+            (_, None) => ",\"manifest\":null".to_string(),
         };
         let mut mode = if self.format != FORMAT {
             format!(",\"journal_mode\":\"{}\"", self.journal_mode.as_str())
         } else {
             String::new()
         };
-        if let (FORMAT_V4, Some(id)) = (self.format, &self.database_id) {
+        if let (FORMAT_V4 | FORMAT_V5, Some(id)) = (self.format, &self.database_id) {
             mode.push_str(&format!(",\"database_id\":{}", escape(id)));
         }
         let opt = |k: &str, v: Option<u64>| v.map_or(String::new(), |v| format!(",\"{k}\":{v}"));
         format!(
-            "{{\"format\":{},\"generation\":{},\"manifest\":{},\"writer_id\":{},\"epoch\":{}{}{}{}{}}}",
+            "{{\"format\":{},\"generation\":{}{},\"writer_id\":{},\"epoch\":{}{}{}{}{}}}",
             self.format,
             self.generation,
             manifest,
@@ -105,9 +114,9 @@ impl Head {
 
     /// The key a head's integrity code is made under: the integrity key `ik` for a format 3
     /// head, the database integrity key (derived from `ik` and the head's `database_id`) for a
-    /// format 4 head. `None` for a format 4 head whose id is missing or not 16 bytes of hex.
+    /// format 4 head. `None` for a format 4 or 5 head whose id is missing or not 16 bytes of hex.
     fn code_key(&self, ik: &IntegrityKey) -> Option<IntegrityKey> {
-        if self.format != FORMAT_V4 {
+        if self.format != FORMAT_V4 && self.format != FORMAT_V5 {
             return Some(ik.clone());
         }
         let id = database_id_bytes(self.database_id.as_deref()?)?;
@@ -120,10 +129,7 @@ impl Head {
     /// keys this build does not know). The code is made under the integrity key in format 3
     /// and under the database integrity key in format 4. Only a coded head carries them.
     pub(crate) fn encode_coded(&self, ik: &IntegrityKey) -> Vec<u8> {
-        debug_assert!(
-            coded_format(self.format),
-            "only a format 3 or 4 head is coded"
-        );
+        debug_assert!(self.is_coded(), "only a coded head is encoded with a code");
         let key = self
             .code_key(ik)
             .expect("a format 4 head is encoded with a database_id");
@@ -152,8 +158,9 @@ impl Head {
         open: bool,
     ) -> Result<Head> {
         let (head, code, kc) = Head::decode_inner(b, ACCEPTED)?;
+        let key_check_present = kc.is_some();
         let Some(ik) = ik else {
-            if coded_format(head.format) {
+            if head.is_coded() || (head.format == FORMAT_V5 && key_check_present) {
                 return Err(Error::Encryption(format!(
                     "{key} is a format {} head, an encrypted database's: set \
                      BUCKWAL_ENCRYPTION_KEY_FILE",
@@ -162,7 +169,7 @@ impl Head {
             }
             return Ok(head);
         };
-        if !coded_format(head.format) {
+        if !head.is_coded() {
             // Before a good open this is a plaintext or pre-codes bucket; after one, someone
             // put back a plaintext-format head to strip the codes.
             return Err(if open {
@@ -209,7 +216,7 @@ impl Head {
     fn decode_inner(b: &[u8], accepted: &[u32]) -> Result<(Head, Option<String>, Option<String>)> {
         let o = Obj::parse(b)?;
         let format = check_format(&o, "head", accepted)?;
-        let journal_mode = if coded_format(format) {
+        let journal_mode = if coded_format(format) || format == FORMAT_V5 {
             let m = o.str("journal_mode")?;
             JournalMode::parse(m)
                 .ok_or_else(|| corrupt(&format!("head: unknown journal_mode {m:?}")))?
@@ -227,7 +234,15 @@ impl Head {
             }
             JournalMode::Wal
         };
-        let manifest = match o.opt_str("manifest")? {
+        if format == FORMAT_V5 && o.has("manifest") {
+            return Err(corrupt("head: format 5 with a manifest key"));
+        }
+        let manifest_str = if format == FORMAT_V5 {
+            None
+        } else {
+            o.opt_str("manifest")?
+        };
+        let manifest = match manifest_str {
             None => None,
             Some(s) => {
                 let digits = s
@@ -267,7 +282,7 @@ impl Head {
             None
         };
         let database_id = if o.has("database_id") {
-            if format != FORMAT_V4 {
+            if format != FORMAT_V4 && format != FORMAT_V5 {
                 return Err(corrupt(&format!(
                     "head: format {format} with a database_id"
                 )));

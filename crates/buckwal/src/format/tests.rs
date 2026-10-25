@@ -790,7 +790,7 @@ fn local_state_v2_roundtrip() {
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s));
     assert!(is_corrupt(LocalState::decode(
-        br#"{"format":5,"writer_id":"w1","generation":3,"complete":true}"#
+        br#"{"format":6,"writer_id":"w1","generation":3,"complete":true}"#
     )));
 }
 
@@ -1530,5 +1530,220 @@ mod integrity_codes {
             let all = format!("{:?}", e.fields);
             assert!(!all.contains("cdcdcd") && !all.contains(&hex::encode(&obj[obj.len() - 32..])));
         }
+    }
+}
+
+mod packer_format {
+    use super::*;
+    use crate::encryption::{Encryption, IntegrityKey};
+    use crate::format::{FORMAT_V4, FORMAT_V5};
+    use crate::pack::PackPointer;
+    use turso_core::{CipherMode, EncryptionKey};
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn ik(seed: u8) -> IntegrityKey {
+        Encryption::new(CipherMode::Aegis256, EncryptionKey::new_256([seed; 32])).integrity_key()
+    }
+
+    fn coded(seed: u8) -> Keys {
+        Keys::new("p").with_integrity(Some(ik(seed)))
+    }
+
+    fn pointer(k: &Keys, id: Option<&str>) -> PackPointer {
+        PackPointer {
+            format: 5,
+            pack_key: k.pack(15, "run1"),
+            codes_key: k.pack_codes(15, "run1"),
+            pack_generation: 15,
+            size: 5_000_000,
+            page_size: 4096,
+            part_size: 16 << 20,
+            block_size: 1 << 20,
+            database_id: id.map(String::from),
+        }
+    }
+
+    fn head5(id: Option<&str>) -> Head {
+        Head {
+            format: FORMAT_V5,
+            generation: 16,
+            manifest: None,
+            writer_id: "w1".into(),
+            epoch: 2,
+            journal_mode: JournalMode::Mvcc,
+            lease_ms: Some(30_000),
+            request_timeout_ms: Some(10_000),
+            next_generation_floor: Some(16),
+            database_id: id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn pack_keys_round_trip_and_stay_apart_from_the_other_keys() {
+        let k = Keys::new("p");
+        assert_eq!(k.pack(15, "run1"), "p/pack/0000000015/run1");
+        assert_eq!(k.pack_codes(15, "run1"), "p/pack/0000000015/run1.codes");
+        assert_eq!(k.pack_pointer(), "p/pack-latest");
+        assert_eq!(k.pack_root(), "p/pack/");
+        assert_eq!(
+            k.parse_pack(&k.pack(15, "run1")),
+            Some((15, "run1".to_string()))
+        );
+        assert_eq!(k.parse_pack(&k.pack_codes(15, "run1")), None);
+        assert_eq!(k.parse_pack(&k.pack_pointer()), None);
+        assert_eq!(k.parse_pack("p/pack/15/run1"), None);
+        assert_eq!(k.parse_pack("q/pack/0000000015/run1"), None);
+        assert_eq!(k.parse_pack(&k.log(15, 1)), None);
+        assert_eq!(k.parse_log(&k.pack(15, "run1")), None);
+        assert_eq!(Keys::new("").pack_pointer(), "pack-latest");
+    }
+
+    #[test]
+    fn a_plain_pointer_round_trips_without_a_code() {
+        let k = Keys::new("p");
+        let p = pointer(&k, None);
+        let body = k.encode_pointer(&p);
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(!text.contains("integrity"), "{text}");
+        assert_eq!(k.decode_pointer(&body).unwrap(), p);
+    }
+
+    #[test]
+    fn a_coded_pointer_round_trips_and_a_changed_field_fails_its_code() {
+        let k = coded(1);
+        k.init_database_id().unwrap();
+        let id = k.database_id();
+        let p = pointer(&k, id.as_deref());
+        let body = k.encode_pointer(&p);
+        assert!(String::from_utf8(body.clone())
+            .unwrap()
+            .contains("\"integrity\":\""));
+        assert_eq!(k.decode_pointer(&body).unwrap(), p);
+        let key = k.pack_pointer();
+        let fail = Error::Corrupt(format!("integrity: {key}"));
+        let edit = |from: &str, to: &str| {
+            let text = String::from_utf8(body.clone()).unwrap();
+            assert!(text.contains(from), "{text}");
+            text.replace(from, to).into_bytes()
+        };
+        for changed in [
+            edit("run1\"", "run2\""),
+            edit("run1.codes", "run2.codes"),
+            edit("\"size\":5000000", "\"size\":5000001"),
+            edit("\"pack_generation\":15", "\"pack_generation\":16"),
+        ] {
+            assert_eq!(k.decode_pointer(&changed).unwrap_err(), fail);
+        }
+        // A pointer without a code, and one made under another key.
+        let plain = Keys::new("p").encode_pointer(&p);
+        assert_eq!(k.decode_pointer(&plain).unwrap_err(), fail);
+        assert!(matches!(
+            Keys::new("p").decode_pointer(&body),
+            Err(Error::Encryption(_))
+        ));
+        let other = coded(2);
+        other.init_database_id().unwrap();
+        assert_eq!(other.decode_pointer(&body).unwrap_err(), fail);
+    }
+
+    #[test]
+    fn a_bad_pointer_is_corrupt() {
+        let k = Keys::new("p");
+        for body in [
+            &b"{}"[..],
+            br#"{"format":4}"#,
+            br#"{"format":5,"pack_key":"a","codes_key":"b","pack_generation":1,"size":1,"page_size":0,"part_size":1,"block_size":1}"#,
+            b"not json",
+        ] {
+            assert!(is_corrupt(k.decode_pointer(body)), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_format_5_head_has_no_manifest_and_keeps_its_other_fields() {
+        let k = Keys::new("p");
+        let h = head5(None);
+        let body = k.encode_head(&h);
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(
+            text.starts_with("{\"format\":5,\"generation\":16,\"writer_id\""),
+            "{text}"
+        );
+        assert!(!text.contains("manifest"), "{text}");
+        assert!(text.contains("\"journal_mode\":\"mvcc\""), "{text}");
+        assert_eq!(k.decode_head(&body).unwrap(), h);
+        // A manifest key in a format 5 head is corrupt.
+        let with = text.replace("\"generation\":16", "\"generation\":16,\"manifest\":null");
+        assert!(is_corrupt(k.decode_head(with.as_bytes())));
+        // A format 5 head of a WAL bucket.
+        let wal = Head {
+            journal_mode: JournalMode::Wal,
+            ..h
+        };
+        assert_eq!(k.decode_head(&k.encode_head(&wal)).unwrap(), wal);
+    }
+
+    #[test]
+    fn a_coded_format_5_head_keeps_database_id_and_key_check() {
+        let k = coded(1);
+        let h = head5(Some(ID));
+        let body = k.encode_head(&h);
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(!text.contains("manifest"), "{text}");
+        assert!(
+            text.contains(&format!("\"database_id\":\"{ID}\"")),
+            "{text}"
+        );
+        assert!(text.contains("\"key_check\":\""), "{text}");
+        assert_eq!(k.decode_head_open(&body).unwrap(), h);
+        assert_eq!(coded(1).decode_head(&body).unwrap(), h);
+        // Another key is the wrong key; no key is `Encryption` too.
+        assert!(matches!(
+            coded(2).decode_head_open(&body),
+            Err(Error::Encryption(_))
+        ));
+        assert!(matches!(
+            Keys::new("p").decode_head(&body),
+            Err(Error::Encryption(_))
+        ));
+        // An edited field, a removed database id and a stripped head fail the code.
+        let edited = text.replace("\"epoch\":2", "\"epoch\":3");
+        assert!(is_corrupt(k.decode_head(edited.as_bytes())));
+        let removed = text.replace(&format!(",\"database_id\":\"{ID}\""), "");
+        assert!(coded(1).decode_head_open(removed.as_bytes()).is_err());
+        let plain = Keys::new("p").encode_head(&head5(None));
+        assert!(matches!(
+            coded(1).decode_head_open(&plain),
+            Err(Error::Encryption(_))
+        ));
+        assert!(is_corrupt(k.decode_head(&plain)));
+        // A format 5 head over a known format 4 database with the same id is accepted; with
+        // another id it is tampering.
+        let k4 = coded(1);
+        let h4 = Head {
+            format: FORMAT_V4,
+            manifest: Some(15),
+            ..head5(Some(ID))
+        };
+        k4.decode_head_open(&k4.encode_head(&h4)).unwrap();
+        k4.decode_head(&body).unwrap();
+        let other_id = head5(Some("fedcba9876543210fedcba9876543210"));
+        assert!(is_corrupt(k4.decode_head(&coded(1).encode_head(&other_id))));
+    }
+
+    #[test]
+    fn formats_1_to_4_still_decode_and_new_format_is_unchanged_until_the_writer_packs() {
+        let k = Keys::new("p");
+        let v1 = br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"w"}"#;
+        assert_eq!(k.decode_head(v1).unwrap().manifest, Some(2));
+        let null = br#"{"format":1,"generation":3,"manifest":null,"writer_id":"w"}"#;
+        assert_eq!(k.decode_head(null).unwrap().manifest, None);
+        // A format 1 to 4 head without a manifest key is still refused.
+        let none = br#"{"format":1,"generation":3,"writer_id":"w"}"#;
+        assert!(is_corrupt(k.decode_head(none)));
+        assert_eq!(k.new_format(JournalMode::Wal), 1);
+        assert_eq!(k.new_format_packed(), 5);
+        assert_eq!(coded(1).new_format_packed(), 5);
     }
 }

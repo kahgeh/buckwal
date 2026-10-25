@@ -16,6 +16,7 @@ pub(crate) enum Kind {
     Record,
     Manifest,
     Head,
+    Pointer,
 }
 
 impl Kind {
@@ -25,6 +26,7 @@ impl Kind {
             Kind::Record => "record",
             Kind::Manifest => "manifest",
             Kind::Head => "head",
+            Kind::Pointer => "pointer",
         }
     }
 }
@@ -166,6 +168,44 @@ pub(crate) fn head_code(ik: &IntegrityKey, fields: &[u8]) -> [u8; 32] {
 
 pub(crate) fn head_verifies(ik: &IntegrityKey, fields: &[u8], code: &[u8]) -> bool {
     ik.verify(&[b"head", fields], code)
+}
+
+/// The code of a pack pointer: it covers the pack key, the codes key, the size and the pack
+/// generation. The key is the database integrity key, so the code is tied to the database.
+pub(crate) fn pointer_code(
+    ik: &IntegrityKey,
+    pack_key: &str,
+    codes_key: &str,
+    size: u64,
+    pack_generation: u64,
+) -> [u8; 32] {
+    ik.code(&[
+        b"pack-latest",
+        pack_key.as_bytes(),
+        codes_key.as_bytes(),
+        &size.to_be_bytes(),
+        &pack_generation.to_be_bytes(),
+    ])
+}
+
+pub(crate) fn pointer_verifies(
+    ik: &IntegrityKey,
+    pack_key: &str,
+    codes_key: &str,
+    size: u64,
+    pack_generation: u64,
+    code: &[u8],
+) -> bool {
+    ik.verify(
+        &[
+            b"pack-latest",
+            pack_key.as_bytes(),
+            codes_key.as_bytes(),
+            &size.to_be_bytes(),
+            &pack_generation.to_be_bytes(),
+        ],
+        code,
+    )
 }
 
 /// The length of a head's `key_check`.

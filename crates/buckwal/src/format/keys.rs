@@ -6,9 +6,12 @@
 //! are exactly those of a plaintext bucket.
 use super::integrity::{self, Check};
 use super::integrity::{integrity_failed, integrity_failed_as, Kind};
-use super::{Head, JournalMode, LogRecord, Manifest, FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4};
+use super::{
+    Head, JournalMode, LogRecord, Manifest, FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5,
+};
 use crate::encryption::IntegrityKey;
 use crate::error::Result;
+use crate::pack::PackPointer;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -153,7 +156,7 @@ impl Keys {
         let key = || self.head();
         match (&*known, head.format) {
             (Identity::Unknown, FORMAT_V3) => *known = Identity::Format3,
-            (Identity::Unknown, FORMAT_V4) => {
+            (Identity::Unknown, FORMAT_V4 | FORMAT_V5) => {
                 let id = head.database_id.clone().unwrap_or_default();
                 let bytes = hex::decode(&id).unwrap_or_default();
                 *known = Identity::Format4 {
@@ -162,7 +165,7 @@ impl Keys {
                 };
             }
             (Identity::Format3, FORMAT_V3) => {}
-            (Identity::Format4 { id, .. }, FORMAT_V4) => {
+            (Identity::Format4 { id, .. }, FORMAT_V4 | FORMAT_V5) => {
                 if head.database_id.as_deref() != Some(id.as_str()) {
                     return Err(integrity_failed(&key(), Kind::Head, head.generation, 0));
                 }
@@ -209,9 +212,17 @@ impl Keys {
         }
     }
 
+    /// The head `format` a new packed bucket is created with. It is 5, coded or not. The writer
+    /// uses `new_format` until it writes packs (a format 5 head has no manifest, which the seal
+    /// path of formats 1 to 4 needs).
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn new_format_packed(&self) -> u32 {
+        FORMAT_V5
+    }
+
     /// The head's bytes: with an integrity key (a format 3 head) its fields and their code.
     pub(crate) fn encode_head(&self, head: &Head) -> Vec<u8> {
-        debug_assert!(!self.coded() || head.format == FORMAT_V3 || head.format == FORMAT_V4);
+        debug_assert!(!self.coded() || head.is_coded());
         match &self.integrity {
             Some(ik) => head.encode_coded(ik),
             None => head.encode(),
@@ -346,6 +357,91 @@ impl Keys {
 
     pub(crate) fn manifest(&self, gen: u64) -> String {
         self.join(&format!("manifest/{gen:010}"))
+    }
+
+    /// The pack `pack/<generation>/<run id>`.
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn pack(&self, gen: u64, run_id: &str) -> String {
+        self.join(&format!("pack/{gen:010}/{run_id}"))
+    }
+
+    /// The codes object of the pack `pack/<generation>/<run id>`.
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn pack_codes(&self, gen: u64, run_id: &str) -> String {
+        self.join(&format!("pack/{gen:010}/{run_id}.codes"))
+    }
+
+    /// The pack pointer.
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn pack_pointer(&self) -> String {
+        self.join("pack-latest")
+    }
+
+    /// Every pack's key, and every pack codes object's, starts with this.
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn pack_root(&self) -> String {
+        self.join("pack/")
+    }
+
+    /// The generation and run id of a pack key (not of a codes key).
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn parse_pack(&self, key: &str) -> Option<(u64, String)> {
+        let rest = self.strip(key)?.strip_prefix("pack/")?;
+        let (g, run) = rest.split_once('/')?;
+        let ok = !run.is_empty()
+            && !run.ends_with(".codes")
+            && run
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let generation = digits(g, 10)?;
+        ok.then(|| (generation, run.to_string()))
+    }
+
+    /// The pack pointer's bytes: with an integrity key its fields and their code, made under the
+    /// database integrity key (the code covers the pack key, the codes key, the size and the
+    /// pack generation).
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn encode_pointer(&self, p: &PackPointer) -> Vec<u8> {
+        let mut out = p.encode_fields();
+        if let Some(ik) = self.object_key() {
+            let code =
+                integrity::pointer_code(&ik, &p.pack_key, &p.codes_key, p.size, p.pack_generation);
+            out.push_str(&format!(",\"integrity\":\"{}\"", hex::encode(code)));
+        }
+        out.push('}');
+        out.into_bytes()
+    }
+
+    /// The pack pointer in `body`. In an encrypted bucket its code must verify, else
+    /// `Corrupt("integrity: <pointer key>")`; a pointer without a code is that too. A coded
+    /// pointer read without a key is `Encryption`.
+    #[allow(dead_code)] // used from task 5 on
+    pub(crate) fn decode_pointer(&self, body: &[u8]) -> Result<PackPointer> {
+        let (p, code) = PackPointer::decode_fields(body)?;
+        let key = self.pack_pointer();
+        let Some(ik) = self.object_key() else {
+            if code.is_some() {
+                return Err(crate::error::Error::Encryption(format!(
+                    "{key} is an encrypted database's: set BUCKWAL_ENCRYPTION_KEY_FILE"
+                )));
+            }
+            return Ok(p);
+        };
+        let ok = code.and_then(|c| hex::decode(c).ok()).is_some_and(|c| {
+            integrity::pointer_verifies(
+                &ik,
+                &p.pack_key,
+                &p.codes_key,
+                p.size,
+                p.pack_generation,
+                &c,
+            )
+        });
+        if ok {
+            Ok(p)
+        } else {
+            Err(integrity_failed(&key, Kind::Pointer, p.pack_generation, 0))
+        }
     }
 
     pub(crate) fn parse_log(&self, key: &str) -> Option<(u64, u64)> {
