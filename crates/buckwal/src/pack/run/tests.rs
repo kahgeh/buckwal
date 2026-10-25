@@ -8,7 +8,7 @@ use crate::store::{
 };
 use crate::{CheckpointMode, Connection, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -71,7 +71,7 @@ struct HookStore {
     /// A multipart upload answers another checksum for its first part.
     sha_lie: AtomicBool,
     /// Each multipart upload waits here first (outside the hook's lock).
-    barrier: Mutex<Option<Arc<Barrier>>>,
+    barrier: Mutex<Option<Arc<TimedBarrier>>>,
 }
 
 impl HookStore {
@@ -129,6 +129,40 @@ impl HookStore {
             Reply::StoreThenTransient => f().and(Err(Self::transient(key))),
             _ => f(),
         }
+    }
+}
+
+/// A barrier whose wait panics after 30 s, so a run that never comes fails the test and does
+/// not hang it.
+struct TimedBarrier {
+    n: usize,
+    count: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl TimedBarrier {
+    fn new(n: usize) -> TimedBarrier {
+        TimedBarrier {
+            n,
+            count: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let mut c = self.count.lock().unwrap();
+        *c += 1;
+        self.cv.notify_all();
+        let (c, timeout) = self
+            .cv
+            .wait_timeout_while(c, Duration::from_secs(30), |c| *c < self.n)
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "the barrier waited 30 s for {} of {} runs",
+            self.n - *c,
+            self.n
+        );
     }
 }
 
@@ -1247,7 +1281,7 @@ fn two_runs_at_once_leave_one_newest_pack() {
     w.end_generation();
     let hs = HookStore::new(mem.clone());
     // Both runs upload before either moves the pointer.
-    *hs.barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    *hs.barrier.lock().unwrap() = Some(Arc::new(TimedBarrier::new(2)));
     let t = tempdir();
     // Each run has its own directory: a run checks that its own working directory is gone.
     let cfgs = [config(&t.path().join("a")), config(&t.path().join("b"))];
@@ -1385,6 +1419,7 @@ fn discard_keeps_the_pack_the_pointer_names() {
         kept: None,
         source: None,
         touched: false,
+        span: tracing::Span::none(),
     };
     r.discard(&p.pack_key, &p.codes_key);
     assert!(mem.get(&p.pack_key).unwrap().is_some() && mem.get(&p.codes_key).unwrap().is_some());
@@ -1886,7 +1921,7 @@ fn two_packers_on_one_directory_at_once() {
     let w = two_generations(&mem, &cfg);
     let at_pack = w.ids();
     let hs = HookStore::new(mem.clone());
-    *hs.barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    *hs.barrier.lock().unwrap() = Some(Arc::new(TimedBarrier::new(2)));
     let reports: Vec<PackReport> = std::thread::scope(|s| {
         let runs: Vec<_> = (0..2)
             .map(|_| s.spawn(|| run(&cfg, hs.clone()).unwrap()))
@@ -2026,4 +2061,292 @@ fn takeover_into_a_directory_with_only_a_kept_copy() {
     drop(db);
     assert_copy_is_the_pack(&cfg, &*mem);
     drop(w);
+}
+
+// ---- The kept copy and the free disk (review round 1) ----
+
+/// A packer `cfg` with a kept copy of about 1.8 MiB (two blocks), then one more ended
+/// generation that changes one row.
+fn big_copy(mem: &Arc<MemStore>, cfg: &Config) -> Writer {
+    let w = writer(mem);
+    for id in 1..=450 {
+        w.c.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[Value::from_i64(id), Value::build_text("x".repeat(3500))],
+        )
+        .unwrap();
+    }
+    w.end_generation();
+    packed(&run(cfg, mem.clone()).unwrap());
+    w.c.execute("UPDATE t SET v = 'small' WHERE id = 7", &[])
+        .unwrap();
+    w.end_generation();
+    w
+}
+
+fn copy_size(cfg: &Config) -> u64 {
+    fs::metadata(cfg.pack_directory().join(COPY_DIR).join(DB_FILE))
+        .unwrap()
+        .len()
+}
+
+/// A kept copy that passes its checks is applied in place: the disk check counts only the
+/// log (twice its images plus 10%), not a second whole file. On a disk with only the pack
+/// size plus 10% in all (so a tenth of the pack free beside the copy), the run uses the copy
+/// and packs. With almost no free byte beside the copy it fails at `disk` and writes nothing
+/// to the bucket.
+#[test]
+fn disk_check_counts_a_usable_kept_copy_as_free() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = big_copy(&mem, &cfg);
+    let s = copy_size(&cfg);
+    let r = {
+        let _disk = FreeDiskForTest::disk_of(s + s / 10);
+        run(&cfg, mem.clone()).unwrap()
+    };
+    packed(&r);
+    assert_eq!(source_of(&r), KEPT);
+    assert_copy_is_the_pack(&cfg, &*mem);
+
+    w.c.execute("UPDATE t SET v = 'again' WHERE id = 9", &[])
+        .unwrap();
+    w.end_generation();
+    let s = copy_size(&cfg);
+    let before = (pointer_of(&*mem), packs(&*mem));
+    let hs = HookStore::new(mem.clone());
+    let r = {
+        let _disk = FreeDiskForTest::disk_of(s + 1024);
+        run(&cfg, hs.clone()).unwrap()
+    };
+    failed_at(&r, "disk");
+    assert!(
+        r.error.as_deref().is_some_and(|e| e.contains("free")),
+        "{r:?}"
+    );
+    assert!(
+        !hs.calls().iter().any(|c| c.starts_with("put")),
+        "{:?}",
+        hs.calls()
+    );
+    assert_eq!((pointer_of(&*mem), packs(&*mem)), before);
+    w.crash();
+}
+
+/// Break the kept copy of `cfg` in the way `reason` names.
+fn break_copy(cfg: &Config, reason: DownloadReason) {
+    let dir = cfg.pack_directory().join(COPY_DIR);
+    match reason {
+        DownloadReason::CheckFailed => {
+            let mut b = fs::read(dir.join(DB_FILE)).unwrap();
+            let at = b.len() - 2000;
+            b[at] ^= 0x5a;
+            fs::write(dir.join(DB_FILE), &b).unwrap();
+        }
+        DownloadReason::Applying => {
+            let st = fs::read_to_string(dir.join(kept::STATE_FILE)).unwrap();
+            let st = st.replace("\"applying\":false", "\"applying\":true");
+            fs::write(dir.join(kept::STATE_FILE), st).unwrap();
+        }
+        DownloadReason::Moved => {
+            let st = fs::read_to_string(dir.join(kept::STATE_FILE)).unwrap();
+            let st = st.replace("/pack/", "/pack/9");
+            fs::write(dir.join(kept::STATE_FILE), st).unwrap();
+        }
+        r => panic!("{r:?}"),
+    }
+}
+
+/// A kept copy that fails its checks (`check_failed`, `moved`, `applying`) is deleted before
+/// the download starts: at the first range GET the pack directory holds only the new file, so
+/// the copy's space is free, and a disk of the pack size plus 10% in all is enough. A disk
+/// one byte smaller than that fails at `disk` before any range GET.
+#[test]
+fn a_kept_copy_that_fails_its_checks_is_deleted_before_the_download() {
+    for reason in [
+        DownloadReason::CheckFailed,
+        DownloadReason::Moved,
+        DownloadReason::Applying,
+    ] {
+        let mem = Arc::new(MemStore::new());
+        let t = tempdir();
+        let cfg = packer(&t);
+        let w = big_copy(&mem, &cfg);
+        let p = pointer_of(&*mem).unwrap();
+        break_copy(&cfg, reason);
+        let hs = HookStore::new(mem.clone());
+        let at_first_range = Arc::new(Mutex::new(None));
+        let (seen, dir) = (at_first_range.clone(), cfg.pack_directory());
+        hs.set_hook(move |op, _, _| {
+            let mut seen = seen.lock().unwrap();
+            if op == "get_range" && seen.is_none() {
+                let copy = dir.join(COPY_DIR);
+                *seen = Some((bytes_under(&dir), copy.join(kept::STATE_FILE).exists()));
+            }
+            Reply::Pass
+        });
+        let r = {
+            let _disk = FreeDiskForTest::disk_of(p.size + p.size / 10);
+            run(&cfg, hs.clone()).unwrap()
+        };
+        packed(&r);
+        assert_eq!(source_of(&r), downloaded(reason));
+        // The new file only (it is made at its full size before the first range).
+        assert_eq!(
+            *at_first_range.lock().unwrap(),
+            Some((p.size, false)),
+            "{reason:?}"
+        );
+        assert_copy_is_the_pack(&cfg, &*mem);
+
+        // Once more with a disk one byte short: `disk`, and no download.
+        w.insert(5000..=5000);
+        w.end_generation();
+        let p = pointer_of(&*mem).unwrap();
+        break_copy(&cfg, reason);
+        let hs = HookStore::new(mem.clone());
+        let r = {
+            let _disk = FreeDiskForTest::disk_of(p.size + p.size / 10 - 1);
+            run(&cfg, hs.clone()).unwrap()
+        };
+        failed_at(&r, "disk");
+        assert_eq!(source_of(&r), downloaded(reason));
+        assert!(!hs.calls().iter().any(|c| c.starts_with("get_range")));
+        assert!(!hs.calls().iter().any(|c| c.starts_with("put")));
+        w.crash();
+    }
+}
+
+/// What is left in the pack directory of `cfg`, the lock of the kept copy left out.
+fn left_in_pack_dir(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(cfg.pack_directory()).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == COPY_DIR {
+            for f in fs::read_dir(e.path()).unwrap().flatten() {
+                let f = f.file_name().to_string_lossy().to_string();
+                if f != kept::LOCK_FILE {
+                    out.push(format!("{COPY_DIR}/{f}"));
+                }
+            }
+        } else {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// A download that fails part way (a range GET fails, a close comes, or a panic) leaves no
+/// partial file: not in `pack-copy/` (the run holds the lock) and not as a `pack-work-*`
+/// entry (another run holds it).
+#[test]
+fn a_download_that_fails_part_way_leaves_no_partial_file() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Fault {
+        Error,
+        Close,
+        Panic,
+    }
+    for locked in [false, true] {
+        for fault in [Fault::Error, Fault::Close, Fault::Panic] {
+            let mem = Arc::new(MemStore::new());
+            let t = tempdir();
+            let mut cfg = packer(&t);
+            cfg.retry_deadline = Duration::from_millis(100);
+            let w = big_copy(&mem, &cfg);
+            break_copy(&cfg, DownloadReason::CheckFailed);
+            let lock = locked.then(|| CopyLock::try_take(&cfg.pack_directory()).unwrap().unwrap());
+            let hs = HookStore::new(mem.clone());
+            let stop = Arc::new(AtomicBool::new(false));
+            let s = stop.clone();
+            hs.set_hook(move |op, _, _| {
+                if op != "get_range" {
+                    return Reply::Pass;
+                }
+                match fault {
+                    Fault::Error => Reply::Transient,
+                    Fault::Close => {
+                        s.store(true, SeqCst);
+                        Reply::Transient
+                    }
+                    Fault::Panic => panic!("a fault in the download (test)"),
+                }
+            });
+            let (_, clock) = fake_clock();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pack_run_in(&cfg, hs.clone(), clock, &stop, 0, None)
+            }));
+            match (fault, &r) {
+                (Fault::Error, Ok(Err(_))) | (Fault::Panic, Err(_)) => {}
+                (Fault::Close, Ok(Ok(rep))) => {
+                    failed_at(rep, CLOSED_STEP);
+                }
+                _ => panic!(
+                    "{fault:?} locked={locked}: {:?}",
+                    r.as_ref().map(|r| r.is_ok())
+                ),
+            }
+            let left = left_in_pack_dir(&cfg);
+            if locked {
+                // The other run's copy is untouched; no working entry is left.
+                assert!(
+                    left.iter().all(|n| !n.starts_with(WORK_DIR_PREFIX)),
+                    "{fault:?}: {left:?}"
+                );
+                assert!(left.contains(&format!("{COPY_DIR}/{DB_FILE}")), "{left:?}");
+            } else {
+                assert!(left.is_empty(), "{fault:?}: {left:?}");
+            }
+            drop(lock);
+            w.crash();
+        }
+    }
+}
+
+/// A run that ends with an error still carries `buckwal.pack.source` and `.reason`: an apply
+/// error over the kept copy, and a block that fails its code in a download after
+/// `check_failed`.
+#[test]
+fn a_run_that_errs_carries_its_source_and_reason() {
+    use crate::telemetry::testing::Capture;
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    w.insert(7..=8);
+    w.end_generation();
+    let cap = Capture::new();
+    let r = tracing::subscriber::with_default(cap.subscriber(), || {
+        let _crash = CrashAfterApplyForTest::set();
+        run(&cfg, mem.clone())
+    });
+    assert!(r.is_err(), "{r:?}");
+    let spans = cap.spans();
+    let s = spans.last_named("buckwal.pack");
+    assert_eq!(s.field("buckwal.outcome"), Some("failed"));
+    assert_eq!(s.field("buckwal.pack.source"), Some("kept"));
+    assert_eq!(s.field("buckwal.pack.reason"), Some("none"));
+
+    // A good copy again, then a changed block, and a pack in the bucket with a changed byte.
+    let t = tempdir();
+    let cfg = packer(&t);
+    packed(&run(&cfg, mem.clone()).unwrap());
+    w.insert(9..=9);
+    w.end_generation();
+    break_copy(&cfg, DownloadReason::CheckFailed);
+    let p = pointer_of(&*mem).unwrap();
+    let mut body = mem.get(&p.pack_key).unwrap().unwrap().body;
+    body[100] ^= 1;
+    mem.put(&p.pack_key, &body).unwrap();
+    let r = tracing::subscriber::with_default(cap.subscriber(), || run(&cfg, mem.clone()));
+    assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
+    let spans = cap.spans();
+    let s = spans.last_named("buckwal.pack");
+    // A plaintext pack fails its SHA-256: `Corrupt`, outcome `failed` at step `error`.
+    assert_eq!(s.field("buckwal.outcome"), Some("failed"));
+    assert_eq!(s.field("buckwal.pack.failed_step"), Some("error"));
+    assert_eq!(s.field("buckwal.pack.source"), Some("downloaded"));
+    assert_eq!(s.field("buckwal.pack.reason"), Some("check_failed"));
+    w.crash();
 }

@@ -238,7 +238,12 @@ pub struct Config {
     /// `dir`, the writer's directory for the packer thread and the `--dir` of `buckwal
     /// packer`. A set one must be a directory, or one the writer's open and a pack run can
     /// make (`Config` otherwise). Put it on a fast local disk when `dir` is on a network file
-    /// system.
+    /// system. The kept copy (about one database size) stays on that disk for good, between
+    /// runs and after the writer closes; a run also needs the pack's size plus 10% free while
+    /// it downloads. One pack directory serves one database: two databases on one pack
+    /// directory share one kept copy, and each run of one deletes the other's copy (`moved`).
+    /// A pack directory inside `dir` works: a takeover and a restore leave `pack-copy/` and
+    /// `pack-work-*` alone.
     pub pack_dir: Option<PathBuf>,
     /// A test hook, not part of the supported API (hidden from the docs): how often the
     /// packer checks whether a pack run is due (`defaults::PACK_CHECK_INTERVAL`). Above 0.

@@ -95,10 +95,10 @@ pub struct PackReport {
     /// With `Failed`, the error behind it, when there is one (the store's error code and
     /// request id, never a response body or a secret).
     pub error: Option<String>,
-    /// Where the run got the file it applied the log to (`buckwal.pack.source` and
-    /// `buckwal.pack.reason`). `None` when the run held the lock of its kept copy and applied
-    /// nothing (`nothing_to_do`, or a failure before the apply); a run without the lock always
-    /// has `Downloaded(Locked)`.
+    /// Where the run got (or would get) the file it applies the log to (`buckwal.pack.source`
+    /// and `buckwal.pack.reason`). Every report has it: a run without the lock has
+    /// `Downloaded(Locked)`, and a run with the lock decides it before its free disk check,
+    /// also when it then finds nothing to do.
     pub source: Option<super::kept::PackSource>,
     pub elapsed: Duration,
 }
@@ -349,7 +349,11 @@ pub(crate) fn pack_run(
 /// gives the size of its local database file. `buckwal pack` and `buckwal packer` give none,
 /// and their first pack is not checked (a known gap: the log sizes are not listed by the
 /// run). If the disk is short, the run ends as `Failed` at the step `disk` and changes
-/// nothing in the bucket. As every `Failed` run, it deletes its kept copy.
+/// nothing in the bucket. As every `Failed` run, it deletes its kept copy. A run that holds
+/// the lock first decides whether it uses its kept copy, and deletes a copy it cannot use, so
+/// the copy's space is free when it is measured. A copy that it uses is applied in place: no
+/// check of a whole pack, but before each generation the room for the log (`apply_room`:
+/// twice the generation's images, plus 10%).
 ///
 /// The run counts its own bytes (`CountingStore`): other traffic on the same store (the
 /// writer's commits) is not in `bytes_down` and `bytes_up`.
@@ -357,7 +361,11 @@ pub(crate) fn pack_run(
 /// The span (spec "Observability"): `buckwal.pack.generation`, `buckwal.pack.key`,
 /// `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
 /// `buckwal.pack.free_page_share`, `buckwal.pack.source` and `buckwal.pack.reason` (where the
-/// run got its file: [`PackSource`]; not on a run that returns `Err`), the time of each step
+/// run got its file: [`PackSource`]; recorded as soon as the run knows it, so a run that ends
+/// with an error after that has them too; a run without the lock knows it at its start, a
+/// run with the lock once it read the pointer and checked the copy, before the free disk
+/// check; only a run that fails before that, at the head, the pointer or the codes GET, has
+/// none), the time of each step
 /// (`buckwal.pack.read_ms`, `buckwal.pack.apply_ms`, `buckwal.pack.upload_ms`, `buckwal.pack.verify_ms`,
 /// `buckwal.pack.publish_ms`; only the steps the run made), `buckwal.elapsed_ms`,
 /// `buckwal.pack.failures`, `buckwal.outcome` (`packed`, `nothing_to_do`, `superseded` or
@@ -432,9 +440,8 @@ fn record_report(span: &tracing::Span, r: &PackReport) {
     span.record("buckwal.pack.bytes_up", r.bytes_up);
     span.record("buckwal.pack.size", r.pack_size);
     span.record("buckwal.pack.free_page_share", r.free_page_share);
-    if let Some(src) = &r.source {
-        span.record("buckwal.pack.source", src.as_str());
-        span.record("buckwal.pack.reason", src.reason());
+    if let Some(src) = r.source {
+        record_source(span, src);
     }
     for (name, t) in &r.step_times {
         let field = match *name {
@@ -510,7 +517,11 @@ fn pack_run_inner(
         kept,
         source,
         touched: false,
+        span: tracing::Span::current(),
     };
+    if let Some(src) = run.source {
+        record_source(&run.span, src);
+    }
     let start = Instant::now();
     let ran = run.run(config)?;
     let report = PackReport {
@@ -546,8 +557,14 @@ pub(crate) const CLOSED_STEP: &str = "closed";
 /// `f_bavail × f_frsize`).
 pub(crate) fn free_disk(dir: &Path) -> Result<u64> {
     #[cfg(test)]
-    if let Some(n) = FREE_DISK.with(|f| f.get()) {
-        return Ok(n);
+    match FREE_DISK.with(|f| f.get()) {
+        Some(FreeDisk::Fixed(n)) => return Ok(n),
+        // `dir` is a run's working directory: its parent is the pack directory.
+        Some(FreeDisk::DiskOf(total)) => {
+            let used = bytes_under(dir.parent().unwrap_or(dir));
+            return Ok(total.saturating_sub(used));
+        }
+        None => {}
     }
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
@@ -568,18 +585,51 @@ pub(crate) fn free_disk(dir: &Path) -> Result<u64> {
 }
 
 #[cfg(test)]
-thread_local! {
-    static FREE_DISK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+#[derive(Clone, Copy)]
+enum FreeDisk {
+    /// This many bytes, whatever the files.
+    Fixed(u64),
+    /// A disk of this many bytes that holds only the pack directory: the free bytes are the
+    /// total less the files under the pack directory now.
+    DiskOf(u64),
 }
 
-/// Tests only: while alive, `free_disk` on this thread answers this many bytes.
+#[cfg(test)]
+thread_local! {
+    static FREE_DISK: std::cell::Cell<Option<FreeDisk>> = const { std::cell::Cell::new(None) };
+}
+
+/// The bytes of the files under `dir`, at any depth.
+#[cfg(test)]
+pub(crate) fn bytes_under(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => bytes_under(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// Tests only: while alive, `free_disk` on this thread answers as set.
 #[cfg(test)]
 pub(crate) struct FreeDiskForTest;
 
 #[cfg(test)]
 impl FreeDiskForTest {
+    /// This many bytes free.
     pub(crate) fn set(n: u64) -> FreeDiskForTest {
-        FREE_DISK.with(|f| f.set(Some(n)));
+        FREE_DISK.with(|f| f.set(Some(FreeDisk::Fixed(n))));
+        FreeDiskForTest
+    }
+
+    /// A disk of `total` bytes that holds the pack directory and nothing else.
+    pub(crate) fn disk_of(total: u64) -> FreeDiskForTest {
+        FREE_DISK.with(|f| f.set(Some(FreeDisk::DiskOf(total))));
         FreeDiskForTest
     }
 }
@@ -594,6 +644,16 @@ impl Drop for FreeDiskForTest {
 #[cfg(test)]
 thread_local! {
     static CRASH_AFTER_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a test asks a run to stop as a crash of the process would: no clean-up of the kept
+/// copy (`CrashAfterApplyForTest`). Always false outside tests.
+pub(crate) fn crash_simulated() -> bool {
+    #[cfg(test)]
+    if CRASH_AFTER_APPLY.with(|f| f.get()) {
+        return true;
+    }
+    false
 }
 
 /// Tests only: while alive, a run on this thread that applies in place stops with an error
@@ -853,6 +913,8 @@ struct Run<'a> {
     source: Option<PackSource>,
     /// The run set the `applying` flag of the kept copy.
     touched: bool,
+    /// The run's `buckwal.pack` span.
+    span: tracing::Span,
 }
 
 /// What `pack-latest` holds, for a run.
@@ -888,7 +950,28 @@ fn failed(step: &str, key: Option<&str>) -> PackOutcome {
     }
 }
 
+/// The free bytes an in-place apply of one generation needs: the `-wal` (and `app.db-log`)
+/// images are written next to `app.db`, and the checkpoint can grow `app.db` by as much before
+/// the TRUNCATE empties them, so twice the images, plus 10%.
+fn apply_room(images: &Images) -> u64 {
+    let n = (images.wal.len() as u64).saturating_add(images.log.len() as u64);
+    let twice = n.saturating_mul(2);
+    twice.saturating_add(twice / 10)
+}
+
+/// `buckwal.pack.source` and `buckwal.pack.reason` on `span`.
+fn record_source(span: &tracing::Span, src: PackSource) {
+    span.record("buckwal.pack.source", src.as_str());
+    span.record("buckwal.pack.reason", src.reason());
+}
+
 impl Run<'_> {
+    /// The run's source, also on its span at once, so a run that ends with an error has it.
+    fn set_source(&mut self, src: PackSource) {
+        self.source = Some(src);
+        record_source(&self.span, src);
+    }
+
     /// End the current step as `name` and start the next.
     fn step(&mut self, name: &'static str) {
         let now = Instant::now();
@@ -918,9 +1001,9 @@ impl Run<'_> {
 
     /// The steps, then the end of the kept copy: a run whose pack the pointer names keeps the
     /// file as the copy of that pack; a run that ends without moving the pointer (`failed`,
-    /// `superseded`, or `nothing_to_do` after it changed the file) deletes the copy. An `Err`
-    /// leaves it as it is: when the run changed the file, the `applying` flag stays on, and
-    /// the next run downloads.
+    /// `superseded`, or `nothing_to_do` after it changed the file) deletes the copy. After an
+    /// `Err` (or a panic), the drop of a dirty `KeptCopy` deletes it; an unchanged copy stays.
+    /// Only a crash of the process leaves a changed file, with the `applying` flag on.
     fn run(&mut self, config: &Config) -> Result<Ran> {
         let ran = self.run_steps(config)?;
         let Some(kept) = &self.kept else {
@@ -974,10 +1057,40 @@ impl Run<'_> {
             ));
         }
         let from = base.as_ref().map_or(1, |p| p.pack_generation);
+        let current = base.as_ref().map_or(0, |p| p.pack_generation);
+        // Step 3 starts with the source: the kept copy, or a download. A copy that cannot be
+        // used is deleted now, before the free disk is measured and before any download, so
+        // the disk never holds the copy and a downloaded pack at once.
+        let codes = match &base {
+            Some(p) => fetch_codes(self.store, &self.keys, &self.retry, p)?,
+            None => None,
+        };
+        let held = self.kept.as_ref().map(|k| match &base {
+            Some(p) => k.source_for(p, &self.keys, codes.as_ref()),
+            None => PackSource::Downloaded(DownloadReason::None),
+        });
+        if let Some(src) = held {
+            self.set_source(src);
+        }
+        if let (Some(k), Some(src)) = (&self.kept, held) {
+            if src == PackSource::Kept {
+                k.tidy()?;
+            } else {
+                k.clear()?;
+            }
+        }
+        let src = self
+            .source
+            .expect("a run without the lock has its source from its start");
         self.step("read");
-        let size = base.as_ref().map(|p| p.size).or(self.first_pack_estimate);
+        // Free disk first (spec rev 21), before any download: the pack's size plus 10%. A
+        // kept copy that is used is applied in place, so it needs only room for the log:
+        // that is checked before each generation's apply (`apply_room`).
+        let size = match src {
+            PackSource::Kept => None,
+            _ => base.as_ref().map(|p| p.size).or(self.first_pack_estimate),
+        };
         if let Some(size) = size {
-            // Free disk first (spec rev 21): the pack's size plus 10%, before any download.
             let need = size.saturating_add(size / 10);
             let free = free_disk(&self.work)?;
             if free < need {
@@ -985,7 +1098,6 @@ impl Run<'_> {
                     "free disk: {free} bytes free in {}, a pack run needs {need} (the pack's size plus 10%)",
                     self.work.display()
                 ));
-                let current = base.as_ref().map_or(0, |p| p.pack_generation);
                 return Ok(Ran::without_pack(failed("disk", None), current));
             }
         }
@@ -1001,6 +1113,7 @@ impl Run<'_> {
         let db = self.work.join(DB_FILE);
         let mut base_ready = false;
         let mut gone: Option<String> = None;
+        let mut short: Option<String> = None;
         let mut applied = 0u64;
         let (work, enc, store, keys, retry, stop) = (
             &self.work,
@@ -1010,10 +1123,9 @@ impl Run<'_> {
             &self.retry,
             self.stop,
         );
-        let (kept, source, touched) = (&self.kept, &mut self.source, &mut self.touched);
-        let current = base.as_ref().map_or(0, |p| p.pack_generation);
+        let (kept, touched) = (&self.kept, &mut self.touched);
         let scanned = scan_generations(&reader, from, &head, &mut |e, records| {
-            if gone.is_some() {
+            if gone.is_some() || short.is_some() {
                 return Ok(());
             }
             if stop.load(Relaxed) {
@@ -1021,29 +1133,16 @@ impl Run<'_> {
             }
             if !base_ready {
                 base_ready = true;
-                let codes = match &base {
-                    Some(p) => fetch_codes(store, keys, retry, p)?,
-                    None => None,
-                };
-                let src = match (&base, kept) {
-                    (Some(p), Some(k)) => k.source_for(p, keys, codes.as_ref()),
-                    (None, Some(_)) => PackSource::Downloaded(DownloadReason::None),
-                    (_, None) => PackSource::Downloaded(DownloadReason::Locked),
-                };
-                *source = Some(src);
-                if let Some(k) = kept {
-                    if src == PackSource::Kept {
-                        k.tidy()?;
-                    } else {
-                        k.clear()?;
-                    }
-                }
                 if let Some(p) = &base {
                     if src != PackSource::Kept {
                         let Some(codes) = &codes else {
                             gone = Some(p.pack_key.clone());
                             return Ok(());
                         };
+                        if let Some(k) = kept {
+                            // A drop from here on deletes the partial file.
+                            k.mark_dirty();
+                        }
                         if !download_pack(store, keys, retry, p, codes, &db, stop)? {
                             gone = Some(p.pack_key.clone());
                             return Ok(());
@@ -1058,6 +1157,17 @@ impl Run<'_> {
                 }
             }
             let images = replay_ended(records, &head, e.generation)?;
+            if src == PackSource::Kept {
+                let (free, need) = (free_disk(work)?, apply_room(&images));
+                if free < need {
+                    short = Some(format!(
+                        "free disk: {free} bytes free in {}, the in-place apply of log/{} needs {need} (twice its images plus 10%)",
+                        work.display(),
+                        e.generation
+                    ));
+                    return Ok(());
+                }
+            }
             apply_images_over(work, &images, &head, enc, None)?;
             applied += 1;
             #[cfg(test)]
@@ -1079,6 +1189,10 @@ impl Run<'_> {
                 failed("log_incomplete", Some(&key)),
                 current,
             ));
+        }
+        if let Some(m) = short {
+            self.error = Some(m);
+            return Ok(Ran::without_pack(failed("disk", None), current));
         }
         if let Some(key) = gone {
             // A newer pack replaced it and GC deleted it: the next run reads the new pointer.

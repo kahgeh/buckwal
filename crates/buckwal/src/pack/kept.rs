@@ -14,7 +14,8 @@
 //! size with each 1 MiB block matching the pack's codes ([`KeptCopy::source_for`]). Else it
 //! deletes the copy and downloads the pack. It sets the flag and fsyncs the state file before
 //! it changes the file ([`KeptCopy::set_applying`]); when its pack is the pointer's, it writes
-//! the new pack into the state and clears the flag ([`KeptCopy::keep`]).
+//! the new pack into the state and clears the flag ([`KeptCopy::keep`]). A run that ends in any
+//! other way deletes the copy (a drop of a dirty `KeptCopy` included).
 use super::codes::{PackCodes, BLOCK_SIZE};
 use super::PackPointer;
 use crate::error::{Error, Result};
@@ -27,6 +28,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, LazyLock, Mutex};
 use turso_core::{OpenFlags, PlatformIO, IO};
 
@@ -218,14 +220,38 @@ impl Drop for CopyLock {
     }
 }
 
-/// The kept copy of a run that holds its lock.
+/// The kept copy of a run that holds its lock. While `app.db` is not the pack the state file
+/// names (a download in progress, or the flag on), the copy is *dirty*: a drop of a dirty copy
+/// (an error, a close or a panic of the run) deletes it, so no partial file stays on the disk.
+/// Only a crash of the process leaves one, and then the `applying` flag, or a missing state
+/// file, makes the next run delete it and download.
 pub(crate) struct KeptCopy {
     lock: CopyLock,
+    dirty: AtomicBool,
+}
+
+impl Drop for KeptCopy {
+    fn drop(&mut self) {
+        if !self.dirty.load(SeqCst) || super::run::crash_simulated() {
+            return;
+        }
+        if let Err(e) = self.clear() {
+            tracing::warn!(target: "buckwal", error = %e, "pack run: cannot delete its unfinished kept copy");
+        }
+    }
 }
 
 impl KeptCopy {
     pub(crate) fn new(lock: CopyLock) -> KeptCopy {
-        KeptCopy { lock }
+        KeptCopy {
+            lock,
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    /// A download into `app.db` starts: the copy is dirty until `keep` or `clear`.
+    pub(crate) fn mark_dirty(&self) {
+        self.dirty.store(true, SeqCst);
     }
 
     /// `pack-copy/`: the run applies the log to `app.db` in it.
@@ -270,6 +296,7 @@ impl KeptCopy {
 
     /// Delete the copy: the state file first, then every other entry but the lock.
     pub(crate) fn clear(&self) -> Result<()> {
+        self.dirty.store(false, SeqCst);
         let dir = self.dir();
         match fs::remove_file(dir.join(STATE_FILE)) {
             Ok(()) => fsync_dir(dir)?,
@@ -311,6 +338,7 @@ impl KeptCopy {
     /// Set the `applying` flag, and fsync the state file, before the run changes `app.db`.
     /// `base` is the pack the file equals now (`None` for a first pack).
     pub(crate) fn set_applying(&self, base: Option<&PackPointer>) -> Result<()> {
+        self.mark_dirty();
         self.write_state(&CopyState {
             pack: base.map(CopyPack::of),
             applying: true,
@@ -323,7 +351,9 @@ impl KeptCopy {
         self.write_state(&CopyState {
             pack: Some(pack),
             applying: false,
-        })
+        })?;
+        self.dirty.store(false, SeqCst);
+        Ok(())
     }
 
     fn write_state(&self, s: &CopyState) -> Result<()> {

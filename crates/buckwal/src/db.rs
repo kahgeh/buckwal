@@ -334,6 +334,8 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     if !read_only {
         // A `BUCKWAL_PACK_DIR` that cannot work fails the open before any bucket request.
         config.prepare_pack_dir()?;
+        // Without the lock of the kept copy: safe by the age rule. A live run's working
+        // entry is younger than half the orphan grace, so only a crashed run's goes.
         crate::pack::run::sweep_work_dirs(&config);
     }
     let local = LocalState::read(&dir)?;
