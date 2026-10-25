@@ -1669,6 +1669,37 @@ mod packer_format {
         assert_eq!(Keys::new("").pack_pointer(), "pack-latest");
     }
 
+    /// Spec rev 8: `pack-latest` holds the pack key and the codes key relative to the prefix,
+    /// and the pointer's code binds those relative keys. So the same bytes decode at another
+    /// prefix (a whole database copied there), to the keys under that prefix.
+    #[test]
+    fn a_pointer_stores_its_keys_relative_to_the_prefix() {
+        for coded_bucket in [false, true] {
+            let (k, p) = if coded_bucket {
+                coded_with_id()
+            } else {
+                let k = Keys::new("p");
+                let p = pointer(&k, None);
+                (k, p)
+            };
+            let body = k.encode_pointer(&p);
+            let text = String::from_utf8(body.clone()).unwrap();
+            assert!(
+                text.contains("\"pack_key\":\"pack/0000000015/run1\"")
+                    && text.contains("\"codes_key\":\"pack/0000000015/run1.codes\""),
+                "{text}"
+            );
+            assert!(!text.contains("p/pack"), "{text}");
+            assert_eq!(k.decode_pointer(&body).unwrap(), p, "full keys in memory");
+            let z = k.at_prefix("z/y");
+            let q = z.decode_pointer(&body).unwrap();
+            assert_eq!(
+                (q.pack_key.as_str(), q.codes_key.as_str()),
+                ("z/y/pack/0000000015/run1", "z/y/pack/0000000015/run1.codes")
+            );
+        }
+    }
+
     #[test]
     fn a_plain_pointer_round_trips_without_a_code() {
         let k = Keys::new("p");

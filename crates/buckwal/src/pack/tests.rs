@@ -61,6 +61,30 @@ fn a_block_of_one_mib_verifies() {
     });
 }
 
+/// Spec rev 8: the block codes and the codes object's own code bind the pack key relative to
+/// the prefix. A pack and its codes copied to another prefix verify there; moved to another
+/// relative key they fail.
+#[test]
+fn codes_bind_the_pack_key_relative_to_the_prefix() {
+    each(|k| {
+        let d = data();
+        let total = d.len() as u64;
+        let body = built(k, &d)
+            .encode(k, "p/pack/0000000015/r1", 15, total)
+            .unwrap();
+        let z = k.at_prefix("z");
+        let c = PackCodes::decode(&z, &body, "z/pack/0000000015/r1", 15, total).unwrap();
+        for (n, b) in blocks(&d).into_iter().enumerate() {
+            c.verify_block(&z, "z/pack/0000000015/r1", 15, total, n as u64, b)
+                .unwrap();
+        }
+        assert!(PackCodes::decode(k, &body, "p/pack/0000000015/r2", 15, total).is_err());
+        let c = PackCodes::decode(k, &body, "p/pack/0000000015/r1", 15, total).unwrap();
+        let moved = c.verify_block(k, "p/pack/0000000015/r2", 15, total, 0, blocks(&d)[0]);
+        assert!(matches!(moved, Err(Error::Corrupt(_))), "{moved:?}");
+    });
+}
+
 #[test]
 fn a_changed_byte_fails() {
     each(|k| {

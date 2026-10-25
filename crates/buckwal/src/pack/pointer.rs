@@ -1,5 +1,8 @@
-//! `pack-latest`: flat JSON that names the newest pack. In an encrypted bucket it also carries
-//! an integrity code over the pack key, the codes key, the size and the pack generation.
+//! `pack-latest`: flat JSON that names the newest pack. The pack key and the codes key are
+//! stored relative to the database's prefix (`pack/0000000015/<run id>`, spec rev 8), so a
+//! database copied with its head to another prefix still names its pack;
+//! `Keys::encode_pointer` and `Keys::decode_pointer` convert. In an encrypted bucket it also
+//! carries an integrity code over every field.
 use crate::error::{Error, Result};
 use crate::format::json::{escape, Obj};
 

@@ -83,7 +83,12 @@ fn bucket_image(store: &dyn ObjectStore) -> BucketImage {
                 .unwrap()
                 .0;
             if p.pack_generation == head.generation {
-                db = store.get(&p.pack_key).unwrap().unwrap().body;
+                // The key is relative to the prefix.
+                db = store
+                    .get(&format!("{PREFIX}/{}", p.pack_key))
+                    .unwrap()
+                    .unwrap()
+                    .body;
             }
         }
     }

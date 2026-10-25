@@ -797,10 +797,10 @@ fn block_read_after_its_pack_was_deleted_takes_the_newer_pack() {
     assert_eq!(text(&one[0][0]), "000300");
     assert_eq!(block_flags(&fresh(&b))[1], 1);
     let pack_file = std::fs::read(fresh(&b).join(PACK_FILE)).unwrap();
+    // The pointer bytes hold the key relative to the prefix.
+    let rel = keys().relative(&new.pack_key).to_string();
     assert!(
-        pack_file
-            .windows(new.pack_key.len())
-            .any(|w| w == new.pack_key.as_bytes()),
+        pack_file.windows(rel.len()).any(|w| w == rel.as_bytes()),
         "app.db-pack does not name the newer pack"
     );
     let want = rows(&cb);

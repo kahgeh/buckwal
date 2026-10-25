@@ -894,6 +894,11 @@ fn an_object_copied_from_another_database_with_the_same_key_fails_its_code() {
     }
 }
 
+/// A whole database with a pack (a pack run after its writer's switch; an MVCC one also has
+/// its first pack) copied with its head to another prefix and to another bucket: it opens
+/// read-only, restores, verifies and a takeover (a restore and a writer's head write) works.
+/// The pointer names the pack relative to the prefix and the codes bind that relative key
+/// (spec rev 8), so nothing in the copy names the old prefix.
 #[test]
 fn a_whole_database_copied_with_its_head_still_opens_and_restores() {
     for mode in MODES {
@@ -901,28 +906,32 @@ fn a_whole_database_copied_with_its_head_still_opens_and_restores() {
         let other_bucket = mem();
         let k = tempdir();
         let _x = writer_at(mode, "x", &store, &k);
+        let packer = tempdir();
+        let mut pc = cfg_for(mode, &packer.path().join("p"), &k);
+        pc.prefix = "x".into();
+        let r = crate::pack::run::pack_with_store(&pc, store.clone()).unwrap();
+        assert_eq!(r.outcome, crate::pack::run::PackOutcome::Packed, "{mode:?}");
         copy_database(&store, "x", &store, "z");
         copy_database(&store, "x", &other_bucket, "x");
         let hex = key_hex();
         for (dst, prefix) in [(&store, "z"), (&other_bucket, "x")] {
-            for r in [Reader::ReadOnly, Reader::Restore, Reader::Verify] {
-                let read = read_at(r, mode, prefix, dst, &k, &hex);
-                if matches!(mode, Mode::Mvcc) && prefix == "z" {
-                    // A new MVCC database has a pack from its start, and the pack pointer
-                    // names its pack by its whole key, prefix included (task 3): a copy at
-                    // another prefix is refused. (A WAL database is the same once it has a
-                    // pack; this one has none yet.)
-                    assert!(
-                        matches!(&read, Err(Error::Corrupt(m)) if m.contains("not a pack of this prefix")),
-                        "{mode:?} {prefix} {r:?}: {read:?}"
-                    );
-                    continue;
-                }
-                let rows = read.unwrap_or_else(|e| panic!("{mode:?} {prefix} {r:?}: {e}"));
+            for r in [
+                Reader::ReadOnly,
+                Reader::Restore,
+                Reader::Verify,
+                Reader::Takeover,
+            ] {
+                let rows = read_at(r, mode, prefix, dst, &k, &hex)
+                    .unwrap_or_else(|e| panic!("{mode:?} {prefix} {r:?}: {e}"));
                 if matches!(r, Reader::ReadOnly | Reader::Verify) {
                     assert_eq!(rows, 45, "{mode:?} {prefix} {r:?}");
                 }
             }
+            assert_eq!(
+                read_at(Reader::ReadOnly, mode, prefix, dst, &k, &hex).unwrap(),
+                45,
+                "{mode:?} {prefix}: after the takeover"
+            );
             assert_eq!(
                 head_at(dst, prefix).database_id,
                 head_at(&store, "x").database_id,

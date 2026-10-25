@@ -7,10 +7,16 @@ use crate::pack::pointer::PackPointer;
 use crate::pack::run::{PackOutcome, PackReport};
 use crate::restore::RestoreReport;
 
-/// The pack pointer, decoded without its code (an encrypted bucket's pointer carries one).
+/// The pack pointer, decoded without its code (an encrypted bucket's pointer carries one),
+/// its keys under the prefix (the object holds them relative to it).
 fn pointer(store: &dyn ObjectStore) -> Option<PackPointer> {
     let body = store.get(&keys().pack_pointer()).unwrap()?.body;
-    Some(PackPointer::decode_fields(&body).unwrap().0)
+    let p = PackPointer::decode_fields(&body).unwrap().0;
+    Some(PackPointer {
+        pack_key: format!("{PREFIX}/{}", p.pack_key),
+        codes_key: format!("{PREFIX}/{}", p.codes_key),
+        ..p
+    })
 }
 
 /// The writes `store` saw from event `from` on: every PUT flavour, in order.

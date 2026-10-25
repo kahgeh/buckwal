@@ -132,6 +132,16 @@ impl Keys {
         }
     }
 
+    /// Tests: these keys at another prefix, with the same integrity key and the same known
+    /// database id (a whole database copied to another prefix).
+    #[cfg(test)]
+    pub(crate) fn at_prefix(&self, prefix: &str) -> Self {
+        Keys {
+            prefix: prefix.to_string(),
+            ..self.clone()
+        }
+    }
+
     /// These keys for an encrypted database (`Some`): its objects carry integrity codes.
     pub(crate) fn with_integrity(mut self, ik: Option<IntegrityKey>) -> Self {
         self.integrity = ik.map(Arc::new);
@@ -449,6 +459,13 @@ impl Keys {
     /// The pack pointer's bytes: with an integrity key its fields and their code, made under the
     /// database integrity key (the code covers every field of the pointer).
     pub(crate) fn encode_pointer(&self, p: &PackPointer) -> Vec<u8> {
+        // The object holds the keys relative to the prefix (spec rev 8), and the code binds
+        // them so.
+        let p = &PackPointer {
+            pack_key: self.relative(&p.pack_key).to_string(),
+            codes_key: self.relative(&p.codes_key).to_string(),
+            ..p.clone()
+        };
         let mut out = p.encode_fields();
         if let Some(ik) = self.object_key() {
             let code = integrity::pointer_code(&ik, p);
@@ -461,11 +478,18 @@ impl Keys {
     /// The pack pointer in `body`. In an encrypted bucket its code must verify and its
     /// `database_id` must be this database's, else `Corrupt("integrity: <pointer key>")`; a
     /// pointer without a code or an id is that too. A coded pointer read without a key is
-    /// `Encryption`. In every bucket the pointer must be consistent: `codes_key` is `pack_key`
-    /// plus `.codes`, `pack_key` parses under the prefix and `pack_generation` is its
-    /// generation, else `Corrupt("pack pointer: ...")`.
+    /// `Encryption`. In every bucket the pointer must be consistent: `pack_key` is
+    /// `pack/<generation>/<run id>` relative to the prefix, `codes_key` is it plus `.codes` and
+    /// `pack_generation` is its generation, else `Corrupt("pack pointer: ...")`. The pointer
+    /// returned has its keys under this prefix (the object holds them relative to it, spec
+    /// rev 8), so a database copied with its head to another prefix names its own pack.
     pub(crate) fn decode_pointer(&self, body: &[u8]) -> Result<PackPointer> {
         let (p, code) = PackPointer::decode_fields(body)?;
+        let full = |p: PackPointer| PackPointer {
+            pack_key: self.join(&p.pack_key),
+            codes_key: self.join(&p.codes_key),
+            ..p
+        };
         let key = self.pack_pointer();
         let Some(ik) = self.object_key() else {
             if code.is_some() {
@@ -473,6 +497,7 @@ impl Keys {
                     "{key} is an encrypted database's: set BUCKWAL_ENCRYPTION_KEY_FILE"
                 )));
             }
+            let p = full(p);
             self.check_pointer_fields(&p)?;
             return Ok(p);
         };
@@ -487,8 +512,14 @@ impl Keys {
         if !ok {
             return Err(fail());
         }
+        let p = full(p);
         self.check_pointer_fields(&p)?;
         Ok(p)
+    }
+
+    /// `key` relative to the prefix (unchanged when it is not under it).
+    pub(crate) fn relative<'k>(&self, key: &'k str) -> &'k str {
+        self.strip(key).unwrap_or(key)
     }
 
     /// The database id these keys know (a format 4 or 5 head read or made).
@@ -503,7 +534,7 @@ impl Keys {
     fn check_pointer_fields(&self, p: &PackPointer) -> Result<()> {
         let bad = |m: &str| Err(crate::error::Error::Corrupt(format!("pack pointer: {m}")));
         let Some((generation, _)) = self.parse_pack(&p.pack_key) else {
-            return bad("pack_key is not a pack of this prefix");
+            return bad("pack_key is not a pack key (pack/<generation>/<run id>)");
         };
         if p.codes_key != format!("{}.codes", p.pack_key) {
             return bad("codes_key is not pack_key plus .codes");

@@ -1,6 +1,7 @@
 //! The pack codes object: one 32-byte code per 1 MiB block of a pack, then a code over all of
 //! it. In a plaintext bucket a code is a SHA-256. In an encrypted bucket it is an integrity code
-//! under the database integrity key. Each block code covers the database id, the pack key, the
+//! under the database integrity key. Each block code covers the database id, the pack key
+//! (relative to the prefix), the
 //! pack generation, the pack's total size and the block number. The codes object's own code
 //! covers the same, and all block codes.
 use crate::error::{Error, Result};
@@ -44,7 +45,9 @@ impl<'a> Binding<'a> {
         Ok(Binding {
             keys,
             id,
-            pack_key,
+            // Relative to the prefix (spec rev 8): a database copied with its head to another
+            // prefix still verifies its packs.
+            pack_key: keys.relative(pack_key),
             pack_generation,
             total,
         })

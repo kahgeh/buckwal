@@ -3985,6 +3985,13 @@ fn first_pack(store: &dyn ObjectStore) -> (crate::pack::pointer::PackPointer, Ve
     let p = crate::pack::pointer::PackPointer::decode_fields(&body)
         .unwrap()
         .0;
+    // The object holds the keys relative to the prefix (spec rev 8).
+    assert!(p.pack_key.starts_with("pack/"), "{p:?}");
+    let p = crate::pack::pointer::PackPointer {
+        pack_key: format!("{PREFIX}/{}", p.pack_key),
+        codes_key: format!("{PREFIX}/{}", p.codes_key),
+        ..p
+    };
     let pack = store.get(&p.pack_key).unwrap().expect("the pack").body;
     assert_eq!(pack.len() as u64, p.size);
     assert!(store.get(&p.codes_key).unwrap().is_some(), "its codes");
