@@ -22,6 +22,7 @@ use crate::uploader::{op_bytes, Ticket, Uploader};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 use tracing::field::{display, Empty};
 use tracing::{info_span, Span};
 use turso_core::io::FileSyncType;
@@ -67,6 +68,9 @@ fn engine_io(e: turso_core::LimboError) -> Error {
 struct CommitSpans {
     commit: Span,
     local_write: Span,
+    /// The thread that recorded the first op: the commit's own sync runs on it. A sync on
+    /// another thread is a checkpoint's and leaves the ops pending.
+    owner: ThreadId,
 }
 
 impl CommitSpans {
@@ -85,6 +89,7 @@ impl CommitSpans {
         CommitSpans {
             commit,
             local_write,
+            owner: std::thread::current().id(),
         }
     }
 }
@@ -192,6 +197,24 @@ impl ShippingFile {
         (ops, commit)
     }
 
+    /// `take_pending` for a commit's own sync: `None` (the ops stay pending) when they belong
+    /// to a commit on another thread. Such a sync is a checkpoint's (the engine's passive
+    /// checkpoint fsyncs the `-wal` while another connection's commit waits for its own
+    /// fsync). It must not ship the commit's ops: a failed upload would fail the checkpoint,
+    /// and the commit's own sync would then find nothing pending and get Ok.
+    fn take_pending_of_this_thread(&self) -> Option<(Vec<Op>, Option<Span>)> {
+        let owned_elsewhere = self
+            .commit
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.owner != std::thread::current().id());
+        if owned_elsewhere {
+            return None;
+        }
+        Some(self.take_pending())
+    }
+
     /// Hand `ops` to the uploader as one sync uploaded with `b`, with `commit` as its span,
     /// which shows `made_with`: the setting the commit was made with.
     fn submit(&self, commit: &Span, ops: Vec<Op>, b: Batching, made_with: Batching) -> Ticket {
@@ -232,7 +255,9 @@ impl ShippingFile {
     /// fsync does not run). A background commit's span ends with its `local_fsync` and has
     /// no outcome: its record is not in the bucket yet.
     fn ship_commit(&self) -> Result<Option<Span>> {
-        let (ops, span) = self.take_pending();
+        let Some((ops, span)) = self.take_pending_of_this_thread() else {
+            return Ok(None);
+        };
         if ops.is_empty() {
             return Ok(None);
         }
@@ -686,5 +711,38 @@ mod tests {
             a_result.is_err(),
             "A got Ok but its record never reached the bucket"
         );
+    }
+
+    /// A commit with no checkpoint during it: its own sync ships its ops and acks. The ops
+    /// are in the bucket when the sync returns, and a failed upload is an error.
+    #[test]
+    fn own_sync_ships_the_commit_and_a_failed_upload_is_an_error() {
+        use crate::store::FaultStore;
+        let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(fault.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let commit = |f: &ShippingFile| {
+            let mut h = vec![0u8; WAL_HEADER];
+            h[8..12].copy_from_slice(&4096u32.to_be_bytes());
+            let c = f
+                .pwrite(0, Arc::new(Buffer::new(h)), Completion::new_write(|_| {}))
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+            f.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+                .and_then(|c| io.wait_for_completion(c))
+        };
+        let puts = || {
+            fault
+                .events()
+                .iter()
+                .filter(|e| e.starts_with("put_if_absent ") && e.contains("/log/"))
+                .count()
+        };
+        let before = puts();
+        commit(&f).unwrap();
+        assert!(puts() > before, "the sync did not upload its ops");
+        fault.fail_next_puts_permanently(1);
+        assert!(commit(&f).is_err(), "a failed upload returned Ok");
     }
 }
