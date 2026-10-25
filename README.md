@@ -1070,7 +1070,7 @@ Every span and log record also carries `test_run_id` when one is set (`BUCKWAL_T
   - `replica stopped` (ERROR: `generation`, `seq`, and `reason`: `mvcc` for an MVCC record, `integrity` for a failed integrity check, or `corrupt` for any other `Corrupt`, such as a malformed log record; with `key`, the object key, where there is one). A conflict is not a stop: it re-restores.
 - Target `buckwal::notify` (the listener): `notification listener started` (INFO: `addr`, `tls`, `auth`), `notification rejected` (WARN: remote address, reason `no credentials` or `wrong credentials`), `sns subscription confirmed` (INFO: topic ARN), `sns confirmation refused` (WARN: reason, for a `SubscribeURL` off an `sns.<region>.amazonaws.com` host) and `sns confirmation failed` (WARN: `error`, when the fetch failed).
 
-The two WARNs for falling behind and for no notification are log lines, not alerts. The owner of a replica asks three things: is it current, did the notifications reach it, and is it costing too much. Each is a card (a read-only ClickHouse query on `otel.otel_traces`, `ServiceName = 'buckwal'`, `SpanName = 'buckwal.replica.sync'`), and the first two also an alert, built from the spans. You set the alerts up in your own stack. buckwal sends that stack only OTLP, and the queries below are SELECTs only. They use the column names `scripts/otel-check.sh` uses (`Timestamp`, `SpanAttributes`); they were written for this README and not run against a live stack by this change. Optimising: `buckwal.lag_ms` p50 and p95 per replica per day (to tune the slow poll), and the share of notification passes below.
+The two WARNs for falling behind and for no notification are log lines, not alerts. The owner of a replica asks three things: is it current, did the notifications reach it, and is it costing too much. Each is a card (a read-only ClickHouse query on `otel.otel_traces`, `ServiceName = 'buckwal'`, `SpanName = 'buckwal.replica.sync'`), and the first two also an alert, built from the spans. You set the alerts up in your own stack. buckwal sends that stack only OTLP, and the queries below are SELECTs only. They use the column names `scripts/otel-check.sh` uses (`Timestamp`, `SpanAttributes`); `scripts/otel-check.sh` runs every one of them in each test run. They leave out test runs with the `deployment.environment.name` filter, like the commit cards. Optimising: `buckwal.lag_ms` p50 and p95 per replica per day (to tune the slow poll), and the share of notification passes below.
 
 *Card 1: is my replica current?* Max lag per replica over 10 minutes:
 
@@ -1079,6 +1079,7 @@ SELECT SpanAttributes['buckwal.replica_id'] AS replica,
        max(toUInt64OrZero(SpanAttributes['buckwal.lag_ms'])) AS max_lag_ms
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND ResourceAttributes['deployment.environment.name'] != 'test'
   AND Timestamp > now() - INTERVAL 10 MINUTE
 GROUP BY replica ORDER BY max_lag_ms DESC
 ```
@@ -1090,16 +1091,20 @@ GROUP BY replica ORDER BY max_lag_ms DESC
 SELECT SpanAttributes['buckwal.replica_id'] AS replica, max(Timestamp) AS last_pass
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND ResourceAttributes['deployment.environment.name'] != 'test'
   AND Timestamp > now() - INTERVAL 1 DAY
-GROUP BY replica HAVING last_pass < now() - INTERVAL 180 SECOND;
+GROUP BY replica HAVING last_pass < now() - INTERVAL 180 SECOND
+```
 
+```sql
 -- lagging replicas: every pass in the last 10 minutes was above 5 minutes behind
 SELECT SpanAttributes['buckwal.replica_id'] AS replica
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND ResourceAttributes['deployment.environment.name'] != 'test'
   AND Timestamp > now() - INTERVAL 10 MINUTE
 GROUP BY replica
-HAVING min(toUInt64OrZero(SpanAttributes['buckwal.lag_ms'])) > 300000;
+HAVING min(toUInt64OrZero(SpanAttributes['buckwal.lag_ms'])) > 300000
 ```
 
 Card: `buckwal.head_generation` minus `buckwal.generation` per replica (a replica that sits short of the head shows here). Diagnosis: the `buckwal.replica.sync` spans with generation, head generation, seq, trigger and outcome, the `replica skipped a generation` INFO, the `replica fell behind` WARN, and the `buckwal.replica.re_restore` span with its reason.
@@ -1114,6 +1119,7 @@ SELECT SpanAttributes['buckwal.replica_id'] AS replica,
                AND SpanAttributes['buckwal.trigger'] = 'notification') / greatest(new_passes, 1) AS notified_share
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND ResourceAttributes['deployment.environment.name'] != 'test'
   AND Timestamp > now() - INTERVAL 1 DAY
 GROUP BY replica, hour ORDER BY replica, hour
 ```
@@ -1132,6 +1138,7 @@ FROM (
          countIf(SpanAttributes['buckwal.trigger'] = 'notification') AS ever_notified
   FROM otel.otel_traces
   WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+    AND ResourceAttributes['deployment.environment.name'] != 'test'
     AND Timestamp > now() - INTERVAL 7 DAY
   GROUP BY replica
 )
@@ -1149,6 +1156,7 @@ SELECT SpanAttributes['buckwal.replica_id'] AS replica,
        sum(toUInt64OrZero(SpanAttributes['buckwal.lists'])) + sum(toUInt64OrZero(SpanAttributes['buckwal.gets'])) AS requests
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.replica.sync'
+  AND ResourceAttributes['deployment.environment.name'] != 'test'
   AND Timestamp > now() - INTERVAL 1 DAY
 GROUP BY replica, hour ORDER BY replica, hour
 ```

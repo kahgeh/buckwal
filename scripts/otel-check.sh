@@ -18,6 +18,9 @@
 # A WAL `buckwal.commit` of the run carries `buckwal.journal_mode = wal` and ends at or after its
 # `buckwal.ack_wait` child. A background commit (`buckwal.batching` starting `background`) has no
 # ack wait: it ends with its local fsync, so this check leaves it out.
+# Also checked: every `sql` block in README, Telemetry runs in ClickHouse with its
+# `!= 'test'` swapped for `= 'test'`. A query that returns no rows passes: the check proves
+# that the query runs, not that the run made its data. A failure names the README line of the block.
 # The password only ever reaches curl on stdin (`-K -`), never a command line,
 # a file or the output.
 set -euo pipefail
@@ -82,6 +85,47 @@ query() {
   [[ "$code" == 200 ]] || fail "HTTP $code: $(head -c 300 <<<"$OUT" | tr '\n' ' ')"
 }
 
+# Every `sql` block in README, Telemetry, with `!= 'test'` swapped for `= 'test'`, must run.
+# Prints the README line and ClickHouse's error of the first block that does not.
+readme_queries() {
+  local readme line sql="" lineno=0 start=0 count=0 in_section=0 in_block=0 r code body
+  local from="!= 'test'" to="= 'test'"
+  readme="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/README.md"
+  [[ -r "$readme" ]] || fail "README.md not found at $readme"
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    if (( ! in_section )); then
+      [[ "$line" == '## Telemetry' ]] && in_section=1
+      continue
+    fi
+    if (( in_block )); then
+      if [[ "$line" != '```' ]]; then
+        sql+="$line"$'\n'
+        continue
+      fi
+      in_block=0
+      count=$((count + 1))
+      sql=${sql//"$from"/$to}
+      if ! r="$(ch "$sql" 2>&1)"; then
+        fail "README.md:$start: query failed: $(tr '\n' ' ' <<<"$r" | head -c 300)"
+      fi
+      code="$(tail -n 1 <<<"$r")"
+      body="$(sed '$d' <<<"$r")"
+      [[ "$code" == 200 ]] \
+        || fail "README.md:$start: HTTP $code: $(head -c 300 <<<"$body" | tr '\n' ' ')"
+    elif [[ "$line" == '```sql' ]]; then
+      in_block=1
+      start=$lineno
+      sql=""
+    elif [[ "$line" == '## '* ]]; then
+      break
+    fi
+  done < "$readme"
+  (( count > 0 )) || fail "README.md: no sql block in Telemetry"
+  README_QUERIES=$count
+}
+readme_queries
+
 TRACES="FROM otel.otel_traces WHERE ServiceName='buckwal' AND SpanAttributes['test_run_id']='$RUN_ID'"
 LOGS="FROM otel.otel_logs WHERE ServiceName='buckwal' AND LogAttributes['test_run_id']='$RUN_ID'"
 
@@ -136,7 +180,7 @@ while :; do
   [[ "$integrity" -gt 0 ]] || missing="$missing log:integrity-check-failed"
   [[ "$integrity_data" -eq 0 ]] || missing="$missing no-data-in-integrity-records(found $integrity_data)"
   if [[ -z "$missing" && "$logs" -gt 0 && "$untimed" -eq 0 ]]; then
-    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity replica_sync_spans=$replica_sync marked_spans=$marked error_spans=$errors"
+    echo "otel check PASSED: $counts logs=$logs takeover_quiet_spans=$quiet_spans integrity_records=$integrity replica_sync_spans=$replica_sync readme_queries=$README_QUERIES marked_spans=$marked error_spans=$errors"
     exit 0
   fi
   if (( SECONDS - start >= DEADLINE )); then
