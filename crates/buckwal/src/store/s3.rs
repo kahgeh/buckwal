@@ -236,7 +236,19 @@ struct Reply {
     etag: Option<String>,
     last_modified: Option<String>,
     date: Option<String>,
+    /// `x-amz-request-id`: with the error `Code`, the only part of a failure reply that is logged.
+    request_id: Option<String>,
     body: Vec<u8>,
+}
+
+/// What an error reply shows in an error text or a log line: the S3 `Code` and the request
+/// id. The body can hold the access key id and the string to sign, so it is never printed.
+fn error_detail(r: &Reply) -> String {
+    let code = error_code(&r.body).unwrap_or_else(|| "no error code".to_string());
+    match &r.request_id {
+        Some(id) => format!("{code} (request id {id})"),
+        None => code,
+    }
 }
 
 /// Map an unexpected HTTP status to the error class callers act on. A 3xx (redirects are
@@ -246,11 +258,7 @@ fn status_error(what: &str, r: &Reply) -> StoreError {
         300..=399 => " (redirect not followed)",
         _ => "",
     };
-    let msg = format!(
-        "{what}: HTTP {}{note}: {}",
-        r.status,
-        String::from_utf8_lossy(&r.body)
-    );
+    let msg = format!("{what}: HTTP {}{note}: {}", r.status, error_detail(r));
     match r.status {
         408 | 429 | 500..=599 => StoreError::Transient(msg),
         _ => StoreError::Permanent(msg),
@@ -470,28 +478,46 @@ impl S3Store {
         };
         let last_modified = header("last-modified");
         let date = header("date");
+        let request_id = header("x-amz-request-id");
         let body = resp.bytes().map_err(net)?.to_vec();
         Ok(Reply {
             status,
             etag,
             last_modified,
             date,
+            request_id,
             body,
         })
     }
 
-    /// Creates the bucket; an existing bucket we own is fine.
+    /// Creates the bucket; an existing bucket we own is fine. Outside `us-east-1` S3 needs
+    /// the region as the `LocationConstraint`; in `us-east-1` it refuses one.
     pub fn create_bucket(&self) -> crate::Result<()> {
+        let config = (self.cfg.region != "us-east-1").then(|| {
+            format!(
+                "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>",
+                self.cfg.region
+            )
+        });
         let r = self
-            .send("PUT", "", &[], &[], &[])
+            .send(
+                "PUT",
+                "",
+                &[],
+                config.as_deref().unwrap_or("").as_bytes(),
+                &[],
+            )
             .map_err(|e| crate::Error::Bucket(e.to_string()))?;
-        let body = String::from_utf8_lossy(&r.body);
-        if r.status == 200 || (r.status == 409 && body.contains("BucketAlreadyOwnedByYou")) {
+        if r.status == 200
+            || (r.status == 409
+                && error_code(&r.body).as_deref() == Some("BucketAlreadyOwnedByYou"))
+        {
             return Ok(());
         }
         Err(crate::Error::Bucket(format!(
-            "create bucket: HTTP {}: {body}",
-            r.status
+            "create bucket: HTTP {}: {}",
+            r.status,
+            error_detail(&r)
         )))
     }
 
@@ -762,6 +788,7 @@ mod tests {
             etag: etag.map(str::to_string),
             last_modified: None,
             date: None,
+            request_id: None,
             body: body.as_bytes().to_vec(),
         }
     }
@@ -1285,6 +1312,82 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A plain-HTTP endpoint on 127.0.0.1 that answers one request with `status`, the extra
+    /// `headers` and `body`. The returned receiver gets the request line and the body.
+    fn one_reply_endpoint(
+        status: u16,
+        headers: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            let (first, _, got) = read_request(&mut s);
+            let _ = tx.send((first, got));
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status} X\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        (endpoint, rx)
+    }
+
+    fn store_in(endpoint: &str, region: &str) -> S3Store {
+        let mut cfg = cfg_for(endpoint);
+        cfg.region = region.into();
+        cfg.path_style = true;
+        S3Store::new(cfg).unwrap()
+    }
+
+    #[test]
+    fn create_bucket_sends_location_constraint_outside_us_east_1() {
+        let (endpoint, rx) = one_reply_endpoint(200, "", "");
+        store_in(&endpoint, "ap-southeast-2")
+            .create_bucket()
+            .unwrap();
+        let (_, body) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>ap-southeast-2</LocationConstraint></CreateBucketConfiguration>"
+        );
+    }
+
+    #[test]
+    fn create_bucket_sends_no_body_in_us_east_1() {
+        let (endpoint, rx) = one_reply_endpoint(200, "", "");
+        store_in(&endpoint, "us-east-1").create_bucket().unwrap();
+        let (_, body) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(body.is_empty(), "{body:?}");
+    }
+
+    #[test]
+    fn s3_error_log_holds_code_and_request_id_only() {
+        const KEY_ID: &str = "AKIAEXAMPLEKEYID123";
+        const BODY: &str = "<Error><Code>SignatureDoesNotMatch</Code><Message>bad</Message><AWSAccessKeyId>AKIAEXAMPLEKEYID123</AWSAccessKeyId><StringToSign>AWS4-HMAC-SHA256 STRINGTOSIGN</StringToSign></Error>";
+        let hdr = "x-amz-request-id: REQ123\r\n";
+        // create_bucket (a crate::Error) and put (a StoreError) both show the code and id only.
+        let (endpoint, _rx) = one_reply_endpoint(403, hdr, BODY);
+        let e = store_in(&endpoint, "us-east-1")
+            .create_bucket()
+            .unwrap_err()
+            .to_string();
+        let (endpoint, _rx) = one_reply_endpoint(403, hdr, BODY);
+        let p = store_in(&endpoint, "us-east-1")
+            .put("k", b"v")
+            .unwrap_err()
+            .to_string();
+        for text in [e, p] {
+            assert!(text.contains("SignatureDoesNotMatch"), "{text}");
+            assert!(text.contains("REQ123"), "{text}");
+            assert!(!text.contains(KEY_ID), "{text}");
+            assert!(!text.contains("STRINGTOSIGN"), "{text}");
+        }
     }
 
     #[test]
