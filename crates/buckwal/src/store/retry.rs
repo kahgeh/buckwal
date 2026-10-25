@@ -54,6 +54,20 @@ pub fn with_retry<T>(
     }
 }
 
+/// [`with_retry`] for a caller that returns a [`StoreError`]: a timeout stays transient (a
+/// caller above may try again), anything else is permanent.
+pub fn retry_store<T>(
+    p: &RetryPolicy,
+    what: &str,
+    op: impl FnMut(u32) -> std::result::Result<T, StoreError>,
+) -> std::result::Result<T, StoreError> {
+    with_retry(p, what, op).map_err(|e| match e {
+        Error::Timeout(m) => StoreError::Transient(m),
+        Error::Bucket(m) => StoreError::Permanent(m),
+        e => StoreError::Permanent(e.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +134,34 @@ mod tests {
                 Duration::from_secs(2)
             )
         );
+    }
+
+    #[test]
+    fn retry_store_keeps_the_store_error_class() {
+        let mut n = 0;
+        let r = retry_store(&fast(), "part 3", |_| {
+            n += 1;
+            if n < 3 {
+                Err(StoreError::Transient("boom".into()))
+            } else {
+                Ok(n)
+            }
+        });
+        assert!(matches!(r, Ok(3)), "{r:?}");
+        let r: std::result::Result<(), StoreError> = retry_store(&fast(), "part 3", |_| {
+            Err(StoreError::Permanent("403".into()))
+        });
+        assert!(
+            matches!(&r, Err(StoreError::Permanent(m)) if m.contains("part 3") && m.contains("403")),
+            "{r:?}"
+        );
+        let p = RetryPolicy {
+            deadline: Duration::from_millis(20),
+            first_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(5),
+        };
+        let r: std::result::Result<(), StoreError> =
+            retry_store(&p, "part 3", |_| Err(StoreError::Transient("x".into())));
+        assert!(matches!(r, Err(StoreError::Transient(_))), "{r:?}");
     }
 }

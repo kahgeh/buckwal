@@ -1,7 +1,10 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Wraps any store and injects put failures on demand, to test that a failed upload is never
 //! acknowledged and that ambiguous (stored, then errored) puts are handled.
-use super::{CondPut, Object, ObjectStat, ObjectStore, StatsSnap, StoreError};
+use super::{
+    part_size_for, CondPut, MultipartDone, Object, ObjectStat, ObjectStore, PartSource, StatsSnap,
+    StoreError,
+};
 use std::sync::atomic::{
     AtomicU64,
     Ordering::{Relaxed, SeqCst},
@@ -20,6 +23,7 @@ pub struct FaultStore {
     fail_next: AtomicU64,
     fail_next_permanent: AtomicU64,
     ambiguous_next: AtomicU64,
+    fail_part: AtomicU64,
     ok_left: AtomicU64,
     only_keys: Mutex<String>,
     delay: Mutex<Duration>,
@@ -38,6 +42,7 @@ impl FaultStore {
             fail_next: AtomicU64::new(0),
             fail_next_permanent: AtomicU64::new(0),
             ambiguous_next: AtomicU64::new(0),
+            fail_part: AtomicU64::new(0),
             ok_left: AtomicU64::new(u64::MAX),
             only_keys: Mutex::new(String::new()),
             delay: Mutex::new(Duration::ZERO),
@@ -60,6 +65,12 @@ impl FaultStore {
     /// The next `n` puts are stored, then report a transient error (ambiguous outcome).
     pub fn store_then_fail_next_puts(&self, n: u64) {
         self.ambiguous_next.store(n, Relaxed);
+    }
+    /// Part `n` (from 1) of the next multipart upload fails once, as a failed read of the
+    /// source: the upload stays incomplete in the inner store, and `abort_incomplete` removes
+    /// it. An upload with fewer parts does not use the fault.
+    pub fn fail_part(&self, n: u64) {
+        self.fail_part.store(n, Relaxed);
     }
     /// Faults and delays apply only to keys containing `s` ("" = all keys).
     pub fn only_keys_containing(&self, s: &str) {
@@ -135,6 +146,28 @@ impl FaultStore {
     }
 }
 
+/// A source that fails one part, once, when `armed` names it (from 1; 0 = none).
+struct FailPart<'a> {
+    inner: &'a dyn PartSource,
+    armed: &'a AtomicU64,
+    part_size: u64,
+}
+
+impl PartSource for FailPart<'_> {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let part = offset / self.part_size + 1;
+        if self.armed.compare_exchange(part, 0, SeqCst, SeqCst).is_ok() {
+            return Err(std::io::Error::other(format!(
+                "injected failure of part {part}"
+            )));
+        }
+        self.inner.read_at(offset, buf)
+    }
+}
+
 impl ObjectStore for FaultStore {
     fn put(&self, key: &str, body: &[u8]) -> Result<String, StoreError> {
         self.faulty("put", key, || self.inner.put(key, body))
@@ -170,6 +203,41 @@ impl ObjectStore for FaultStore {
     fn list_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>, StoreError> {
         self.record("list_after", &format!("{prefix} {start_after}"));
         self.inner.list_after(prefix, start_after)
+    }
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>, StoreError> {
+        self.record("list_sized", prefix);
+        self.inner.list_sized(prefix)
+    }
+    fn put_multipart(
+        &self,
+        key: &str,
+        source: &mut dyn PartSource,
+        part_size: usize,
+        concurrency: usize,
+    ) -> Result<MultipartDone, StoreError> {
+        let matches = key.contains(self.only_keys.lock().unwrap().as_str());
+        let none = AtomicU64::new(0);
+        let mut failing = FailPart {
+            inner: &*source,
+            armed: if matches { &self.fail_part } else { &none },
+            part_size: part_size_for(source.len(), part_size) as u64,
+        };
+        self.faulty("put_multipart", key, || {
+            self.inner
+                .put_multipart(key, &mut failing, part_size, concurrency)
+        })
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        self.record("get_range", key);
+        let d = *self.get_delay.lock().unwrap();
+        if !d.is_zero() && key.contains(self.only_keys.lock().unwrap().as_str()) {
+            std::thread::sleep(d);
+        }
+        self.inner.get_range(key, offset, len)
+    }
+    fn abort_incomplete(&self, prefix: &str, older_than: Duration) -> Result<u64, StoreError> {
+        self.record("abort_incomplete", prefix);
+        self.inner.abort_incomplete(prefix, older_than)
     }
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.record("delete", key);
@@ -427,5 +495,57 @@ mod tests {
         assert!(s.stat("slow").unwrap().is_some());
         assert!(t.elapsed() >= Duration::from_millis(60));
         assert_eq!(s.events(), vec!["stat fast", "stat slow"]);
+    }
+
+    struct Bytes(Vec<u8>);
+
+    impl crate::store::PartSource for Bytes {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            buf.copy_from_slice(&self.0[offset as usize..offset as usize + buf.len()]);
+            Ok(())
+        }
+    }
+
+    /// `fail_part(2)` fails part 2 of the next upload once: nothing becomes visible, the
+    /// upload stays for `abort_incomplete`, and the next upload goes through.
+    #[test]
+    fn fault_store_fail_part_leaves_an_upload_to_abort() {
+        let (m, s) = setup();
+        let data = vec![7u8; 2500];
+        s.fail_part(2);
+        assert!(s
+            .put_multipart("p/k", &mut Bytes(data.clone()), 1000, 1)
+            .is_err());
+        assert!(m.get("p/k").unwrap().is_none());
+        assert_eq!(s.abort_incomplete("p/", Duration::ZERO).unwrap(), 1);
+        let done = s
+            .put_multipart("p/k", &mut Bytes(data.clone()), 1000, 1)
+            .unwrap();
+        assert_eq!(done.part_sha256.len(), 3);
+        assert_eq!(
+            s.get_range("p/k", 1000, 1000).unwrap().unwrap(),
+            &data[1000..2000]
+        );
+        assert_eq!(s.list_sized("p/").unwrap(), vec![("p/k".to_string(), 2500)]);
+        let ev = s.events();
+        assert!(ev.contains(&"put_multipart p/k".to_string()), "{ev:?}");
+        assert!(ev.contains(&"get_range p/k".to_string()), "{ev:?}");
+        assert!(ev.contains(&"abort_incomplete p/".to_string()), "{ev:?}");
+    }
+
+    /// The put faults apply to a multipart upload as they do to a put.
+    #[test]
+    fn fault_store_put_faults_hit_multipart() {
+        let (m, s) = setup();
+        s.fail_next_puts(1);
+        assert!(matches!(
+            s.put_multipart("k", &mut Bytes(vec![1; 10]), 4, 1),
+            Err(StoreError::Transient(_))
+        ));
+        assert!(m.get("k").unwrap().is_none());
+        s.put_multipart("k", &mut Bytes(vec![1; 10]), 4, 1).unwrap();
     }
 }

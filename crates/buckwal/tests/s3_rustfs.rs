@@ -283,6 +283,105 @@ fn s3_list_after_start_after_and_paging() {
     assert_eq!(s.list_after(&dir, &key(N - 2)).unwrap(), vec![key(N - 1)]);
 }
 
+/// A source over bytes that records the largest offset read, checks a hook before each read
+/// and fails the read at one offset.
+struct Src<'a> {
+    data: &'a [u8],
+    before_read: Box<dyn Fn() + Send + Sync + 'a>,
+    fail_at: Option<u64>,
+}
+
+impl buckwal::store::PartSource for Src<'_> {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        (self.before_read)();
+        if self.fail_at == Some(offset) {
+            return Err(std::io::Error::other("injected"));
+        }
+        buf.copy_from_slice(&self.data[offset as usize..offset as usize + buf.len()]);
+        Ok(())
+    }
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// A 40 MB object in 16 MiB parts, 8 at once, against the real server: the object is
+/// invisible until the upload completes, the part checksums are the SHA-256 of each part,
+/// three ranges read it back, and `stat` and `list_sized` give its size.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn s3_multipart_40mb_then_range_reads() {
+    use sha2::{Digest, Sha256};
+    let s = store();
+    let p = prefix("multipart");
+    let key = format!("{p}pack");
+    let data: Vec<u8> = (0..40_000_000u32).map(|i| (i % 251) as u8).collect();
+    let src = Src {
+        data: &data,
+        before_read: Box::new(|| assert!(s.get(&key).unwrap().is_none(), "visible too early")),
+        fail_at: None,
+    };
+    let mut src = src;
+    let done = s.put_multipart(&key, &mut src, 16 * MIB, 8).unwrap();
+    assert_eq!(done.part_sha256.len(), 3);
+    for (i, sha) in done.part_sha256.iter().enumerate() {
+        let part = &data[i * 16 * MIB..((i + 1) * 16 * MIB).min(data.len())];
+        assert_eq!(sha.as_slice(), Sha256::digest(part).as_slice(), "part {i}");
+    }
+    assert!(done.etag.trim_matches('"').ends_with("-3"), "{}", done.etag);
+    let mut back = Vec::new();
+    for i in 0..3u64 {
+        let r = s
+            .get_range(&key, i * 16 * MIB as u64, 16 * MIB as u64)
+            .unwrap();
+        back.extend(r.expect("object is there"));
+    }
+    assert!(back == data, "ranges differ from the source");
+    assert_eq!(s.stat(&key).unwrap().unwrap().size, 40_000_000);
+    assert_eq!(s.list_sized(&p).unwrap(), vec![(key.clone(), 40_000_000)]);
+    // Past the end: cut short, then nothing.
+    let tail = s.get_range(&key, 39_999_990, 100).unwrap().unwrap();
+    assert_eq!(tail, &data[39_999_990..]);
+    assert_eq!(s.get_range(&key, 40_000_000, 10).unwrap().unwrap(), b"");
+    assert_eq!(s.get_range(&format!("{p}missing"), 0, 10).unwrap(), None);
+}
+
+/// A part that fails leaves nothing visible; `abort_incomplete` keeps a fresh upload when
+/// the age bound is an hour, removes it with a bound of zero, and then finds none. A
+/// completed upload is not a candidate.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn s3_failed_part_is_invisible_and_abort_incomplete_removes_it() {
+    let s = store();
+    let p = prefix("abort");
+    let data = vec![9u8; 12 * MIB];
+    let mut bad = Src {
+        data: &data,
+        before_read: Box::new(|| {}),
+        fail_at: Some(5 * MIB as u64),
+    };
+    let key = format!("{p}bad");
+    assert!(s.put_multipart(&key, &mut bad, 5 * MIB, 1).is_err());
+    assert!(s.get(&key).unwrap().is_none());
+    assert!(s.list(&p).unwrap().is_empty());
+    let mut ok = Src {
+        data: &data,
+        before_read: Box::new(|| {}),
+        fail_at: None,
+    };
+    s.put_multipart(&format!("{p}ok"), &mut ok, 5 * MIB, 2)
+        .unwrap();
+    assert_eq!(
+        s.abort_incomplete(&p, Duration::from_secs(3600)).unwrap(),
+        0
+    );
+    assert_eq!(s.abort_incomplete(&p, Duration::ZERO).unwrap(), 1);
+    assert_eq!(s.abort_incomplete(&p, Duration::ZERO).unwrap(), 0);
+    assert_eq!(s.list(&p).unwrap(), vec![format!("{p}ok")]);
+}
+
 /// The public API end to end over S3: open (create), commit, close, restore, reopen.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]

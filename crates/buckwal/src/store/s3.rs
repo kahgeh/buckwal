@@ -1,11 +1,16 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! Generic S3 client: SigV4 over reqwest's blocking client. Endpoint, region, path style
 //! and credentials all come from settings; nothing here is specific to RustFS.
-use super::{CondPut, Object, ObjectStat, ObjectStore, StatsSnap, StoreError};
+use super::{
+    part_count, part_size_for, read_part, retry_store, sha256_of, CondPut, MultipartDone, Object,
+    ObjectStat, ObjectStore, PartSource, RetryPolicy, StatsSnap, StoreError,
+};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::time::Duration;
+use std::time::SystemTime;
 
 #[derive(Clone)]
 pub struct S3Config {
@@ -40,6 +45,8 @@ impl std::fmt::Debug for S3Config {
 pub struct S3Store {
     cfg: S3Config,
     http: reqwest::blocking::Client,
+    /// How a multipart upload retries one request (a part, the start or the end).
+    retry: RetryPolicy,
     puts: AtomicU64,
     gets: AtomicU64,
     lists: AtomicU64,
@@ -55,6 +62,26 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 fn sha256_hex(b: &[u8]) -> String {
     hex::encode(Sha256::digest(b))
+}
+
+/// Standard base64 with padding: the form of the `x-amz-checksum-sha256` header.
+fn base64(b: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &x)| n | (x as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// RFC 3986 encoding as SigV4 wants it; `/` is kept in paths and encoded in query values.
@@ -159,6 +186,8 @@ pub(crate) fn object_url(cfg: &S3Config, key: &str) -> (String, String, String) 
 
 pub(crate) struct ListPage {
     pub keys: Vec<String>,
+    /// The `<Size>` of each entry, in the order of `keys`.
+    pub sizes: Vec<u64>,
     pub next: Option<String>,
 }
 
@@ -228,7 +257,11 @@ pub(crate) fn parse_list(xml: &str) -> ListPage {
     } else {
         None
     };
-    ListPage { keys, next }
+    let sizes = between(xml, "<Size>", "</Size>")
+        .into_iter()
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    ListPage { keys, sizes, next }
 }
 
 struct Reply {
@@ -238,6 +271,10 @@ struct Reply {
     date: Option<String>,
     /// `x-amz-request-id`: with the error `Code`, the only part of a failure reply that is logged.
     request_id: Option<String>,
+    /// `Content-Length`: on a HEAD the size of the object.
+    content_length: Option<u64>,
+    /// `x-amz-checksum-sha256`: the checksum the server holds for a part.
+    checksum_sha256: Option<String>,
     body: Vec<u8>,
 }
 
@@ -400,6 +437,7 @@ impl S3Store {
         Ok(Self {
             cfg,
             http,
+            retry: RetryPolicy::default(),
             puts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
             lists: AtomicU64::new(0),
@@ -409,12 +447,19 @@ impl S3Store {
         })
     }
 
+    /// The policy a multipart upload retries each of its requests with.
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
     fn count_put(&self, n: usize) {
         self.puts.fetch_add(1, Relaxed);
         self.bytes_up.fetch_add(n as u64, Relaxed);
     }
 
-    /// One signed request. `extra` headers (conditionals) are sent but not signed.
+    /// One signed request. `extra` headers are sent; those named `x-amz-*` are signed too,
+    /// the others (conditionals, `range`) are not.
     fn send(
         &self,
         method: &str,
@@ -431,11 +476,17 @@ impl S3Store {
             .as_secs();
         let date = amz_date(now);
         let ph = sha256_hex(body);
-        let headers = vec![
+        let mut headers = vec![
             ("host".to_string(), host),
             ("x-amz-content-sha256".to_string(), ph.clone()),
             ("x-amz-date".to_string(), date.clone()),
         ];
+        headers.extend(
+            extra
+                .iter()
+                .filter(|(k, _)| k.starts_with("x-amz-"))
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
         let auth = authorization(&self.cfg, method, &uri, &cq, &headers, &ph, &date);
         let full = if cq.is_empty() {
             url
@@ -479,6 +530,8 @@ impl S3Store {
         let last_modified = header("last-modified");
         let date = header("date");
         let request_id = header("x-amz-request-id");
+        let content_length = header("content-length").and_then(|v| v.parse().ok());
+        let checksum_sha256 = header("x-amz-checksum-sha256");
         let body = resp.bytes().map_err(net)?.to_vec();
         Ok(Reply {
             status,
@@ -486,6 +539,8 @@ impl S3Store {
             last_modified,
             date,
             request_id,
+            content_length,
+            checksum_sha256,
             body,
         })
     }
@@ -602,10 +657,13 @@ fn stat_reply(what: &str, r: &Reply) -> Result<Option<ObjectStat>, StoreError> {
         .etag
         .clone()
         .ok_or_else(|| StoreError::Permanent(format!("{what}: no ETag")))?;
+    let size = r
+        .content_length
+        .ok_or_else(|| StoreError::Permanent(format!("{what}: no Content-Length header")))?;
     let modified = date_of("Last-Modified", &r.last_modified)?;
     let now = date_of("Date", &r.date)?;
     let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-    Ok(Some(ObjectStat { etag, age }))
+    Ok(Some(ObjectStat { etag, age, size }))
 }
 
 /// The reply to a conditional PUT (`If-None-Match: *` or `If-Match`).
@@ -672,12 +730,245 @@ fn canonical_query(query: &[(&str, String)]) -> String {
         .join("&")
 }
 
+/// A part that is up: the ETag the server gave it and the SHA-256 buckwal computed.
+#[derive(Clone)]
+struct PartDone {
+    etag: String,
+    sha256: [u8; 32],
+}
+
+/// The body of the call that completes a multipart upload.
+fn complete_body(parts: &[PartDone]) -> String {
+    let mut b =
+        String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for (i, p) in parts.iter().enumerate() {
+        b.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><ChecksumSHA256>{}</ChecksumSHA256></Part>",
+            i + 1,
+            xml_escape(&p.etag),
+            base64(&p.sha256)
+        ));
+    }
+    b.push_str("</CompleteMultipartUpload>");
+    b
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fff]Z`, the form of an upload's `Initiated`; UTC only.
+fn parse_iso8601(s: &str) -> Option<SystemTime> {
+    let s = s.trim().strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let time = time.split('.').next()?;
+    let num = |t: &str| {
+        t.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| t.parse::<i64>().ok())
+            .flatten()
+    };
+    let d: Vec<&str> = date.split('-').collect();
+    let t: Vec<&str> = time.split(':').collect();
+    let [y, mo, da] = d[..] else { return None };
+    let [h, mi, se] = t[..] else { return None };
+    let (y, mo, da, h, mi, se) = (num(y)?, num(mo)?, num(da)?, num(h)?, num(mi)?, num(se)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let secs = days_from_civil(y, mo, da) * 86_400 + h * 3600 + mi * 60 + se;
+    u64::try_from(secs)
+        .ok()
+        .map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s))
+}
+
+struct UploadInfo {
+    key: String,
+    id: String,
+    initiated: SystemTime,
+}
+
+struct UploadsPage {
+    uploads: Vec<UploadInfo>,
+    /// The key and upload id markers of the next page.
+    next: Option<(String, String)>,
+}
+
+/// A `ListMultipartUploads` reply.
+fn parse_uploads(xml: &str) -> Result<UploadsPage, StoreError> {
+    let bad = |what: &str| StoreError::Permanent(format!("LIST uploads: {what} in a reply"));
+    let one = |block: &str, tag: &str| {
+        between(block, &format!("<{tag}>"), &format!("</{tag}>"))
+            .first()
+            .map(|v| xml_unescape(v))
+    };
+    let mut uploads = Vec::new();
+    for block in between(xml, "<Upload>", "</Upload>") {
+        let (Some(key), Some(id), Some(at)) = (
+            one(block, "Key"),
+            one(block, "UploadId"),
+            one(block, "Initiated"),
+        ) else {
+            return Err(bad("an upload with no key, id or start time"));
+        };
+        let initiated = parse_iso8601(&at).ok_or_else(|| bad("a bad start time"))?;
+        uploads.push(UploadInfo { key, id, initiated });
+    }
+    let next = if between(xml, "<IsTruncated>", "</IsTruncated>").first() == Some(&"true") {
+        match (one(xml, "NextKeyMarker"), one(xml, "NextUploadIdMarker")) {
+            (Some(k), Some(u)) => Some((k, u)),
+            _ => return Err(bad("a truncated page with no marker")),
+        }
+    } else {
+        None
+    };
+    Ok(UploadsPage { uploads, next })
+}
+
+/// The reply to the start of a multipart upload: the upload id.
+fn initiate_reply(what: &str, r: &Reply) -> Result<String, StoreError> {
+    if r.status != 200 {
+        return Err(status_error(what, r));
+    }
+    let body = String::from_utf8_lossy(&r.body);
+    between(&body, "<UploadId>", "</UploadId>")
+        .first()
+        .map(|v| xml_unescape(v))
+        .ok_or_else(|| StoreError::Permanent(format!("{what}: no upload id in the reply")))
+}
+
+/// The reply to one part: its ETag. A checksum the server holds for the part must be ours.
+fn part_reply(what: &str, r: &Reply, sent_b64: &str) -> Result<String, StoreError> {
+    if r.status != 200 {
+        return Err(status_error(what, r));
+    }
+    if r.checksum_sha256.as_deref().is_some_and(|c| c != sent_b64) {
+        return Err(StoreError::Permanent(format!(
+            "{what}: the server holds another SHA-256 checksum for the part"
+        )));
+    }
+    r.etag
+        .clone()
+        .ok_or_else(|| StoreError::Permanent(format!("{what}: no ETag in response")))
+}
+
+/// The reply to the end of a multipart upload: the object's ETag. S3 can answer 200 and then
+/// put an error in the body; that is a transient failure.
+fn complete_reply(what: &str, r: &Reply) -> Result<String, StoreError> {
+    if r.status != 200 {
+        return Err(status_error(what, r));
+    }
+    let body = String::from_utf8_lossy(&r.body);
+    if body.contains("<Error>") {
+        return Err(StoreError::Transient(format!(
+            "{what}: error in a 200 reply: {}",
+            error_detail(r)
+        )));
+    }
+    between(&body, "<ETag>", "</ETag>")
+        .first()
+        .map(|v| xml_unescape(v))
+        .or_else(|| r.etag.clone())
+        .ok_or_else(|| StoreError::Permanent(format!("{what}: no ETag in response")))
+}
+
+/// The reply to a ranged GET: `Some(bytes)`, or `None` for a missing key. A range that starts
+/// at or past the end of the object is 416 and gives no bytes.
+fn range_reply(what: &str, r: &Reply) -> Result<Option<Vec<u8>>, StoreError> {
+    match r.status {
+        206 => Ok(Some(r.body.clone())),
+        416 => Ok(Some(Vec::new())),
+        404 if String::from_utf8_lossy(&r.body).contains("NoSuchKey") => Ok(None),
+        200 => Err(StoreError::Permanent(format!(
+            "{what}: the server ignored the range"
+        ))),
+        _ => Err(status_error(what, r)),
+    }
+}
+
+impl S3Store {
+    fn initiate(&self, key: &str) -> Result<String, StoreError> {
+        let what = format!("POST {key} (start multipart)");
+        retry_store(&self.retry, &what, |_| {
+            self.count_put(0);
+            let r = self.send(
+                "POST",
+                key,
+                &[("uploads", String::new())],
+                &[],
+                &[("x-amz-checksum-algorithm", "SHA256")],
+            )?;
+            initiate_reply(&what, &r)
+        })
+    }
+
+    /// Part `number` (from 1), retried alone: a failed request does not restart the upload.
+    fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        number: u64,
+        body: Vec<u8>,
+    ) -> Result<PartDone, StoreError> {
+        let what = format!("PUT {key} part {number}");
+        let sha256 = sha256_of(&body);
+        let b64 = base64(&sha256);
+        let query = [
+            ("partNumber", number.to_string()),
+            ("uploadId", upload_id.to_string()),
+        ];
+        let etag = retry_store(&self.retry, &what, |_| {
+            self.count_put(body.len());
+            let r = self.send(
+                "PUT",
+                key,
+                &query,
+                &body,
+                &[("x-amz-checksum-sha256", b64.as_str())],
+            )?;
+            part_reply(&what, &r, &b64)
+        })?;
+        Ok(PartDone { etag, sha256 })
+    }
+
+    fn complete_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[PartDone],
+    ) -> Result<String, StoreError> {
+        let what = format!("POST {key} (complete multipart)");
+        let body = complete_body(parts);
+        let query = [("uploadId", upload_id.to_string())];
+        retry_store(&self.retry, &what, |_| {
+            self.count_put(body.len());
+            let r = self.send("POST", key, &query, body.as_bytes(), &[])?;
+            complete_reply(&what, &r)
+        })
+    }
+}
+
 impl S3Store {
     fn list_from(
         &self,
         prefix: &str,
         start_after: Option<&str>,
     ) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .list_sized_from(prefix, start_after)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+
+    fn list_sized_from(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -688,14 +979,21 @@ impl S3Store {
                 return Err(status_error(&format!("LIST {prefix}"), &r));
             }
             let page = parse_list(&String::from_utf8_lossy(&r.body));
-            keys.extend(page.keys);
+            if page.sizes.len() != page.keys.len() {
+                return Err(StoreError::Permanent(format!(
+                    "LIST {prefix}: {} keys but {} sizes in a reply",
+                    page.keys.len(),
+                    page.sizes.len()
+                )));
+            }
+            keys.extend(page.keys.into_iter().zip(page.sizes));
             match page.next {
                 Some(t) => token = Some(t),
                 None => break,
             }
         }
         if let Some(a) = start_after {
-            keys.retain(|k| k.as_str() > a);
+            keys.retain(|(k, _)| k.as_str() > a);
         }
         keys.sort();
         Ok(keys)
@@ -757,6 +1055,119 @@ impl ObjectStore for S3Store {
         self.list_from(prefix, Some(start_after))
     }
 
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>, StoreError> {
+        self.list_sized_from(prefix, None)
+    }
+
+    /// `concurrency` parts go up at once, each read from `source` when its turn comes. A
+    /// failure stops new parts and leaves the upload in the bucket, hidden; see
+    /// [`ObjectStore::abort_incomplete`].
+    fn put_multipart(
+        &self,
+        key: &str,
+        source: &mut dyn PartSource,
+        part_size: usize,
+        concurrency: usize,
+    ) -> Result<MultipartDone, StoreError> {
+        let source: &dyn PartSource = source;
+        let size = part_size_for(source.len(), part_size);
+        let n = part_count(source.len(), size);
+        let upload_id = self.initiate(key)?;
+        let next = AtomicU64::new(0);
+        let parts: Mutex<Vec<Option<PartDone>>> = Mutex::new(vec![None; n as usize]);
+        let failure: Mutex<Option<StoreError>> = Mutex::new(None);
+        std::thread::scope(|sc| {
+            for _ in 0..(concurrency.max(1) as u64).min(n) {
+                sc.spawn(|| loop {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= n {
+                        return;
+                    }
+                    let done = read_part(source, size, i)
+                        .and_then(|body| self.upload_part(key, &upload_id, i + 1, body));
+                    match done {
+                        Ok(p) => parts.lock().unwrap()[i as usize] = Some(p),
+                        Err(e) => {
+                            failure.lock().unwrap().get_or_insert(e);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = failure.into_inner().unwrap() {
+            return Err(e);
+        }
+        let parts = parts
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .collect::<Option<Vec<PartDone>>>()
+            .ok_or_else(|| StoreError::Permanent(format!("PUT {key}: a part is missing")))?;
+        let etag = self.complete_upload(key, &upload_id, &parts)?;
+        Ok(MultipartDone {
+            etag,
+            part_sha256: parts.iter().map(|p| p.sha256).collect(),
+        })
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        if len == 0 {
+            return Err(StoreError::Permanent(format!("GET {key}: an empty range")));
+        }
+        let range = format!("bytes={offset}-{}", offset.saturating_add(len) - 1);
+        let r = self.send("GET", key, &[], &[], &[("range", range.as_str())])?;
+        self.gets.fetch_add(1, Relaxed);
+        let got = range_reply(&format!("GET {key} (range)"), &r)?;
+        self.bytes_down
+            .fetch_add(got.as_ref().map_or(0, Vec::len) as u64, Relaxed);
+        Ok(got)
+    }
+
+    /// Ages come from the bucket: an upload's `Initiated` against the `Date` of the listing.
+    fn abort_incomplete(&self, prefix: &str, older_than: Duration) -> Result<u64, StoreError> {
+        let what = format!("LIST uploads {prefix}");
+        let mut marker: Option<(String, String)> = None;
+        let mut aborted = 0;
+        loop {
+            let mut q = vec![("uploads", String::new()), ("prefix", prefix.to_string())];
+            if let Some((k, u)) = &marker {
+                q.push(("key-marker", k.clone()));
+                q.push(("upload-id-marker", u.clone()));
+            }
+            let r = self.send("GET", "", &q, &[], &[])?;
+            self.lists.fetch_add(1, Relaxed);
+            if r.status != 200 {
+                return Err(status_error(&what, &r));
+            }
+            let now =
+                r.date.as_deref().and_then(parse_http_date).ok_or_else(|| {
+                    StoreError::Permanent(format!("{what}: no usable Date header"))
+                })?;
+            let page = parse_uploads(&String::from_utf8_lossy(&r.body))?;
+            for u in page.uploads {
+                let age = now.duration_since(u.initiated).unwrap_or(Duration::ZERO);
+                if age < older_than {
+                    continue;
+                }
+                let a = self.send("DELETE", &u.key, &[("uploadId", u.id)], &[], &[])?;
+                self.deletes.fetch_add(1, Relaxed);
+                match a.status {
+                    200 | 204 => aborted += 1,
+                    // Gone since the listing: another run aborted or completed it.
+                    404 => {}
+                    _ => return Err(status_error(&format!("DELETE {} (abort)", u.key), &a)),
+                }
+            }
+            match page.next {
+                Some(m) => marker = Some(m),
+                None => return Ok(aborted),
+            }
+        }
+    }
+
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         let r = self.send("DELETE", key, &[], &[], &[])?;
         self.deletes.fetch_add(1, Relaxed);
@@ -789,6 +1200,8 @@ mod tests {
             last_modified: None,
             date: None,
             request_id: None,
+            content_length: None,
+            checksum_sha256: None,
             body: body.as_bytes().to_vec(),
         }
     }
@@ -840,8 +1253,10 @@ mod tests {
         let mut r = reply(200, Some("\"e\""), "");
         r.last_modified = Some("Sun, 06 Nov 1994 08:49:37 GMT".into());
         r.date = Some("Sun, 06 Nov 1994 08:50:07 GMT".into());
+        r.content_length = Some(1234);
         let st = stat_reply("HEAD k", &r).unwrap().unwrap();
         assert_eq!(st.etag, "\"e\"");
+        assert_eq!(st.size, 1234);
         assert_eq!(st.age, std::time::Duration::from_secs(30));
         // A clock skew that puts Last-Modified after Date saturates at 0.
         std::mem::swap(&mut r.last_modified, &mut r.date);
@@ -1284,7 +1699,7 @@ mod tests {
             let mut cfg = cfg_for(&endpoint);
             cfg.path_style = true;
             let s = S3Store::new(cfg).unwrap();
-            let calls: [(&str, Result<(), StoreError>); 8] = [
+            let calls: [(&str, Result<(), StoreError>); 12] = [
                 ("put", s.put("log/1/00000001", b"ROW").map(drop)),
                 ("put_if_absent", s.put_if_absent("k", b"ROW").map(drop)),
                 (
@@ -1295,6 +1710,16 @@ mod tests {
                 ("stat", s.stat("k").map(drop)),
                 ("list", s.list("log/").map(drop)),
                 ("delete", s.delete("k")),
+                ("list_sized", s.list_sized("log/").map(drop)),
+                ("get_range", s.get_range("k", 0, 4).map(drop)),
+                (
+                    "abort_incomplete",
+                    s.abort_incomplete("p/", Duration::ZERO).map(drop),
+                ),
+                (
+                    "put_multipart",
+                    s.put_multipart("k", &mut Bytes(vec![1; 3]), 4, 2).map(drop),
+                ),
                 (
                     "create_bucket",
                     s.create_bucket()
@@ -1442,5 +1867,256 @@ mod tests {
             }
             r => panic!("{:?}", r.err()),
         }
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (raw, enc) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(raw), enc);
+        }
+    }
+
+    #[test]
+    fn iso8601_dates_parse() {
+        use std::time::UNIX_EPOCH;
+        assert_eq!(
+            parse_iso8601("1994-11-06T08:49:37.000Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(784_111_777))
+        );
+        assert_eq!(
+            parse_iso8601("1970-01-01T00:00:10Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(10))
+        );
+        for bad in ["", "1994-11-06", "1994-11-06T08:49:37", "x-11-06T08:49:37Z"] {
+            assert_eq!(parse_iso8601(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn list_sized_page_pairs_keys_and_sizes() {
+        let xml = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+            <Contents><Key>a/1</Key><LastModified>x</LastModified><Size>12</Size></Contents>\
+            <Contents><Key>a/2&amp;</Key><Size>0</Size></Contents></ListBucketResult>";
+        let page = parse_list(xml);
+        assert_eq!(page.keys, ["a/1", "a/2&"]);
+        assert_eq!(page.sizes, [12, 0]);
+    }
+
+    #[test]
+    fn uploads_page_parses_ids_ages_and_markers() {
+        let xml = "<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+            <NextKeyMarker>p/b</NextKeyMarker><NextUploadIdMarker>u2</NextUploadIdMarker>\
+            <Upload><Key>p/a</Key><UploadId>u1</UploadId><Initiated>2026-10-25T01:00:00.000Z</Initiated></Upload>\
+            <Upload><Key>p/b&amp;</Key><UploadId>u2</UploadId><Initiated>2026-10-25T02:00:00.000Z</Initiated></Upload>\
+            </ListMultipartUploadsResult>";
+        let page = parse_uploads(xml).unwrap();
+        assert_eq!(page.uploads.len(), 2);
+        assert_eq!(
+            (page.uploads[1].key.as_str(), page.uploads[1].id.as_str()),
+            ("p/b&", "u2")
+        );
+        assert_eq!(page.next, Some(("p/b".to_string(), "u2".to_string())));
+        let done = parse_uploads("<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>").unwrap();
+        assert!(done.uploads.is_empty() && done.next.is_none());
+    }
+
+    #[test]
+    fn complete_body_lists_every_part_with_its_checksum() {
+        let parts = vec![
+            PartDone {
+                etag: "\"e1\"".into(),
+                sha256: [1; 32],
+            },
+            PartDone {
+                etag: "\"e2\"".into(),
+                sha256: [2; 32],
+            },
+        ];
+        let b = complete_body(&parts);
+        assert!(b.starts_with("<CompleteMultipartUpload"), "{b}");
+        assert!(b.contains("<Part><PartNumber>1</PartNumber><ETag>&quot;e1&quot;</ETag><ChecksumSHA256>AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=</ChecksumSHA256></Part>"), "{b}");
+        assert!(b.contains("<PartNumber>2</PartNumber>"), "{b}");
+    }
+
+    /// A plain-HTTP endpoint on 127.0.0.1 that answers `script` in order, one connection per
+    /// reply. The receiver gets each request's line, headers and body.
+    #[allow(clippy::type_complexity)]
+    fn scripted_endpoint(
+        script: Vec<(u16, String, String)>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<(String, Vec<String>, Vec<u8>)>,
+    ) {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, headers, body) in script {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let _ = tx.send(read_request(&mut s));
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status} X\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (endpoint, rx)
+    }
+
+    struct Bytes(Vec<u8>);
+
+    impl crate::store::PartSource for Bytes {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            buf.copy_from_slice(&self.0[offset as usize..offset as usize + buf.len()]);
+            Ok(())
+        }
+    }
+
+    fn fast_retry() -> crate::store::RetryPolicy {
+        crate::store::RetryPolicy {
+            deadline: Duration::from_secs(5),
+            first_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        }
+    }
+
+    /// One part fails with a 503, then goes through: the retry repeats that part only. The
+    /// part carries its SHA-256 as a signed header, and complete lists the part.
+    #[test]
+    fn multipart_retries_the_part_not_the_upload() {
+        let sha = base64(&Sha256::digest(b"hello"));
+        let part_ok = format!("ETag: \"p1\"\r\nx-amz-checksum-sha256: {sha}\r\n");
+        let (endpoint, rx) = scripted_endpoint(vec![
+            (200, String::new(), "<InitiateMultipartUploadResult><UploadId>U1</UploadId></InitiateMultipartUploadResult>".into()),
+            (503, String::new(), s3_error("SlowDown")),
+            (200, part_ok, String::new()),
+            (200, String::new(), "<CompleteMultipartUploadResult><ETag>&quot;final-1&quot;</ETag></CompleteMultipartUploadResult>".into()),
+        ]);
+        let s = store_in(&endpoint, "us-east-1").with_retry_policy(fast_retry());
+        let done = s
+            .put_multipart("pack/1", &mut Bytes(b"hello".to_vec()), 16, 8)
+            .unwrap();
+        assert_eq!(done.etag, "\"final-1\"");
+        assert_eq!(
+            done.part_sha256,
+            vec![<[u8; 32]>::from(Sha256::digest(b"hello"))]
+        );
+        let reqs: Vec<_> = rx.try_iter().collect();
+        let lines: Vec<&str> = reqs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /b/pack/1?uploads= HTTP/1.1",
+                "PUT /b/pack/1?partNumber=1&uploadId=U1 HTTP/1.1",
+                "PUT /b/pack/1?partNumber=1&uploadId=U1 HTTP/1.1",
+                "POST /b/pack/1?uploadId=U1 HTTP/1.1",
+            ]
+        );
+        let has = |r: &(String, Vec<String>, Vec<u8>), h: &str| {
+            r.1.iter().any(|x| x.eq_ignore_ascii_case(h))
+        };
+        assert!(
+            has(&reqs[1], &format!("x-amz-checksum-sha256: {sha}")),
+            "{:?}",
+            reqs[1].1
+        );
+        assert!(
+            has(&reqs[0], "x-amz-checksum-algorithm: SHA256"),
+            "{:?}",
+            reqs[0].1
+        );
+        let auth = reqs[1]
+            .1
+            .iter()
+            .find(|h| h.to_ascii_lowercase().starts_with("authorization"))
+            .unwrap();
+        assert!(
+            auth.contains("x-amz-checksum-sha256"),
+            "the header is signed: {auth}"
+        );
+        assert!(String::from_utf8_lossy(&reqs[3].2).contains("<PartNumber>1</PartNumber>"));
+    }
+
+    /// A server that echoes another checksum for a part is an error, not an upload.
+    #[test]
+    fn multipart_refuses_a_part_with_a_wrong_checksum() {
+        let (endpoint, _rx) = scripted_endpoint(vec![
+            (200, String::new(), "<InitiateMultipartUploadResult><UploadId>U1</UploadId></InitiateMultipartUploadResult>".into()),
+            (200, "ETag: \"p1\"\r\nx-amz-checksum-sha256: AAAA\r\n".into(), String::new()),
+        ]);
+        let s = store_in(&endpoint, "us-east-1").with_retry_policy(fast_retry());
+        let e = s
+            .put_multipart("k", &mut Bytes(b"hello".to_vec()), 16, 1)
+            .unwrap_err();
+        assert!(
+            matches!(&e, StoreError::Permanent(m) if m.contains("checksum")),
+            "{e:?}"
+        );
+    }
+
+    /// The new requests print the error `Code` and request id only, as every other request does.
+    #[test]
+    fn new_requests_log_code_and_request_id_only() {
+        const BODY: &str = "<Error><Code>AccessDenied</Code><AWSAccessKeyId>AKIAEXAMPLEKEYID123</AWSAccessKeyId><StringToSign>STRINGTOSIGN</StringToSign></Error>";
+        let hdr = "x-amz-request-id: REQ9\r\n";
+        let texts = [
+            (|s: &S3Store| s.get_range("k", 0, 4).unwrap_err()) as fn(&S3Store) -> StoreError,
+            |s| s.abort_incomplete("p/", Duration::ZERO).unwrap_err(),
+            |s| s.list_sized("p/").unwrap_err(),
+            |s| s.put_multipart("k", &mut Bytes(vec![1]), 4, 1).unwrap_err(),
+        ];
+        for call in texts {
+            let (endpoint, _rx) = one_reply_endpoint(403, hdr, BODY);
+            let t = call(&store_in(&endpoint, "us-east-1")).to_string();
+            assert!(t.contains("AccessDenied") && t.contains("REQ9"), "{t}");
+            assert!(
+                !t.contains("AKIAEXAMPLEKEYID123") && !t.contains("STRINGTOSIGN"),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_range_sends_a_range_header_and_maps_statuses() {
+        let (endpoint, rx) = scripted_endpoint(vec![(206, String::new(), "abcd".into())]);
+        let s = store_in(&endpoint, "us-east-1");
+        assert_eq!(s.get_range("k", 10, 4).unwrap().unwrap(), b"abcd");
+        let (line, headers, _) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(line.starts_with("GET /b/k "), "{line}");
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("range: bytes=10-13")),
+            "{headers:?}"
+        );
+        let (endpoint, _rx) = one_reply_endpoint(404, "", "<Error><Code>NoSuchKey</Code></Error>");
+        assert_eq!(
+            store_in(&endpoint, "us-east-1")
+                .get_range("k", 0, 4)
+                .unwrap(),
+            None
+        );
+        let (endpoint, _rx) =
+            one_reply_endpoint(416, "", "<Error><Code>InvalidRange</Code></Error>");
+        assert_eq!(
+            store_in(&endpoint, "us-east-1")
+                .get_range("k", 99, 4)
+                .unwrap()
+                .unwrap(),
+            b""
+        );
     }
 }
