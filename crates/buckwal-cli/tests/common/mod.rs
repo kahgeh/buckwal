@@ -16,7 +16,7 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_buckwal");
 /// environment never leaks into a test (the TLS and encryption ones come back through
 /// `env()`). `BUCKWAL_OTEL*` and `BUCKWAL_TEST_RUN_ID` are not here: `scripts/test.sh` sets
 /// them so the children export under its run id.
-pub const OPTIONAL: [&str; 28] = [
+pub const OPTIONAL: [&str; 34] = [
     "BUCKWAL_REPLICA_POLL_MS",
     "BUCKWAL_REPLICA_NOTIFY_LISTEN",
     "BUCKWAL_REPLICA_NOTIFY_TLS_CERT",
@@ -36,6 +36,12 @@ pub const OPTIONAL: [&str; 28] = [
     "BUCKWAL_ENCRYPTION_KEY_FILE",
     "BUCKWAL_ENCRYPTION_CIPHER",
     "BUCKWAL_JOURNAL_MODE",
+    "BUCKWAL_PACK",
+    "BUCKWAL_PACK_DIR",
+    "BUCKWAL_PACK_LOG_PERCENT",
+    "BUCKWAL_PACK_MAX_AGE_SECS",
+    "BUCKWAL_PACK_ORPHAN_GRACE_SECS",
+    "BUCKWAL_PACK_KEEP_SECS",
     "BUCKWAL_SERVE_LISTEN",
     "BUCKWAL_SERVE_TLS_CERT",
     "BUCKWAL_SERVE_TLS_KEY",

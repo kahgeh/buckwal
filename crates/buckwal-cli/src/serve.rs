@@ -1,6 +1,6 @@
 //! `serve`: `buckwal-server` (tursodb's SQL over HTTP v3) over a database opened as the
 //! writer.
-use crate::{open_writer, say};
+use crate::{open_writer_with, say};
 use buckwal::Batching;
 use buckwal_server::{bind, os_signals, ServeConfig, ShutdownReport};
 use std::path::{Path, PathBuf};
@@ -34,21 +34,21 @@ pub fn run(
     listen: Option<&str>,
     claim: bool,
     batching: Option<Batching>,
+    pack: Option<bool>,
 ) -> Result<(), Failure> {
-    run_lookup(dir, listen, claim, batching, |k| std::env::var(k).ok())
+    let cfg = serve_config(listen, pack, |k| std::env::var(k).ok())?;
+    run_with(cfg, dir, claim, batching)
 }
 
-/// [`run`] reading settings through `get`. The settings are read before the directory, the
-/// bucket or the port is touched.
-fn run_lookup(
-    dir: &Path,
+/// The server's settings, read through `get`, with `--listen` and `--pack`. They are read
+/// before the directory, the bucket or the port is touched.
+fn serve_config(
     listen: Option<&str>,
-    claim: bool,
-    batching: Option<Batching>,
+    pack: Option<bool>,
     get: impl Fn(&str) -> Option<String>,
-) -> Result<(), Failure> {
+) -> Result<ServeConfig, Failure> {
     let cfg = ServeConfig::from_lookup(listen, get).map_err(Failure::Usage)?;
-    run_with(cfg, dir, claim, batching)
+    Ok(ServeConfig { pack, ..cfg })
 }
 
 /// Everything after the settings are read.
@@ -65,6 +65,8 @@ fn run_with(
     if !claim {
         crate::claim_check(dir).map_err(Failure::Failed)?;
     }
+    // The settings the writer's config takes (`--pack`).
+    let settings = cfg.clone();
     let bound = bind(cfg).map_err(Failure::Failed)?;
     say(&format!(
         "serve listening addr={} tls={} auth={}",
@@ -75,7 +77,7 @@ fn run_with(
     let dir: PathBuf = dir.to_path_buf();
     let report = bound
         .serve(
-            move || open_writer(&dir, claim, batching),
+            move || open_writer_with(&dir, claim, batching, |c| settings.apply_to(c)),
             |db| say(&format!("serve ready generation={}", db.generation())),
             os_signals(),
         )
@@ -135,6 +137,17 @@ mod tests {
             assert_eq!(e.message(), sql_e, "same message as sql");
         }
         assert!(!t.path().join("missing").exists(), "created the directory");
+    }
+
+    /// `--pack` reaches the server's settings, which put it into the writer's config.
+    #[test]
+    fn serve_config_takes_the_pack_flag() {
+        for pack in [None, Some(true), Some(false)] {
+            let c = serve_config(Some("127.0.0.1:0"), pack, |_| None).unwrap();
+            assert_eq!(c.pack, pack);
+        }
+        let e = serve_config(Some("x"), Some(true), |_| None).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{e:?}");
     }
 
     fn report(clean: bool, fenced: bool) -> ShutdownReport {

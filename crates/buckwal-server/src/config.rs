@@ -43,6 +43,9 @@ pub struct ServeConfig {
     pub max_streams: usize,
     /// Worker threads running statements (`BUCKWAL_SERVE_WORKERS`, default 32).
     pub workers: usize,
+    /// The packer thread of the writer (`serve --pack on|off`). `None` keeps the database's
+    /// own setting (`BUCKWAL_PACK`, on by default).
+    pub pack: Option<bool>,
 }
 
 impl ServeConfig {
@@ -94,7 +97,16 @@ impl ServeConfig {
             busy_timeout: ms("BUCKWAL_SERVE_BUSY_TIMEOUT_MS", 5_000)?,
             max_streams: positive(&get, "BUCKWAL_SERVE_MAX_STREAMS", 256)? as usize,
             workers: positive(&get, "BUCKWAL_SERVE_WORKERS", 32)? as usize,
+            pack: None,
         })
+    }
+
+    /// Put the settings of this server that the database reads into `config`: `pack`, when
+    /// it is set, replaces `config.pack` (`BUCKWAL_PACK`).
+    pub fn apply_to(&self, config: &mut buckwal::Config) {
+        if let Some(pack) = self.pack {
+            config.pack = pack;
+        }
     }
 
     /// A non-loopback address exposes the server to the network, so it needs both TLS and
@@ -217,6 +229,32 @@ mod tests {
             c.token_file = Some("t".into());
         }
         c
+    }
+
+    /// `--pack` replaces `BUCKWAL_PACK` in the writer's config; without it, the config keeps
+    /// its own value.
+    #[test]
+    fn serve_pack_flag_reaches_config() {
+        let base = |pack: bool| {
+            let mut c = buckwal::Config::new("/d", "http://e", "b", "ak", "sk");
+            c.pack = pack;
+            c
+        };
+        assert_eq!(ServeConfig::from_lookup(None, |_| None).unwrap().pack, None);
+        for (flag, env, want) in [
+            (None, true, true),
+            (None, false, false),
+            (Some(false), true, false),
+            (Some(true), false, true),
+        ] {
+            let s = ServeConfig {
+                pack: flag,
+                ..ServeConfig::from_lookup(None, |_| None).unwrap()
+            };
+            let mut c = base(env);
+            s.apply_to(&mut c);
+            assert_eq!(c.pack, want, "flag {flag:?}, BUCKWAL_PACK {env}");
+        }
     }
 
     #[test]

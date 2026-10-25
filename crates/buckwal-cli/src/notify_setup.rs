@@ -4,9 +4,9 @@
 /// The most replicas one run prints commands for.
 const MAX_REPLICAS: u32 = 1000;
 
-/// The three object kinds a replica reads, as S3 key prefix filters. `pages/` is left out:
-/// replicas never read a page object, and each one would send an event.
-const PREFIXES: [&str; 3] = ["log/", "head", "manifest"];
+/// The two object kinds whose new objects a replica follows, as S3 key prefix filters. A
+/// format 5 bucket has no `manifest/` and no `pages/` objects.
+const PREFIXES: [&str; 2] = ["log/", "head"];
 
 /// A bucket name as S3 allows it, checked loosely: 3 to 63 of lowercase letters, digits, dots
 /// and hyphens, starting and ending with a letter or digit.
@@ -120,7 +120,7 @@ pub fn render(bucket: &str, replicas: u32, region: Option<&str>, topic: Option<&
     line("");
     line("## 3. AWS: the bucket's notification configuration");
     line("");
-    line("# Only the objects replicas read: log/, head and manifest. Not pages/.");
+    line("# Only the objects replicas follow: log/ and head.");
     line("# If the database lives under a prefix P (BUCKWAL_PREFIX), start each prefix with P/");
     line("# (for example P/log/).");
     line("");
@@ -287,8 +287,44 @@ mod tests {
             })
             .collect();
         prefixes.sort();
-        assert_eq!(prefixes, ["head", "log/", "manifest"]);
+        assert_eq!(prefixes, ["head", "log/"]);
         assert!(!cfg.contains("pages"), "{cfg}");
+    }
+
+    /// A format 5 bucket has no `manifest/` objects (spec "Contract changes"): no rule, in the
+    /// SNS and the RustFS JSON, and no word of it in the text.
+    #[test]
+    fn notify_setup_prefixes_have_no_manifest() {
+        let o = out();
+        let blocks = json_blocks(&o);
+        let mut rules = 0;
+        for (cfg_key, arn_key) in [
+            ("TopicConfigurations", "TopicArn"),
+            ("QueueConfigurations", "QueueArn"),
+        ] {
+            let cfg = blocks
+                .iter()
+                .find(|b| b.contains(cfg_key))
+                .unwrap_or_else(|| panic!("no {cfg_key} in {o}"));
+            let v: serde_json::Value = serde_json::from_str(cfg).unwrap();
+            let mut prefixes: Vec<&str> = v[cfg_key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    assert!(r[arn_key].is_string(), "{r}");
+                    r["Filter"]["Key"]["FilterRules"][0]["Value"]
+                        .as_str()
+                        .unwrap()
+                })
+                .collect();
+            prefixes.sort();
+            assert_eq!(prefixes, ["head", "log/"], "{cfg_key}");
+            rules += prefixes.len();
+        }
+        assert_eq!(rules, 4);
+        assert!(!o.contains("manifest"), "{o}");
+        assert!(o.contains("log/ and head"), "{o}");
     }
 
     #[test]

@@ -114,6 +114,17 @@ pub enum Command {
         listen: Option<String>,
         claim: bool,
         batching: Option<Batching>,
+        /// `--pack on|off`: the packer thread of the writer; overrides `BUCKWAL_PACK`.
+        pack: Option<bool>,
+    },
+    /// One pack run now; `dir` is the pack directory (`BUCKWAL_PACK_DIR` overrides it).
+    Pack {
+        dir: PathBuf,
+    },
+    /// The packer loop until SIGTERM or SIGINT; `dir` is the pack directory
+    /// (`BUCKWAL_PACK_DIR` overrides it).
+    Packer {
+        dir: PathBuf,
     },
     /// Follow the bucket's database as a read replica until SIGTERM or SIGINT.
     Follow {
@@ -145,9 +156,12 @@ pub const USAGE: &str = "usage: buckwal <command> [options]
           [--journal-mode wal|mvcc] [--concurrent [all|mixed]]
   bench   --dir DIR --commits N [--connections N] [--batching SPEC] [--journal-mode wal|mvcc]
   serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal|mvcc]
+          [--pack on|off]
   takeover --dir DIR [--journal-mode wal|mvcc]
   follow  --dir DIR [--poll-ms N]
   notify-setup --bucket B --replicas N [--region R] [--topic NAME]
+  pack    --dir DIR
+  packer  --dir DIR
 --journal-mode is the mode a new database is created in (an existing one keeps its own; asking
 for the other is refused); without it, BUCKWAL_JOURNAL_MODE applies; with neither, an existing
 database's own mode is used and a new one is wal. restore and verify follow the bucket head's mode.
@@ -159,6 +173,13 @@ follow runs a read replica until SIGTERM or SIGINT and prints a status line per 
 overrides BUCKWAL_REPLICA_POLL_MS, and BUCKWAL_REPLICA_NOTIFY_* start the notification listener.
 notify-setup only prints the AWS CLI commands and bucket notification JSON (and RustFS
 equivalents, untested) that route bucket events to N replicas; it runs nothing.
+pack runs one pack run now and exits: 0 when it packed, found nothing to do or was superseded,
+1 when it failed. packer runs the packer loop until SIGTERM or SIGINT. Both need the key file
+of an encrypted bucket. DIR is their pack directory (the kept copy, its lock and the working
+files); BUCKWAL_PACK_DIR replaces it. When a packer runs on another machine, set BUCKWAL_PACK=0
+on the writer to stop its packer thread; serve --pack on|off replaces BUCKWAL_PACK for serve.
+The packer settings: BUCKWAL_PACK, BUCKWAL_PACK_DIR, BUCKWAL_PACK_LOG_PERCENT,
+BUCKWAL_PACK_MAX_AGE_SECS, BUCKWAL_PACK_ORPHAN_GRACE_SECS and BUCKWAL_PACK_KEEP_SECS.
 S3 settings come from the BUCKWAL_* environment variables; serve also reads BUCKWAL_SERVE_*.";
 
 fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
@@ -173,6 +194,15 @@ fn positive<T: std::str::FromStr + PartialEq + From<u8>>(flag: &str, v: &str) ->
         return Err(format!("{flag} must be at least 1"));
     }
     Ok(n)
+}
+
+/// An on or off value, as `BUCKWAL_PACK` takes it: `1`, `true`, `on`, `0`, `false` or `off`.
+fn on_off(flag: &str, v: &str) -> Result<bool, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(format!("{flag} is on or off, not {v:?}")),
+    }
 }
 
 /// A batching setting in the PRAGMA's text, valid.
@@ -217,6 +247,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
     let mut replicas: Option<u32> = None;
     let mut region = None;
     let mut topic = None;
+    let mut pack = None;
 
     let mut it = rest.iter().peekable();
     while let Some(a) = it.next() {
@@ -271,6 +302,10 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             }
             ("serve", "--listen") => {
                 listen = Some(value(a)?);
+                true
+            }
+            ("serve", "--pack") => {
+                pack = Some(on_off(a, &value(a)?)?);
                 true
             }
             ("follow", "--poll-ms") => {
@@ -415,7 +450,10 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             listen,
             claim,
             batching: batching_spec,
+            pack,
         },
+        "pack" => Command::Pack { dir },
+        "packer" => Command::Packer { dir },
         "soak" => Command::Soak(SoakArgs {
             dir,
             checkpoint,
@@ -568,6 +606,7 @@ mod tests {
                 listen: Some("127.0.0.1:0".into()),
                 claim: true,
                 batching: Some(Batching::Off),
+                pack: None,
             })
         );
         assert_eq!(
@@ -577,6 +616,7 @@ mod tests {
                 listen: None,
                 claim: false,
                 batching: None,
+                pack: None,
             })
         );
         assert!(p(&["serve"]).is_err());
@@ -684,6 +724,77 @@ mod tests {
         assert!(p(&["takeover"]).is_err(), "--dir is required");
         assert!(p(&["takeover", "--dir", "d", "--claim"]).is_err());
         assert!(p(&["takeover", "--dir", "d", "extra"]).is_err());
+    }
+
+    /// `pack --dir DIR`: one pack run, with `DIR` as the pack directory.
+    #[test]
+    fn pack_subcommand_parses() {
+        assert_eq!(
+            p(&["pack", "--dir", "d"]),
+            Ok(Command::Pack { dir: "d".into() })
+        );
+        assert!(p(&["pack"]).unwrap_err().contains("--dir"));
+        for bad in [
+            &["pack", "--dir", "d", "extra"][..],
+            &["pack", "--dir", "d", "--claim"],
+            &["pack", "--dir", "d", "--pack", "on"],
+            &["pack", "--dir", "d", "--journal-mode", "wal"],
+            &["pack", "--dir"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+        assert!(USAGE.contains("pack    --dir DIR"), "{USAGE}");
+    }
+
+    /// `packer --dir DIR`: the packer loop, with `DIR` as the pack directory.
+    #[test]
+    fn packer_subcommand_parses() {
+        assert_eq!(
+            p(&["packer", "--dir", "d"]),
+            Ok(Command::Packer { dir: "d".into() })
+        );
+        assert!(p(&["packer"]).unwrap_err().contains("--dir"));
+        for bad in [
+            &["packer", "--dir", "d", "extra"][..],
+            &["packer", "--dir", "d", "--poll-ms", "5"],
+            &["packer", "--dir", "d", "--pack", "off"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+        assert!(USAGE.contains("packer  --dir DIR"), "{USAGE}");
+        for var in ["BUCKWAL_PACK_DIR", "BUCKWAL_PACK=0"] {
+            assert!(USAGE.contains(var), "{var}: {USAGE}");
+        }
+    }
+
+    /// `serve --pack on|off` sets the packer thread; it takes the values `BUCKWAL_PACK` takes,
+    /// and only `serve` takes it.
+    #[test]
+    fn serve_pack_flag_parses() {
+        let pack = |a: &[&str]| match p(a).unwrap() {
+            Command::Serve { pack, .. } => pack,
+            c => panic!("{c:?}"),
+        };
+        assert_eq!(pack(&["serve", "--dir", "d"]), None);
+        for (v, want) in [
+            ("on", true),
+            ("1", true),
+            ("true", true),
+            ("off", false),
+            ("0", false),
+            ("false", false),
+        ] {
+            assert_eq!(
+                pack(&["serve", "--dir", "d", "--pack", v]),
+                Some(want),
+                "{v}"
+            );
+        }
+        let e = p(&["serve", "--dir", "d", "--pack", "maybe"]).unwrap_err();
+        assert!(e.contains("--pack"), "{e}");
+        assert!(p(&["serve", "--dir", "d", "--pack"]).is_err());
+        assert!(p(&["sql", "--dir", "d", "--pack", "on", "SELECT 1"]).is_err());
+        assert!(USAGE.contains("[--pack on|off]"), "{USAGE}");
     }
 
     /// `gc` takes no directory: it works on the bucket alone.

@@ -3,6 +3,7 @@ mod args;
 mod bench;
 mod follow;
 mod notify_setup;
+mod packer;
 mod scan;
 mod serve;
 mod soak;
@@ -126,7 +127,7 @@ fn reader_config_with_head(dir: &Path) -> CliResult<(Config, Option<Vec<u8>>)> {
     Ok((cfg, head))
 }
 
-/// `head format=<n>` and, for a format 4 head, ` database_id=<id>`: the head's JSON read as
+/// `head format=<n>` and, for a format 4 or 5 head, ` database_id=<id>`: the head's JSON read as
 /// text (a head is plaintext in every format; the library's decoder is crate-internal). Format
 /// 3 is an encrypted bucket made before format 4: it has no database id, and an object copied
 /// in from another database of the same key file verifies (README, Encryption).
@@ -305,7 +306,23 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
         None => Vec::new(),
     };
     let (cfg, head) = reader_config_with_head(dir)?;
-    let db = buckwal::open_read_only(cfg).map_err(err)?;
+    let store = s3_store(&cfg)?;
+    say_all("", &verify_with(cfg, store, head, &acked)?);
+    Ok(())
+}
+
+/// `verify` against `store`: its lines.
+fn verify_with(
+    cfg: Config,
+    store: Arc<dyn ObjectStore>,
+    head: Option<Vec<u8>>,
+    acked: &[i64],
+) -> CliResult<Vec<String>> {
+    // The bucket first: a local copy that was restored before shows nothing of it.
+    let checked = buckwal::check_bucket_with_store(&cfg, store.clone())
+        .map_err(|e| format!("verify: bucket: {e}"))?;
+    let mut lines = Vec::new();
+    let db = buckwal::open_read_only_with_store(cfg, store).map_err(err)?;
     let conn = db.connect().map_err(err)?;
     let rows = conn.query("PRAGMA integrity_check", &[]).map_err(err)?;
     let verdict = rows
@@ -325,12 +342,83 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
         Err(e) if is_missing_table(&e.to_string()) => BTreeSet::new(),
         Err(e) => return Err(err(e)),
     };
-    say(&check_ids(&acked, &ids)?);
+    lines.push(check_ids(acked, &ids)?);
     if let Some(head) = head {
-        say(&head_summary(&head));
+        lines.push(head_summary(&head));
+    }
+    if let Some(key) = &checked.pack_key {
+        lines.push(format!(
+            "verify pack key={key} pack_generation={} size={} blocks={} log_generations={} \
+             log_objects={}",
+            checked.pack_generation,
+            checked.pack_size,
+            checked.blocks,
+            checked.log_generations,
+            checked.log_objects
+        ));
     }
     conn.close().map_err(err)?;
-    db.close().map_err(err)
+    db.close().map_err(err)?;
+    Ok(lines)
+}
+
+/// Make the pack directory of `pack` and `packer`: `dir`, when `BUCKWAL_PACK_DIR` names no
+/// other (the library makes that one).
+pub(crate) fn make_pack_dir(cfg: &Config, dir: &Path) -> CliResult<()> {
+    if cfg.pack_dir.is_none() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// `pack`: one pack run now, with `dir` as the pack directory. A `failed` run is an error
+/// (exit 1); `packed`, `nothing_to_do` and `superseded` are not.
+fn pack(dir: &Path) -> CliResult<()> {
+    let cfg = config(dir)?;
+    make_pack_dir(&cfg, dir)?;
+    let r = buckwal::pack(&cfg).map_err(err)?;
+    say(&pack_line(&r));
+    pack_exit(&r.outcome).map_err(|e| match &r.error {
+        Some(why) => format!("{e}: {why}"),
+        None => e,
+    })
+}
+
+/// The exit of `pack`: an error for a `failed` run, which names its step and key, else none.
+fn pack_exit(outcome: &buckwal::PackOutcome) -> CliResult<()> {
+    match outcome {
+        buckwal::PackOutcome::Failed { step, key } => Err(match key {
+            Some(k) => format!("the pack run failed at {step} ({k})"),
+            None => format!("the pack run failed at {step}"),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The line `pack` prints for its report: each value one word (`-` for none, and spaces in a
+/// step become `_`). The error is not in it: `pack` gives it on stderr.
+fn pack_line(r: &buckwal::PackReport) -> String {
+    let (step, key) = match &r.outcome {
+        buckwal::PackOutcome::Failed { step, key } => (
+            step.replace(' ', "_"),
+            key.clone().unwrap_or_else(|| "-".into()),
+        ),
+        _ => ("-".into(), "-".into()),
+    };
+    let (source, reason) = r.source.map_or(("-", "-"), |s| (s.as_str(), s.reason()));
+    format!(
+        "pack outcome={} pack_generation={} pack_key={} size={} bytes_down={} bytes_up={} \
+         source={source} reason={reason} free_page_share={:.3} failed_step={step} \
+         failed_key={key} ms={}",
+        r.outcome.as_str(),
+        r.pack_generation,
+        r.pack_key.as_deref().unwrap_or("-"),
+        r.pack_size,
+        r.bytes_down,
+        r.bytes_up,
+        r.free_page_share,
+        r.elapsed.as_millis()
+    )
 }
 
 /// Refuse a directory the writer does not own (see [`open_writer`]); no bucket call.
@@ -355,10 +443,23 @@ pub(crate) fn open_writer(
     claim: bool,
     batching: Option<Batching>,
 ) -> CliResult<Database> {
+    open_writer_with(dir, claim, batching, |_| {})
+}
+
+/// [`open_writer`], with `adjust` applied to the writer's config before the open (`serve
+/// --pack`).
+pub(crate) fn open_writer_with(
+    dir: &Path,
+    claim: bool,
+    batching: Option<Batching>,
+    adjust: impl FnOnce(&mut Config),
+) -> CliResult<Database> {
     if !claim {
         claim_check(dir)?;
     }
-    let db = buckwal::open(writer_config(dir)?).map_err(err)?;
+    let mut cfg = writer_config(dir)?;
+    adjust(&mut cfg);
+    let db = buckwal::open(cfg).map_err(err)?;
     if let Some(b) = batching {
         db.set_batching(b).map_err(err)?;
     }
@@ -434,9 +535,10 @@ fn main() -> ExitCode {
         listen,
         claim,
         batching,
+        pack,
     } = &cmd
     {
-        return match serve::run(dir, listen.as_deref(), *claim, *batching) {
+        return match serve::run(dir, listen.as_deref(), *claim, *batching, *pack) {
             Ok(()) => ExitCode::SUCCESS,
             Err(f) => {
                 eprintln!("error: {}", f.message());
@@ -446,6 +548,7 @@ fn main() -> ExitCode {
     }
     let handled = match &cmd {
         Command::Follow { dir, poll_ms } => Some(follow::run(dir, *poll_ms)),
+        Command::Packer { dir } => Some(packer::run(dir)),
         Command::NotifySetup {
             bucket,
             replicas,
@@ -487,7 +590,11 @@ fn main() -> ExitCode {
         Command::Soak(a) => soak::run(a),
         Command::Bench(a) => bench::run(a),
         Command::Scan(a) => scan::run(a),
-        Command::Serve { .. } | Command::Follow { .. } | Command::NotifySetup { .. } => {
+        Command::Pack { dir } => pack(dir),
+        Command::Serve { .. }
+        | Command::Follow { .. }
+        | Command::Packer { .. }
+        | Command::NotifySetup { .. } => {
             unreachable!("handled above")
         }
     };
@@ -616,6 +723,208 @@ mod tests {
         assert_eq!(head_journal_mode(v2), JournalMode::Mvcc);
         assert_eq!(head_journal_mode(v1), JournalMode::Wal);
         assert_eq!(head_journal_mode(b"not json"), JournalMode::Wal);
+    }
+
+    /// `pack` exits 0 on `packed`, `nothing_to_do` and `superseded`, and 1 on `failed`, with
+    /// the failed step and key in the message.
+    #[test]
+    fn pack_command_exit_codes() {
+        use buckwal::PackOutcome;
+        for ok in [
+            PackOutcome::Packed,
+            PackOutcome::NothingToDo,
+            PackOutcome::Superseded,
+        ] {
+            assert_eq!(pack_exit(&ok), Ok(()), "{ok:?}");
+        }
+        let e = pack_exit(&PackOutcome::Failed {
+            step: "disk".into(),
+            key: None,
+        })
+        .unwrap_err();
+        assert!(e.contains("failed") && e.contains("disk"), "{e}");
+        let e = pack_exit(&PackOutcome::Failed {
+            step: "verify size".into(),
+            key: Some("t/pack/0000000003/r1".into()),
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("verify size") && e.contains("t/pack/0000000003/r1"),
+            "{e}"
+        );
+    }
+
+    fn report(outcome: buckwal::PackOutcome) -> buckwal::PackReport {
+        buckwal::PackReport {
+            outcome,
+            pack_generation: 3,
+            pack_key: Some("t/pack/0000000003/r1".into()),
+            bytes_down: 4096,
+            bytes_up: 8192,
+            step_times: vec![("read", Duration::from_millis(5))],
+            free_page_share: 0.25,
+            pack_size: 8192,
+            error: None,
+            source: Some(buckwal::PackSource::Downloaded(
+                buckwal::DownloadReason::Moved,
+            )),
+            elapsed: Duration::from_millis(1234),
+        }
+    }
+
+    #[test]
+    fn pack_line_names_the_report() {
+        assert_eq!(
+            pack_line(&report(buckwal::PackOutcome::Packed)),
+            "pack outcome=packed pack_generation=3 pack_key=t/pack/0000000003/r1 size=8192 \
+             bytes_down=4096 bytes_up=8192 source=downloaded reason=moved free_page_share=0.250 \
+             failed_step=- failed_key=- ms=1234"
+        );
+        let mut r = report(buckwal::PackOutcome::Failed {
+            step: "verify size".into(),
+            key: Some("t/pack/0000000003/r1".into()),
+        });
+        r.source = Some(buckwal::PackSource::Kept);
+        r.pack_key = None;
+        r.error = Some("the HEAD size is 1 byte more".into());
+        let line = pack_line(&r);
+        assert!(
+            line.starts_with("pack outcome=failed pack_generation=3 pack_key=- "),
+            "{line}"
+        );
+        assert!(line.contains(" source=kept reason=none "), "{line}");
+        assert!(
+            line.contains(" failed_step=verify_size failed_key=t/pack/0000000003/r1 "),
+            "{line}"
+        );
+        assert!(
+            !line.contains("HEAD size"),
+            "the error is not in the line: {line}"
+        );
+        r.source = None;
+        assert!(pack_line(&r).contains(" source=- reason=- "));
+    }
+
+    fn mem_config(dir: &Path) -> Config {
+        let mut c = Config::new(dir, "http://127.0.0.1:1", "bucket", "ak", "sk");
+        c.prefix = "t".to_string();
+        c.retry_deadline = Duration::from_secs(2);
+        c
+    }
+
+    /// A writer commits ids 1 to 3 in `soak`, ends its generation, commits 4, ends it again
+    /// and commits 5; a pack run between the two switches packs the first generation.
+    fn soak_bucket(mem: &Arc<buckwal::store::MemStore>, root: &Path) {
+        use buckwal::CheckpointMode;
+        let store: Arc<dyn ObjectStore> = mem.clone();
+        let db = buckwal::open_with_store(mem_config(&root.join("w")), store.clone()).unwrap();
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE soak(id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for id in 1..=3 {
+            c.execute("INSERT INTO soak VALUES (?)", &[Value::from_i64(id)])
+                .unwrap();
+        }
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        let r = buckwal::pack_with_store(&mem_config(&root.join("p")), store.clone()).unwrap();
+        assert_eq!(r.outcome, buckwal::PackOutcome::Packed, "{r:?}");
+        c.execute("INSERT INTO soak VALUES (4)", &[]).unwrap();
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        c.execute("INSERT INTO soak VALUES (5)", &[]).unwrap();
+        c.close().unwrap();
+        db.close().unwrap();
+    }
+
+    fn head_of(mem: &buckwal::store::MemStore) -> Option<Vec<u8>> {
+        mem.get("t/head").unwrap().map(|o| o.body)
+    }
+
+    /// `verify` reads the pointer and checks every block of the pack against its codes, and
+    /// the chain of generations and the log from the pack on: a flipped byte in the pack, and
+    /// a generation's log that is gone, are reported. A correct bucket verifies, and its lines
+    /// begin with the `verify ok` line, as before.
+    #[test]
+    fn verify_checks_pack_blocks() {
+        let mem = Arc::new(buckwal::store::MemStore::new());
+        let t = tempfile::tempdir().unwrap();
+        soak_bucket(&mem, t.path());
+        let store: Arc<dyn ObjectStore> = mem.clone();
+        let lines = verify_with(
+            mem_config(&t.path().join("r1")),
+            store.clone(),
+            head_of(&mem),
+            &[1, 2, 3, 4, 5],
+        )
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            "verify ok acked=5 present=5 unacked_present=0 duplicate_acks=0"
+        );
+        assert!(
+            lines[1].starts_with("head format=5 database_id="),
+            "{lines:?}"
+        );
+        let pack_key = mem
+            .list("t/pack/")
+            .unwrap()
+            .into_iter()
+            .find(|k| !k.ends_with(".codes"))
+            .unwrap();
+        let rel = pack_key.strip_prefix("t/").unwrap();
+        assert!(
+            lines[2].starts_with(&format!("verify pack key={rel} pack_generation=2 ")),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains(" blocks=1 "), "{lines:?}");
+        // Every log object from the pack generation on, and their generations.
+        let log: Vec<String> = mem
+            .list("t/log/")
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.as_str() >= "t/log/0000000002/")
+            .collect();
+        let generations: BTreeSet<&str> = log.iter().map(|k| &k[..17]).collect();
+        assert!(generations.len() >= 2, "{log:?}");
+        assert!(
+            lines[2].ends_with(&format!(
+                " log_generations={} log_objects={}",
+                generations.len(),
+                log.len()
+            )),
+            "{lines:?} {log:?}"
+        );
+
+        // One flipped byte in the pack: the local restore in r1 is not read, the bucket is.
+        let good = mem.get(&pack_key).unwrap().unwrap().body;
+        let mut bad = good.clone();
+        bad[good.len() - 1] ^= 0x01;
+        mem.put(&pack_key, &bad).unwrap();
+        let e = verify_with(
+            mem_config(&t.path().join("r1")),
+            store.clone(),
+            head_of(&mem),
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.starts_with("verify: bucket: "), "{e}");
+        assert!(
+            e.contains("checksum mismatch") && e.contains(&pack_key),
+            "{e}"
+        );
+        mem.put(&pack_key, &good).unwrap();
+
+        // The log of the first generation after the pack is gone: the chain is broken.
+        let log: Vec<String> = mem.list("t/log/0000000002/").unwrap();
+        assert!(!log.is_empty());
+        for k in &log {
+            mem.delete(k).unwrap();
+        }
+        let e =
+            verify_with(mem_config(&t.path().join("r2")), store, head_of(&mem), &[]).unwrap_err();
+        assert!(
+            e.starts_with("verify: bucket: ") && e.contains("log_incomplete"),
+            "{e}"
+        );
     }
 
     #[test]
