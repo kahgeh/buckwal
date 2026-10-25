@@ -202,7 +202,7 @@ pub fn run_packer_with_store(
 ) -> Result<()> {
     config.validate()?;
     crate::encryption::load(config)?;
-    packer_loop(config, &store, &stop, Instant::now());
+    packer_loop(config, &store, &stop, Instant::now(), None);
     Ok(())
 }
 
@@ -303,21 +303,35 @@ fn error_kind(text: &str) -> String {
 
 /// The loop: a check at `first`, then one every `config.pack_check_interval`, longer after
 /// failed runs ([`next_wait`]).
-fn packer_loop(config: &Config, store: &Arc<dyn ObjectStore>, stop: &AtomicBool, first: Instant) {
+fn packer_loop(
+    config: &Config,
+    store: &Arc<dyn ObjectStore>,
+    stop: &AtomicBool,
+    first: Instant,
+    local_db: Option<&std::path::Path>,
+) {
     let pack_root = config.keys_for(None).pack_root();
     let mut failures = Failures::default();
-    // Failed runs in a row: the back-off counts them (a failed check does not).
+    // Failed runs in a row: the back-off counts them (`failed_runs_after`).
     let mut failed_runs = 0u64;
     let mut next = first;
     while wait_until(next, stop) {
         let started = Instant::now();
+        #[cfg(test)]
+        CHECK_STARTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((config.dir.clone(), started));
         let n = failures.count;
-        let r = catch_unwind(AssertUnwindSafe(|| check_and_run(config, store, stop, n)));
-        let run_failed = match r {
+        let estimate = first_pack_estimate(local_db);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            check_and_run(config, store, stop, n, estimate)
+        }));
+        let checked = match r {
             // No run is due: a failure before it does not continue.
             Ok(Ok(None)) => {
                 failures.ok("pack runs succeed again");
-                false
+                Checked::NothingDue
             }
             Ok(Ok(Some(report))) => match &report.outcome {
                 PackOutcome::Failed { step, .. } if step == CLOSED => return,
@@ -333,11 +347,11 @@ fn packer_loop(config: &Config, store: &Arc<dyn ObjectStore>, stop: &AtomicBool,
                             "pack run failed"
                         );
                     });
-                    true
+                    Checked::RunFailed
                 }
                 _ => {
                     failures.ok("pack runs succeed again");
-                    false
+                    Checked::Succeeded
                 }
             },
             Ok(Err(e)) => {
@@ -345,26 +359,26 @@ fn packer_loop(config: &Config, store: &Arc<dyn ObjectStore>, stop: &AtomicBool,
                     tracing::warn!(target: "buckwal", step = "error", error = %e, failures = count, "pack run failed");
                 });
                 // An error of the run itself (not of the check) backs off as a failed run.
-                matches!(e, RunError::Run(_))
+                match e {
+                    RunError::Run(_) => Checked::RunFailed,
+                    RunError::Check(_) => Checked::CheckFailed,
+                }
             }
             Err(panic) => {
                 let what = panic_text(&panic);
                 failures.fail("pack check panicked", format!("panic {what}"), |count| {
                     tracing::error!(target: "buckwal", error = %what, failures = count, "packer panicked");
                 });
-                true
+                Checked::RunFailed
             }
         };
         if stop.load(SeqCst) {
             return;
         }
-        if run_failed {
-            failed_runs += 1;
-        } else {
-            failed_runs = 0;
-        }
+        let before = failed_runs;
+        failed_runs = failed_runs_after(failed_runs, checked);
         let wait = next_wait(config.pack_check_interval, failed_runs, config.pack_max_age);
-        if failed_runs == 2 {
+        if failed_runs == 2 && before == 1 {
             tracing::info!(
                 target: "buckwal",
                 wait_secs = wait.as_secs_f64(),
@@ -374,6 +388,42 @@ fn packer_loop(config: &Config, store: &Arc<dyn ObjectStore>, stop: &AtomicBool,
         }
         next = started + wait;
     }
+}
+
+/// Tests only: the directory of each loop's packer and the time it started each check.
+#[cfg(test)]
+pub(crate) static CHECK_STARTS: std::sync::Mutex<Vec<(std::path::PathBuf, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How one check of the loop ended, for the back-off.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Checked {
+    /// No run was due.
+    NothingDue,
+    /// A run packed, found nothing to do or was superseded.
+    Succeeded,
+    /// A run ended as `failed` (not `closed`), returned an error or panicked.
+    RunFailed,
+    /// The check itself failed (the head or the pointer could not be read): no run started.
+    CheckFailed,
+}
+
+/// The failed runs in a row after a check that ended as `c`. A failed check leaves the count
+/// as it is: it downloads nothing, and a run failure, a check failure and a run failure still
+/// back off.
+pub(crate) fn failed_runs_after(prev: u64, c: Checked) -> u64 {
+    match c {
+        Checked::RunFailed => prev.saturating_add(1),
+        Checked::CheckFailed => prev,
+        Checked::NothingDue | Checked::Succeeded => 0,
+    }
+}
+
+/// The size to check the free disk against for a database with no pack yet: the size of the
+/// writer's local database file `db` (`None` for `buckwal pack` and `buckwal packer`, which
+/// have no local database, and for a missing file).
+pub(crate) fn first_pack_estimate(db: Option<&std::path::Path>) -> Option<u64> {
+    std::fs::metadata(db?).ok().map(|m| m.len())
 }
 
 /// The step of a run that a close ended (`run::pack_run_in`).
@@ -406,6 +456,7 @@ fn check_and_run(
     store: &Arc<dyn ObjectStore>,
     stop: &AtomicBool,
     failures: u64,
+    first_pack_estimate: Option<u64>,
 ) -> std::result::Result<Option<PackReport>, RunError> {
     let Some(reason) = check(config, &**store).map_err(RunError::Check)? else {
         return Ok(None);
@@ -418,6 +469,7 @@ fn check_and_run(
         Arc::new(move || origin.age()),
         stop,
         failures,
+        first_pack_estimate,
     )
     .map_err(RunError::Run)?;
     Ok(Some(report))
@@ -574,7 +626,8 @@ impl PackerThreads {
             let (config, store, stop) = (config.clone(), store.clone(), stop.clone());
             spawn_named("buckwal-packer", move || {
                 let first = Instant::now() + config.pack_check_interval;
-                packer_loop(&config, &store, &stop, first);
+                let db = config.dir.join(crate::files::DB_FILE);
+                packer_loop(&config, &store, &stop, first, Some(&db));
             })
         });
         let gauges = Gauges {

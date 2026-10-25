@@ -317,7 +317,7 @@ pub(crate) fn pack_run(
     store: Arc<dyn ObjectStore>,
     clock: Clock,
 ) -> Result<PackReport> {
-    pack_run_in(config, store, clock, &AtomicBool::new(false), 0)
+    pack_run_in(config, store, clock, &AtomicBool::new(false), 0, None)
 }
 
 /// One pack run in its `buckwal.pack` span: [`pack_run`] that `stop` can end early, and
@@ -329,14 +329,17 @@ pub(crate) fn pack_run(
 /// ends as `Failed` at the step `closed` ([`CLOSED_STEP`]): it aborts its multipart upload
 /// (when the abort fails, GC aborts the upload after the orphan grace), deletes its pack and
 /// codes when they are complete, moves no pointer, and its working directory goes with it. A
-/// close during the local apply leaves the kept copy's `applying` flag on, so the next run
-/// downloads the pack (the flag is reserved for the kept copy of task 11b; this run keeps no
-/// copy yet). A `closed` span keeps status Unset: a close is not a fault.
+/// close during the local apply removes the working directory too, so the next run downloads
+/// the pack again. (The kept copy of task 11b adds an `applying` flag for this case.) A
+/// `closed` span keeps status Unset: a close is not a fault.
 ///
 /// Before it downloads a pack or applies the log, the run checks that the working
-/// directory's disk has the pointer's pack size plus 10% free ([`free_disk`]). If not, it
-/// ends as `Failed` at the step `disk` and changes nothing. The first pack of a database has
-/// no pack size to check against: its run makes no check.
+/// directory's disk has the pack size plus 10% free ([`free_disk`]). The size is the
+/// pointer's pack size. With no pack yet it is `first_pack_estimate`: the writer's thread
+/// gives the size of its local database file. `buckwal pack` and `buckwal packer` give none,
+/// and their first pack is not checked (a known gap: the log sizes are not listed by the
+/// run). If the disk is short, the run ends as `Failed` at the step `disk` and changes
+/// nothing.
 ///
 /// The run counts its own bytes (`CountingStore`): other traffic on the same store (the
 /// writer's commits) is not in `bytes_down` and `bytes_up`.
@@ -356,6 +359,7 @@ pub(crate) fn pack_run_in(
     clock: Clock,
     stop: &AtomicBool,
     failures: u64,
+    first_pack_estimate: Option<u64>,
 ) -> Result<PackReport> {
     let span = tracing::info_span!(
         target: "buckwal",
@@ -379,7 +383,7 @@ pub(crate) fn pack_run_in(
         buckwal.outcome = Empty,
     );
     let start = Instant::now();
-    let r = span.in_scope(|| pack_run_inner(config, &store, clock, stop));
+    let r = span.in_scope(|| pack_run_inner(config, &store, clock, stop, first_pack_estimate));
     span.record("buckwal.elapsed_ms", start.elapsed().as_millis() as u64);
     match &r {
         Ok(report) => record_report(&span, report),
@@ -443,6 +447,7 @@ fn pack_run_inner(
     store: &Arc<dyn ObjectStore>,
     clock: Clock,
     stop: &AtomicBool,
+    first_pack_estimate: Option<u64>,
 ) -> Result<PackReport> {
     config.validate()?;
     let enc = encryption::load(config)?;
@@ -450,6 +455,7 @@ fn pack_run_inner(
     sweep_work_dirs(config);
     let work = WorkDir::create(config.dir.join(format!("{WORK_DIR_PREFIX}{run_id}")))?;
     let counting = CountingStore::new(&**store);
+    let first_pack_estimate = first_pack_estimate.filter(|n| *n > 0);
     let mut run = Run {
         store: &counting,
         keys: config.keys_for(enc.as_deref()),
@@ -463,6 +469,7 @@ fn pack_run_inner(
         step_start: Instant::now(),
         stop,
         error: None,
+        first_pack_estimate,
     };
     let start = Instant::now();
     let ran = run.run(config)?;
@@ -766,6 +773,8 @@ struct Run<'a> {
     stop: &'a AtomicBool,
     /// The error behind a `Failed` outcome, when there is one.
     error: Option<String>,
+    /// The size to check the free disk against when there is no pack yet.
+    first_pack_estimate: Option<u64>,
 }
 
 /// What `pack-latest` holds, for a run.
@@ -861,16 +870,18 @@ impl Run<'_> {
         }
         let from = base.as_ref().map_or(1, |p| p.pack_generation);
         self.step("read");
-        if let Some(p) = &base {
+        let size = base.as_ref().map(|p| p.size).or(self.first_pack_estimate);
+        if let Some(size) = size {
             // Free disk first (spec rev 21): the pack's size plus 10%, before any download.
-            let need = p.size.saturating_add(p.size / 10);
+            let need = size.saturating_add(size / 10);
             let free = free_disk(&self.work)?;
             if free < need {
                 self.error = Some(format!(
                     "free disk: {free} bytes free in {}, a pack run needs {need} (the pack's size plus 10%)",
                     self.work.display()
                 ));
-                return Ok(Ran::without_pack(failed("disk", None), p.pack_generation));
+                let current = base.as_ref().map_or(0, |p| p.pack_generation);
+                return Ok(Ran::without_pack(failed("disk", None), current));
             }
         }
 

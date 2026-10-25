@@ -669,7 +669,7 @@ fn stop_abandons_a_run_and_removes_its_working_dir() {
     *ts.on_log_get.lock().unwrap() = Some(stop.clone());
     let t = tempdir();
     let cfg = packer_cfg(&t, "p");
-    let r = pack_run_in(&cfg, ts.clone(), clock(), &stop, 0).unwrap();
+    let r = pack_run_in(&cfg, ts.clone(), clock(), &stop, 0, None).unwrap();
     assert_eq!(
         r.outcome,
         PackOutcome::Failed {
@@ -1093,7 +1093,7 @@ fn close_before_the_pointer_write_discards_the_pack() {
     let stop = Arc::new(AtomicBool::new(false));
     *ts.on_pack_stat.lock().unwrap() = Some(stop.clone());
     let t = tempdir();
-    let r = pack_run_in(&packer_cfg(&t, "p"), ts.clone(), clock(), &stop, 0).unwrap();
+    let r = pack_run_in(&packer_cfg(&t, "p"), ts.clone(), clock(), &stop, 0, None).unwrap();
     assert!(
         matches!(&r.outcome, PackOutcome::Failed { step, .. } if step == "closed"),
         "{r:?}"
@@ -1131,13 +1131,13 @@ fn failed_runs_back_off_and_a_success_resets_the_wait() {
     let (stop, h) =
         tracing::subscriber::with_default(cap.subscriber(), || spawn_loop(cfg, ts.clone()));
     assert!(eventually(20, || ts.uploads_started.load(SeqCst) >= 6));
-    let times = ts.upload_times.lock().unwrap().clone();
+    // The loop counts each wait from the start of a check (each check here is a failed run).
+    let times = check_starts(&t.path().join("p"));
+    assert!(times.len() >= 6, "{times:?}");
     for k in 1..6 {
         let gap = times[k] - times[k - 1];
         let want = next_wait(interval, k as u64, max);
-        // The wait counts from the start of a check; the upload comes a little after it.
-        let slack = Duration::from_millis(15);
-        assert!(gap + slack >= want, "gap {k}: {gap:?} < {want:?}");
+        assert!(gap >= want, "gap {k}: {gap:?} < {want:?}");
     }
     // A success resets the wait: the next failure counts from 0 again.
     ts.set_upload(Upload::Pass);
@@ -1183,7 +1183,7 @@ fn run_without_free_disk_fails_at_disk_and_writes_nothing() {
     let before = packs(&*mem);
     // Just below the pack's size plus 10%.
     let free = crate::pack::run::FreeDiskForTest::set(p.size + p.size / 10 - 1);
-    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0).unwrap();
+    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0, None).unwrap();
     let PackOutcome::Failed { step, .. } = &r.outcome else {
         panic!("{r:?}")
     };
@@ -1206,7 +1206,7 @@ fn run_without_free_disk_fails_at_disk_and_writes_nothing() {
     drop(free);
     // With enough room the run packs.
     let _free = crate::pack::run::FreeDiskForTest::set(p.size + p.size / 10);
-    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0).unwrap();
+    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0, None).unwrap();
     assert_eq!(r.outcome, PackOutcome::Packed);
 }
 
@@ -1232,6 +1232,7 @@ fn run_counts_only_its_own_bytes() {
         clock(),
         &AtomicBool::new(false),
         0,
+        None,
     )
     .unwrap();
     assert_eq!(r.outcome, PackOutcome::Packed);
@@ -1293,4 +1294,75 @@ fn mvcc_seal_writer_and_replica_start_no_packer() {
     assert_eq!(ts.calls_of("get_aged", "pack-latest"), 0);
     assert_eq!(ts.calls_of("put_multipart", ""), 0);
     drop(replica);
+}
+
+// ---- Fix round 2 ----
+
+/// When the loop of the packer whose directory is `dir` started each check.
+fn check_starts(dir: &Path) -> Vec<Instant> {
+    CHECK_STARTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(d, _)| d == dir)
+        .map(|(_, t)| *t)
+        .collect()
+}
+
+#[test]
+fn a_failed_check_leaves_the_back_off_count() {
+    use Checked::*;
+    assert_eq!(failed_runs_after(0, RunFailed), 1);
+    assert_eq!(failed_runs_after(2, RunFailed), 3);
+    // A failed check reads only the head and the pointer: run, check, run still backs off.
+    assert_eq!(failed_runs_after(2, CheckFailed), 2);
+    assert_eq!(
+        failed_runs_after(failed_runs_after(2, CheckFailed), RunFailed),
+        3
+    );
+    assert_eq!(failed_runs_after(5, Succeeded), 0);
+    assert_eq!(failed_runs_after(5, NothingDue), 0);
+}
+
+#[test]
+fn first_pack_disk_check_uses_the_estimate() {
+    let mem = Arc::new(MemStore::new());
+    let w = plain_writer(mem.clone());
+    w.insert(1..=3);
+    w.end_generation();
+    let t = tempdir();
+    let cfg = packer_cfg(&t, "p");
+    let ts = TestStore::new(mem.clone());
+    let _free = crate::pack::run::FreeDiskForTest::set(1 << 20);
+    // No pack yet: the estimate (the writer's local database file) is the size to check.
+    let r = pack_run_in(
+        &cfg,
+        ts.clone(),
+        clock(),
+        &AtomicBool::new(false),
+        0,
+        Some(10 << 20),
+    )
+    .unwrap();
+    assert!(
+        matches!(&r.outcome, PackOutcome::Failed { step, .. } if step == "disk"),
+        "{r:?}"
+    );
+    assert_eq!(ts.calls_of("get", "/log/"), 0, "no log read");
+    assert!(pointer_of(&*mem).is_none() && packs(&*mem).is_empty());
+    // Without an estimate (`buckwal pack`, `buckwal packer`) the first pack is not checked.
+    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0, None).unwrap();
+    assert_eq!(r.outcome, PackOutcome::Packed);
+}
+
+#[test]
+fn writer_estimate_is_the_local_database_size() {
+    let t = tempdir();
+    assert_eq!(first_pack_estimate(Some(&t.path().join("app.db"))), None);
+    std::fs::write(t.path().join("app.db"), vec![0u8; 8192]).unwrap();
+    assert_eq!(
+        first_pack_estimate(Some(&t.path().join("app.db"))),
+        Some(8192)
+    );
+    assert_eq!(first_pack_estimate(None), None);
 }
