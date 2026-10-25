@@ -77,6 +77,8 @@ fn a_takeover_after_a_commit_reports_a_zero_quiet() {
 /// which it wrote its pages and manifest); the next seal does not.
 #[test]
 fn only_the_first_seal_after_a_takeover_has_a_skipped_generation() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = writer_left_in_a_seal(&store, 5);
     let g = head(&*store).generation;
@@ -159,6 +161,8 @@ fn the_mvcc_seal_span_names_the_skipped_generation_too() {
 /// the seal that skips one.
 #[test]
 fn seal_events_report_the_generation_sealed_after_a_skip_too() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = writer_left_in_a_seal(&store, 5);
     let g = head(&*store).generation;
@@ -190,6 +194,55 @@ fn seal_events_report_the_generation_sealed_after_a_skip_too() {
     assert_eq!(finished, [g], "{ev:?}");
     c.close().unwrap();
     db.close().unwrap();
+}
+
+/// Format 5: a writer that took over waits out the takeover quiet before its first switch (the
+/// old writer's last record is a seal-start record), then switches over the skipped generation:
+/// `SealQuiet`, then `GenerationSwitched` from G to G+2, and the span names G+2.
+#[test]
+fn the_first_switch_after_a_takeover_waits_the_quiet_and_skips_a_generation() {
+    let store = mem();
+    let _a = writer_left_in_a_seal(&store, 5);
+    let g = head(&*store).generation;
+    assert_eq!(head(&*store).format, crate::format::FORMAT_V5);
+    let bt = tempdir();
+    let b_dir = fresh(&bt);
+    crate::takeover_with_store(quiet_config(&b_dir, None), store.clone()).unwrap();
+    let (hook, seen) = recorder();
+    let ((), spans) = captured(|| {
+        let db = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
+        let c = db.connect().unwrap();
+        insert(&c, 1001).unwrap();
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        assert_eq!(head(&*store).generation, g + 2);
+        c.close().unwrap();
+        db.close().unwrap();
+    });
+    let ev = seen.lock().unwrap().clone();
+    let kinds: Vec<String> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::SealQuiet { generation, .. } => Some(format!("quiet {generation}")),
+            Event::GenerationSwitched { from, to, .. } => Some(format!("switched {from}->{to}")),
+            Event::SealStarted { .. } | Event::SealFinished { .. } => Some("seal".into()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        [format!("quiet {g}"), format!("switched {g}->{}", g + 2)]
+    );
+    assert!(!kinds.contains(&"seal".to_string()), "{kinds:?}");
+    let switches = spans.named("buckwal.generation_switch");
+    let next = (g + 2).to_string();
+    assert_eq!(
+        switches[0].field("buckwal.next_generation"),
+        Some(next.as_str()),
+        "{:?}",
+        switches[0]
+    );
+    assert_eq!(switches[0].field("buckwal.outcome"), Some("switched"));
+    assert!(spans.named("buckwal.checkpoint_upload").is_empty());
 }
 
 /// A takeover that fails before its head write still carries what it knew by then: its own

@@ -30,8 +30,15 @@ fn bucket(store: Arc<dyn ObjectStore>) -> Bucket {
     bucket_with(store, fast())
 }
 
+/// A WAL bucket of format 1, which seals (`bucket::legacy`): the seal jobs are tested on it.
 fn bucket_with(store: Arc<dyn ObjectStore>, retry: RetryPolicy) -> Bucket {
+    let _legacy = crate::format::LegacySeal::on();
     Bucket::create(store, Keys::new("db"), retry, 4, "w1".into()).unwrap()
+}
+
+/// A WAL bucket of format 5, which switches generations.
+fn packed_bucket(store: Arc<dyn ObjectStore>) -> Bucket {
+    Bucket::create(store, Keys::new("db"), fast(), 4, "w1".into()).unwrap()
 }
 
 /// A 100 ms retry deadline, so failing uploads fail quickly.
@@ -880,4 +887,135 @@ fn settle_log_adopts_a_published_pending_seal() {
     );
     let p = u.submit_log_file(LogFile::Log, op(3), 1).wait().unwrap();
     assert_eq!(p, pos(3, 1));
+}
+
+/// A generation switch runs behind every log record queued before it, wakes the trimmer, and
+/// reports `GenerationSwitched`; it uploads no page. Its `buckwal.generation_switch` span says
+/// `switched`.
+#[test]
+fn switch_is_ordered_after_queued_logs_and_reports() {
+    let mem = Arc::new(MemStore::new());
+    let seen: Arc<Mutex<Vec<Event>>> = Arc::default();
+    let hook: EventHook = {
+        let seen = seen.clone();
+        Arc::new(move |e: &Event| seen.lock().unwrap().push(e.clone()))
+    };
+    let (trim_tx, trim_rx) = mpsc::channel();
+    // The uploader thread reports to the subscriber of the thread that spawned it.
+    let cap = crate::telemetry::testing::Capture::new();
+    let up = tracing::subscriber::with_default(cap.subscriber(), || {
+        Uploader::spawn(
+            packed_bucket(mem.clone()),
+            Some(trim_tx),
+            Some(hook),
+            Arc::default(),
+        )
+    });
+    let tickets: Vec<Ticket> = (1..=3)
+        .map(|n| up.submit_log(op(n), Batching::Off))
+        .collect();
+    let switched = up.switch_generation();
+    assert_eq!(switched, Ok(2));
+    assert_eq!(up.generation(), 2);
+    for (i, t) in tickets.into_iter().enumerate() {
+        assert_eq!(
+            t.wait(),
+            Ok(LogPos {
+                generation: 1,
+                seq: i as u64 + 1
+            })
+        );
+    }
+    assert_eq!(
+        up.submit_log(op(4), Batching::Off).wait(),
+        Ok(LogPos {
+            generation: 2,
+            seq: 1
+        })
+    );
+    assert_eq!(
+        up.counters(),
+        UploaderCounters {
+            // The three records, the seal-start record, and one in generation 2.
+            log_puts: 5,
+            page_puts: 0,
+            seals: 1,
+            retries: 0
+        }
+    );
+    let snap = trim_rx
+        .try_recv()
+        .expect("a trim snapshot after the switch");
+    assert_eq!((snap.head.generation, snap.head.manifest), (2, None));
+    assert!(snap.manifest.is_none());
+    let spans = cap.spans();
+    let span = spans.last_named("buckwal.generation_switch");
+    assert_eq!(span.field("buckwal.generation"), Some("1"));
+    assert_eq!(span.field("buckwal.next_generation"), Some("2"));
+    assert_eq!(span.field("buckwal.seq"), Some("4"));
+    assert_eq!(span.field("buckwal.outcome"), Some("switched"));
+    assert!(span.field("buckwal.elapsed_ms").is_some());
+    let kinds: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::LogUploaded {
+                generation, seq, ..
+            } => Some(format!("log {generation}/{seq}")),
+            Event::GenerationSwitched { from, to, .. } => Some(format!("switched {from}->{to}")),
+            Event::SealStarted { .. } | Event::SealFinished { .. } => Some("seal".into()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "log 1/1",
+            "log 1/2",
+            "log 1/3",
+            "log 1/4",
+            "switched 1->2",
+            "log 2/1"
+        ]
+    );
+}
+
+/// A switch whose head move another writer beat ends `fenced` on its span.
+#[test]
+fn a_fenced_switch_says_fenced_on_its_span() {
+    let mem = Arc::new(MemStore::new());
+    let cap = crate::telemetry::testing::Capture::new();
+    let up = tracing::subscriber::with_default(cap.subscriber(), || {
+        Uploader::spawn(packed_bucket(mem.clone()), None, None, Arc::default())
+    });
+    up.submit_log(op(1), Batching::Off).wait().unwrap();
+    let k = Keys::new("db");
+    crate::bucket::take_over(&*mem, &k, &fast(), 1, "w2").unwrap();
+    let r = up.switch_generation();
+    assert!(matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    let spans = cap.spans();
+    let span = spans.last_named("buckwal.generation_switch");
+    assert_eq!(span.field("buckwal.outcome"), Some("fenced"));
+    assert_eq!(up.generation(), 1);
+}
+
+/// A switch whose head move fails (the store refuses every PUT) ends `upload_failed`.
+#[test]
+fn a_failed_switch_says_upload_failed_on_its_span() {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem.clone()));
+    let b = Bucket::create(fault.clone(), Keys::new("db"), short(), 4, "w1".into()).unwrap();
+    let cap = crate::telemetry::testing::Capture::new();
+    let up = tracing::subscriber::with_default(cap.subscriber(), || {
+        Uploader::spawn(b, None, None, Arc::default())
+    });
+    fault.only_keys_containing("/head");
+    fault.fail_puts_after(0);
+    let r = up.switch_generation();
+    assert!(r.is_err() && !matches!(r, Err(Error::Fenced(_))), "{r:?}");
+    let spans = cap.spans();
+    let span = spans.last_named("buckwal.generation_switch");
+    assert_eq!(span.field("buckwal.outcome"), Some("upload_failed"));
+    assert_eq!(up.generation(), 1);
 }

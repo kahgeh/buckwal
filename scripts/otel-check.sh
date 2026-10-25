@@ -29,7 +29,7 @@ RUN_ID="${1:-}"
 CH_URL="${BUCKWAL_CH_URL:-http://localhost:8123}"
 CH_USER="${BUCKWAL_CH_USER:-hyperdx_ro}"
 USERS_SQL="${BUCKWAL_CH_USERS_SQL:-}"
-SPANS="buckwal.commit buckwal.local_write buckwal.local_fsync buckwal.ack_wait buckwal.upload buckwal.checkpoint_upload buckwal.restore buckwal.takeover buckwal.fence buckwal.gc buckwal.server.request"
+SPANS="buckwal.commit buckwal.local_write buckwal.local_fsync buckwal.ack_wait buckwal.upload buckwal.checkpoint_upload buckwal.generation_switch buckwal.restore buckwal.takeover buckwal.fence buckwal.gc buckwal.server.request"
 DEADLINE=60
 
 fail() { echo "otel check FAILED: $*"; exit 1; }

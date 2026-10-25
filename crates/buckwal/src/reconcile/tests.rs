@@ -123,6 +123,17 @@ fn seal_by_hand(store: Arc<dyn ObjectStore>, dir: &Path) -> u64 {
     b.seal_generation(pages, ps, page_count).unwrap()
 }
 
+/// End a crashed directory's generation by hand, as the writer does at a WAL restart up to its
+/// head write: in a format 5 bucket the generation switch (no page), else the seal
+/// (`seal_by_hand`). The local state and files are left as they are. Returns the new generation.
+fn end_by_hand(store: Arc<dyn ObjectStore>, dir: &Path) -> u64 {
+    if head(&*store).format != crate::format::FORMAT_V5 {
+        return seal_by_hand(store, dir);
+    }
+    let (mut b, _) = attach(store, dir, &cfg());
+    b.switch_generation().unwrap()
+}
+
 #[test]
 fn level_restart_continues() {
     let mem = Arc::new(MemStore::new());
@@ -224,8 +235,11 @@ fn behind_restart_takes_bucket_image() {
     assert_eq!(ids(&c2), (1..=230).collect::<Vec<_>>());
 }
 
-#[test]
-fn restart_after_head_moved_discards_covered_wal() {
+/// The head moved to G+1 (a seal or a switch), then a crash before the local state recorded it:
+/// the local `-wal` of G is covered (by the manifest, or, in format 5, by the local `app.db`
+/// that the checkpoint before the switch wrote), so it is replaced.
+fn restart_after_head_moved_discards_covered_wal(legacy: bool) {
+    let _legacy = legacy.then(crate::format::LegacySeal::on);
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -233,7 +247,7 @@ fn restart_after_head_moved_discards_covered_wal() {
     commit_rows(&conn, 1..=300);
     passive(&conn);
     let crashed = crash(e, conn, d.path());
-    assert_eq!(seal_by_hand(mem.clone(), crashed.path()), 2);
+    assert_eq!(end_by_hand(mem.clone(), crashed.path()), 2);
     assert_eq!(
         LocalState::read(crashed.path())
             .unwrap()
@@ -269,10 +283,20 @@ fn restart_after_head_moved_discards_covered_wal() {
     assert_eq!(ids(&c3), (1..=301).collect::<Vec<_>>());
 }
 
-/// The seal records G+1 locally before the restart write reaches the `-wal`: a crash in
-/// between leaves state == head == G+1 next to a `-wal` that still holds G.
 #[test]
-fn sealed_state_before_restart_write_discards_old_wal() {
+fn restart_after_head_moved_discards_covered_wal_sealed() {
+    restart_after_head_moved_discards_covered_wal(true);
+}
+
+#[test]
+fn restart_after_head_moved_discards_covered_wal_switched() {
+    restart_after_head_moved_discards_covered_wal(false);
+}
+
+/// The seal (or switch) records G+1 locally before the restart write reaches the `-wal`: a
+/// crash in between leaves state == head == G+1 next to a `-wal` that still holds G.
+fn sealed_state_before_restart_write_discards_old_wal(legacy: bool) {
+    let _legacy = legacy.then(crate::format::LegacySeal::on);
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -280,7 +304,7 @@ fn sealed_state_before_restart_write_discards_old_wal() {
     commit_rows(&conn, 1..=300);
     passive(&conn);
     let crashed = crash(e, conn, d.path());
-    let g = seal_by_hand(mem.clone(), crashed.path());
+    let g = end_by_hand(mem.clone(), crashed.path());
     let mut state = LocalState::read(crashed.path()).unwrap().unwrap();
     state.generation = g;
     state.write_atomic(crashed.path()).unwrap();
@@ -305,6 +329,16 @@ fn sealed_state_before_restart_write_discards_old_wal() {
     let (_r, _e3, c3) = restored(mem.clone());
     assert_eq!(integrity(&c3), "ok");
     assert_eq!(ids(&c3), (1..=301).collect::<Vec<_>>());
+}
+
+#[test]
+fn sealed_state_before_restart_write_discards_old_wal_sealed() {
+    sealed_state_before_restart_write_discards_old_wal(true);
+}
+
+#[test]
+fn sealed_state_before_restart_write_discards_old_wal_switched() {
+    sealed_state_before_restart_write_discards_old_wal(false);
 }
 
 #[test]
@@ -431,6 +465,8 @@ fn seal_after_passive_checkpoint_crash_keeps_pages() {
 
 #[test]
 fn seal_after_passive_checkpoint_crash_keeps_pages_on_restored_dir() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -448,6 +484,8 @@ fn seal_after_passive_checkpoint_crash_keeps_pages_on_restored_dir() {
 /// they are never fetched over it.
 #[test]
 fn dirty_pages_are_local_at_open() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -487,6 +525,8 @@ fn dirty_pages_are_local_at_open() {
 /// stale and to restore again.
 #[test]
 fn generation_jump_is_corrupt() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -769,4 +809,62 @@ mod fence_image {
             );
         }
     }
+}
+
+/// Format 5: a claimed directory behind the head by more than one switch cannot be brought
+/// level; nor can an unclaimed (restored) one behind it by one switch, since it never
+/// checkpointed its generation (no manifest covers its `-wal`). Both say to restore again and
+/// change nothing.
+#[test]
+fn format_5_generation_jump_or_stale_restore_is_corrupt() {
+    let stale = |r: &Result<Reconciled>| {
+        matches!(r, Err(Error::Corrupt(m))
+            if m.contains("generation") && m.contains("stale") && m.contains("restore again"))
+    };
+    let mem = Arc::new(MemStore::new());
+    let d = tempfile::tempdir().unwrap();
+    let (e, conn) = writer(mem.clone(), d.path());
+    assert_eq!(head(&*mem).format, crate::format::FORMAT_V5);
+    create_table(&conn);
+    commit_rows(&conn, 1..=3);
+    let r = tempfile::tempdir().unwrap();
+    restore_into(mem.clone(), &keys(), r.path(), &cfg()).unwrap();
+    commit_rows(&conn, 4..=6);
+    seal_now(&conn);
+    commit_rows(&conn, 7..=9);
+    seal_now(&conn);
+    let crashed = crash(e, conn, d.path());
+    assert_eq!(head(&*mem).generation, 3);
+
+    let (mut b, mut s) = attach(mem.clone(), crashed.path(), &cfg());
+    s.generation = 1;
+    let wal = local_wal(crashed.path());
+    let got = reconcile(crashed.path(), &mut b, &mut s, &cfg());
+    assert!(stale(&got), "{got:?}");
+    assert_eq!(
+        local_wal(crashed.path()),
+        wal,
+        "a refused reconcile changes nothing"
+    );
+
+    // The restored copy (generation 1, unclaimed) against a head the writer moved on twice:
+    // and once, with the head moved back by hand to generation 2.
+    let (mut b, mut s) = attach(mem.clone(), r.path(), &cfg());
+    assert!(!s.claimed);
+    let wal = local_wal(r.path());
+    let got = reconcile(r.path(), &mut b, &mut s, &cfg());
+    assert!(stale(&got), "{got:?}");
+    let two = Head {
+        generation: 2,
+        ..head(&*mem)
+    };
+    mem.put(&keys().head(), &two.encode()).unwrap();
+    let (mut b, mut s) = attach(mem.clone(), r.path(), &cfg());
+    let got = reconcile(r.path(), &mut b, &mut s, &cfg());
+    assert!(stale(&got), "{got:?}");
+    assert_eq!(
+        local_wal(r.path()),
+        wal,
+        "a refused reconcile changes nothing"
+    );
 }

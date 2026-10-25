@@ -26,7 +26,7 @@ pub(crate) const FORMAT_V5: u32 = 5;
 pub(crate) use head::{Head, LocalState};
 pub(crate) use keys::Keys;
 #[cfg(test)]
-pub(crate) use keys::LegacyFormat3;
+pub(crate) use keys::{LegacyFormat3, LegacySeal};
 pub(crate) use manifest::Manifest;
 pub(crate) use record::{apply_ops, LogFile, LogRecord, Op};
 #[cfg(test)]

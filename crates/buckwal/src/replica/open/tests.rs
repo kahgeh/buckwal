@@ -165,6 +165,44 @@ fn int(v: i64) -> Value {
     Value::from_i64(v)
 }
 
+/// `open_with_store` that creates a WAL database of format 1 (format 4 when encrypted), which
+/// seals: a replica follows formats 1 to 4 only, for now (a format 5 head is refused,
+/// `a_replica_refuses_a_format_5_bucket`).
+fn legacy_open_with_store(
+    config: Config,
+    store: Arc<dyn crate::store::ObjectStore>,
+) -> crate::Result<crate::Database> {
+    let _legacy = crate::format::LegacySeal::on();
+    crate::open_with_store(config, store)
+}
+
+/// A format 5 bucket (a WAL database made now, which switches generations) is refused with a
+/// clear `Unsupported` error before anything is written to the replica's directory.
+#[test]
+fn a_replica_refuses_a_format_5_bucket() {
+    let store = Arc::new(MemStore::new());
+    let t = tempfile::tempdir().unwrap();
+    let db = crate::open_with_store(wconfig(&t.path().join("w")), store.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    add(&conn, 1);
+    let r = tempfile::tempdir().unwrap();
+    let got = open_replica_with_store(rconfig(&r.path().join("r")), store.clone());
+    match got {
+        Err(Error::Unsupported(m)) => assert!(m.contains("format 5"), "{m}"),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("a replica opened a format 5 bucket"),
+    }
+    let left: Vec<_> = std::fs::read_dir(r.path().join("r"))
+        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(
+        left.iter().all(|n| n == crate::files::LOCK_FILE),
+        "{left:?}"
+    );
+}
+
 /// A writer on `store` in a new temp dir with table `t` and `n` rows.
 fn writer(
     store: &Arc<MemStore>,
@@ -181,7 +219,7 @@ fn writer_with(
     let t = tempfile::tempdir().unwrap();
     let mut c = wconfig(&t.path().join("w"));
     tune(&mut c);
-    let db = crate::open_with_store(c, store.clone()).unwrap();
+    let db = legacy_open_with_store(c, store.clone()).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
         .unwrap();
@@ -325,7 +363,7 @@ fn wrong_key_refused_at_open_before_any_follow() {
     let k = tempfile::tempdir().unwrap();
     let t = tempfile::tempdir().unwrap();
     let good = "11".repeat(32);
-    let db = crate::open_with_store(
+    let db = legacy_open_with_store(
         key_config(&t.path().join("w"), k.path(), &good, wconfig),
         store.clone(),
     )
@@ -374,7 +412,7 @@ fn mvcc_head_refused_with_unsupported() {
     let t = tempfile::tempdir().unwrap();
     let mut c = wconfig(&t.path().join("w"));
     c.journal_mode = JournalMode::Mvcc;
-    let db = crate::open_with_store(c, store.clone()).unwrap();
+    let db = legacy_open_with_store(c, store.clone()).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", &[])
         .unwrap();
@@ -705,7 +743,7 @@ fn refusals_before_the_restore_leave_the_directory_untouched() {
     let t = tempfile::tempdir().unwrap();
     let mut c = wconfig(&t.path().join("w"));
     c.journal_mode = JournalMode::Mvcc;
-    let db = crate::open_with_store(c, store.clone()).unwrap();
+    let db = legacy_open_with_store(c, store.clone()).unwrap();
     let r = tempfile::tempdir().unwrap();
     let dir = r.path().join("r");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1766,7 +1804,7 @@ fn replica_logs_carry_no_token_or_row_data() {
     let t = tempfile::tempdir().unwrap();
     let mut wc_cfg = key_config(&t.path().join("w"), k.path(), &key_hex, wconfig);
     wc_cfg.secret_key = TOKEN.to_string();
-    let db = crate::open_with_store(wc_cfg, store.clone()).unwrap();
+    let db = legacy_open_with_store(wc_cfg, store.clone()).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
         .unwrap();
@@ -1856,7 +1894,7 @@ fn stopped_reasons_integrity_and_corrupt_carry_the_object_key() {
                 f(d)
             }
         };
-        let db = crate::open_with_store(mk(&t.path().join("w"), wconfig), store.clone()).unwrap();
+        let db = legacy_open_with_store(mk(&t.path().join("w"), wconfig), store.clone()).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
             .unwrap();

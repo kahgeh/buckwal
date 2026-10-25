@@ -634,13 +634,22 @@ pub enum Event {
     /// confirmed in the bucket. `batching` is the setting the commit was made with, even when
     /// a degraded uploader made a Window commit take the blocking `Off` path.
     CommitAcked { commit: u64, batching: Batching },
-    /// Sealing `generation` began with `pages` dirty pages to upload. `generation` is the
-    /// generation being sealed, the head's before the seal (the one `log/<generation>` holds).
+    /// Formats 1 to 4 only: sealing `generation` began with `pages` dirty pages to upload.
+    /// `generation` is the generation being sealed, the head's before the seal (the one
+    /// `log/<generation>` holds).
     SealStarted { generation: u64, pages: u64 },
-    /// `generation` is sealed: the same number `SealStarted` reported. The head now points at
-    /// generation + 1, or at generation + 2 for the first seal after a takeover (it skips a
-    /// generation).
+    /// Formats 1 to 4 only: `generation` is sealed, the same number `SealStarted` reported. The
+    /// head now points at generation + 1, or at generation + 2 for the first seal after a
+    /// takeover (it skips a generation).
     SealFinished { generation: u64, elapsed: Duration },
+    /// Format 5: the writer switched from generation `from` to `to` at a WAL restart (its
+    /// seal-start record, then the head move). `to` is `from + 1`, or more after a takeover
+    /// (the generations between have no log). `elapsed` is the switch's extra wait.
+    GenerationSwitched {
+        from: u64,
+        to: u64,
+        elapsed: Duration,
+    },
     /// The trimmer deleted `deleted` objects no head can reach any more.
     Trimmed { deleted: u64 },
     /// A maintenance checkpoint of `generation` began: its log held `log_objects` objects
@@ -674,7 +683,8 @@ pub enum Event {
         epoch: u64,
         fence_seq: u64,
     },
-    /// A seal of `generation` waits `wait` before it starts: the takeover quiet. When this
+    /// A seal (or a generation switch) of `generation` waits `wait` before it starts: the
+    /// takeover quiet. When this
     /// writer took `generation` over, another writer's last record before its fence was a
     /// seal-start record (or a record could not be read), so that writer's page and manifest
     /// PUTs may still be in flight.

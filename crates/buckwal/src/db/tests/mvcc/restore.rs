@@ -555,6 +555,8 @@ fn restore_of_mvcc_bucket_by_wal_config_is_refused() {
 /// `restore_wal_bucket_bytes_identical_to_before`).
 #[test]
 fn restore_wal_bucket_files_match_kind1_replay() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for sealed in [false, true] {
         let store = mem();
         let t = tempdir();

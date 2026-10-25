@@ -106,6 +106,7 @@ impl Soak<'_> {
         cfg.on_event = Some(Arc::new(move |e: &Event| match e {
             Event::SealStarted { .. } => say("event seal-started"),
             Event::SealFinished { .. } => say("event seal-finished"),
+            Event::GenerationSwitched { .. } => say("event generation-switched"),
             Event::BatchWaiting { commits } if events => {
                 say(&format!("event batch-waiting {commits}"))
             }

@@ -256,7 +256,8 @@ impl Writer {
         }
     }
 
-    /// A TRUNCATE checkpoint: the generation ends (a seal, until the generation switch).
+    /// A TRUNCATE checkpoint: the generation ends (a generation switch; a seal in a bucket of
+    /// format 1 to 4).
     fn end_generation(&self) {
         let g = self.db.generation();
         self.c.checkpoint(CheckpointMode::Truncate).unwrap();
@@ -646,7 +647,7 @@ fn head_past_generation_without_seal_start_last_is_log_incomplete() {
     let s = last_seq(&*mem, 1);
     assert_eq!(
         record_at(&*mem, 1, s),
-        seal_start(&head_of(&*mem).writer_id, None)
+        seal_start(&head_of(&*mem).writer_id, Some(2))
     );
     mem.delete(&keys().log(1, s)).unwrap();
     let t = tempdir();
@@ -772,14 +773,22 @@ fn insert_on(c: &Connection, ids: std::ops::RangeInclusive<i64>) {
     }
 }
 
-/// A generation switch of `db` (a TRUNCATE checkpoint), its seal-start record made the format
-/// 5 one that names the generation the head moved to. Returns that generation.
+/// A generation switch of `db` (a TRUNCATE checkpoint): its seal-start record, the last of the
+/// generation, names the generation the head moved to. Returns that generation.
 fn switch(mem: &MemStore, db: &Database, c: &Connection) -> u64 {
     let from = db.generation();
     c.checkpoint(CheckpointMode::Truncate).unwrap();
     let to = db.generation();
     assert!(to > from);
-    link(mem, from, to);
+    let LogRecord::Extents {
+        syncs,
+        next_generation,
+        ..
+    } = record_at(mem, from, last_seq(mem, from))
+    else {
+        panic!("log/{from} ends with a fence");
+    };
+    assert_eq!((syncs.len(), next_generation), (0, Some(to)));
     to
 }
 
@@ -798,7 +807,10 @@ fn restore_rows(mem: &MemStore) -> Vec<i64> {
 fn skipped_generation_is_passed_over() {
     for format5 in [true, false] {
         let mem = Arc::new(MemStore::new());
+        // The seal formats write seal-start records that name no next generation.
+        let legacy = (!format5).then(crate::format::LegacySeal::on);
         let a = writer(&mem);
+        drop(legacy);
         a.insert(1..=3);
         if format5 {
             switch(&mem, &a.db, &a.c);
@@ -927,7 +939,10 @@ fn chain_names_a_gap_longer_than_the_fence_count() {
 #[test]
 fn missing_log_without_floor_is_an_error() {
     let mem = Arc::new(MemStore::new());
-    let w = writer(&mem);
+    let w = {
+        let _legacy = crate::format::LegacySeal::on();
+        writer(&mem)
+    };
     w.insert(1..=2);
     w.end_generation();
     w.insert(3..=4);
@@ -1369,5 +1384,53 @@ fn discard_keeps_the_pack_the_pointer_names() {
     r.discard(&keys().pack(9, "y"), &keys().pack_codes(9, "y"));
     assert!(mem.get(&keys().pack(9, "y")).unwrap().is_none());
     assert!(mem.get(&keys().pack_codes(9, "y")).unwrap().is_none());
+    w.crash();
+}
+
+/// A real format 5 writer switches generations itself (no record is rewritten by the test), and
+/// `pack_with_store` packs them: the pack equals the writer's database at the end of the last
+/// switched generation, and the pack plus the head's generation equals the writer's database.
+#[test]
+fn pack_run_on_a_real_writer_bucket_equals_restore() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    assert_eq!(head_of(&*mem).format, crate::format::FORMAT_V5);
+    w.insert(1..=10);
+    w.end_generation();
+    w.c.execute("UPDATE t SET v = 'x' WHERE id < 4", &[])
+        .unwrap();
+    w.insert(11..=50);
+    w.end_generation();
+    w.c.execute("DELETE FROM t WHERE id > 45", &[]).unwrap();
+    w.end_generation();
+    let at_end = w.ids();
+    w.insert(100..=105);
+    for g in 1..=3 {
+        match record_at(&*mem, g, last_seq(&*mem, g)) {
+            LogRecord::Extents {
+                syncs,
+                next_generation,
+                ..
+            } => assert_eq!((syncs.len(), next_generation), (0, Some(g + 1))),
+            r => panic!("log/{g}: {r:?}"),
+        }
+    }
+    let t = tempdir();
+    let cfg = packer(&t);
+    let r = pack_with_store(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(r.pack_generation, 4);
+    assert_eq!(pack_rows(&*mem), at_end);
+    let head = head_of(&*mem);
+    assert_eq!(head.generation, 4);
+    let images = crate::restore::generation_image(
+        &*mem,
+        &keys(),
+        &head,
+        &cfg.engine(crate::io::IoMode::Writer),
+    )
+    .unwrap();
+    let (_, body) = pack_bytes(&*mem, &keys());
+    assert_eq!(rows_of(&body, Some(&images.wal), None), w.ids());
     w.crash();
 }

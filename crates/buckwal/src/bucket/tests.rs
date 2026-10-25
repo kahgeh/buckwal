@@ -21,6 +21,18 @@ fn keys() -> Keys {
     Keys::new(PREFIX)
 }
 
+/// `Bucket::create` of a format 1 bucket (format 4 when encrypted): it seals (`legacy`).
+fn legacy_create(
+    store: Arc<dyn ObjectStore>,
+    keys: Keys,
+    retry: RetryPolicy,
+    concurrency: usize,
+    writer_id: String,
+) -> Result<Bucket> {
+    let _legacy = crate::format::LegacySeal::on();
+    Bucket::create(store, keys, retry, concurrency, writer_id)
+}
+
 struct Fixture {
     mem: Arc<MemStore>,
     fault: Arc<FaultStore>,
@@ -35,7 +47,13 @@ impl Fixture {
     fn store(&self) -> Arc<dyn ObjectStore> {
         self.fault.clone()
     }
+    /// A WAL bucket of format 1, which seals (`legacy`): most tests here are of the seal and
+    /// the head rules it shares with the generation switch.
     fn create(&self, retry: RetryPolicy, concurrency: usize) -> Bucket {
+        legacy_create(self.store(), keys(), retry, concurrency, "w1".into()).unwrap()
+    }
+    /// A WAL bucket of format 5, which switches generations (`switch`).
+    fn create_packed(&self, retry: RetryPolicy, concurrency: usize) -> Bucket {
         Bucket::create(self.store(), keys(), retry, concurrency, "w1".into()).unwrap()
     }
     /// An MVCC bucket (format 2) as `create_sealed` leaves it: generation 2.
@@ -176,11 +194,11 @@ fn attach_ignores_unparseable_log_keys_and_needs_manifest() {
 fn create_twice_is_config_error() {
     let f = Fixture::new();
     f.create(fast(), 4);
-    let again = Bucket::create(f.store(), keys(), fast(), 4, "w1".into());
+    let again = legacy_create(f.store(), keys(), fast(), 4, "w1".into());
     assert!(matches!(again, Err(Error::Config(_))), "{:?}", again.err());
     // After a failed attempt the stored head is compared; another writer's is still an error.
     f.fault.fail_next_puts(1);
-    let again = Bucket::create(f.store(), keys(), fast(), 4, "w2".into());
+    let again = legacy_create(f.store(), keys(), fast(), 4, "w2".into());
     assert!(matches!(again, Err(Error::Config(_))), "{:?}", again.err());
 }
 
@@ -1767,7 +1785,7 @@ fn rival_takeover(mem: &MemStore, writer_id: &str, generation: Option<u64>) {
 #[test]
 fn take_over_after_a_rival_retries_on_the_same_generation_only() {
     let mem = Arc::new(MemStore::new());
-    Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
+    legacy_create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
     let store = Interpose {
         mem: mem.clone(),
         ..Interpose::default()
@@ -1803,7 +1821,11 @@ fn fence(writer_id: &str, epoch: u64) -> LogRecord {
 
 /// w1 at seq 1, then a takeover by w2 (epoch 2) attached at seq 2.
 fn taken_over(f: &Fixture) -> (Bucket, Bucket) {
-    let mut a = f.create(fast(), 4);
+    taken_over_with(f, f.create(fast(), 4))
+}
+
+/// `taken_over`, with `a` (w1, just created) as the old writer.
+fn taken_over_with(f: &Fixture, mut a: Bucket) -> (Bucket, Bucket) {
     a.append_log(LogFile::Wal, syncs(1)).unwrap();
     take_over(&*f.store(), &keys(), &fast(), 1, "w2").unwrap();
     let b = Bucket::attach(f.store(), keys(), fast(), 4, "w2", 2).unwrap();
@@ -1958,7 +1980,7 @@ fn a_chained_fence_reports_a_seal_in_flight_further_back() {
 fn append_fence_gives_up_after_the_step_bound() {
     // An old writer that always wins: before each fence PUT, its record lands at that key.
     let mem = Arc::new(MemStore::new());
-    let mut a = Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
+    let mut a = legacy_create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
     a.append_log(LogFile::Wal, syncs(1)).unwrap();
     take_over(&*mem, &keys(), &fast(), 1, "w2").unwrap();
     let store = Arc::new(Interpose {
@@ -2292,7 +2314,7 @@ const RESUME: &str = "open this directory to resume the takeover (`open`, or `bu
 #[test]
 fn take_over_timeout_says_to_open_the_directory() {
     let mem = Arc::new(MemStore::new());
-    Bucket::create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
+    legacy_create(mem.clone(), keys(), fast(), 4, "w1".into()).unwrap();
     let store = Interpose {
         mem: mem.clone(),
         ..Interpose::default()
@@ -2350,7 +2372,7 @@ fn object_events(events: &[String]) -> Vec<String> {
 fn stale_writers_late_put_is_refused(held: &str) {
     let f = Fixture::new();
     let hold = Arc::new(HoldStore::new(f.mem.clone()));
-    let mut a = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
+    let mut a = legacy_create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
     a.set_lease(Duration::from_millis(200));
     a.append_log(LogFile::Wal, syncs(1)).unwrap();
     let (held_rx, go) = hold.hold_next_put(held);
@@ -2527,7 +2549,7 @@ fn a_seal_finding_its_own_page_overwritten_checks_the_head_first() {
     for moved in [false, true] {
         let f = Fixture::new();
         let hold = Arc::new(HoldStore::new(f.store()));
-        let mut b = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
+        let mut b = legacy_create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
         b.append_log(LogFile::Wal, syncs(1)).unwrap();
         f.fault.only_keys_containing("/manifest/");
         f.fault.fail_next_puts_permanently(1);
@@ -2608,7 +2630,7 @@ fn late_put_cannot_replace_new_writers_page() {
     let f = Fixture { mem, fault };
     let k = keys();
     let hold = Arc::new(HoldStore::new(f.store()));
-    let mut a = Bucket::create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
+    let mut a = legacy_create(hold.clone(), keys(), fast(), 1, "w1".into()).unwrap();
     a.set_lease(Duration::from_millis(200));
     a.append_log(LogFile::Wal, syncs(1)).unwrap();
     f.fault.only_keys_containing("/manifest/");
@@ -2737,7 +2759,7 @@ fn a_seal_against_a_store_that_answers_412_forever_times_out() {
     let deadline = Duration::from_millis(300);
     let lease = Duration::from_millis(50);
     let retry = RetryPolicy { deadline, ..fast() };
-    let mut b = Bucket::create(store, keys(), retry, 1, "w1".into()).unwrap();
+    let mut b = legacy_create(store, keys(), retry, 1, "w1".into()).unwrap();
     b.set_lease(lease);
     b.append_log(LogFile::Wal, syncs(1)).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2961,3 +2983,5 @@ fn a_racing_creators_objects_do_not_stay_under_the_winners_head() {
         reader.open_page(*p, *g, &obj).unwrap();
     }
 }
+
+mod switch;

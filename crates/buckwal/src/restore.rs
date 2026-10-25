@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
     apply_ops, Head, Keys, LocalState, LogFile, LogRecord, FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4,
+    FORMAT_V5,
 };
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
@@ -561,10 +562,64 @@ pub(crate) fn restore_into(
 /// against page 1).
 pub(crate) fn local_format(head: &Head) -> u32 {
     match (head.format, head.journal_mode) {
-        (FORMAT_V3 | FORMAT_V4, JournalMode::Mvcc) => FORMAT_V2,
-        (FORMAT_V3 | FORMAT_V4, JournalMode::Wal) => FORMAT,
+        (FORMAT_V3 | FORMAT_V4 | FORMAT_V5, JournalMode::Mvcc) => FORMAT_V2,
+        (FORMAT_V3 | FORMAT_V4 | FORMAT_V5, JournalMode::Wal) => FORMAT,
         (f, _) => f,
     }
+}
+
+/// A format 5 bucket with no pack yet, restored from its log only: every generation the chain
+/// of terminal records ends before the head's (`pack::run::scan_generations`, from generation
+/// 1), each applied to `<dir>/app.db` with a local checkpoint (`apply_generation`), as a pack
+/// run applies them. The head's generation is left for the caller, as the `-wal`. A log that is
+/// not as buckwal writes it is `Corrupt`. Returns whether `app.db` was written.
+///
+/// A bucket that holds a pack pointer is refused for now: reading a pack comes with the restore
+/// from packs.
+fn apply_ended_generations(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    dir: &Path,
+    cfg: &EngineConfig,
+    head: &Head,
+    retries: &AtomicU64,
+) -> Result<bool> {
+    if head.journal_mode == JournalMode::Mvcc {
+        return Err(Error::Unsupported("restore of a format 5 MVCC bucket"));
+    }
+    let pointer = keys.pack_pointer();
+    if counted(retries, &cfg.retry, &pointer, || store.stat(&pointer))?.is_some() {
+        return Err(Error::Unsupported(
+            "restore of a bucket that holds a pack (pack-latest): reading a pack is not \
+             supported yet",
+        ));
+    }
+    let reader = crate::pack::run::LogReader {
+        store,
+        keys,
+        retry: &cfg.retry,
+        concurrency: cfg.upload_concurrency,
+    };
+    let enc = cfg.encryption.as_deref();
+    let mut applied = false;
+    let scanned = crate::pack::run::scan_generations(&reader, 1, head, &mut |e, records| {
+        let wal = crate::pack::run::replay_ended(records, head, e.generation)?.wal;
+        if !applied {
+            // Page 1 against the encryption setting before the engine opens it, so a wrong key
+            // or cipher is the `Encryption` error a restore of a sealed bucket gives.
+            crate::encryption::check_page_one(wal_page_one(&wal), enc)?;
+        }
+        apply_generation(dir, &wal, head, enc)?;
+        applied = true;
+        Ok(())
+    })?;
+    if let Some(key) = scanned.incomplete {
+        return Err(Error::Corrupt(format!(
+            "{key}: the log is not as buckwal writes it (a generation below the head's does not \
+             end with a seal-start record, or the chain of generations breaks)"
+        )));
+    }
+    Ok(applied && file_len(&dir.join(DB_FILE))? > 0)
 }
 
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
@@ -646,6 +701,10 @@ fn restore_files(
     let head = keys.decode_head_open(&head_obj.body)?;
     // The mode is checked on the head alone first: nothing is fetched for a mismatch.
     refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
+    fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
+    // A format 5 bucket holds no page: the generations before the head's come from the log.
+    let built = head.format == FORMAT_V5
+        && apply_ended_generations(&*store, keys, dir, cfg, &head, retries)?;
     let sealed_page1 = match head.manifest {
         Some(g) => {
             let p = manifest_page_one(&*store, keys, g, retry, retries)?;
@@ -659,19 +718,22 @@ fn restore_files(
         log,
         records: log_objects,
     } = generation_image_counted(&*store, keys, &head, cfg, retries)?;
-    // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`).
+    // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`),
+    // unless the ended generations of a format 5 bucket built it.
     let db = match head.manifest {
         Some(_) => Vec::new(),
+        None if built => Vec::new(),
         None => page_one_seed(&wal, &head, cfg.journal_mode)?,
     };
-    fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
     write_synced(&dir.join(WAL_FILE), &wal)?;
     // Only an MVCC database has an `app.db-log`; a WAL restore writes exactly what it did.
     if head.journal_mode == JournalMode::Mvcc {
         write_synced(&dir.join(LOG_FILE), &log)?;
         repair_wal_without_log(dir)?;
     }
-    write_synced(&dir.join(DB_FILE), &db)?;
+    if !built {
+        write_synced(&dir.join(DB_FILE), &db)?;
+    }
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))?;
@@ -679,7 +741,8 @@ fn restore_files(
         format: local_format(&head),
         writer_id: head.writer_id.clone(),
         generation: head.generation,
-        complete: false,
+        // A format 5 bucket holds no page to fetch: the local file is the whole database.
+        complete: head.format == FORMAT_V5,
         // Nothing is written to the bucket: the first writer open claims the head (with
         // this ETag) under a new writer id.
         claimed: false,
@@ -720,11 +783,15 @@ pub fn restore_with_store(
 ) -> Result<RestoreReport> {
     config.validate()?;
     let guard = DirGuard::acquire(dir)?;
+    let encryption = crate::encryption::load(config)?;
+    let mut cfg = config.engine(crate::io::IoMode::Writer);
+    // A format 5 restore applies the log with the engine, which reads ciphertext pages.
+    cfg.encryption = encryption.clone();
     restore_staged(
         store,
-        &config.keys()?,
+        &config.keys_for(encryption.as_deref()),
         guard.dir(),
-        &config.engine(crate::io::IoMode::Writer),
+        &cfg,
     )
     .map(|staged| staged.report)
 }

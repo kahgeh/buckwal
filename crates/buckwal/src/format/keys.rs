@@ -41,6 +41,32 @@ impl Drop for LegacyFormat3 {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEGACY_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: while alive, a WAL database created on this thread is a format 1 one (format 4
+/// when encrypted), as every WAL bucket made before format 5 is: it seals, with pages and a
+/// manifest. The tests of the seal code that formats 1 to 4 keep use it.
+#[cfg(test)]
+pub(crate) struct LegacySeal;
+
+#[cfg(test)]
+impl LegacySeal {
+    pub(crate) fn on() -> Self {
+        LEGACY_SEAL.with(|f| f.set(true));
+        LegacySeal
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacySeal {
+    fn drop(&mut self) {
+        LEGACY_SEAL.with(|f| f.set(false));
+    }
+}
+
 /// What these keys know of the database's format, learned from its head (shared by every clone
 /// of the keys): the objects of a format 4 database are coded under its database integrity key.
 #[derive(Debug)]
@@ -220,12 +246,20 @@ impl Keys {
         }
     }
 
-    /// The head `format` a new packed bucket is created with. It is 5, coded or not. The writer
-    /// uses `new_format` until it writes packs (a format 5 head has no manifest, which the seal
-    /// path of formats 1 to 4 needs).
-    #[allow(dead_code)] // the writer makes format 5 heads from the generation switch on
+    /// The head `format` a new packed bucket is created with. It is 5, coded or not: a format 5
+    /// head has no manifest, and its writer switches generations instead of sealing them.
     pub(crate) fn new_format_packed(&self) -> u32 {
         FORMAT_V5
+    }
+
+    /// The head `format` a new WAL database is created with: `new_format_packed`. (Tests can
+    /// make the seal formats with `LegacySeal` and `LegacyFormat3`.)
+    pub(crate) fn new_wal_format(&self) -> u32 {
+        #[cfg(test)]
+        if LEGACY_SEAL.with(|f| f.get()) || LEGACY_FORMAT3.with(|f| f.get()) {
+            return self.new_format(JournalMode::Wal);
+        }
+        self.new_format_packed()
     }
 
     /// The head's bytes: with an integrity key (a format 3 head) its fields and their code.

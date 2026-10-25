@@ -139,6 +139,11 @@ enum Job {
         /// The caller's current span: the parent of `buckwal.checkpoint_upload`.
         parent: Span,
     },
+    Switch {
+        reply: Sender<Result<u64>>,
+        /// The caller's current span: the parent of `buckwal.generation_switch`.
+        parent: Span,
+    },
 }
 
 pub(crate) struct Uploader {
@@ -322,6 +327,18 @@ impl Uploader {
         rx.recv().unwrap_or_else(|_| Err(stopped()))
     }
 
+    /// Queue a generation switch (format 5, `Bucket::switch_generation`) behind every log
+    /// object already submitted and wait for it; returns the new generation. Waiting and owed
+    /// syncs are flushed first; the switch fails if owed ones remain.
+    pub(crate) fn switch_generation(&self) -> Result<u64> {
+        let (reply, rx) = mpsc::channel();
+        self.send(Job::Switch {
+            reply,
+            parent: Span::current(),
+        });
+        rx.recv().unwrap_or_else(|_| Err(stopped()))
+    }
+
     /// The current generation, without waiting for queued jobs.
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(SeqCst)
@@ -499,6 +516,13 @@ impl Worker {
                     parent,
                 }) => {
                     let r = self.seal(pages, page_size, page_count, &parent);
+                    drop(parent);
+                    self.last_failed.store(r.is_err(), SeqCst);
+                    self.publish_degraded();
+                    let _ = reply.send(r);
+                }
+                Ok(Job::Switch { reply, parent }) => {
+                    let r = self.switch(&parent);
                     drop(parent);
                     self.last_failed.store(r.is_err(), SeqCst);
                     self.publish_degraded();
@@ -763,7 +787,49 @@ impl Worker {
         Ok(g)
     }
 
-    /// The bucket moved to generation `g` (a seal, or an adopted one): publish it and wake
+    /// Flush first, as `seal` does (owed syncs left fail the switch), then switch the generation (format 5) inside a
+    /// `buckwal.generation_switch` span under `parent`: `buckwal.generation` (the generation
+    /// that ends), `buckwal.next_generation`, `buckwal.seq` (its seal-start record),
+    /// `buckwal.retries` and `s3.status` (recorded by the bucket and the stores), then
+    /// `buckwal.elapsed_ms` and `buckwal.outcome`: `switched`, `fenced` (another writer took the
+    /// database over) or `upload_failed` (any other failure; the switch is retried at the next
+    /// WAL restart). Its duration is the extra wait of the commit that restarts the WAL.
+    fn switch(&mut self, parent: &Span) -> Result<u64> {
+        if let Err(e) = self.flush() {
+            if !self.owed.is_empty() {
+                return Err(e);
+            }
+        }
+        let start = Instant::now();
+        let span = info_span!(
+            target: "buckwal",
+            parent: parent,
+            "buckwal.generation_switch",
+            buckwal.generation = Empty,
+            buckwal.next_generation = Empty,
+            buckwal.seq = Empty,
+            buckwal.retries = Empty,
+            buckwal.elapsed_ms = Empty,
+            buckwal.outcome = Empty,
+            s3.status = Empty,
+        );
+        let r = span.in_scope(|| self.bucket.switch_generation());
+        span.record("buckwal.elapsed_ms", start.elapsed().as_millis() as u64);
+        span.record(
+            "buckwal.outcome",
+            match &r {
+                Ok(_) => "switched",
+                Err(Error::Fenced(_)) => "fenced",
+                Err(_) => "upload_failed",
+            },
+        );
+        drop(span);
+        let g = r?;
+        self.sealed(g);
+        Ok(g)
+    }
+
+    /// The bucket moved to generation `g` (a seal, a switch, or an adopted one): publish it and wake
     /// the trimmer.
     fn sealed(&self, g: u64) {
         self.generation.store(g, SeqCst);

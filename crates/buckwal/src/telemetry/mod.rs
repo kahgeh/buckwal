@@ -9,7 +9,9 @@
 //! - `buckwal.upload` (`buckwal.commits`, `buckwal.commit_first`, `buckwal.commit_last`,
 //!   `buckwal.bytes`, `buckwal.generation`, `buckwal.seq`, `buckwal.retries`,
 //!   `buckwal.oldest_behind_ms`, `s3.status`; a root span when its first commit is a background
-//!   one) and `buckwal.checkpoint_upload`
+//!   one), `buckwal.generation_switch` (format 5: `buckwal.generation`, `buckwal.next_generation`,
+//!   `buckwal.seq`, `buckwal.retries`, `s3.status`, `buckwal.elapsed_ms`, `buckwal.outcome`:
+//!   `switched`, `fenced` or `upload_failed`) and, for formats 1 to 4, `buckwal.checkpoint_upload`
 //!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`,
 //!   and `buckwal.skipped_generation`, on the first seal after a takeover only),
 //!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);

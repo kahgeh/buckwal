@@ -217,7 +217,7 @@ impl Env {
         Ok((db, follower))
     }
 
-    /// The head, read afresh; an MVCC head is refused.
+    /// The head, read afresh; an MVCC head and a format 5 head are refused.
     fn read_head(&self) -> Result<(Head, String, SystemTime)> {
         let read_at = SystemTime::now();
         let key = self.keys.head();
@@ -226,6 +226,11 @@ impl Env {
         let head = self.keys.decode_head_open(&obj.body)?;
         if head.journal_mode == JournalMode::Mvcc {
             return Err(Error::Unsupported("replica: MVCC"));
+        }
+        if head.format == crate::format::FORMAT_V5 {
+            return Err(Error::Unsupported(
+                "replica: a format 5 bucket (packs); a replica follows formats 1 to 4 only, for now",
+            ));
         }
         Ok((head, obj.etag, read_at))
     }

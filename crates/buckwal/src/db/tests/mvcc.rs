@@ -643,7 +643,8 @@ fn wal_mode_open_unchanged() {
     let c = db.connect().unwrap();
     create(&c);
     insert(&c, 1).unwrap();
-    assert_eq!(head(&*store).format, 1);
+    // A new WAL database is a format 5 one (it switches generations, no seal).
+    assert_eq!(head(&*store).format, crate::format::FORMAT_V5);
     let kinds: Vec<_> = (1..=2)
         .map(|seq| record(&store, 1, seq))
         .map(|r| {

@@ -118,6 +118,8 @@ fn recorder() -> (EventHook, Arc<Mutex<Vec<u64>>>) {
 
 #[test]
 fn gc_deletes_nothing_while_the_manifest_is_young() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     sealed_writer(&store, config(a.path()), 2);
@@ -137,6 +139,8 @@ fn gc_deletes_nothing_while_the_manifest_is_young() {
 
 #[test]
 fn gc_deletes_what_an_old_enough_head_no_longer_reaches() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     let rows = sealed_writer(&store, config(a.path()), 2);
@@ -162,6 +166,8 @@ fn gc_deletes_what_an_old_enough_head_no_longer_reaches() {
 
 #[test]
 fn gc_uses_the_newest_old_enough_manifest() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     let k = keys();
@@ -208,6 +214,8 @@ fn gc_with_no_head_or_no_manifest_does_nothing() {
 /// The pass the trimmer already made against manifest `last` is not made again.
 #[test]
 fn gc_once_skips_the_manifest_it_last_trimmed_against() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     sealed_writer(&store, config(a.path()), 2);
@@ -224,6 +232,8 @@ fn gc_once_skips_the_manifest_it_last_trimmed_against() {
 
 #[test]
 fn short_lived_writer_trims_at_open() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for gc_after_seal in [true, false] {
         let store = mem();
         let a = tempdir();
@@ -254,6 +264,8 @@ fn short_lived_writer_trims_at_open() {
 /// nothing the restore reads.
 #[test]
 fn gc_during_restore_keeps_what_the_restore_reads() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     let rows = sealed_writer(&store, config(a.path()), 3);
@@ -283,6 +295,8 @@ fn gc_during_restore_keeps_what_the_restore_reads() {
 /// `gc` needs no directory: `config.dir` is never touched.
 #[test]
 fn gc_ignores_the_directory() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     sealed_writer(&store, config(a.path()), 2);
@@ -473,6 +487,8 @@ fn rows_of(store: &Arc<MemStore>) -> Vec<i64> {
 /// B's head still works.
 #[test]
 fn gc_ignores_fenced_writers_leftover_manifest() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = crashed_after_one_seal(&store);
     let k = keys();
@@ -511,6 +527,8 @@ fn gc_ignores_fenced_writers_leftover_manifest() {
 /// lands and its manifest is old enough, GC trims against it and removes A's leftover.
 #[test]
 fn gc_pause_between_takeover_and_skip_seal_ends() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = crashed_after_one_seal(&store);
     let k = keys();
@@ -550,4 +568,35 @@ fn gc_pause_between_takeover_and_skip_seal_ends() {
     assert_eq!(rows_of(&store), want);
     std::mem::forget(c);
     std::mem::forget(db);
+}
+
+/// A format 5 bucket with no pack: its head names no manifest, so a GC pass (the trimmer's, or
+/// `gc`) deletes nothing. The log is the only copy of the database until a pack exists.
+#[test]
+fn gc_of_a_format_5_bucket_without_a_pack_deletes_no_log() {
+    let store = mem();
+    let w = tempdir();
+    let mut cfg = config(w.path());
+    // The writer's own trimmer runs too, after each switch.
+    cfg.gc_after_seal = true;
+    let rows = sealed_writer(&store, cfg, 3);
+    let h = head(&*store);
+    assert_eq!((h.format, h.manifest), (crate::format::FORMAT_V5, None));
+    let before = all_keys(&store);
+    let k = keys();
+    let r = gc_with_store(&config(Path::new("/x")), store.clone()).unwrap();
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::Nothing, 0));
+    // A pass with no minimum age, as the trimmer of a writer whose grace has passed.
+    let pass = gc_once(&*store, &k.for_open(), Duration::ZERO, None).unwrap();
+    assert_eq!((pass.outcome, pass.deleted), (GcOutcome::Nothing, 0));
+    assert_eq!(all_keys(&store), before);
+    for g in 1..h.generation {
+        assert!(
+            before
+                .iter()
+                .any(|key| k.parse_log(key).map(|(lg, _)| lg) == Some(g)),
+            "log/{g} is gone"
+        );
+    }
+    restores_rows(&store, rows);
 }

@@ -212,6 +212,8 @@ fn current_manifest(store: &MemStore) -> (u64, Manifest) {
 
 #[test]
 fn swapped_pages_fail_the_read() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -238,6 +240,8 @@ fn swapped_pages_fail_the_read() {
 
 #[test]
 fn an_older_generations_page_put_back_fails_the_read() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -305,6 +309,8 @@ fn a_record_replayed_at_another_seq_fails_the_read() {
 
 #[test]
 fn an_edited_manifest_fails_the_read() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -367,6 +373,8 @@ fn an_edited_head_fails_the_read() {
 
 #[test]
 fn a_page_object_shorter_than_a_code_fails_without_a_panic() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -388,6 +396,8 @@ fn a_page_object_shorter_than_a_code_fails_without_a_panic() {
 /// of it is refused.
 #[test]
 fn an_encrypted_bucket_has_a_format_4_head_and_a_keyless_open_is_refused() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -420,6 +430,8 @@ fn an_encrypted_bucket_has_a_format_4_head_and_a_keyless_open_is_refused() {
 /// `buckwal verify` over a swapped page and a replayed record fails like the open it wraps.
 #[test]
 fn verify_fails_over_tampered_objects() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -460,6 +472,8 @@ fn verify_fails_over_tampered_objects() {
 /// GC trims against a manifest once it is old enough, so it reads and checks that manifest.
 #[test]
 fn gc_over_a_tampered_manifest_fails() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -829,6 +843,8 @@ fn copy_targets(store: &MemStore, prefix: &str) -> Vec<(&'static str, Vec<String
 
 #[test]
 fn an_object_copied_from_another_database_with_the_same_key_fails_its_code() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         // Two databases, one key file, two prefixes of one bucket; and the same prefix in
         // another bucket.
@@ -923,6 +939,8 @@ fn unsealed_writer(prefix: &str, store: &Arc<MemStore>, k: &TempDir) -> TempDir 
 
 #[test]
 fn a_whole_head_copied_over_another_database_fails_at_the_first_object_read() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let k = tempdir();
     let hex = key_hex();
     // Over a sealed database: the manifest GET fails.
@@ -1007,6 +1025,8 @@ fn a_whole_head_copied_over_another_database_fails_at_the_first_object_read() {
 
 #[test]
 fn a_format_4_head_with_its_database_id_edited_or_removed_fails_its_code() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for mode in MODES {
         let store = mem();
         let k = tempdir();
@@ -1151,6 +1171,8 @@ mod telemetry_signals {
 
     #[test]
     fn a_tampered_page_yields_one_record_and_an_integrity_outcome() {
+        // A seal test of formats 1 to 4 (`bucket::legacy`).
+        let _legacy = crate::format::LegacySeal::on();
         for mode in MODES {
             let store = mem();
             let k = tempdir();
@@ -1193,6 +1215,8 @@ mod telemetry_signals {
 
     #[test]
     fn restore_and_gc_spans_end_with_outcome_integrity() {
+        // A seal test of formats 1 to 4 (`bucket::legacy`).
+        let _legacy = crate::format::LegacySeal::on();
         for mode in MODES {
             let store = mem();
             let k = tempdir();
@@ -1259,6 +1283,8 @@ mod telemetry_signals {
 /// `integrity`, which is a failure; the page is not made local.
 #[test]
 fn a_prefetch_over_a_tampered_page_ends_integrity() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     use crate::telemetry::testing::Capture;
     let store = mem();
     let k = tempdir();

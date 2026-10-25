@@ -235,6 +235,8 @@ pub(crate) fn log_seqs(store: &dyn ObjectStore, gen: u64) -> Vec<u64> {
 
 #[test]
 fn every_ack_restores_across_checkpoints_and_pages_are_lazy() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let t = Instant::now();
     let mem = Arc::new(MemStore::new());
     let store: Arc<dyn ObjectStore> = mem.clone();
@@ -336,7 +338,11 @@ fn header_resend_after_failed_header_sync_stays_in_generation() {
     let hook: EventHook = {
         let (fault, armed) = (fault.clone(), armed.clone());
         Arc::new(move |ev: &Event| {
-            if matches!(ev, Event::SealFinished { .. }) && !armed.swap(true, SeqCst) {
+            let ended = matches!(
+                ev,
+                Event::SealFinished { .. } | Event::GenerationSwitched { .. }
+            );
+            if ended && !armed.swap(true, SeqCst) {
                 fault.only_keys_containing("/log/");
                 fault.fail_next_puts(u64::MAX / 2);
             }
@@ -389,8 +395,11 @@ fn header_resend_after_failed_header_sync_stays_in_generation() {
     assert_eq!(ids(&c2), acked);
 }
 
-#[test]
-fn seal_failure_refuses_restart_and_loses_nothing() {
+/// The upload at the end of a generation fails (`fail`: the page PUTs of a seal, formats 1 to
+/// 4, or the head move of a generation switch, format 5): the WAL restart is refused, and no
+/// ack is lost.
+fn end_of_generation_failure_refuses_restart_and_loses_nothing(legacy: bool, fail: &str) {
+    let _legacy = legacy.then(crate::format::LegacySeal::on);
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let d = tempfile::tempdir().unwrap();
@@ -401,7 +410,7 @@ fn seal_failure_refuses_restart_and_loses_nothing() {
     );
     create_table(&conn);
     let gen0 = e.uploader.generation();
-    fault.only_keys_containing("/pages/");
+    fault.only_keys_containing(fail);
     fault.fail_puts_after(0);
 
     let mut acked = vec![];
@@ -416,8 +425,8 @@ fn seal_failure_refuses_restart_and_loses_nothing() {
     }
     let err = stash::take();
     assert!(
-        matches!(&err, Some(Error::Timeout(m)) if m.contains("/pages/")),
-        "the refused restart must stash the page upload's error: {err:?}"
+        matches!(&err, Some(Error::Timeout(m)) if m.contains(fail)),
+        "the refused restart must stash the failed upload's error: {err:?}"
     );
     assert_eq!(e.uploader.generation(), gen0);
     assert_eq!(e.uploader.counters().seals, 0);
@@ -435,7 +444,19 @@ fn seal_failure_refuses_restart_and_loses_nothing() {
 }
 
 #[test]
+fn seal_failure_refuses_restart_and_loses_nothing() {
+    end_of_generation_failure_refuses_restart_and_loses_nothing(true, "/pages/");
+}
+
+#[test]
+fn switch_failure_refuses_restart_and_loses_nothing() {
+    end_of_generation_failure_refuses_restart_and_loses_nothing(false, "/head");
+}
+
+#[test]
 fn missing_page_object_is_not_found() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -467,6 +488,8 @@ fn missing_page_object_is_not_found() {
 
 #[test]
 fn prefetch_fetches_every_sealed_page() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -545,6 +568,8 @@ fn db_log_path_is_refused() {
 
 #[test]
 fn restore_refuses_mvcc_page_one() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer(mem.clone(), d.path());
@@ -691,7 +716,11 @@ fn checkpoint_restores_every_ack(mode: CheckpointMode) {
 /// Page uploads fail from just before the checkpoint after commit 350: commits either succeed
 /// or fail at the generation boundary. After the faults clear, 20 more commits succeed and a
 /// restore has exactly the acknowledged ids.
-fn checkpoint_with_page_upload_failure_loses_nothing(mode: CheckpointMode) {
+///
+/// `legacy` makes a format 1 bucket, whose seal uploads pages (`fail` is `/pages/`); a format 5
+/// bucket fails its switch's head move instead (`fail` is `/head`).
+fn checkpoint_with_upload_failure_loses_nothing(mode: CheckpointMode, legacy: bool, fail: &str) {
+    let _legacy = legacy.then(crate::format::LegacySeal::on);
     let t = Instant::now();
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));
@@ -712,14 +741,14 @@ fn checkpoint_with_page_upload_failure_loses_nothing(mode: CheckpointMode) {
                 failed += 1;
                 let stashed = stash::take();
                 assert!(
-                    matches!(&stashed, Some(Error::Timeout(m)) if m.contains("/pages/")),
+                    matches!(&stashed, Some(Error::Timeout(m)) if m.contains(fail)),
                     "{mode:?} commit {id}: {err} ({stashed:?})"
                 );
             }
         }
         if id == 350 {
             seals_at_arm = e.uploader.counters().seals;
-            fault.only_keys_containing("/pages/");
+            fault.only_keys_containing(fail);
             fault.fail_puts_after(0);
         }
         if id % 50 == 0 {
@@ -745,7 +774,7 @@ fn checkpoint_with_page_upload_failure_loses_nothing(mode: CheckpointMode) {
     assert_eq!(integrity(&c2), "ok");
     assert_eq!(ids(&c2), acked);
     eprintln!(
-        "{mode:?} page_upload_failure: {failed} failed commits, {:?}",
+        "{mode:?} upload_failure at {fail}: {failed} failed commits, {:?}",
         t.elapsed()
     );
 }
@@ -772,22 +801,42 @@ fn checkpoint_mode_truncate_restores_every_ack() {
 
 #[test]
 fn checkpoint_mode_passive_with_page_upload_failure_loses_nothing() {
-    checkpoint_with_page_upload_failure_loses_nothing(PASSIVE);
+    checkpoint_with_upload_failure_loses_nothing(PASSIVE, true, "/pages/");
+}
+
+#[test]
+fn checkpoint_mode_passive_with_switch_failure_loses_nothing() {
+    checkpoint_with_upload_failure_loses_nothing(PASSIVE, false, "/head");
 }
 
 #[test]
 fn checkpoint_mode_full_with_page_upload_failure_loses_nothing() {
-    checkpoint_with_page_upload_failure_loses_nothing(CheckpointMode::Full);
+    checkpoint_with_upload_failure_loses_nothing(CheckpointMode::Full, true, "/pages/");
+}
+
+#[test]
+fn checkpoint_mode_full_with_switch_failure_loses_nothing() {
+    checkpoint_with_upload_failure_loses_nothing(CheckpointMode::Full, false, "/head");
 }
 
 #[test]
 fn checkpoint_mode_restart_with_page_upload_failure_loses_nothing() {
-    checkpoint_with_page_upload_failure_loses_nothing(CheckpointMode::Restart);
+    checkpoint_with_upload_failure_loses_nothing(CheckpointMode::Restart, true, "/pages/");
+}
+
+#[test]
+fn checkpoint_mode_restart_with_switch_failure_loses_nothing() {
+    checkpoint_with_upload_failure_loses_nothing(CheckpointMode::Restart, false, "/head");
 }
 
 #[test]
 fn checkpoint_mode_truncate_with_page_upload_failure_loses_nothing() {
-    checkpoint_with_page_upload_failure_loses_nothing(TRUNCATE);
+    checkpoint_with_upload_failure_loses_nothing(TRUNCATE, true, "/pages/");
+}
+
+#[test]
+fn checkpoint_mode_truncate_with_switch_failure_loses_nothing() {
+    checkpoint_with_upload_failure_loses_nothing(TRUNCATE, false, "/head");
 }
 
 #[test]
@@ -852,9 +901,9 @@ fn close_with_bucket_down_keeps_wal_and_loses_nothing() {
     assert_eq!(ids(&c2), (1..=100).collect::<Vec<_>>());
 }
 
-/// Review Focus 5.
-#[test]
-fn sql_truncate_checkpoint_with_bucket_down_loses_nothing() {
+/// Review Focus 5. `fail` as in `checkpoint_with_upload_failure_loses_nothing`.
+fn sql_truncate_checkpoint_with_bucket_down(legacy: bool, fail: &str) {
+    let _legacy = legacy.then(crate::format::LegacySeal::on);
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let d = tempfile::tempdir().unwrap();
@@ -868,7 +917,7 @@ fn sql_truncate_checkpoint_with_bucket_down_loses_nothing() {
         commit_row(&conn, id).unwrap();
     }
     let gen0 = e.uploader.generation();
-    fault.only_keys_containing("/pages/");
+    fault.only_keys_containing(fail);
     fault.fail_puts_after(0);
     let rows = run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap_or_else(|err| panic!("the PRAGMA must return a row: {err}"));
@@ -894,7 +943,19 @@ fn sql_truncate_checkpoint_with_bucket_down_loses_nothing() {
 }
 
 #[test]
+fn sql_truncate_checkpoint_with_bucket_down_loses_nothing() {
+    sql_truncate_checkpoint_with_bucket_down(true, "/pages/");
+}
+
+#[test]
+fn sql_truncate_checkpoint_with_head_down_loses_nothing() {
+    sql_truncate_checkpoint_with_bucket_down(false, "/head");
+}
+
+#[test]
 fn restore_after_many_checkpoints_reads_only_current_generation() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let t = Instant::now();
     let mem = Arc::new(MemStore::new());
     let trimmed = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
@@ -1058,6 +1119,8 @@ fn prefetch_span(f: impl FnOnce()) -> crate::telemetry::testing::SpanRec {
 
 #[test]
 fn a_prefetch_that_finishes_ends_complete_with_its_pages() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let (_r, e2, _c2) = sealed_and_restored(&mem);
     let pages = manifest(&*mem).1.pages.len();
@@ -1073,6 +1136,8 @@ fn a_prefetch_that_finishes_ends_complete_with_its_pages() {
 
 #[test]
 fn a_prefetch_stopped_early_ends_stopped() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let (_r, e2, _c2) = sealed_and_restored(&mem);
     let s = prefetch_span(|| e2.storage.prefetch(&AtomicBool::new(true)));
@@ -1083,6 +1148,8 @@ fn a_prefetch_stopped_early_ends_stopped() {
 
 #[test]
 fn a_prefetch_over_a_missing_page_ends_error() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let mem = Arc::new(MemStore::new());
     let (_r, e2, _c2) = sealed_and_restored(&mem);
     let m = manifest(&*mem).1;

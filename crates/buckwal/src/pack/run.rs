@@ -139,8 +139,9 @@ pub(crate) fn ended_generations(r: &LogReader, from: u64, head: &Head) -> Result
 }
 
 /// [`ended_generations`], calling `visit` with each ended generation and all its records, in
-/// order, as it finds them.
-fn scan_generations(
+/// order, as it finds them. A log-only restore of a format 5 bucket uses it too
+/// (`restore::restore_files`).
+pub(crate) fn scan_generations(
     r: &LogReader,
     from: u64,
     head: &Head,
@@ -246,7 +247,7 @@ fn next_by_floor(
 /// had then. That head named the writer of the terminal record, because only the head's own
 /// writer can move the head with `If-Match`. The current head can name a later writer, and
 /// `replay`'s rule for logs without a fence record reads the head's writer id.
-fn replay_ended(records: &[LogRecord], head: &Head, generation: u64) -> Result<Images> {
+pub(crate) fn replay_ended(records: &[LogRecord], head: &Head, generation: u64) -> Result<Images> {
     let writer_id = match records.last() {
         Some(LogRecord::Extents { writer_id, .. }) => writer_id.clone(),
         _ => head.writer_id.clone(),

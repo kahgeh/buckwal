@@ -924,11 +924,28 @@ fn sealed_objects(all: &BTreeMap<String, Vec<u8>>, gen: u64) -> BTreeMap<String,
 ///
 /// With `trim`, B's trimmer has also run (its grace passed): `log/G` is gone, so A's
 /// seal-start record cannot collide with B's fence record.
+///
+/// It runs on a format 5 bucket (B's generation switch, no page) and on a format 1 bucket (B's
+/// seal). The trim runs on the format 1 bucket only: GC deletes no log of a format 5 bucket
+/// without a pack.
 fn old_writer_after_claim_and_seal(
     prepare_a: fn(&Connection),
     trim: bool,
     old_writer: fn(Database, Connection) -> Result<()>,
 ) {
+    if !trim {
+        old_writer_after_claim_and_seal_in(prepare_a, false, old_writer, false);
+    }
+    old_writer_after_claim_and_seal_in(prepare_a, trim, old_writer, true);
+}
+
+fn old_writer_after_claim_and_seal_in(
+    prepare_a: fn(&Connection),
+    trim: bool,
+    old_writer: fn(Database, Connection) -> Result<()>,
+    legacy: bool,
+) {
+    let legacy_guard = legacy.then(crate::format::LegacySeal::on);
     let store = mem();
     let a = tempdir();
     let db_a = open_mem(&store, a.path());
@@ -952,11 +969,13 @@ fn old_writer_after_claim_and_seal(
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
     cb.close().unwrap();
     db_b.close().unwrap();
+    drop(legacy_guard);
     let h = head(&*store);
-    // B took G over, so its first seal skips a generation: head G+2, objects under G+1.
+    // B took G over, so its first seal (or switch) skips a generation: head G+2, a seal's
+    // objects under G+1.
     assert_eq!(
         (h.generation, h.manifest),
-        (gen + 2, Some(gen + 1)),
+        (gen + 2, legacy.then_some(gen + 1)),
         "B sealed G"
     );
     if trim {
@@ -965,7 +984,7 @@ fn old_writer_after_claim_and_seal(
         assert!(log_seqs(&*store, gen).is_empty(), "log/G trimmed");
     }
     let before = bucket_objects(&store);
-    assert!(!sealed_objects(&before, gen + 1).is_empty());
+    assert_eq!(sealed_objects(&before, gen + 1).is_empty(), !legacy);
     assert!(
         sealed_objects(&before, gen).is_empty(),
         "B wrote nothing under G"
@@ -1051,6 +1070,8 @@ fn old_writer_commit_crossing_its_boundary_after_claim_and_seal_is_fenced() {
 /// A checks the head before that append and is fenced.
 #[test]
 fn idle_old_writer_appending_into_trimmed_log_is_fenced() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     let cfg_a = config_with_lease(a.path(), Duration::ZERO);
@@ -1345,6 +1366,8 @@ impl ObjectStore for PrefetchGate {
 /// has taken the engine, so a close that did not stop it would let it fetch every page.
 #[test]
 fn close_stops_prefetch_before_releasing_the_dir() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     {
         let a = tempdir();
@@ -1480,6 +1503,8 @@ impl ObjectStore for SlowPrefetchStore {
 /// across each GET, so it is skipped when the open knows the database is not fresh.
 #[test]
 fn writer_open_after_restore_does_not_wait_for_prefetch() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     {
         let a = tempdir();
@@ -1533,6 +1558,8 @@ fn writer_open_after_restore_does_not_wait_for_prefetch() {
 /// process of the directory fetches nothing, even when no seal ever ran in between.
 #[test]
 fn finished_prefetch_persists_complete() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = closed_writer(&store, 200);
     let r = tempdir();
@@ -1585,6 +1612,8 @@ fn finished_prefetch_persists_complete() {
 /// the seal changed rather than trust `app.db`.
 #[test]
 fn read_only_prefetch_then_seal_reads_fresh_pages() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     let db = open_mem(&store, a.path());
@@ -1771,22 +1800,58 @@ fn writer_open_raises_the_epoch() {
 /// seal would otherwise move the head first and hide the race.
 #[test]
 fn late_head_put_after_restart_cannot_land() {
-    let store = mem();
-    let a = closed_writer(&store, 10);
-    let e = head_etag(&store);
-    let h = head(&*store);
+    for legacy in [false, true] {
+        late_head_put_after_restart_cannot_land_in(legacy);
+    }
+}
+
+/// What a crashed seal (`legacy`, formats 1 to 4) or generation switch (format 5) of the head's
+/// generation put in the bucket before its head PUT, and the head that PUT would write. A seal
+/// uploaded its manifest: the generation's pages are unchanged since the last seal, so it maps
+/// them as that one did. A switch uploaded its seal-start record, which names the next
+/// generation.
+fn crashed_end_of_generation(store: &MemStore, h: &Head, legacy: bool) -> Head {
     let late = Head {
         generation: h.generation + 1,
-        manifest: Some(h.generation),
-        ..h
+        manifest: legacy.then_some(h.generation),
+        ..h.clone()
     };
-    // The crashed seal uploaded its manifest before its head PUT: the generation's pages
-    // are unchanged since the last seal, so it maps them as that one did.
-    let m = store
-        .get(&keys().manifest(h.generation - 1))
-        .unwrap()
-        .unwrap();
-    store.put(&keys().manifest(h.generation), &m.body).unwrap();
+    if legacy {
+        let m = store
+            .get(&keys().manifest(h.generation - 1))
+            .unwrap()
+            .unwrap();
+        store.put(&keys().manifest(h.generation), &m.body).unwrap();
+    } else {
+        let seq = log_seqs(store, h.generation)
+            .iter()
+            .max()
+            .map_or(1, |s| s + 1);
+        let rec = LogRecord::Extents {
+            file: LogFile::Wal,
+            writer_id: h.writer_id.clone(),
+            syncs: vec![],
+            next_generation: Some(h.generation + 1),
+        };
+        store
+            .put(
+                &keys().log(h.generation, seq),
+                &keys().encode_record(&rec, h.generation, seq),
+            )
+            .unwrap();
+    }
+    late
+}
+
+fn late_head_put_after_restart_cannot_land_in(legacy: bool) {
+    let store = mem();
+    let a = {
+        let _legacy = legacy.then(crate::format::LegacySeal::on);
+        closed_writer(&store, 10)
+    };
+    let e = head_etag(&store);
+    let h = head(&*store);
+    let late = crashed_end_of_generation(&store, &h, legacy);
     let (s2, body) = (store.clone(), late.encode());
     let (opened, wait) = mpsc::channel::<()>();
     let put = std::thread::spawn(move || {
@@ -2013,22 +2078,21 @@ impl ObjectStore for LateHeadBeforeRaise {
 /// attaches again (now at the sealed generation) instead of failing `Fenced`.
 #[test]
 fn open_attaches_again_when_its_own_late_seal_head_lands_before_the_raise() {
+    for legacy in [false, true] {
+        open_attaches_again_when_its_own_late_head_lands_in(legacy);
+    }
+}
+
+fn open_attaches_again_when_its_own_late_head_lands_in(legacy: bool) {
     let store = mem();
-    let a = closed_writer(&store, 10);
+    let a = {
+        let _legacy = legacy.then(crate::format::LegacySeal::on);
+        closed_writer(&store, 10)
+    };
     let h = head(&*store);
     let e = head_etag(&store);
-    let late = Head {
-        generation: h.generation + 1,
-        manifest: Some(h.generation),
-        ..h.clone()
-    };
-    // The crashed seal uploaded its manifest before its head PUT (as in
-    // `late_head_put_after_restart_cannot_land`).
-    let m = store
-        .get(&keys().manifest(h.generation - 1))
-        .unwrap()
-        .unwrap();
-    store.put(&keys().manifest(h.generation), &m.body).unwrap();
+    // As in `late_head_put_after_restart_cannot_land`.
+    let late = crashed_end_of_generation(&store, &h, legacy);
     let wrapped = Arc::new(LateHeadBeforeRaise {
         inner: store.clone(),
         late: Mutex::new(Some((late.encode(), e))),
@@ -2222,13 +2286,15 @@ fn writer_left_in_a_seal(store: &Arc<MemStore>, n: i64) -> TempDir {
     }
     c.close().unwrap();
     db.close().unwrap();
-    let gen = head(&**store).generation;
+    let h = head(&**store);
+    let gen = h.generation;
     let next = log_seqs(&**store, gen).last().map_or(1, |s| s + 1);
+    // A switch's seal-start record (format 5) names the generation it moves the head to.
     let rec = LogRecord::Extents {
         file: LogFile::Wal,
         writer_id: state(a.path()).writer_id,
         syncs: Vec::new(),
-        next_generation: None,
+        next_generation: (h.format == crate::format::FORMAT_V5).then_some(gen + 1),
     };
     let r = store
         .put_if_absent(&keys().log(gen, next), &crate::format::encode_record(&rec))
@@ -2255,6 +2321,8 @@ fn insert_kb(c: &Connection, id: i64) {
 /// next lease check, and a restore holds both writers' rows.
 #[test]
 fn old_writer_page_puts_in_flight_cannot_overwrite_the_new_seal() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let fault = Arc::new(FaultStore::new(store.clone()));
     let (started_tx, started_rx) = mpsc::channel::<u64>();
@@ -2532,6 +2600,8 @@ fn stale_writers_late_put_after_the_new_seal(batching: crate::Batching, held: &s
 /// A stale writer's late page PUT, under `Off` and a `Window`.
 #[test]
 fn a_stale_writers_late_page_put_cannot_overwrite_a_published_seal() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for b in batchings() {
         stale_writers_late_put_after_the_new_seal(b, "/pages/");
     }
@@ -2540,6 +2610,8 @@ fn a_stale_writers_late_page_put_cannot_overwrite_a_published_seal() {
 /// A stale writer's late manifest PUT (its pages went out), under `Off` and a `Window`.
 #[test]
 fn a_stale_writers_late_manifest_put_cannot_overwrite_a_published_seal() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for b in batchings() {
         stale_writers_late_put_after_the_new_seal(b, "/manifest/");
     }
@@ -2551,6 +2623,8 @@ fn a_stale_writers_late_manifest_put_cannot_overwrite_a_published_seal() {
 /// it with `put_if_match` on the ETag it read. A restore holds every row.
 #[test]
 fn a_crash_of_the_new_writer_mid_seal_resumes_over_its_own_leftovers() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = closed_writer(&store, 10);
     let bt = tempdir();
@@ -2742,6 +2816,8 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
 /// C1, B → C over A mid-seal, B committing nothing, under `Off` and a `Window`.
 #[test]
 fn a_chained_takeover_over_a_writer_mid_seal_keeps_the_quiet() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for b in batchings() {
         chained_takeover_over_a_writer_mid_seal(b, false);
     }
@@ -2751,6 +2827,8 @@ fn a_chained_takeover_over_a_writer_mid_seal_keeps_the_quiet() {
 /// `Window`: A's seal-start record sits several records before C's fence.
 #[test]
 fn a_chained_takeover_after_the_middle_writer_committed_keeps_the_quiet() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for b in batchings() {
         chained_takeover_over_a_writer_mid_seal(b, true);
     }
@@ -2927,6 +3005,8 @@ fn forward_wall_step_between_takeover_and_open(batching: crate::Batching) {
 /// B1 under `Off` and a `Window`.
 #[test]
 fn a_forward_wall_step_between_takeover_and_open_keeps_the_quiet() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     for b in batchings() {
         forward_wall_step_between_takeover_and_open(b);
     }
@@ -3074,6 +3154,8 @@ fn encrypted_open_commit_reopen_keeps_rows() {
 
 #[test]
 fn encrypted_restore_fetches_pages_lazily_and_decrypts() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let k = tempdir();
     let _a = encrypted_writer(&store, &k);
@@ -4295,6 +4377,7 @@ fn create_mvcc_encrypted_has_no_plaintext() {
 mod checkpoint_race;
 mod integrity;
 mod mvcc;
+mod switch;
 mod telemetry;
 
 /// `quiet_config` with the lease and request timeout (ms) given.
@@ -4321,13 +4404,15 @@ fn left_in_a_seal_with(store: &Arc<MemStore>, lease_ms: u64, request_timeout_ms:
     }
     c.close().unwrap();
     db.close().unwrap();
-    let gen = head(&**store).generation;
+    let h = head(&**store);
+    let gen = h.generation;
     let next = log_seqs(&**store, gen).last().map_or(1, |s| s + 1);
+    // A switch's seal-start record (format 5) names the generation it moves the head to.
     let rec = LogRecord::Extents {
         file: LogFile::Wal,
         writer_id: state(a.path()).writer_id,
         syncs: Vec::new(),
-        next_generation: None,
+        next_generation: (h.format == crate::format::FORMAT_V5).then_some(gen + 1),
     };
     let r = store
         .put_if_absent(&keys().log(gen, next), &crate::format::encode_record(&rec))
@@ -4511,6 +4596,8 @@ fn skip_sealed(store: &Arc<MemStore>) -> (u64, TempDir, Vec<i64>) {
 /// and a second takeover all work across the head that went up by 2.
 #[test]
 fn skipped_generation_restore_verify_gc_maintenance_reconcile_second_takeover() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = crashed_writer_a(&store, 5);
     let g = head(&*store).generation;
@@ -4608,8 +4695,19 @@ fn skipped_generation_restore_verify_gc_maintenance_reconcile_second_takeover() 
 /// seal skips both earlier writers' generations.
 #[test]
 fn two_takeovers_before_first_seal_skip_both() {
+    for legacy in [false, true] {
+        two_takeovers_before_first_seal_skip_both_in(legacy);
+    }
+}
+
+/// A's bucket is format 1 with `legacy` (the first seal writes pages and a manifest under the
+/// generation before its target), else format 5 (the first switch writes neither).
+fn two_takeovers_before_first_seal_skip_both_in(legacy: bool) {
     let store = mem();
-    let _a = crashed_writer_a(&store, 5);
+    let _a = {
+        let _legacy = legacy.then(crate::format::LegacySeal::on);
+        crashed_writer_a(&store, 5)
+    };
     let g = head(&*store).generation;
     let tb = tempdir();
     let (db_b, cb, _) = takeover_and_open(&store, &tb);
@@ -4623,12 +4721,17 @@ fn two_takeovers_before_first_seal_skip_both() {
     insert(&cc, 600).unwrap();
     cc.checkpoint(CheckpointMode::Truncate).unwrap();
     let h = head(&*store);
-    assert_eq!((h.generation, h.manifest), (g + 3, Some(g + 2)), "{h:?}");
     assert_eq!(
-        sealed_gens(&store),
-        BTreeSet::from([g + 2]),
-        "nothing under G or G+1"
+        (h.generation, h.manifest),
+        (g + 3, legacy.then_some(g + 2)),
+        "{h:?}"
     );
+    let sealed: BTreeSet<u64> = if legacy {
+        BTreeSet::from([g + 2])
+    } else {
+        BTreeSet::new()
+    };
+    assert_eq!(sealed_gens(&store), sealed, "nothing under G or G+1");
     assert!(!log_gens(&store).contains(&(g + 1)) && !log_gens(&store).contains(&(g + 2)));
     let mut want: Vec<i64> = (1..=5).collect();
     want.extend([500, 600]);
@@ -4640,8 +4743,18 @@ fn two_takeovers_before_first_seal_skip_both() {
 /// the first seal after the restart still skips.
 #[test]
 fn restart_between_takeover_and_first_seal_keeps_floor() {
+    for legacy in [false, true] {
+        restart_between_takeover_and_first_seal_keeps_floor_in(legacy);
+    }
+}
+
+/// `legacy` as in `two_takeovers_before_first_seal_skip_both_in`.
+fn restart_between_takeover_and_first_seal_keeps_floor_in(legacy: bool) {
     let store = mem();
-    let _a = crashed_writer_a(&store, 5);
+    let _a = {
+        let _legacy = legacy.then(crate::format::LegacySeal::on);
+        crashed_writer_a(&store, 5)
+    };
     let g = head(&*store).generation;
     let tb = tempdir();
     let dir = fresh(&tb);
@@ -4667,8 +4780,17 @@ fn restart_between_takeover_and_first_seal_keeps_floor() {
     insert(&c, 1002).unwrap();
     c.checkpoint(CheckpointMode::Truncate).unwrap();
     let h = head(&*store);
-    assert_eq!((h.generation, h.manifest), (g + 2, Some(g + 1)), "{h:?}");
-    assert_eq!(sealed_gens(&store), BTreeSet::from([g + 1]));
+    assert_eq!(
+        (h.generation, h.manifest),
+        (g + 2, legacy.then_some(g + 1)),
+        "{h:?}"
+    );
+    let sealed: BTreeSet<u64> = if legacy {
+        BTreeSet::from([g + 1])
+    } else {
+        BTreeSet::new()
+    };
+    assert_eq!(sealed_gens(&store), sealed);
     let mut want: Vec<i64> = (1..=5).collect();
     want.extend([1001, 1002]);
     assert_eq!(restored_ids(&store), want);
@@ -4681,6 +4803,8 @@ fn restart_between_takeover_and_first_seal_keeps_floor() {
 /// seal is an ordinary one.
 #[test]
 fn previous_build_restores_from_new_head() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     use crate::format::{FORMAT, FORMAT_V2};
     let store = mem();
     let (g, tb, want) = skip_sealed(&store);
@@ -4775,6 +4899,8 @@ fn replica_mode_allows_local_wal_and_db_writes_and_uploads_nothing() {
 /// Replica mode reads pages from the bucket until they are local, as a read-only open does.
 #[test]
 fn replica_mode_reads_pages_lazily_from_bucket() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let _a = closed_writer(&store, 200);
     let v = tempdir();

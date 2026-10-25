@@ -8,7 +8,7 @@ use crate::config::{EngineConfig, JournalMode};
 use crate::encryption::{check_page_one, local_page_one};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOG_FILE};
-use crate::format::LocalState;
+use crate::format::{LocalState, FORMAT_V5};
 use crate::io::db_storage::StorageParts;
 use crate::io::log_storage::LogDurableStorage;
 use crate::io::{stash, BucketDbStorage, DurableIo};
@@ -121,6 +121,7 @@ pub(crate) fn open_engine(
     let store = bucket.store();
     let keys = bucket.keys().clone();
     let manifest = bucket.manifest().cloned();
+    let packed = bucket.head().format == FORMAT_V5;
     let page_size = manifest
         .as_ref()
         .map_or(DEFAULT_PAGE_SIZE, |m| m.page_size as usize);
@@ -150,6 +151,7 @@ pub(crate) fn open_engine(
         manifest,
         mode: cfg.io_mode,
         mvcc: cfg.journal_mode == JournalMode::Mvcc,
+        packed,
     }));
     storage.adopt_persisted_dirty()?;
     // D16: page 1, as the engine will read it, against the encryption setting.

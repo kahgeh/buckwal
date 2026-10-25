@@ -2,6 +2,10 @@
 //! The database file: a local page cache backed by the bucket's sealed pages. Pages not yet
 //! local are fetched on first read; pages the engine writes are recorded dirty (in memory and
 //! in `<dir>/app.db-dirty`) and uploaded only when the generation is sealed (D6).
+//!
+//! A format 5 bucket (`packed`) holds no page: the local file is the whole database, nothing is
+//! fetched, no dirty page is recorded and no dirty file is written. Its WAL restart is a
+//! generation switch (`switch_generation`), which uploads no page.
 use super::stash::stash;
 use super::IoMode;
 use super::{read_at, sync_file, write_at};
@@ -99,6 +103,9 @@ pub(crate) struct BucketDbStorage {
     /// An MVCC database: a read-only open lets the engine's bootstrap write the local file
     /// (backfill); the pages are tracked as dirty locally and nothing is uploaded.
     mvcc: bool,
+    /// A format 5 bucket: no dirty page set, no dirty file, a generation switch at a WAL
+    /// restart (the module doc).
+    packed: bool,
 }
 
 pub(crate) struct StorageParts {
@@ -115,6 +122,8 @@ pub(crate) struct StorageParts {
     pub manifest: Option<Manifest>,
     pub mode: IoMode,
     pub mvcc: bool,
+    /// The bucket is format 5 (`BucketDbStorage::packed`).
+    pub packed: bool,
 }
 
 impl BucketDbStorage {
@@ -145,7 +154,13 @@ impl BucketDbStorage {
             lazy_gets: AtomicU64::new(0),
             mode: p.mode,
             mvcc: p.mvcc,
+            packed: p.packed,
         }
+    }
+
+    /// The bucket is format 5: a WAL restart is a generation switch (`switch_generation`).
+    pub(crate) fn packed(&self) -> bool {
+        self.packed
     }
 
     /// Pages fetched from the bucket so far.
@@ -317,6 +332,10 @@ impl BucketDbStorage {
         self.page_size.store(page_size as u32, SeqCst);
         let pages = (0..count as u32).map(|i| first + i);
         self.local.lock().unwrap().extend(pages.clone());
+        if self.packed {
+            // Nothing uploads pages: no dirty set.
+            return;
+        }
         let mut d = self.dirty.lock().unwrap();
         d.memory.extend(pages.clone());
         d.unpersisted.extend(pages);
@@ -348,7 +367,34 @@ impl BucketDbStorage {
         Ok(())
     }
 
-    /// D6 steps 2-6: upload the generation's pages, manifest and head (through the uploader,
+    /// Format 5, at a WAL restart: fsync the local file, then the generation switch (through
+    /// the uploader, behind every log record already submitted), then record the new generation
+    /// locally. No page and no manifest goes up, and there is no dirty set to forget. Returns
+    /// the new generation.
+    ///
+    /// The fsync comes first: once the head names the next generation, this writer's own
+    /// `app.db` is the only local copy of the generation that ended (its WAL is restarted next,
+    /// and a reopen replaces it, `reconcile`).
+    pub(crate) fn switch_generation(&self) -> Result<u64> {
+        let mut dirty = self.dirty.lock().unwrap();
+        sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
+        let generation = self.uploader.switch_generation()?;
+        // As in `seal`: the head's ETag changed, and a takeover quiet of the generation that
+        // ended is cleared. Writer id, epoch and claim id carry over.
+        let state = LocalState {
+            generation,
+            complete: self.complete.load(SeqCst),
+            claimed: true,
+            head_etag: String::new(),
+            seal_not_before_ms: 0,
+            seal_quiet_ms: 0,
+            ..dirty.state.clone()
+        };
+        self.write_state(&mut dirty, state)?;
+        Ok(generation)
+    }
+
+    /// Formats 1 to 4. D6 steps 2-6: upload the generation's pages, manifest and head (through the uploader,
     /// behind every log record already submitted), fsync the local file, record the new
     /// generation locally, then forget the dirty set. Returns the new generation.
     pub(crate) fn seal(&self, wal_frame_pages: &BTreeSet<u32>) -> Result<u64> {

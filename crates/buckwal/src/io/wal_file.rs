@@ -3,7 +3,7 @@
 //! ops as one log record and only then fsyncs (D3), or, for a Window commit, queues them in
 //! the uploader's batch and fsyncs at once (the commit's call waits for the upload). A
 //! rewrite of the WAL header with new salts, or a truncate to 0, starts a new generation:
-//! the old one is sealed first (D6).
+//! the old one is sealed first (D6), or, in a format 5 bucket, ended with a generation switch.
 //!
 //! In an MVCC database (`in_mvcc`) the `-wal` holds only checkpoint frames, and the seal is
 //! `LogDurableStorage`'s, before the engine cuts the log: this file never seals (not at a new
@@ -302,9 +302,13 @@ impl ShippingFile {
         Ok(Some(span))
     }
 
-    /// Seal the generation the local file still holds (D6): its last ops, then the pages.
+    /// End the generation the local file still holds (D6): its last ops, then, in a format 5
+    /// bucket, the generation switch (no page), else the seal with the pages.
     fn seal(&self) -> Result<u64> {
         self.ship_pending()?;
+        if self.storage.packed() {
+            return self.storage.switch_generation();
+        }
         let len = self.inner.size().map_err(engine_io)?;
         let wal = read_at(&*self.inner, &*self.io, 0, len as usize).map_err(engine_io)?;
         if wal.len() >= WAL_HEADER {
@@ -603,6 +607,8 @@ mod tests {
     /// not recorded.
     #[test]
     fn mvcc_wal_never_seals_and_skips_the_truncate_of_a_generation_change() {
+        // A seal test of formats 1 to 4 (`bucket::legacy`).
+        let _legacy = crate::format::LegacySeal::on();
         let mem = Arc::new(MemStore::new());
         let d = tempfile::tempdir().unwrap();
         let (e, _conn) = writer(mem.clone(), d.path());

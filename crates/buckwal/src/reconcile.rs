@@ -20,7 +20,7 @@ use crate::bucket::{Bucket, LogPos};
 use crate::config::{EngineConfig, JournalMode};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, WAL_FILE};
-use crate::format::{Head, LocalState, LogFile, Op};
+use crate::format::{Head, LocalState, LogFile, Op, FORMAT_V5};
 use crate::io::db_storage::{truncate_dirty_file, READ_ONLY};
 use crate::io::wal_file::EPOCH;
 use crate::restore::{generation_image, page_one_seed, repair_wal_without_log, write_synced};
@@ -100,9 +100,25 @@ pub(crate) fn reconcile_files(
     // `max(local generation + 1, the floor)` (a takeover's first seal skips a generation) and
     // names the manifest before it. Anything else (a head further on, or one whose manifest is
     // not the one before it) cannot be leveled.
+    //
+    // A format 5 head names no manifest: the switch of the local generation moved the head, and
+    // the local `app.db` already holds that generation (the switch runs at a WAL restart, after
+    // the checkpoint wrote and synced every frame), so the local WAL may be replaced. That holds
+    // only for this writer's own copy (claimed): an unclaimed one (restored, or only ever
+    // opened read-only) never checkpointed, and its WAL is the only copy of its generation here.
+    let packed = head.format == FORMAT_V5;
     let expected = (state.generation + 1).max(state.next_generation_floor);
+    if state.generation < head.generation && packed && !state.claimed {
+        return Err(Error::Corrupt(format!(
+            "{} is stale: it was restored at generation {}, and the head moved on to generation \
+             {}; restore again into a new directory",
+            dir.display(),
+            state.generation,
+            head.generation
+        )));
+    }
     if state.generation < head.generation
-        && (head.generation != expected || head.manifest != Some(expected - 1))
+        && (head.generation != expected || (!packed && head.manifest != Some(expected - 1)))
     {
         return Err(Error::Corrupt(format!(
             "{} is stale: its local state is at generation {}, but the head is at generation \

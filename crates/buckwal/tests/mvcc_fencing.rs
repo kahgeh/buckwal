@@ -608,11 +608,12 @@ fn restore_through_library_format_v2() {
 // v1 buckets stay v1
 // ---------------------------------------------------------------------------------------
 
-/// The same operations on a WAL database: head format 1 with no journal_mode key, only kind-1
-/// records (and no kind 3 anywhere); the MVCC one has format 2, journal_mode, kind-3 records.
+/// The same operations on a WAL database: head format 5 with journal_mode, kind-1 records and
+/// the kind-4 seal-start record of its generation switch (no kind 3 anywhere); the MVCC one
+/// has format 2, journal_mode, kind-3 records.
 #[test]
-fn wal_bucket_stays_format_1_under_the_same_operations() {
-    for (mode, format) in [(JournalMode::Wal, 1), (JournalMode::Mvcc, 2)] {
+fn wal_bucket_is_format_5_under_the_same_operations() {
+    for (mode, format) in [(JournalMode::Wal, 5), (JournalMode::Mvcc, 2)] {
         let mem = Arc::new(MemStore::new());
         let t = tempdir();
         let db = open_with_store(config(&fresh(&t), mode), mem.clone()).unwrap();
@@ -648,13 +649,16 @@ fn wal_bucket_stays_format_1_under_the_same_operations() {
             body.contains(&format!("\"format\":{format}")),
             "{mode:?}: {body}"
         );
-        assert_eq!(body.contains("journal_mode"), format == 2, "{body}");
+        assert!(body.contains("journal_mode"), "{body}");
+        assert_eq!(body.contains("manifest"), format == 2, "{body}");
         let mut seen_kinds = BTreeSet::new();
         for k in mem.list(&format!("{PREFIX}/log/")).unwrap() {
             seen_kinds.insert(mem.get(&k).unwrap().unwrap().body[8]);
         }
         match mode {
-            JournalMode::Wal => assert_eq!(seen_kinds, BTreeSet::from([1]), "{seen_kinds:?}"),
+            JournalMode::Wal => {
+                assert_eq!(seen_kinds, BTreeSet::from([1, 4]), "{seen_kinds:?}")
+            }
             JournalMode::Mvcc => assert!(seen_kinds.contains(&3), "{seen_kinds:?}"),
         }
         c.close().unwrap();

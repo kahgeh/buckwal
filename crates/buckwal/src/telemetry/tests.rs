@@ -284,6 +284,8 @@ fn window_upload_span_counts_its_commits_and_links_the_rest() {
 
 #[test]
 fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let cap = Capture::new();
     let dir = tempfile::tempdir().unwrap();
     let restored = tempfile::tempdir().unwrap();
@@ -323,6 +325,69 @@ fn checkpoint_upload_and_restore_spans_carry_bucket_fields() {
             && e.field("pages").is_some()
             && e.field("ms").is_some()),
         "no seal record"
+    );
+    let r = spans.last_named("buckwal.restore");
+    assert_eq!(r.target, "buckwal");
+    assert_eq!(r.field("buckwal.generation"), Some("2"));
+    assert!(r.field("buckwal.gets").unwrap().parse::<u64>().unwrap() > 0);
+    assert!(r.field("buckwal.log_objects").is_some());
+    // The highest seq replayed: generation 2's last record.
+    assert_ne!(logged(2), "0");
+    assert_eq!(r.field("buckwal.seq"), Some(logged(2).as_str()));
+    assert_eq!(r.field("buckwal.retries"), Some("0"));
+    assert!(r.field("buckwal.bytes").is_some());
+    assert!(
+        spans.events.iter().any(|e| e.level == Level::INFO
+            && e.target == "buckwal"
+            && e.field("log_objects").is_some()),
+        "no restore record"
+    );
+}
+
+#[test]
+fn generation_switch_and_restore_spans_carry_bucket_fields() {
+    let cap = Capture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let restored = tempfile::tempdir().unwrap();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemStore::new());
+        let db = crate::open_with_store(config(dir.path()), store.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 0..3 {
+            insert(&conn, i).unwrap();
+        }
+        conn.checkpoint(CheckpointMode::Truncate).unwrap();
+        // One more commit, so generation 2's log has a record to replay.
+        insert(&conn, 3).unwrap();
+        crate::restore_with_store(&config(restored.path()), store.clone(), restored.path())
+            .unwrap();
+        // Counted before the database closes (its close-time seal appends to log/2).
+        let keys = crate::format::Keys::new("");
+        let logged = |g| store.list(&keys.log_prefix(g)).unwrap().len().to_string();
+        (cap.spans(), [logged(1), logged(2)])
+    });
+    let (spans, logged) = spans;
+    let logged = |g: usize| logged[g - 1].clone();
+    assert!(spans.named("buckwal.checkpoint_upload").is_empty());
+    let sw = spans.last_named("buckwal.generation_switch");
+    assert_eq!(sw.target, "buckwal");
+    assert_eq!(sw.field("buckwal.generation"), Some("1"));
+    assert_eq!(sw.field("buckwal.next_generation"), Some("2"));
+    // The seal-start record is generation 1's last.
+    assert_eq!(sw.field("buckwal.seq"), Some(logged(1).as_str()));
+    assert_eq!(sw.field("buckwal.retries"), Some("0"));
+    assert_eq!(sw.field("s3.status"), Some("200"));
+    assert_eq!(sw.field("buckwal.outcome"), Some("switched"));
+    assert!(sw.field("buckwal.elapsed_ms").is_some());
+    assert!(sw.closed.is_some());
+    assert!(
+        spans.events.iter().any(|e| e.level == Level::INFO
+            && e.target == "buckwal"
+            && e.field("next_generation").is_some()
+            && e.field("ms").is_some()),
+        "no switch record"
     );
     let r = spans.last_named("buckwal.restore");
     assert_eq!(r.target, "buckwal");
@@ -658,6 +723,8 @@ impl ObjectStore for ProbeStore {
 /// caller's dispatcher.
 #[test]
 fn seal_and_restore_threads_run_under_the_callers_subscriber() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let cap = Capture::new();
     let dir = tempfile::tempdir().unwrap();
     let restored = tempfile::tempdir().unwrap();
@@ -693,7 +760,7 @@ fn seal_and_restore_threads_run_under_the_callers_subscriber() {
 }
 
 /// The maintenance thread reports under the opening thread's subscriber: a
-/// `buckwal.maintenance` span with its fields, the seal's `buckwal.checkpoint_upload` under it.
+/// `buckwal.maintenance` span with its fields, the switch's `buckwal.generation_switch` under it.
 #[test]
 fn maintenance_span_carries_its_fields_and_parents_the_seal() {
     let cap = Capture::new();
@@ -756,8 +823,9 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
         }
         false
     };
-    let seals = spans.named("buckwal.checkpoint_upload");
-    assert!(seals.iter().any(|s| under_m(s)), "{seals:?}");
+    // A format 5 bucket ends the generation with a switch (no page upload).
+    let switches = spans.named("buckwal.generation_switch");
+    assert!(switches.iter().any(|s| under_m(s)), "{switches:?}");
 }
 
 /// A run that panics still closes its `buckwal.maintenance` span, with outcome `error`.
@@ -1212,6 +1280,8 @@ fn a_takeover_resumed_through_open_exports_a_takeover_span() {
 /// its age, what was deleted, and the outcome.
 #[test]
 fn gc_exports_a_gc_span() {
+    // A seal test of formats 1 to 4 (`bucket::legacy`).
+    let _legacy = crate::format::LegacySeal::on();
     let cap = Capture::new();
     let a = tempfile::tempdir().unwrap();
     let mem = Arc::new(MemStore::new());
@@ -1465,7 +1535,8 @@ fn without_buckwal_otel_the_pipeline_stays_off() {
     assert!(format!("{guard:?}").contains("running: false"));
 }
 
-/// A checkpoint whose seal cannot reach the bucket records `error` on its maintenance span.
+/// A checkpoint whose generation switch cannot move the head records `error` on its
+/// maintenance span.
 #[test]
 fn a_failed_maintenance_checkpoint_records_error_on_its_span() {
     let dir = tempfile::tempdir().unwrap();
@@ -1480,7 +1551,8 @@ fn a_failed_maintenance_checkpoint_records_error_on_its_span() {
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
             .unwrap();
-        fault.only_keys_containing("pages/");
+        // The test prefix is empty: the head's key is `head`.
+        fault.only_keys_containing("head");
         fault.fail_puts_after(0);
         for i in 0..10 {
             let _ = insert(&conn, i);

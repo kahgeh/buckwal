@@ -198,6 +198,10 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
                 last.1 = Some(*elapsed);
             }
         }
+        // A format 5 bucket switches generations: no page goes up.
+        Event::GenerationSwitched { elapsed, .. } => {
+            c.seals.lock().unwrap().push((0, Some(*elapsed)))
+        }
         e => c.maintenance.record(e),
     }));
     let fault = Arc::new(FaultStore::new(s3_store(&cfg)?));
