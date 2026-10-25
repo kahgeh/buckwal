@@ -104,6 +104,7 @@ fn ours(tag: u8) -> LogRecord {
         file: LogFile::Wal,
         writer_id: "w1".into(),
         syncs: syncs(tag),
+        next_generation: None,
     }
 }
 
@@ -288,6 +289,7 @@ fn empty(writer_id: &str) -> LogRecord {
         file: LogFile::Wal,
         writer_id: writer_id.into(),
         syncs: vec![],
+        next_generation: None,
     }
 }
 
@@ -1160,7 +1162,8 @@ fn seal_uploads_pages_manifest_head_in_order() {
         Some(LogRecord::Extents {
             file: LogFile::Wal,
             writer_id: "w1".into(),
-            syncs: vec![]
+            syncs: vec![],
+            next_generation: None,
         })
     );
     assert!(ev[2..manifest_at].iter().all(is_page), "{ev:?}");

@@ -55,6 +55,7 @@ fn sample_extents() -> LogRecord {
                 bytes: vec![],
             }],
         ],
+        next_generation: None,
     }
 }
 
@@ -331,9 +332,60 @@ fn golden_extents_record() {
             off: 0x1000,
             bytes: vec![10, 11, 12],
         }]],
+        next_generation: None,
     };
     assert_eq!(encode_record(&r), seal(body.clone()));
     assert_eq!(decode_record(&seal(body)).unwrap(), r);
+}
+
+/// A seal-start record of formats 1 to 4: kind 1 with no sync, byte for byte as before.
+#[test]
+fn golden_seal_start_without_next_generation() {
+    let body = hex::decode(concat!(
+        "54444c4f47000001", // magic
+        "01",               // kind extents
+        "02",
+        "7731",     // writer id "w1"
+        "00000000", // sync_count 0
+    ))
+    .unwrap();
+    let r = LogRecord::Extents {
+        file: LogFile::Wal,
+        writer_id: "w1".into(),
+        syncs: vec![],
+        next_generation: None,
+    };
+    assert_eq!(encode_record(&r), seal(body.clone()));
+    assert_eq!(decode_record(&seal(body)).unwrap(), r);
+}
+
+/// A format 5 seal-start record (kind 4) names the generation the switch moves the head to.
+#[test]
+fn golden_seal_start_with_next_generation() {
+    let body = hex::decode(concat!(
+        "54444c4f47000001", // magic
+        "04",               // kind seal-start
+        "02",
+        "7731",             // writer id "w1"
+        "00000000",         // sync_count 0
+        "0c00000000000000", // next generation 12
+    ))
+    .unwrap();
+    let r = LogRecord::Extents {
+        file: LogFile::Wal,
+        writer_id: "w1".into(),
+        syncs: vec![],
+        next_generation: Some(12),
+    };
+    assert_eq!(encode_record(&r), seal(body.clone()));
+    assert_eq!(decode_record(&seal(body.clone())).unwrap(), r);
+    // A kind 4 record with a sync, or cut short, is not a seal-start record.
+    let mut with_sync = body.clone();
+    with_sync[12] = 1;
+    assert!(is_corrupt(decode_record(&seal(with_sync))));
+    assert!(is_corrupt(decode_record(&seal(
+        body[..body.len() - 1].to_vec()
+    ))));
 }
 
 #[test]
@@ -353,6 +405,7 @@ fn golden_truncate_op() {
         file: LogFile::Wal,
         writer_id: "w".into(),
         syncs: vec![vec![Op::Truncate { len: 5 }]],
+        next_generation: None,
     };
     assert_eq!(encode_record(&r), seal(body));
 }
@@ -716,6 +769,7 @@ fn kind3_record_roundtrip() {
             off: 0x1000,
             bytes: vec![10, 11, 12],
         }]],
+        next_generation: None,
     };
     // Kind 3 body = kind 1 body with the kind byte 3.
     let body = hex::decode(concat!(
@@ -741,6 +795,7 @@ fn kind3_record_roundtrip() {
             LogRecord::Extents { syncs, .. } => syncs.clone(),
             _ => unreachable!(),
         },
+        next_generation: None,
     };
     let (a, b) = (encode_record(&wal), encode_record(&r));
     assert_eq!(a[8], 1);
@@ -755,6 +810,7 @@ fn kind3_checksum_mismatch_is_corrupt() {
         file: LogFile::Log,
         writer_id: "w1".into(),
         syncs: vec![vec![Op::Truncate { len: 5 }]],
+        next_generation: None,
     };
     let mut b = encode_record(&r);
     assert_eq!(decode_record(&b).unwrap(), r);
@@ -959,6 +1015,7 @@ mod integrity_codes {
                 off: 0,
                 bytes: vec![1, 2, 3],
             }]],
+            next_generation: None,
         }
     }
 
@@ -1015,8 +1072,20 @@ mod integrity_codes {
             file: LogFile::Log,
             writer_id: "w".into(),
             syncs: vec![vec![Op::Truncate { len: 5 }]],
+            next_generation: None,
         };
-        for rec in [fence, log3] {
+        let start = LogRecord::Extents {
+            file: LogFile::Wal,
+            writer_id: "w".into(),
+            syncs: vec![],
+            next_generation: Some(9),
+        };
+        // The next generation is covered by the code: an edited one fails.
+        let b = k.encode_record(&start, 1, 2);
+        let mut next = b.clone();
+        next[b.len() - 32 - 8] ^= 1;
+        assert_failed(k.decode_record(&next, 1, 2), &k.log(1, 2));
+        for rec in [fence, log3, start] {
             let b = k.encode_record(&rec, 1, 2);
             assert_eq!(k.decode_record(&b, 1, 2).unwrap(), rec);
             assert_failed(k.decode_record(&b, 1, 3), &k.log(1, 3));
@@ -1414,6 +1483,7 @@ mod integrity_codes {
             file: LogFile::Log,
             writer_id: "w".into(),
             syncs: vec![vec![Op::Truncate { len: 5 }]],
+            next_generation: None,
         };
         for (rec, golden) in [
             (extents(), GOLDEN_RECORD),

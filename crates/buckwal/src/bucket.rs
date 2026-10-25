@@ -1050,6 +1050,7 @@ impl Bucket {
                 file,
                 writer_id: self.head.writer_id.clone(),
                 syncs,
+                next_generation: None,
             },
             self.head.generation,
             self.seq,
@@ -1797,6 +1798,9 @@ impl Bucket {
                 file: LogFile::Wal,
                 writer_id: self.head.writer_id.clone(),
                 syncs: Vec::new(),
+                // Format 5 names the switch's target here (`seal_target`) from the
+                // generation switch on; formats 1 to 4 keep the kind 1 record.
+                next_generation: None,
             },
             self.head.generation,
             self.seq,

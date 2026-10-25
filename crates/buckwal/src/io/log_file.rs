@@ -927,6 +927,7 @@ mod tests {
                             off: 0,
                             bytes: vec![9; 8],
                         }]],
+                        next_generation: None,
                     });
                     r.mem.put(&keys().log(2, 1), &foreign).unwrap();
                     r.heal();

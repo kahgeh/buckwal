@@ -1,4 +1,5 @@
-//! Log object codec: magic, kind, writer id, syncs of ops, sha256 trailer.
+//! Log object codec: magic, kind, writer id, syncs of ops (or a fence's epoch, or a format 5
+//! seal-start record's next generation), sha256 trailer.
 // Op and its wire encoding (tag 1: [u64 off][u32 len][bytes]; tag 2: [u64 len])
 // are Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 use super::integrity::{integrity_failed, record_code, record_verifies, Check, Kind, CODE_LEN};
@@ -9,6 +10,8 @@ const MAGIC: &[u8; 8] = b"TDLOG\0\0\x01";
 const KIND_EXTENTS: u8 = 1;
 const KIND_FENCE: u8 = 2;
 const KIND_LOG_EXTENTS: u8 = 3;
+/// A format 5 seal-start record: no sync, then the generation the switch moves the head to.
+const KIND_SEAL_START: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -30,6 +33,10 @@ pub(crate) enum LogRecord {
         file: LogFile,
         writer_id: String,
         syncs: Vec<Vec<Op>>,
+        /// In a format 5 seal-start record (no syncs, `app.db-wal`), the generation the
+        /// generation switch moves the head to (kind 4). `None` in every other record, and in
+        /// the seal-start records of formats 1 to 4 (kind 1, byte for byte as before).
+        next_generation: Option<u64>,
     },
     Fence {
         writer_id: String,
@@ -62,10 +69,26 @@ pub(crate) fn encode_record_with(r: &LogRecord, ik: Option<Check<'_>>) -> Vec<u8
     let mut out = MAGIC.to_vec();
     match r {
         LogRecord::Extents {
+            file: LogFile::Wal,
+            writer_id,
+            syncs,
+            next_generation: Some(next),
+        } if syncs.is_empty() => {
+            out.push(KIND_SEAL_START);
+            put_writer_id(&mut out, writer_id);
+            out.extend(0u32.to_le_bytes()); // sync_count, always 0
+            out.extend(next.to_le_bytes());
+        }
+        LogRecord::Extents {
             file,
             writer_id,
             syncs,
+            next_generation,
         } => {
+            assert!(
+                next_generation.is_none(),
+                "only a seal-start record of app.db-wal names a next generation"
+            );
             out.push(match file {
                 LogFile::Wal => KIND_EXTENTS,
                 LogFile::Log => KIND_LOG_EXTENTS,
@@ -177,6 +200,17 @@ pub(crate) fn decode_record_with(b: &[u8], ik: Option<Check<'_>>) -> Result<LogR
                 epoch: r.u64()?,
             }
         }
+        KIND_SEAL_START => {
+            if r.u32()? != 0 {
+                return Err(corrupt("seal-start record with syncs"));
+            }
+            LogRecord::Extents {
+                file: LogFile::Wal,
+                writer_id,
+                syncs: Vec::new(),
+                next_generation: Some(r.u64()?),
+            }
+        }
         KIND_EXTENTS | KIND_LOG_EXTENTS => {
             let sync_count = r.u32()?;
             let mut syncs = Vec::new();
@@ -208,6 +242,7 @@ pub(crate) fn decode_record_with(b: &[u8], ik: Option<Check<'_>>) -> Result<LogR
                 file,
                 writer_id,
                 syncs,
+                next_generation: None,
             }
         }
         k => return Err(corrupt(&format!("unknown kind {k}"))),

@@ -591,6 +591,7 @@ fn fence_fails_every_waiting_window_commit_and_later_ones() {
         file: LogFile::Wal,
         writer_id: "w2".into(),
         syncs: vec![],
+        next_generation: None,
     });
     mem.put(&Keys::new("db").log(1, 1), &foreign).unwrap();
     let tickets: Vec<Ticket> = (1..=3)

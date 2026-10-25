@@ -367,6 +367,7 @@ fn foreign_record_in_log_is_fenced() {
         file: LogFile::Wal,
         writer_id: "f".repeat(32),
         syncs: vec![vec![]],
+        next_generation: None,
     });
     mem.put(&keys().log(1, next), &rec).unwrap();
 
@@ -625,6 +626,7 @@ fn claimed_generation_accepts_old_writer_prefix_only() {
             file: LogFile::Wal,
             writer_id: w.to_string(),
             syncs: vec![vec![]],
+            next_generation: None,
         })
     };
     mem.put(&keys().log(old.generation, next), &empty(&claimer))
@@ -684,6 +686,7 @@ mod fence_image {
                         off: *n - 1,
                         bytes: vec![*n as u8],
                     }]],
+                    next_generation: None,
                 },
                 R::Fence(w, e) => LogRecord::Fence {
                     writer_id: w.to_string(),

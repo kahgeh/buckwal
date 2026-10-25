@@ -2228,6 +2228,7 @@ fn writer_left_in_a_seal(store: &Arc<MemStore>, n: i64) -> TempDir {
         file: LogFile::Wal,
         writer_id: state(a.path()).writer_id,
         syncs: Vec::new(),
+        next_generation: None,
     };
     let r = store
         .put_if_absent(&keys().log(gen, next), &crate::format::encode_record(&rec))
@@ -4326,6 +4327,7 @@ fn left_in_a_seal_with(store: &Arc<MemStore>, lease_ms: u64, request_timeout_ms:
         file: LogFile::Wal,
         writer_id: state(a.path()).writer_id,
         syncs: Vec::new(),
+        next_generation: None,
     };
     let r = store
         .put_if_absent(&keys().log(gen, next), &crate::format::encode_record(&rec))

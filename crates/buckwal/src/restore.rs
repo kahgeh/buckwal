@@ -282,6 +282,7 @@ pub(crate) fn replay(records: &[LogRecord], head: &Head) -> Result<Images> {
                 file,
                 writer_id,
                 syncs,
+                ..
             } => {
                 // Kind 3 exists only in an MVCC bucket (format 2, or 3 when encrypted).
                 if *file == LogFile::Log && head.journal_mode != JournalMode::Mvcc {

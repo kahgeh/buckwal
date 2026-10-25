@@ -415,6 +415,7 @@ fn maintenance_skips_during_takeover_quiet() {
         file: LogFile::Wal,
         writer_id: LocalState::read(a.path()).unwrap().unwrap().writer_id,
         syncs: Vec::new(),
+        next_generation: None,
     };
     store
         .put_if_absent(&keys.log(gen, next), &encode_record(&rec))

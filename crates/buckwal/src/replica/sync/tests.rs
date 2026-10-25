@@ -272,6 +272,7 @@ fn ext(writer: &str, ops: Vec<Op>) -> LogRecord {
         file: LogFile::Wal,
         writer_id: writer.into(),
         syncs: vec![ops],
+        next_generation: None,
     }
 }
 
@@ -535,6 +536,7 @@ fn mvcc_record_stops_with_mvcc_reason() {
                 off: 0,
                 bytes: vec![1; 8],
             }]],
+            next_generation: None,
         },
     );
     let r = f.pass();

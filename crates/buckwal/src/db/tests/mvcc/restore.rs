@@ -256,6 +256,7 @@ fn restore_prefix_of_log_gives_prefix_rows() {
         file,
         writer_id,
         mut syncs,
+        ..
     } = decode_record(&as_plain(&store.get(&key).unwrap().unwrap().body)).unwrap()
     else {
         panic!("not extents")
@@ -273,6 +274,7 @@ fn restore_prefix_of_log_gives_prefix_rows() {
                 file,
                 writer_id,
                 syncs,
+                next_generation: None,
             }),
         )
         .unwrap();
@@ -357,6 +359,7 @@ fn restore_with_wal_frames_and_empty_log_image_writes_a_header() {
             file,
             writer_id,
             syncs: vec![vec![]],
+            next_generation: None,
         };
         mem.put(&key, &encode_record(&empty)).unwrap();
     }
@@ -672,6 +675,7 @@ fn restore_wal_bucket_bytes_identical_to_before() {
         file: LogFile::Wal,
         writer_id: "w".into(),
         syncs,
+        next_generation: None,
     };
     let w = |off: usize, bytes: Vec<u8>| Op::Write {
         off: off as u64,

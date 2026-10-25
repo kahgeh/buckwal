@@ -312,6 +312,7 @@ fn trim_reads_format_2_head() {
                 off: 0,
                 bytes: vec![tag; 8],
             }]],
+            next_generation: None,
         })
     };
     mem.put(&k.log(1, 3), &kind3(1)).unwrap();
