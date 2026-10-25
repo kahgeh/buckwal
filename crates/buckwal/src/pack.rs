@@ -5,12 +5,14 @@
 
 pub(crate) mod codes;
 pub(crate) mod first;
+pub(crate) mod kept;
 pub(crate) mod pointer;
 pub(crate) mod run;
 #[cfg(test)]
 mod tests;
 pub(crate) mod thread;
 
+pub use kept::{DownloadReason, PackSource};
 pub(crate) use pointer::PackPointer;
 pub use run::{pack, pack_with_store, PackOutcome, PackReport};
 pub use thread::{run_packer, run_packer_with_store};

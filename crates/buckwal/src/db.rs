@@ -332,6 +332,8 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     clear_interrupted_restore(&dir)?;
     clear_interrupted_create(&dir)?;
     if !read_only {
+        // A `BUCKWAL_PACK_DIR` that cannot work fails the open before any bucket request.
+        config.prepare_pack_dir()?;
         crate::pack::run::sweep_work_dirs(&config);
     }
     let local = LocalState::read(&dir)?;

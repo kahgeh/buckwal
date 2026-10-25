@@ -1382,6 +1382,9 @@ fn discard_keeps_the_pack_the_pointer_names() {
         stop: &AtomicBool::new(false),
         error: None,
         first_pack_estimate: None,
+        kept: None,
+        source: None,
+        touched: false,
     };
     r.discard(&p.pack_key, &p.codes_key);
     assert!(mem.get(&p.pack_key).unwrap().is_some() && mem.get(&p.codes_key).unwrap().is_some());
@@ -1516,4 +1519,511 @@ fn stale_pack_work_directory_is_removed() {
 fn run_dirty(cfg: &Config, store: Arc<dyn ObjectStore>) -> PackReport {
     let (_, clock) = fake_clock();
     pack_run(cfg, store, clock).unwrap()
+}
+
+// ---- The kept copy (spec "The kept copy") ----
+
+use super::super::kept::{self, CopyLock, DownloadReason, PackSource, COPY_DIR};
+
+/// The kept copy of the packer `cfg`: its file, and what its state file says.
+fn copy_file(cfg: &Config) -> Option<Vec<u8>> {
+    fs::read(cfg.pack_directory().join(COPY_DIR).join(DB_FILE)).ok()
+}
+
+fn copy_state(cfg: &Config) -> Option<kept::CopyState> {
+    kept::read_state(&cfg.pack_directory().join(COPY_DIR)).unwrap()
+}
+
+/// The kept copy equals the pointer's pack, byte for byte, and its state file names that pack
+/// with the applying flag off.
+fn assert_copy_is_the_pack(cfg: &Config, store: &dyn ObjectStore) {
+    let (p, body) = pack_bytes(store, &keys());
+    assert_eq!(
+        copy_file(cfg).as_deref(),
+        Some(&body[..]),
+        "the kept copy is not the pack"
+    );
+    let st = copy_state(cfg).expect("a state file");
+    assert!(!st.applying, "{st:?}");
+    let pack = st.pack.expect("the state names a pack");
+    assert_eq!(
+        (
+            pack.pack_key,
+            pack.pack_generation,
+            pack.size,
+            pack.database_id
+        ),
+        (p.pack_key, p.pack_generation, p.size, p.database_id)
+    );
+}
+
+/// No kept copy at all: no file and no state file.
+fn assert_no_copy(cfg: &Config) {
+    assert!(copy_file(cfg).is_none(), "a kept copy is left");
+    assert!(copy_state(cfg).is_none(), "a state file is left");
+}
+
+fn source_of(r: &PackReport) -> PackSource {
+    r.source.unwrap_or_else(|| panic!("no source: {r:?}"))
+}
+
+const KEPT: PackSource = PackSource::Kept;
+
+fn downloaded(reason: DownloadReason) -> PackSource {
+    PackSource::Downloaded(reason)
+}
+
+/// The restore of the bucket (the pack, then the head's generation as the WAL) equals the
+/// writer, and the pack holds `at_pack`.
+fn assert_pack_equals_restore(store: &MemStore, w: &Writer, at_pack: &[i64], cfg: &Config) {
+    assert_eq!(pack_rows(store), at_pack);
+    let head = head_of(store);
+    let images = crate::restore::generation_image(
+        store,
+        &keys(),
+        &head,
+        &cfg.engine(crate::io::IoMode::Writer),
+    )
+    .unwrap();
+    let (_, body) = pack_bytes(store, &keys());
+    assert_eq!(rows_of(&body, Some(&images.wal), None), w.ids());
+}
+
+/// The first run builds the pack and keeps it; the second run starts from the kept copy: it
+/// downloads only the codes and the log, far less than the pack, and its pack equals a
+/// restore. A packer with no kept copy downloads the whole pack.
+#[test]
+fn second_run_uses_the_kept_copy_and_downloads_only_codes_and_log() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    // About 1.8 MiB: two blocks.
+    for id in 1..=450 {
+        w.c.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[Value::from_i64(id), Value::build_text("x".repeat(3500))],
+        )
+        .unwrap();
+    }
+    w.end_generation();
+    let t = tempdir();
+    let cfg = packer(&t);
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    // No pack to start from: nothing was kept.
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
+    assert_copy_is_the_pack(&cfg, &*mem);
+    let first = pointer_of(&*mem).unwrap();
+    assert!(first.size > BLOCK_SIZE, "{first:?}");
+
+    w.insert(1000..=1010);
+    w.end_generation();
+    let at_pack = w.ids();
+    w.insert(2000..=2001);
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), KEPT);
+    let codes = mem.get(&first.codes_key).unwrap();
+    assert!(codes.is_some(), "the old pack's codes are still there");
+    assert!(
+        r.bytes_down < first.size / 4,
+        "{} bytes down for a {}-byte pack",
+        r.bytes_down,
+        first.size
+    );
+    assert!(r.bytes_down >= codes.unwrap().body.len() as u64);
+    assert_pack_equals_restore(&mem, &w, &at_pack, &cfg);
+    assert_copy_is_the_pack(&cfg, &*mem);
+
+    // A packer without a kept copy downloads the pack.
+    w.end_generation();
+    let other = config(&t.path().join("other"));
+    let r = run(&other, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
+    assert!(r.bytes_down > pointer_of(&*mem).unwrap().size / 2, "{r:?}");
+    w.crash();
+}
+
+/// Another packer moved the pointer: the kept copy is of an older pack, so the run deletes it
+/// and downloads (`moved`).
+#[test]
+fn kept_copy_is_not_used_when_another_packer_moved_the_pointer() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let a = packer(&t);
+    let w = two_generations(&mem, &a);
+    let b = config(&t.path().join("b"));
+    let r = run(&b, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
+    w.insert(7..=9);
+    w.end_generation();
+    let at_pack = w.ids();
+    let r = run(&a, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::Moved));
+    assert_pack_equals_restore(&mem, &w, &at_pack, &a);
+    assert_copy_is_the_pack(&a, &*mem);
+    w.crash();
+}
+
+/// A kept copy without its state file is not used.
+#[test]
+fn kept_copy_is_not_used_without_its_state_file() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    fs::remove_file(cfg.pack_directory().join(COPY_DIR).join(kept::STATE_FILE)).unwrap();
+    let at_pack = w.ids();
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
+    assert_pack_equals_restore(&mem, &w, &at_pack, &cfg);
+    assert_copy_is_the_pack(&cfg, &*mem);
+    w.crash();
+}
+
+/// One changed byte in the kept copy fails its block's code: the run deletes the copy and
+/// downloads (`check_failed`), and the new pack is good.
+#[test]
+fn kept_copy_with_a_changed_block_is_check_failed() {
+    for encrypted in [false, true] {
+        let mem = Arc::new(MemStore::new());
+        let keydir = tempdir();
+        let t = tempdir();
+        let cfg = if encrypted {
+            enc_config(&t.path().join("packer"), &keydir)
+        } else {
+            packer(&t)
+        };
+        let w = if encrypted {
+            writer_with(&mem, |d| enc_config(d, &keydir))
+        } else {
+            writer(&mem)
+        };
+        w.insert(1..=3);
+        w.end_generation();
+        packed(&run(&cfg, mem.clone()).unwrap());
+        w.insert(4..=6);
+        w.end_generation();
+        let at_pack = w.ids();
+        // A byte in the middle of the last page: the header stays valid.
+        let path = cfg.pack_directory().join(COPY_DIR).join(DB_FILE);
+        let mut b = fs::read(&path).unwrap();
+        let at = b.len() - 2000;
+        b[at] ^= 0x5a;
+        fs::write(&path, &b).unwrap();
+        let r = run(&cfg, mem.clone()).unwrap();
+        packed(&r);
+        assert_eq!(source_of(&r), downloaded(DownloadReason::CheckFailed));
+        let k = cfg.keys().unwrap().adopting(&*mem);
+        let (_, body) = pack_bytes(&*mem, &k);
+        assert_eq!(rows_of(&body, None, encrypted.then_some(&cfg)), at_pack);
+        assert_eq!(copy_file(&cfg).as_deref(), Some(&body[..]));
+        w.crash();
+    }
+}
+
+/// A kept copy one block short (the file was cut) is `check_failed` too.
+#[test]
+fn kept_copy_of_another_size_is_check_failed() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    let path = cfg.pack_directory().join(COPY_DIR).join(DB_FILE);
+    let len = fs::metadata(&path).unwrap().len();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len - 4096)
+        .unwrap();
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::CheckFailed));
+    assert_eq!(pack_rows(&*mem), w.ids());
+    w.crash();
+}
+
+/// A run that stops during its in-place apply (an error or a crash after the first
+/// generation) leaves the `applying` flag on. The next run does not use the copy, downloads
+/// (`applying`), and its pack and kept copy equal the writer's database.
+#[test]
+fn crash_during_the_in_place_apply_makes_the_next_run_download() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    w.c.execute("UPDATE t SET v = 'changed' WHERE id = 2", &[])
+        .unwrap();
+    w.insert(7..=9);
+    w.end_generation();
+    let at_pack = w.ids();
+    let r = {
+        let _crash = CrashAfterApplyForTest::set();
+        run(&cfg, mem.clone())
+    };
+    assert!(r.is_err(), "{r:?}");
+    let st = copy_state(&cfg).expect("the state file stays");
+    assert!(st.applying, "{st:?}");
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::Applying));
+    assert_pack_equals_restore(&mem, &w, &at_pack, &cfg);
+    assert_copy_is_the_pack(&cfg, &*mem);
+    w.crash();
+}
+
+/// A run that ends `failed` or `superseded` deletes its kept copy; the next run downloads.
+#[test]
+fn failed_or_superseded_run_deletes_its_kept_copy() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    let hs = HookStore::new(mem.clone());
+    hs.size_lie.store(true, SeqCst);
+    let r = run(&cfg, hs.clone()).unwrap();
+    failed_at(&r, "verify size");
+    assert_eq!(source_of(&r), KEPT);
+    assert_no_copy(&cfg);
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
+    assert_copy_is_the_pack(&cfg, &*mem);
+
+    w.insert(7..=8);
+    w.end_generation();
+    let hs = HookStore::new(mem.clone());
+    on_first_pointer_write(&hs, Reply::Pass, |inner| {
+        inner
+            .put(&keys().pack_pointer(), &other_pointer(inner, 9))
+            .unwrap();
+    });
+    let r = run(&cfg, hs.clone()).unwrap();
+    assert_eq!(r.outcome, PackOutcome::Superseded);
+    assert_no_copy(&cfg);
+    w.crash();
+}
+
+/// A run that finds nothing to do leaves its kept copy as it is.
+#[test]
+fn nothing_to_do_keeps_the_kept_copy() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    packed(&run(&cfg, mem.clone()).unwrap());
+    let r = run(&cfg, mem.clone()).unwrap();
+    assert_eq!(r.outcome, PackOutcome::NothingToDo);
+    assert_copy_is_the_pack(&cfg, &*mem);
+    w.crash();
+}
+
+/// A run that cannot take the lock (the test holds it) does not touch the kept copy: it
+/// downloads to its own working file, records `locked`, packs, and removes its file.
+#[test]
+fn run_that_cannot_take_the_lock_downloads_to_its_own_file() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    let before = (copy_file(&cfg), copy_state(&cfg));
+    assert!(before.0.is_some());
+    let at_pack = w.ids();
+    let lock = CopyLock::try_take(&cfg.pack_directory())
+        .unwrap()
+        .expect("the lock is free");
+    // While the test holds it, no other run takes it.
+    assert!(CopyLock::try_take(&cfg.pack_directory()).unwrap().is_none());
+    let hs = HookStore::new(mem.clone());
+    let work_seen = Arc::new(Mutex::new(Vec::new()));
+    let (seen, dir) = (work_seen.clone(), cfg.pack_directory());
+    hs.set_hook(move |op, _, _| {
+        if op == "put_multipart" {
+            let names = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string());
+            seen.lock().unwrap().extend(names);
+        }
+        Reply::Pass
+    });
+    let r = run(&cfg, hs.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::Locked));
+    let seen = work_seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|n| n.starts_with(WORK_DIR_PREFIX)),
+        "no working file during the upload: {seen:?}"
+    );
+    assert_pack_equals_restore(&mem, &w, &at_pack, &cfg);
+    assert_eq!(
+        (copy_file(&cfg), copy_state(&cfg)),
+        before,
+        "the kept copy changed"
+    );
+    drop(lock);
+    // The pointer moved past the kept copy.
+    w.insert(9..=9);
+    w.end_generation();
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::Moved));
+    assert_copy_is_the_pack(&cfg, &*mem);
+    w.crash();
+}
+
+/// Two packers on one directory at once: one holds the lock and uses the kept copy, the other
+/// records `locked` and works in its own file; the pointer ends on one correct pack, and the
+/// kept copy is that pack or gone.
+#[test]
+fn two_packers_on_one_directory_at_once() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = two_generations(&mem, &cfg);
+    let at_pack = w.ids();
+    let hs = HookStore::new(mem.clone());
+    *hs.barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    let reports: Vec<PackReport> = std::thread::scope(|s| {
+        let runs: Vec<_> = (0..2)
+            .map(|_| s.spawn(|| run(&cfg, hs.clone()).unwrap()))
+            .collect();
+        runs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut sources: Vec<_> = reports.iter().map(source_of).collect();
+    sources.sort_by_key(|s| format!("{s:?}"));
+    assert_eq!(sources, [downloaded(DownloadReason::Locked), KEPT]);
+    let mut outcomes: Vec<_> = reports.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    outcomes.sort();
+    assert_eq!(outcomes, ["Packed", "Superseded"]);
+    let p = pointer_of(&*mem).unwrap();
+    // One pack of the new pack generation is left (the older pack stays for GC).
+    let new: Vec<_> = packs(&*mem)
+        .into_iter()
+        .filter(|k| k.starts_with(&format!("t/pack/{:010}/", p.pack_generation)))
+        .collect();
+    assert_eq!(new, [p.pack_key.clone(), p.codes_key.clone()]);
+    assert_pack_equals_restore(&mem, &w, &at_pack, &cfg);
+    let holder = reports.iter().find(|r| r.source == Some(KEPT)).unwrap();
+    if holder.outcome == PackOutcome::Packed {
+        assert_copy_is_the_pack(&cfg, &*mem);
+    } else {
+        assert_no_copy(&cfg);
+    }
+    w.crash();
+}
+
+/// A `pack-work-*` file or directory left by a crashed run and older than a run's time limit
+/// (half the orphan grace) is deleted by the next run that holds the lock; a younger one is
+/// kept, and a run without the lock deletes nothing.
+#[test]
+fn run_that_holds_the_lock_deletes_stale_working_files() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let t = tempdir();
+    let cfg = packer(&t);
+    fs::create_dir_all(&cfg.dir).unwrap();
+    let half = cfg.pack_orphan_grace / 2;
+    let old_dir = cfg.dir.join("pack-work-old");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::write(old_dir.join(DB_FILE), b"copy").unwrap();
+    age_dir(&old_dir, half + Duration::from_secs(60));
+    let old_file = cfg.dir.join("pack-work-oldfile");
+    fs::write(&old_file, b"copy").unwrap();
+    age_dir(&old_file, half + Duration::from_secs(60));
+    let young = cfg.dir.join("pack-work-young");
+    fs::create_dir_all(&young).unwrap();
+    age_dir(&young, half - Duration::from_secs(60));
+
+    let lock = CopyLock::try_take(&cfg.pack_directory()).unwrap().unwrap();
+    packed(&run_dirty(&cfg, mem.clone()));
+    assert!(
+        old_dir.exists() && old_file.exists(),
+        "a run without the lock deleted them"
+    );
+    drop(lock);
+    w.insert(4..=4);
+    w.end_generation();
+    packed(&run_dirty(&cfg, mem.clone()));
+    assert!(!old_dir.exists() && !old_file.exists());
+    assert!(young.exists());
+    w.crash();
+}
+
+/// With `pack_dir` (`BUCKWAL_PACK_DIR`) on another directory, the kept copy, its lock and the
+/// working files go there, and nothing of them goes to the database's directory.
+#[test]
+fn pack_dir_holds_the_kept_copy_lock_and_working_files() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let db_dir = t.path().join("db");
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let mut cfg = config(&db_dir);
+    cfg.pack_dir = Some(t.path().join("fast/pack"));
+    fs::create_dir_all(&db_dir).unwrap();
+    packed(&run(&cfg, mem.clone()).unwrap());
+    let copy = t.path().join("fast/pack").join(COPY_DIR);
+    for f in [DB_FILE, kept::STATE_FILE, kept::LOCK_FILE] {
+        assert!(copy.join(f).exists(), "{f}");
+    }
+    assert_copy_is_the_pack(&cfg, &*mem);
+    // A run without the lock: its working file is in the pack directory.
+    w.insert(4..=4);
+    w.end_generation();
+    let lock = CopyLock::try_take(&cfg.pack_directory()).unwrap().unwrap();
+    let hs = HookStore::new(mem.clone());
+    let seen = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    let (s, pack_dir, dbd) = (seen.clone(), cfg.pack_directory(), db_dir.clone());
+    hs.set_hook(move |op, _, _| {
+        if op == "put_multipart" {
+            let names = |d: &Path| -> Vec<String> {
+                fs::read_dir(d)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                    .collect()
+            };
+            *s.lock().unwrap() = (names(&pack_dir), names(&dbd));
+        }
+        Reply::Pass
+    });
+    let r = run(&cfg, hs.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::Locked));
+    drop(lock);
+    let (in_pack_dir, in_db_dir) = seen.lock().unwrap().clone();
+    assert!(
+        in_pack_dir.iter().any(|n| n.starts_with(WORK_DIR_PREFIX)),
+        "{in_pack_dir:?}"
+    );
+    assert!(in_db_dir.is_empty(), "{in_db_dir:?}");
+    let left: Vec<_> = fs::read_dir(&db_dir).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+    w.crash();
+}
+
+/// A kept copy holds no database of its directory: a takeover into a directory that holds
+/// only `pack-copy/` goes ahead, and the writer's open keeps the copy.
+#[test]
+fn takeover_into_a_directory_with_only_a_kept_copy() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let t = tempdir();
+    let cfg = config(&t.path().join("b"));
+    packed(&run(&cfg, mem.clone()).unwrap());
+    assert!(copy_file(&cfg).is_some());
+    crate::takeover_with_store(cfg.clone(), mem.clone()).unwrap();
+    let db = open_with_store(cfg.clone(), mem.clone()).unwrap();
+    assert_eq!(query_ids(&db.connect().unwrap()), vec![1, 2, 3]);
+    drop(db);
+    assert_copy_is_the_pack(&cfg, &*mem);
+    drop(w);
 }

@@ -121,8 +121,8 @@ pub fn takeover_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Resul
     }
 }
 
-/// `Config` when `dir` holds an entry other than `allowed` and `pack-work-*` directories. A
-/// missing `dir` is empty.
+/// `Config` when `dir` holds an entry other than `allowed`, `pack-work-*` directories and the
+/// kept copy (`pack-copy/`). A missing `dir` is empty.
 fn refuse_entries(dir: &Path, allowed: &[&str]) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -132,10 +132,12 @@ fn refuse_entries(dir: &Path, allowed: &[&str]) -> Result<()> {
     for e in entries {
         let e = e.map_err(|e| io_err(&format!("list {}", dir.display()), e))?;
         let name = e.file_name();
-        // A pack run's working dir holds no database of this directory.
+        // A pack run's working dir and a packer's kept copy hold no database of this
+        // directory.
         let pack_work = name
             .to_string_lossy()
-            .starts_with(crate::pack::run::WORK_DIR_PREFIX);
+            .starts_with(crate::pack::run::WORK_DIR_PREFIX)
+            || name == crate::pack::kept::COPY_DIR;
         if !pack_work && !allowed.iter().any(|a| name == *a) {
             return Err(Error::Config(format!(
                 "{} is not empty ({}): a takeover restores into a missing or empty directory; \

@@ -1319,3 +1319,77 @@ fn writer_gc_keeps_the_pack_its_own_copy_still_reads() {
     drop(c);
     db.close().unwrap();
 }
+
+/// With batching Off and with a Window, a writer commits (a pack, then acked commits in a
+/// generation it switched after the pack and in its current one, from several connections at
+/// once), its directory is deleted, and a claim from an empty directory restores every acked
+/// commit (spec "Tests"). Background commits that were not yet acked are not part of it.
+#[test]
+fn claim_from_an_empty_directory_restores_every_acked_commit() {
+    let window = crate::Batching::Window {
+        max_wait: Duration::from_millis(20),
+        max_commits: 8,
+        max_bytes: 1 << 20,
+    };
+    for batching in [crate::Batching::Off, window] {
+        let store = mem();
+        let a = tempdir();
+        let mut cfg = config(&fresh(&a));
+        cfg.batching = batching;
+        let (db, c) = packed_writer(&store, cfg.clone());
+        let packed_at = db.generation();
+        insert_big(&c, 451..=455);
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        assert!(db.generation() > packed_at);
+        // Four connections at once: with a Window their commits share uploads.
+        let acked: Vec<i64> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..4)
+                .map(|n| {
+                    let conn = db.connect().unwrap();
+                    s.spawn(move || {
+                        let ids: Vec<i64> = (0..10).map(|i| 1000 + n * 100 + i).collect();
+                        for id in &ids {
+                            conn.execute(
+                                "INSERT INTO t(id, v) VALUES (?, ?)",
+                                &[Value::from_i64(*id), Value::build_text(big(*id))],
+                            )
+                            .unwrap();
+                        }
+                        ids
+                    })
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(acked.len(), 40);
+        let want = rows(&c);
+        assert_eq!(want.len(), 450 + 5 + 40, "{batching:?}");
+        let before = head(&*store);
+        crash(db, vec![c]);
+        std::fs::remove_dir_all(fresh(&a)).unwrap();
+
+        let b = tempdir();
+        let mut cfg_b = config(&fresh(&b));
+        cfg_b.batching = batching;
+        let db = open_with_store(cfg_b, store.clone()).unwrap();
+        let after = head(&*store);
+        assert_eq!(
+            after.epoch,
+            before.epoch + 1,
+            "{batching:?}: the open claims"
+        );
+        assert_eq!(after.writer_id, state(&fresh(&b)).writer_id);
+        let cb = db.connect().unwrap();
+        integrity_ok(&cb);
+        assert_eq!(rows(&cb), want, "{batching:?}");
+        // The claimed writer carries on, and a restore equals it.
+        insert_big(&cb, 461..=461);
+        let want = rows(&cb);
+        cb.close().unwrap();
+        db.close().unwrap();
+        let r = tempdir();
+        restore_with_store(&config(&fresh(&r)), store.clone(), &fresh(&r)).unwrap();
+        let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
+        assert_eq!(rows(&v.connect().unwrap()), want, "{batching:?}");
+    }
+}

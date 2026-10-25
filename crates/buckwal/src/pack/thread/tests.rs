@@ -1366,3 +1366,131 @@ fn writer_estimate_is_the_local_database_size() {
     );
     assert_eq!(first_pack_estimate(None), None);
 }
+
+// ---- The writer's thread and the pack directory ----
+
+/// The `buckwal.pack` spans that packed, as (source, reason).
+fn packed_sources(cap: &Capture) -> Vec<(String, String)> {
+    cap.spans()
+        .named("buckwal.pack")
+        .into_iter()
+        .filter(|s| s.field("buckwal.outcome") == Some("packed"))
+        .map(|s| {
+            (
+                s.field("buckwal.pack.source").unwrap_or("-").to_string(),
+                s.field("buckwal.pack.reason").unwrap_or("-").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn names_in(d: &Path) -> Vec<String> {
+    std::fs::read_dir(d)
+        .map(|es| {
+            es.map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A writer whose pack directory (`BUCKWAL_PACK_DIR`) does not exist at open: the open makes
+/// it. Its thread's first run downloads the pack another packer made (`downloaded`, `none`),
+/// the next run uses the kept copy (`kept`). The kept copy, its lock and the working files are
+/// in the pack directory, and nothing of them is in the database's directory.
+#[test]
+fn empty_pack_dir_at_open_first_run_downloads_then_the_kept_copy_is_used() {
+    let mem = Arc::new(MemStore::new());
+    let a = plain_writer(mem.clone());
+    a.insert(1..=20);
+    a.end_generation();
+    let t = tempdir();
+    crate::pack::pack_with_store(&packer_cfg(&t, "other"), mem.clone()).unwrap();
+    a.insert(21..=30);
+    a.end_generation();
+    drop(a.c);
+    drop(a.db);
+    let pack_dir = t.path().join("fast/pack");
+    let cap = Capture::new();
+    let dir = tempdir();
+    let mut cfg = fast_packer(dir.path());
+    cfg.pack_dir = Some(pack_dir.clone());
+    let db = tracing::subscriber::with_default(cap.subscriber(), || {
+        open_with_store(cfg, mem.clone()).unwrap()
+    });
+    let c = db.connect().unwrap();
+    let b = Writer { db, c, dir };
+    assert!(pack_dir.is_dir(), "the open makes the pack directory");
+    assert!(eventually(10, || packed_sources(&cap).len() == 1));
+    assert_eq!(
+        packed_sources(&cap)[0],
+        ("downloaded".to_string(), "none".to_string())
+    );
+    b.insert(31..=40);
+    b.end_generation();
+    assert!(eventually(10, || packed_sources(&cap).len() == 2));
+    assert_eq!(
+        packed_sources(&cap)[1],
+        ("kept".to_string(), "none".to_string())
+    );
+    let copy = names_in(&pack_dir.join("pack-copy"));
+    for f in ["app.db", "state.json", "lock"] {
+        assert!(copy.iter().any(|n| n == f), "{f}: {copy:?}");
+    }
+    let in_db_dir = names_in(b.dir.path());
+    assert!(
+        in_db_dir
+            .iter()
+            .all(|n| n != "pack-copy" && !n.starts_with(WORK_DIR_PREFIX)),
+        "{in_db_dir:?}"
+    );
+    // The pack and a restore equal the writer's database.
+    let p = pointer_of(&*mem).unwrap();
+    let want: Vec<i64> = (1..=40).collect();
+    drop(b.c);
+    drop(b.db);
+    let r = tempdir();
+    let rep = crate::restore::restore_with_store(
+        &config(&r.path().join("r")),
+        mem.clone(),
+        &r.path().join("r"),
+    )
+    .unwrap();
+    assert_eq!(rep.pack_key.as_deref(), Some(p.pack_key.as_str()));
+    let db = open_with_store(config(&r.path().join("r")), mem.clone()).unwrap();
+    let c = db.connect().unwrap();
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// Without `pack_dir`, the writer's thread keeps its copy in the database's directory.
+#[test]
+fn writer_thread_keeps_its_copy_in_the_database_directory_by_default() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer_on(mem.clone(), fast_packer);
+    w.insert(1..=20);
+    w.end_generation();
+    assert!(eventually(10, || pointer_of(&*mem).is_some()));
+    assert!(eventually(10, || names_in(&w.dir.path().join("pack-copy"))
+        .iter()
+        .any(|n| n == "state.json")));
+}
+
+/// A writer whose `pack_dir` is a file does not open.
+#[test]
+fn writer_with_a_pack_dir_that_is_a_file_does_not_open() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    std::fs::write(t.path().join("file"), b"x").unwrap();
+    let mut cfg = config(&t.path().join("db"));
+    cfg.pack_dir = Some(t.path().join("file"));
+    match open_with_store(cfg, mem.clone()) {
+        Err(crate::Error::Config(m)) => assert!(m.contains("BUCKWAL_PACK_DIR"), "{m}"),
+        r => panic!("{:?}", r.map(|_| ())),
+    }
+    assert_eq!(mem.stats().puts, 0, "nothing was written to the bucket");
+}

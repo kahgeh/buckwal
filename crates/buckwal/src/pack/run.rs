@@ -3,10 +3,13 @@
 //! 1. Read the head (its database id is then known), then the pack pointer.
 //! 2. List the log from the pointer's pack generation and follow the chain of ended
 //!    generations (`ended_generations`) up to the head's generation.
-//! 3. Download the newest pack in ranges and check each block against its codes.
+//! 3. Use the kept copy (`kept`), when this packer made the pointer's pack and the copy
+//!    passes its checks, else download the newest pack in ranges and check each block against
+//!    its codes.
 //! 4. Apply each ended generation with a local checkpoint, the code a restore uses
 //!    (`restore::apply_images_over`: a WAL generation's `-wal`, an MVCC one's `-wal` and
-//!    `app.db-log`), in `<config.dir>/pack-work-<run id>`.
+//!    `app.db-log`), in `<pack dir>/pack-copy/` (the run holds the lock of the kept copy) or
+//!    in `<pack dir>/pack-work-<run id>` (another run holds it).
 //! 5. Upload the database file as `pack/<G>/<run id>` in 16 MiB parts, 8 at once.
 //! 6. Check the upload: the HEAD size and the SHA-256 of each part. Then upload the codes.
 //! 7. HEAD the pack and its codes, then move the pointer with `If-Match` on its ETag
@@ -17,6 +20,7 @@
 //! The run never writes the head or the log. It deletes its own pack and codes when it does
 //! not move the pointer, but never a pack the pointer names.
 use super::codes::{CodesBuilder, PackCodes, BLOCK_SIZE};
+use super::kept::{fetch_codes, CopyLock, CopyPack, DownloadReason, KeptCopy, PackSource};
 use super::pointer::{PackPointer, POINTER_FORMAT};
 use crate::clock::Stamp;
 use crate::config::{Config, JournalMode};
@@ -91,6 +95,11 @@ pub struct PackReport {
     /// With `Failed`, the error behind it, when there is one (the store's error code and
     /// request id, never a response body or a secret).
     pub error: Option<String>,
+    /// Where the run got the file it applied the log to (`buckwal.pack.source` and
+    /// `buckwal.pack.reason`). `None` when the run held the lock of its kept copy and applied
+    /// nothing (`nothing_to_do`, or a failure before the apply); a run without the lock always
+    /// has `Downloaded(Locked)`.
+    pub source: Option<super::kept::PackSource>,
     pub elapsed: Duration,
 }
 
@@ -328,10 +337,11 @@ pub(crate) fn pack_run(
 /// before each part of its upload (a part read fails) and before each pointer write. Then it
 /// ends as `Failed` at the step `closed` ([`CLOSED_STEP`]): it aborts its multipart upload
 /// (when the abort fails, GC aborts the upload after the orphan grace), deletes its pack and
-/// codes when they are complete, moves no pointer, and its working directory goes with it. A
-/// close during the local apply removes the working directory too, so the next run downloads
-/// the pack again. (The kept copy of task 11b adds an `applying` flag for this case.) A
-/// `closed` span keeps status Unset: a close is not a fault.
+/// codes when they are complete, moves no pointer, and its working directory goes with it, or
+/// it deletes its kept copy. A close during the local apply does the same, so the next run
+/// downloads the pack again; a crash during it leaves the `applying` flag of the kept copy on,
+/// so the next run downloads too (reason `applying`). A `closed` span keeps status Unset: a
+/// close is not a fault.
 ///
 /// Before it downloads a pack or applies the log, the run checks that the working
 /// directory's disk has the pack size plus 10% free ([`free_disk`]). The size is the
@@ -339,15 +349,16 @@ pub(crate) fn pack_run(
 /// gives the size of its local database file. `buckwal pack` and `buckwal packer` give none,
 /// and their first pack is not checked (a known gap: the log sizes are not listed by the
 /// run). If the disk is short, the run ends as `Failed` at the step `disk` and changes
-/// nothing.
+/// nothing in the bucket. As every `Failed` run, it deletes its kept copy.
 ///
 /// The run counts its own bytes (`CountingStore`): other traffic on the same store (the
 /// writer's commits) is not in `bytes_down` and `bytes_up`.
 ///
 /// The span (spec "Observability"): `buckwal.pack.generation`, `buckwal.pack.key`,
 /// `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
-/// `buckwal.pack.free_page_share`, the time of each step (`buckwal.pack.read_ms`,
-/// `buckwal.pack.apply_ms`, `buckwal.pack.upload_ms`, `buckwal.pack.verify_ms`,
+/// `buckwal.pack.free_page_share`, `buckwal.pack.source` and `buckwal.pack.reason` (where the
+/// run got its file: [`PackSource`]; not on a run that returns `Err`), the time of each step
+/// (`buckwal.pack.read_ms`, `buckwal.pack.apply_ms`, `buckwal.pack.upload_ms`, `buckwal.pack.verify_ms`,
 /// `buckwal.pack.publish_ms`; only the steps the run made), `buckwal.elapsed_ms`,
 /// `buckwal.pack.failures`, `buckwal.outcome` (`packed`, `nothing_to_do`, `superseded` or
 /// `failed`; `integrity` for a read that failed its integrity code) and, when it failed,
@@ -370,6 +381,8 @@ pub(crate) fn pack_run_in(
         buckwal.pack.bytes_up = Empty,
         buckwal.pack.size = Empty,
         buckwal.pack.free_page_share = Empty,
+        buckwal.pack.source = Empty,
+        buckwal.pack.reason = Empty,
         buckwal.pack.read_ms = Empty,
         buckwal.pack.apply_ms = Empty,
         buckwal.pack.upload_ms = Empty,
@@ -419,6 +432,10 @@ fn record_report(span: &tracing::Span, r: &PackReport) {
     span.record("buckwal.pack.bytes_up", r.bytes_up);
     span.record("buckwal.pack.size", r.pack_size);
     span.record("buckwal.pack.free_page_share", r.free_page_share);
+    if let Some(src) = &r.source {
+        span.record("buckwal.pack.source", src.as_str());
+        span.record("buckwal.pack.reason", src.reason());
+    }
     for (name, t) in &r.step_times {
         let field = match *name {
             "read" => "buckwal.pack.read_ms",
@@ -452,8 +469,28 @@ fn pack_run_inner(
     config.validate()?;
     let enc = encryption::load(config)?;
     let run_id = crate::db::new_writer_id()?;
-    sweep_work_dirs(config);
-    let work = WorkDir::create(config.dir.join(format!("{WORK_DIR_PREFIX}{run_id}")))?;
+    let pack_dir = config.prepare_pack_dir()?;
+    // The kept copy when the run takes its lock; else a working directory of its own, which
+    // goes when the run ends.
+    let (kept, work_dir) = match CopyLock::try_take(&pack_dir)? {
+        Some(lock) => {
+            // Only the run that holds the lock removes what a crashed run left.
+            sweep_work_dirs(config);
+            (Some(KeptCopy::new(lock)), None)
+        }
+        None => {
+            let path = pack_dir.join(format!("{WORK_DIR_PREFIX}{run_id}"));
+            (None, Some(WorkDir::create(path)?))
+        }
+    };
+    let work = match (&kept, &work_dir) {
+        (Some(k), _) => k.dir().to_path_buf(),
+        (None, Some(w)) => w.0.clone(),
+        (None, None) => unreachable!("a run has a kept copy or a working directory"),
+    };
+    let source = kept
+        .is_none()
+        .then_some(PackSource::Downloaded(DownloadReason::Locked));
     let counting = CountingStore::new(&**store);
     let first_pack_estimate = first_pack_estimate.filter(|n| *n > 0);
     let mut run = Run {
@@ -464,12 +501,15 @@ fn pack_run_inner(
         clock,
         limit: config.pack_orphan_grace / 2,
         run_id,
-        work: work.0.clone(),
+        work,
         steps: Vec::new(),
         step_start: Instant::now(),
         stop,
         error: None,
         first_pack_estimate,
+        kept,
+        source,
+        touched: false,
     };
     let start = Instant::now();
     let ran = run.run(config)?;
@@ -483,8 +523,10 @@ fn pack_run_inner(
         free_page_share: ran.free_page_share,
         pack_size: ran.size,
         error: run.error,
+        source: run.source,
         elapsed: start.elapsed(),
     };
+    drop(work_dir);
     tracing::info!(
         target: "buckwal",
         outcome = ?report.outcome,
@@ -546,6 +588,31 @@ impl FreeDiskForTest {
 impl Drop for FreeDiskForTest {
     fn drop(&mut self) {
         FREE_DISK.with(|f| f.set(None));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: while alive, a run on this thread that applies in place stops with an error
+/// after its first generation, as a crash would.
+#[cfg(test)]
+pub(crate) struct CrashAfterApplyForTest;
+
+#[cfg(test)]
+impl CrashAfterApplyForTest {
+    pub(crate) fn set() -> CrashAfterApplyForTest {
+        CRASH_AFTER_APPLY.with(|f| f.set(true));
+        CrashAfterApplyForTest
+    }
+}
+
+#[cfg(test)]
+impl Drop for CrashAfterApplyForTest {
+    fn drop(&mut self) {
+        CRASH_AFTER_APPLY.with(|f| f.set(false));
     }
 }
 
@@ -656,18 +723,18 @@ impl ObjectStore for CountingStore<'_> {
     }
 }
 
-/// The name of a pack run's working directory in `config.dir` starts with this, then its
-/// run id.
+/// The name of a pack run's working directory in the pack directory starts with this, then
+/// its run id. A run works there only when another run holds the lock of the kept copy.
 pub(crate) const WORK_DIR_PREFIX: &str = "pack-work-";
 
-/// Remove each `pack-work-*` directory in `dir` that nothing changed for `max_age` (half the
-/// orphan grace): a crashed run left it. The age is the directory's modified time: a run adds
-/// its last entry before its upload starts, and gives up at half the orphan grace after that
-/// start. So a live run can own a directory this old only while it is past its own limit, in
+/// Remove each `pack-work-*` directory or file in `dir` that nothing changed for `max_age`
+/// (half the orphan grace): a crashed run left it. The age is the directory's modified time:
+/// a run adds its last entry before its upload starts, and gives up at half the orphan grace
+/// after that start. So a live run can own a directory this old only while it is past its own limit, in
 /// its last step: its next time check fails it, or, with its files removed under it, its next
 /// read fails it. Either way it ends `failed` with no pointer write, and nothing in the bucket
-/// changes. A missing `dir` has nothing to remove. A pack run's start and a writer's open call
-/// it.
+/// changes. A missing `dir` has nothing to remove. A pack run that holds the lock of the kept
+/// copy calls it at its start, and a writer's open calls it, both on the pack directory.
 pub(crate) fn remove_stale_work_dirs(dir: &Path, max_age: Duration) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -685,7 +752,7 @@ pub(crate) fn remove_stale_work_dirs(dir: &Path, max_age: Duration) -> Result<()
             .map_err(|e| io_err("read pack working dir time", e))?
             .elapsed()
             .unwrap_or_default();
-        if age < max_age || !e.path().is_dir() {
+        if age < max_age {
             continue;
         }
         tracing::info!(
@@ -694,7 +761,12 @@ pub(crate) fn remove_stale_work_dirs(dir: &Path, max_age: Duration) -> Result<()
             age_secs = age.as_secs(),
             "removing the working dir of a pack run that did not finish"
         );
-        match fs::remove_dir_all(e.path()) {
+        let removed = if e.path().is_dir() {
+            fs::remove_dir_all(e.path())
+        } else {
+            fs::remove_file(e.path())
+        };
+        match removed {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_err("remove stale pack working dir", e)),
@@ -703,10 +775,10 @@ pub(crate) fn remove_stale_work_dirs(dir: &Path, max_age: Duration) -> Result<()
     Ok(())
 }
 
-/// [`remove_stale_work_dirs`] with `config`'s orphan grace; a failure only warns (the next
-/// start tries again).
+/// [`remove_stale_work_dirs`] in `config`'s pack directory with its orphan grace; a failure
+/// only warns (the next start tries again).
 pub(crate) fn sweep_work_dirs(config: &Config) {
-    if let Err(e) = remove_stale_work_dirs(&config.dir, config.pack_orphan_grace / 2) {
+    if let Err(e) = remove_stale_work_dirs(&config.pack_directory(), config.pack_orphan_grace / 2) {
         tracing::warn!(target: "buckwal", error = %e, "cannot remove an old pack working dir");
     }
 }
@@ -775,6 +847,12 @@ struct Run<'a> {
     error: Option<String>,
     /// The size to check the free disk against when there is no pack yet.
     first_pack_estimate: Option<u64>,
+    /// The kept copy, when the run holds its lock: `work` is its directory.
+    kept: Option<KeptCopy>,
+    /// Where the run got its file (`PackReport::source`).
+    source: Option<PackSource>,
+    /// The run set the `applying` flag of the kept copy.
+    touched: bool,
 }
 
 /// What `pack-latest` holds, for a run.
@@ -838,7 +916,34 @@ impl Run<'_> {
         })
     }
 
+    /// The steps, then the end of the kept copy: a run whose pack the pointer names keeps the
+    /// file as the copy of that pack; a run that ends without moving the pointer (`failed`,
+    /// `superseded`, or `nothing_to_do` after it changed the file) deletes the copy. An `Err`
+    /// leaves it as it is: when the run changed the file, the `applying` flag stays on, and
+    /// the next run downloads.
     fn run(&mut self, config: &Config) -> Result<Ran> {
+        let ran = self.run_steps(config)?;
+        let Some(kept) = &self.kept else {
+            return Ok(ran);
+        };
+        let ended = match (&ran.outcome, &ran.pack_key) {
+            (PackOutcome::Packed, Some(pack_key)) => kept.keep(CopyPack {
+                pack_key: pack_key.clone(),
+                pack_generation: ran.pack_generation,
+                size: ran.size,
+                database_id: self.keys.known_database_id(),
+            }),
+            (PackOutcome::NothingToDo, _) if !self.touched => Ok(()),
+            _ => kept.clear(),
+        };
+        if let Err(e) = ended {
+            // The flag stays on, or the copy names an older pack: the next run downloads.
+            tracing::warn!(target: "buckwal", error = %e, "pack run: cannot update its kept copy");
+        }
+        Ok(ran)
+    }
+
+    fn run_steps(&mut self, config: &Config) -> Result<Ran> {
         // Step 1. The head first: a coded pointer is decoded only once the keys adopted the
         // head and know its database id.
         let head_key = self.keys.head();
@@ -905,6 +1010,7 @@ impl Run<'_> {
             &self.retry,
             self.stop,
         );
+        let (kept, source, touched) = (&self.kept, &mut self.source, &mut self.touched);
         let current = base.as_ref().map_or(0, |p| p.pack_generation);
         let scanned = scan_generations(&reader, from, &head, &mut |e, records| {
             if gone.is_some() {
@@ -915,22 +1021,56 @@ impl Run<'_> {
             }
             if !base_ready {
                 base_ready = true;
+                let codes = match &base {
+                    Some(p) => fetch_codes(store, keys, retry, p)?,
+                    None => None,
+                };
+                let src = match (&base, kept) {
+                    (Some(p), Some(k)) => k.source_for(p, keys, codes.as_ref()),
+                    (None, Some(_)) => PackSource::Downloaded(DownloadReason::None),
+                    (_, None) => PackSource::Downloaded(DownloadReason::Locked),
+                };
+                *source = Some(src);
+                if let Some(k) = kept {
+                    if src == PackSource::Kept {
+                        k.tidy()?;
+                    } else {
+                        k.clear()?;
+                    }
+                }
                 if let Some(p) = &base {
-                    if !download_pack(store, keys, retry, p, &db, stop)? {
-                        gone = Some(p.pack_key.clone());
-                        return Ok(());
+                    if src != PackSource::Kept {
+                        let Some(codes) = &codes else {
+                            gone = Some(p.pack_key.clone());
+                            return Ok(());
+                        };
+                        if !download_pack(store, keys, retry, p, codes, &db, stop)? {
+                            gone = Some(p.pack_key.clone());
+                            return Ok(());
+                        }
                     }
                     check_page_size(work, enc, p)?;
+                }
+                if let Some(k) = kept {
+                    // Before the file changes: a crash from here on leaves the flag on.
+                    k.set_applying(base.as_ref())?;
+                    *touched = true;
                 }
             }
             let images = replay_ended(records, &head, e.generation)?;
             apply_images_over(work, &images, &head, enc, None)?;
             applied += 1;
+            #[cfg(test)]
+            if kept.is_some() && CRASH_AFTER_APPLY.with(|f| f.get()) {
+                return Err(Error::Io(
+                    "pack run: a crash after the first apply (test)".into(),
+                ));
+            }
             Ok(())
         });
         self.step("apply");
         if self.stop.load(Relaxed) {
-            // The working directory goes with the run; nothing was uploaded.
+            // The working directory or the kept copy goes with the run; nothing was uploaded.
             return Ok(Ran::without_pack(failed(CLOSED_STEP, None), current));
         }
         let scanned = scanned?;
@@ -1237,20 +1377,17 @@ fn check_page_size(dir: &Path, enc: Option<&Encryption>, p: &PackPointer) -> Res
 }
 
 /// Download the pack `p` names into `path`, in ranges of whole blocks, up to
-/// `PART_CONCURRENCY` at once, checking each block against the pack's codes. False when the
-/// pack or its codes are gone.
+/// `PART_CONCURRENCY` at once, checking each block against the pack's `codes`. False when the
+/// pack is gone.
 fn download_pack(
     store: &dyn ObjectStore,
     keys: &Keys,
     retry: &RetryPolicy,
     p: &PackPointer,
+    codes: &PackCodes,
     path: &Path,
     stop: &AtomicBool,
 ) -> Result<bool> {
-    let Some(body) = with_retry(retry, &p.codes_key, |_| store.get(&p.codes_key))? else {
-        return Ok(false);
-    };
-    let codes = PackCodes::decode(keys, &body.body, &p.pack_key, p.pack_generation, p.size)?;
     let file = File::create(path).map_err(|e| io_err("create pack file", e))?;
     file.set_len(p.size)
         .map_err(|e| io_err("size pack file", e))?;
@@ -1270,7 +1407,7 @@ fn download_pack(
                 if i >= ranges {
                     return;
                 }
-                let r = fetch_range(store, keys, retry, p, &codes, i * range, range, &file);
+                let r = fetch_range(store, keys, retry, p, codes, i * range, range, &file);
                 match r {
                     Ok(true) => {}
                     Ok(false) => missing.store(true, Relaxed),

@@ -233,6 +233,13 @@ pub struct Config {
     /// fixed time (`BUCKWAL_PACK_KEEP_SECS`), which must not be below `trim_grace` (`Config`
     /// otherwise).
     pub pack_keep: Option<Duration>,
+    /// The *pack directory* (`BUCKWAL_PACK_DIR`): where a packer keeps its kept copy
+    /// (`pack-copy/`), its lock and its working files (`pack-work-*`). `None` (the default):
+    /// `dir`, the writer's directory for the packer thread and the `--dir` of `buckwal
+    /// packer`. A set one must be a directory, or one the writer's open and a pack run can
+    /// make (`Config` otherwise). Put it on a fast local disk when `dir` is on a network file
+    /// system.
+    pub pack_dir: Option<PathBuf>,
     /// A test hook, not part of the supported API (hidden from the docs): how often the
     /// packer checks whether a pack run is due (`defaults::PACK_CHECK_INTERVAL`). Above 0.
     #[doc(hidden)]
@@ -276,6 +283,7 @@ impl fmt::Debug for Config {
             .field("pack_max_age", &self.pack_max_age)
             .field("pack_orphan_grace", &self.pack_orphan_grace)
             .field("pack_keep", &self.pack_keep)
+            .field("pack_dir", &self.pack_dir)
             .field("pack_check_interval", &self.pack_check_interval)
             .field("pack_gauge_interval", &self.pack_gauge_interval)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
@@ -299,7 +307,7 @@ const REMOVED_ENV_VARS: [(&str, &str); 2] = [
 ];
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 26] = [
+const ENV_VARS: [&str; 27] = [
     "BUCKWAL_ENDPOINT",
     "BUCKWAL_CA_BUNDLE",
     "BUCKWAL_REGION",
@@ -326,6 +334,7 @@ const ENV_VARS: [&str; 26] = [
     "BUCKWAL_PACK_MAX_AGE_SECS",
     "BUCKWAL_PACK_ORPHAN_GRACE_SECS",
     "BUCKWAL_PACK_KEEP_SECS",
+    "BUCKWAL_PACK_DIR",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -410,6 +419,7 @@ impl Config {
             pack_max_age: defaults::PACK_MAX_AGE,
             pack_orphan_grace: defaults::PACK_ORPHAN_GRACE,
             pack_keep: None,
+            pack_dir: None,
             pack_check_interval: defaults::PACK_CHECK_INTERVAL,
             pack_gauge_interval: defaults::PACK_GAUGE_INTERVAL,
             on_event: None,
@@ -515,6 +525,9 @@ impl Config {
                 &v,
             )?));
         }
+        if let Some(v) = get("BUCKWAL_PACK_DIR").filter(|v| !v.is_empty()) {
+            c.pack_dir = Some(PathBuf::from(v));
+        }
         if let Some(v) = get("BUCKWAL_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
             c.encryption_key_file = Some(PathBuf::from(v));
         }
@@ -529,6 +542,32 @@ impl Config {
             })?;
         }
         Ok(c)
+    }
+
+    /// The pack directory: `pack_dir`, or `dir` when it is not set.
+    pub(crate) fn pack_directory(&self) -> PathBuf {
+        self.pack_dir.clone().unwrap_or_else(|| self.dir.clone())
+    }
+
+    /// The pack directory. A `pack_dir` that does not exist yet is made; one that is not a
+    /// directory, or cannot be made, is `Config`. `dir` is not made here.
+    pub(crate) fn prepare_pack_dir(&self) -> Result<PathBuf> {
+        let Some(d) = &self.pack_dir else {
+            return Ok(self.dir.clone());
+        };
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return Err(Error::Config(format!(
+                "BUCKWAL_PACK_DIR {}: cannot make the directory: {e}",
+                d.display()
+            )));
+        }
+        if !d.is_dir() {
+            return Err(Error::Config(format!(
+                "BUCKWAL_PACK_DIR {} is not a directory",
+                d.display()
+            )));
+        }
+        Ok(d.clone())
     }
 
     /// The checks a read replica makes at open: the poll interval is above 0 and below
@@ -845,6 +884,37 @@ mod tests {
         assert_eq!(pack_keep_time(e.trim_grace, e.pack_keep, 1), min(20.0));
     }
 
+    /// `BUCKWAL_PACK_DIR`: empty is unset; a set one must be a directory, or one that can be
+    /// made (`prepare_pack_dir` makes it).
+    #[test]
+    fn pack_dir_must_be_a_directory_or_one_that_can_be_made() {
+        let mut env = required();
+        env.insert("BUCKWAL_PACK_DIR", "");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(c.pack_dir, None);
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Config::new(t.path().join("db"), "http://e", "b", "ak", "sk");
+        // Unset: the database's directory, which is not made here.
+        assert_eq!(c.prepare_pack_dir().unwrap(), t.path().join("db"));
+        // A directory that does not exist yet is made.
+        c.pack_dir = Some(t.path().join("fast/pack"));
+        assert_eq!(c.prepare_pack_dir().unwrap(), t.path().join("fast/pack"));
+        assert!(t.path().join("fast/pack").is_dir());
+        // A file is refused.
+        std::fs::write(t.path().join("file"), b"x").unwrap();
+        c.pack_dir = Some(t.path().join("file"));
+        match c.prepare_pack_dir() {
+            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_PACK_DIR"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+        // So is a directory that cannot be made under a file.
+        c.pack_dir = Some(t.path().join("file/pack"));
+        match c.prepare_pack_dir() {
+            Err(Error::Config(m)) => assert!(m.contains("BUCKWAL_PACK_DIR"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
     #[test]
     fn replica_poll_defaults_to_60s() {
         let c = Config::new("/d", "http://e", "b", "ak", "sk");
@@ -1067,6 +1137,7 @@ mod tests {
             ("BUCKWAL_PACK_MAX_AGE_SECS", "90"),
             ("BUCKWAL_PACK_ORPHAN_GRACE_SECS", "600"),
             ("BUCKWAL_PACK_KEEP_SECS", "900"),
+            ("BUCKWAL_PACK_DIR", "/fast/pack"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads BUCKWAL_* variables.
@@ -1112,11 +1183,16 @@ mod tests {
         assert_eq!(c.pack_max_age, Duration::from_secs(90));
         assert_eq!(c.pack_orphan_grace, Duration::from_secs(600));
         assert_eq!(c.pack_keep, Some(Duration::from_secs(900)));
+        assert_eq!(c.pack_dir, Some(PathBuf::from("/fast/pack")));
+        assert_eq!(c.pack_directory(), PathBuf::from("/fast/pack"));
 
         // Only the four required ones: the rest are defaults.
         let env = required();
         let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(c.region, defaults::REGION);
+        assert_eq!(c.pack_dir, None);
+        // The pack directory is then the database's own directory.
+        assert_eq!(c.pack_directory(), PathBuf::from("/d"));
         assert_eq!(c.upload_concurrency, defaults::UPLOAD_CONCURRENCY);
         assert_eq!(c.batching, Batching::Off);
 

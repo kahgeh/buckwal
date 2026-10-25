@@ -40,7 +40,7 @@ pub use error::{Error, Result};
 #[doc(hidden)]
 pub use gc::gc_with_store;
 pub use gc::{gc, GcOutcome, GcReport};
-pub use pack::{pack, run_packer, PackOutcome, PackReport};
+pub use pack::{pack, run_packer, DownloadReason, PackOutcome, PackReport, PackSource};
 #[doc(hidden)]
 pub use pack::{pack_with_store, run_packer_with_store};
 #[doc(hidden)]

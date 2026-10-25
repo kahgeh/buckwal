@@ -71,6 +71,7 @@ One line per term, as the code on this branch uses it: the meaning, then "Not:",
 - **key_check**: the format 3 and 4 head's 16 bytes of HMAC-SHA256 under the integrity key over a fixed label. It says which key a bucket was written with, and is compared at open before any integrity code, so a wrong key is an `Encryption` error and never counts as tampering. Not: key hash, key id, fingerprint.
 - **skipped generation**: the generation number after a takeover that never gets a log: the new writer's first seal writes its pages and manifest under it and moves the head one past it, so they never share keys with the fenced old writer's seal. Not: gap generation, missing generation.
 - **next generation floor**: the head's `next_generation_floor`: the generation a seal moves the head to after a takeover, at the least (a seal moves it to `max(G + 1, floor)` and writes under one below that). It stays in every later head, and GC trusts no manifest below `floor - 1` (the oldest manifest GC may trust). Not: minimum generation, generation base.
+- **pack directory**: where a packer keeps its kept copy (`pack-copy/app.db` and `pack-copy/state.json`), the lock of that copy (`pack-copy/lock`) and its working files (`pack-work-<run id>`): the writer's directory for the packer thread and the `--dir` of `buckwal packer`, unless `BUCKWAL_PACK_DIR` (`Config::pack_dir`) names another. A pack directory that is lost costs one download of the pack and nothing else. Not: cache directory, work dir.
 
 ## Not yet consistent
 

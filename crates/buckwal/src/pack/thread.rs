@@ -10,8 +10,10 @@
 //! A writer of a format 5 bucket runs the loop on its `buckwal-packer` thread when
 //! `Config::pack` is on (`BUCKWAL_PACK`, the default), and the gauges on its
 //! `buckwal-pack-gauges` thread in any case ([`PackerThreads`]). Both only read the bucket and
-//! write packs, the pack pointer and their own working directory: they never take a lock or a
-//! gate of the writer, so they never block a commit. Each waits a whole interval before its
+//! write packs, the pack pointer and the packer's own files in the pack directory
+//! (`Config::pack_dir`, by default the writer's directory: the kept copy and its lock, or a
+//! working directory): they never take a lock or a gate of the writer, so they never block a
+//! commit. Each waits a whole interval before its
 //! first look, so a writer that is open for less than a minute makes no request for them.
 //!
 //! A failed run, an error and a panic end one check only: the loop logs one WARN per distinct
