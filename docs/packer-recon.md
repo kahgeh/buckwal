@@ -1,6 +1,6 @@
 # Packer, stage 1: what was measured
 
-Date: 2026-10-25. Sizes: in the multipart tables, "MB" and "GB" mean MiB and GiB, so a "100 MB" object is 104,857,600 bytes. Every other size is in decimal MB. Machine: Apple M4 Max Mac, macOS, home internet link. Stores: RustFS 1.0.0 on this Mac, and AWS S3 in ap-southeast-2.
+Date: 2026-10-25. Sizes: in the multipart results, "MB" and "GB" mean MiB and GiB, so a "100 MB" object is 104,857,600 bytes. Every other size is in decimal MB. Machine: Apple M4 Max Mac, macOS, home internet link. Stores: RustFS 1.0.0 on this Mac, and AWS S3 in ap-southeast-2.
 
 **This report is partial.** The user asked to stop the measurements on 2026-10-25 and to start stage 2. The section "Not measured" lists what stage 1 did not do. The probes were throwaway code and are not in the repository.
 
@@ -53,7 +53,7 @@ The upload speed is the speed of this Mac's link. A server in the same AWS regio
 
 ## turso 0.8.3 `VACUUM` (turso_core, `DatabaseOpts::with_vacuum(true)`)
 
-A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, then the statement. The 1 GB numbers are shown (1,000 MB of rows). The times come from the first 1 GB run. The reopen and header checks come from a second run. A run at 100 MB gave the same results.
+A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, then the statement. The 1 GB numbers are shown (256,000 rows of 4,000 bytes). The times come from the first 1 GB run. The reopen and header checks come from a second run. A run at 100 MB gave the same results.
 
 | Database | Statement | Time | Result | Peak WAL |
 |---|---|---|---|---|
