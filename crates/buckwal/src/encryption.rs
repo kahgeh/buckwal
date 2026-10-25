@@ -317,12 +317,28 @@ mod tests {
     use turso_core::{CipherMode, EncryptionContext, EncryptionKey};
 
     fn with_key_file(text: &[u8]) -> (tempfile::TempDir, Config) {
-        let t = tempfile::tempdir().unwrap();
+        with_key_file_in(tempfile::tempdir().unwrap(), text)
+    }
+
+    fn with_key_file_in(t: tempfile::TempDir, text: &[u8]) -> (tempfile::TempDir, Config) {
         let path = t.path().join("key");
         std::fs::write(&path, text).unwrap();
         let mut c = Config::new(t.path(), "http://e", "b", "ak", "sk");
         c.encryption_key_file = Some(path);
         (t, c)
+    }
+
+    /// `m` with the key file's path taken out: the path holds a random directory name, which
+    /// can hold any short needle a test looks for in the key text.
+    fn without_path(m: &str, c: &Config) -> String {
+        let path = c
+            .encryption_key_file
+            .as_ref()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(m.contains(&path), "the message names the key file: {m}");
+        m.replace(&path, "")
     }
 
     fn config_err<T: std::fmt::Debug>(r: Result<T>) -> String {
@@ -455,20 +471,35 @@ mod tests {
             format!("{}zz", "cd".repeat(31)),
         ] {
             let (_t, c) = with_key_file(text.as_bytes());
-            let path = c.encryption_key_file.clone().unwrap();
             let m = config_err(load(&c));
-            assert!(m.contains(&path.display().to_string()), "{m}");
+            let rest = without_path(&m, &c);
             assert!(m.contains("64 hex digits"), "{m}");
-            assert!(!m.contains("cdcd") && !m.contains("zz"), "{m}");
+            assert!(!rest.contains("cdcd") && !rest.contains("zz"), "{rest}");
         }
         // 64 digits for a 16-byte cipher.
         let (_t, mut c) = with_key_file("cd".repeat(32).as_bytes());
         c.encryption_cipher = "aegis128l".into();
         let m = config_err(load(&c));
+        let rest = without_path(&m, &c);
         assert!(
-            m.contains("16 bytes as 32 hex digits") && !m.contains("cdcd"),
-            "{m}"
+            m.contains("16 bytes as 32 hex digits") && !rest.contains("cdcd"),
+            "{rest}"
         );
+    }
+
+    /// The key file under a directory whose name holds the needles: only the key text counts.
+    #[test]
+    fn key_file_in_a_directory_named_like_key_text_is_still_without_content() {
+        let dir = tempfile::Builder::new()
+            .prefix("zz-cdcd-")
+            .tempdir()
+            .unwrap();
+        let (_t, c) = with_key_file_in(dir, "cd".repeat(31).as_bytes());
+        let m = config_err(load(&c));
+        assert!(m.contains("zz-cdcd-"), "the path is in the message: {m}");
+        let rest = without_path(&m, &c);
+        assert!(m.contains("64 hex digits"), "{m}");
+        assert!(!rest.contains("cdcd") && !rest.contains("zz"), "{rest}");
     }
 
     #[test]
