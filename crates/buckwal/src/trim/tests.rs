@@ -139,7 +139,7 @@ fn trimmer(
     };
     let (tx, rx) = mpsc::channel();
     let ages = crate::gc::GcAges::new(min_age, crate::config::defaults::PACK_ORPHAN_GRACE);
-    let t = spawn_trimmer(store, keys(), ages, rx, Some(hook));
+    let t = spawn_trimmer(store, keys(), ages, rx, Some(hook), Arc::new(|| None));
     (tx, t, seen)
 }
 

@@ -376,12 +376,15 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     let engine = open_engine(&dir, bucket, &state, &cfg, trim_tx)?;
     // open_engine sent the open's wake: the trimmer's pass at start.
     let trimmer = trim_rx.map(|rx| {
+        let storage = engine.storage.clone();
         spawn_trimmer(
             store.clone(),
             keys.clone(),
-            crate::gc::GcAges::new(cfg.gc_min_age(), config.pack_orphan_grace),
+            crate::gc::GcAges::new(cfg.gc_min_age(), config.pack_orphan_grace)
+                .with_pack_keep(config.pack_keep),
             rx,
             cfg.events.clone(),
+            Arc::new(move || storage.reading_pack()),
         )
     });
     let uploader = engine.uploader.clone();

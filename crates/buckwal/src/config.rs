@@ -89,6 +89,12 @@ pub mod defaults {
     /// How long an orphan pack stays, from its upload start, before GC deletes it
     /// (`BUCKWAL_PACK_ORPHAN_GRACE_SECS`). A pack run gives up at half of it.
     pub const PACK_ORPHAN_GRACE: Duration = Duration::from_secs(6 * 3600);
+    /// The download speed the default pack keep time assumes (stage 1 measured 60 to 68 MB/s
+    /// for a range download from AWS S3), in bytes per second.
+    pub const PACK_KEEP_SPEED: u64 = 60_000_000;
+    /// The default pack keep time is this many times the newest pack's download time at
+    /// `PACK_KEEP_SPEED`, and never below the trim grace.
+    pub const PACK_KEEP_FACTOR: u32 = 4;
 
     /// Export traces and logs over OTLP (`BUCKWAL_OTEL`): off in the library.
     pub const OTEL: bool = false;
@@ -207,6 +213,12 @@ pub struct Config {
     /// upload start, by the bucket's clock (`BUCKWAL_PACK_ORPHAN_GRACE_SECS`). A pack run gives
     /// up at half of it, so it never moves the pointer to a pack GC can delete. Above 0.
     pub pack_orphan_grace: Duration,
+    /// How long GC keeps an older pack, and the log it needs, after a newer pack replaced it
+    /// (the *pack keep time*, by the bucket's clock). `None` (the default): 4 times the newest
+    /// pack's download time at 60 MB/s, and never below `trim_grace`. `Some` replaces it with a
+    /// fixed time (`BUCKWAL_PACK_KEEP_SECS`), which must not be below `trim_grace` (`Config`
+    /// otherwise).
+    pub pack_keep: Option<Duration>,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -242,13 +254,14 @@ impl fmt::Debug for Config {
             .field("pack_log_percent", &self.pack_log_percent)
             .field("pack_max_age", &self.pack_max_age)
             .field("pack_orphan_grace", &self.pack_orphan_grace)
+            .field("pack_keep", &self.pack_keep)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
 
 /// Every environment variable [`Config::from_env`] reads.
-const ENV_VARS: [&str; 26] = [
+const ENV_VARS: [&str; 27] = [
     "BUCKWAL_ENDPOINT",
     "BUCKWAL_CA_BUNDLE",
     "BUCKWAL_REGION",
@@ -275,6 +288,7 @@ const ENV_VARS: [&str; 26] = [
     "BUCKWAL_PACK_LOG_PERCENT",
     "BUCKWAL_PACK_MAX_AGE_SECS",
     "BUCKWAL_PACK_ORPHAN_GRACE_SECS",
+    "BUCKWAL_PACK_KEEP_SECS",
 ];
 
 pub(crate) fn parse_bool(var: &str, v: &str) -> Result<bool> {
@@ -359,6 +373,7 @@ impl Config {
             pack_log_percent: defaults::PACK_LOG_PERCENT,
             pack_max_age: defaults::PACK_MAX_AGE,
             pack_orphan_grace: defaults::PACK_ORPHAN_GRACE,
+            pack_keep: None,
             on_event: None,
         }
     }
@@ -454,6 +469,12 @@ impl Config {
             let var = "BUCKWAL_PACK_ORPHAN_GRACE_SECS";
             c.pack_orphan_grace = Duration::from_secs(parse_num(var, &v)?);
         }
+        if let Some(v) = get("BUCKWAL_PACK_KEEP_SECS").filter(|v| !v.is_empty()) {
+            c.pack_keep = Some(Duration::from_secs(parse_num(
+                "BUCKWAL_PACK_KEEP_SECS",
+                &v,
+            )?));
+        }
         if let Some(v) = get("BUCKWAL_ENCRYPTION_KEY_FILE").filter(|v| !v.is_empty()) {
             c.encryption_key_file = Some(PathBuf::from(v));
         }
@@ -535,6 +556,12 @@ impl Config {
                 "pack_orphan_grace (BUCKWAL_PACK_ORPHAN_GRACE_SECS) must be above 0".into(),
             ));
         }
+        if let Some(keep) = self.pack_keep.filter(|k| *k < self.trim_grace) {
+            return Err(Error::Config(format!(
+                "pack_keep (BUCKWAL_PACK_KEEP_SECS, {keep:?}) must not be below trim_grace ({:?})",
+                self.trim_grace
+            )));
+        }
         let maintenance = self.maintenance_log_objects > 0 || self.maintenance_wal_bytes > 0;
         if maintenance && self.maintenance_gate_wait.is_zero() {
             return Err(Error::Config(
@@ -571,6 +598,7 @@ impl Config {
             lease: self.lease,
             request_timeout: self.request_timeout,
             trim_grace: self.trim_grace,
+            pack_keep: self.pack_keep,
             events: self.on_event.clone(),
             read_only: mode != crate::io::IoMode::Writer,
             io_mode: mode,
@@ -699,6 +727,8 @@ pub(crate) struct EngineConfig {
     pub request_timeout: Duration,
     /// `Config::trim_grace`, for [`EngineConfig::gc_min_age`].
     pub trim_grace: Duration,
+    /// `Config::pack_keep`, for the pack keep time of a background fetch (`pack_keep_time`).
+    pub pack_keep: Option<Duration>,
     pub events: Option<EventHook>,
     /// A read-only open: nothing may be written to the bucket, and the engine's writes are
     /// refused (`ShippingFile`, `BucketDbStorage`).
@@ -725,9 +755,48 @@ impl EngineConfig {
     }
 }
 
+/// The pack keep time (spec "GC"): `fixed` when set, else `PACK_KEEP_FACTOR` (4) times the time
+/// to download `pack_size` bytes at `PACK_KEEP_SPEED` (60 MB/s); never below `floor` (the trim
+/// grace, or GC's minimum age).
+pub(crate) fn pack_keep_time(floor: Duration, fixed: Option<Duration>, pack_size: u64) -> Duration {
+    let time = fixed.unwrap_or_else(|| {
+        let secs = pack_size as f64 / defaults::PACK_KEEP_SPEED as f64;
+        Duration::from_secs_f64(secs * f64::from(defaults::PACK_KEEP_FACTOR))
+    });
+    time.max(floor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_keep_time_is_four_downloads_at_60_mb_and_never_below_the_trim_grace() {
+        let grace = defaults::TRIM_GRACE;
+        let min = |m: f64| Duration::from_secs_f64(m * 60.0);
+        // 1 GB: 4 x 16.7 s is below the trim grace: 10 min.
+        assert_eq!(pack_keep_time(grace, None, 1_000_000_000), min(10.0));
+        // 10 GB: 4 x 166.7 s = 666.7 s, about 11 min.
+        let ten = pack_keep_time(grace, None, 10_000_000_000);
+        assert!((ten.as_secs_f64() - 666.67).abs() < 0.1, "{ten:?}");
+        // A fixed time replaces it, and is never below the trim grace.
+        assert_eq!(
+            pack_keep_time(grace, Some(min(30.0)), 10_000_000_000),
+            min(30.0)
+        );
+        assert_eq!(pack_keep_time(grace, Some(min(1.0)), 1), grace);
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.pack_keep = Some(c.trim_grace - Duration::from_secs(1));
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("pack_keep")));
+        c.pack_keep = Some(c.trim_grace);
+        c.validate().unwrap();
+        let mut env = required();
+        env.insert("BUCKWAL_PACK_KEEP_SECS", "1200");
+        let c = Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(c.pack_keep, Some(min(20.0)));
+        let e = c.engine(crate::io::IoMode::Writer);
+        assert_eq!(pack_keep_time(e.trim_grace, e.pack_keep, 1), min(20.0));
+    }
 
     #[test]
     fn replica_poll_defaults_to_60s() {
@@ -951,6 +1020,7 @@ mod tests {
             ("BUCKWAL_PACK_LOG_PERCENT", "30"),
             ("BUCKWAL_PACK_MAX_AGE_SECS", "90"),
             ("BUCKWAL_PACK_ORPHAN_GRACE_SECS", "600"),
+            ("BUCKWAL_PACK_KEEP_SECS", "900"),
         ];
         assert_eq!(all.len(), ENV_VARS.len());
         // No other unit test reads BUCKWAL_* variables.
@@ -996,6 +1066,7 @@ mod tests {
         assert_eq!(c.pack_log_percent, 30);
         assert_eq!(c.pack_max_age, Duration::from_secs(90));
         assert_eq!(c.pack_orphan_grace, Duration::from_secs(600));
+        assert_eq!(c.pack_keep, Some(Duration::from_secs(900)));
 
         // Only the four required ones: the rest are defaults.
         let env = required();

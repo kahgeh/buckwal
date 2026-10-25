@@ -607,6 +607,15 @@ fn put_pack(store: &MemStore, generation: u64, run: &str) -> (String, String) {
 }
 
 fn pointer_body(generation: u64, run: &str, database_id: Option<String>) -> Vec<u8> {
+    pointer_body_sized(generation, run, database_id, 4)
+}
+
+fn pointer_body_sized(
+    generation: u64,
+    run: &str,
+    database_id: Option<String>,
+    size: u64,
+) -> Vec<u8> {
     let k = keys();
     k.encode_pointer(&crate::pack::PackPointer {
         format: crate::pack::pointer::POINTER_FORMAT,
@@ -614,7 +623,7 @@ fn pointer_body(generation: u64, run: &str, database_id: Option<String>) -> Vec<
         codes_key: k.pack_codes(generation, run),
         write_id: format!("{generation}{run}"),
         pack_generation: generation,
-        size: 4,
+        size,
         page_size: 4096,
         part_size: 16 << 20,
         block_size: 1 << 20,
@@ -1123,8 +1132,19 @@ fn gc_after_two_packs_leaves_one_newest_pack_and_needed_log() {
     assert_eq!((again.outcome, again.deleted), (GcOutcome::Trimmed, 0));
 }
 
-/// The writer's trimmer, after a pass that left nothing to wait for, skips a pass while the
-/// pointer keeps its ETag: the head and the pointer, nothing else. A pointer move ends it.
+/// The ages of `gc` with the test config.
+fn ages() -> GcAges {
+    GcAges::new(min_age(), orphan_grace())
+}
+
+/// A pass as the writer's trimmer makes it, with the trimmer's last mark and the pack its
+/// background fetch reads.
+fn trimmer_pass(store: &dyn ObjectStore, last: Option<&GcMark>, fetching: Option<&str>) -> GcPass {
+    gc_pass(store, &keys().for_open(), ages(), last, fetching).unwrap()
+}
+
+/// The writer's trimmer, after a pass that left nothing to wait for, skips the trim while the
+/// pointer keeps its ETag: no HEAD, no log listing. A pointer move ends it.
 #[test]
 fn gc_pass_skips_the_pointer_it_last_trimmed_against() {
     let store = mem();
@@ -1132,26 +1152,292 @@ fn gc_pass_skips_the_pointer_it_last_trimmed_against() {
     put_pack(&store, 3, "named");
     point(&store, 3, "named");
     store.advance_clock(min_age());
-    let ages = GcAges::new(min_age(), orphan_grace());
-    let first = gc_pass(&*store, &keys().for_open(), ages, None).unwrap();
+    let first = trimmer_pass(&*store, None, None);
     assert_eq!(first.outcome, GcOutcome::Trimmed, "{first:?}");
     let etag = store.get(&keys().pack_pointer()).unwrap().unwrap().etag;
-    assert_eq!(first.mark, Some(GcMark::Pointer(etag)));
+    assert_eq!(
+        first.mark,
+        Some(GcMark::Pointer {
+            etag,
+            fetching: None
+        })
+    );
     let fault = FaultStore::new(store.clone());
-    let again = gc_pass(&fault, &keys().for_open(), ages, first.mark.as_ref()).unwrap();
+    let again = trimmer_pass(&fault, first.mark.as_ref(), None);
     assert_eq!((again.outcome, again.deleted), (GcOutcome::Nothing, 0));
     let ev = fault.events();
-    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert!(!ev.iter().any(|e| e.starts_with("stat ")), "{ev:?}");
+    let log_list = format!("list {}", keys().log_root());
+    assert!(!ev.contains(&log_list), "{ev:?}");
     // The pointer moves: a whole pass again.
     put_pack(&store, 4, "next");
     point(&store, 4, "next");
     let fault = FaultStore::new(store.clone());
-    let moved = gc_pass(&fault, &keys().for_open(), ages, first.mark.as_ref()).unwrap();
+    let moved = trimmer_pass(&fault, first.mark.as_ref(), None);
     // Pack 3 is old enough, pack 4 is not yet: no mark until it is.
     assert_eq!(moved.outcome, GcOutcome::Trimmed, "{moved:?}");
     assert!(
         moved.next_due.is_some() && moved.mark.is_none(),
         "{moved:?}"
     );
-    assert!(fault.events().len() > 2);
+    assert!(fault.events().contains(&log_list));
+}
+
+/// I1: an orphan pack and a dead multipart upload that appear after the trimmer's mark (a pack
+/// run crashed, so the pointer kept its ETag) still go once the orphan grace has passed.
+#[test]
+fn gc_removes_orphan_and_upload_that_appear_after_the_trimmer_mark() {
+    let store = mem();
+    switched(&store, 3);
+    put_pack(&store, 3, "named");
+    point(&store, 3, "named");
+    store.advance_clock(min_age());
+    let first = trimmer_pass(&*store, None, None);
+    assert!(first.mark.is_some(), "{first:?}");
+    let (op, oc) = put_pack(&store, 4, "crashed-run");
+    crashed_upload(&store);
+    let young = trimmer_pass(&*store, first.mark.as_ref(), None);
+    assert_eq!((young.orphan_packs_deleted, young.uploads_aborted), (0, 0));
+    assert!(young.next_due.is_some(), "the orphan's due time: {young:?}");
+    store.advance_clock(orphan_grace() + Duration::from_secs(2));
+    let late = trimmer_pass(&*store, first.mark.as_ref(), None);
+    assert_eq!(
+        (late.orphan_packs_deleted, late.uploads_aborted),
+        (1, 1),
+        "{late:?}"
+    );
+    assert!(!exists(&store, &op) && !exists(&store, &oc));
+    assert!(exists(&store, &keys().pack(3, "named")));
+}
+
+/// Packs made closer together than the pack keep time (4 min apart, keep time 641 s): the GC
+/// base still moves forward, one keep time behind the newest pack, and GC deletes the packs
+/// and the log below it.
+#[test]
+fn gc_base_moves_one_keep_time_behind_packs_closer_than_the_keep_time() {
+    let store = mem();
+    switched(&store, 6);
+    let step = Duration::from_secs(240);
+    for g in 2..=6 {
+        put_pack(&store, g, "p");
+        point(&store, g, "p");
+        store.advance_clock(step);
+    }
+    // Codes ages now: 6 -> 4 min, 5 -> 8 min, 4 -> 12 min, 3 -> 16 min, 2 -> 20 min. The keep
+    // time is 641 s (10.7 min): the GC base is 4.
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+    assert_eq!(r.packs_deleted, 2, "{r:?}");
+    let packs: BTreeSet<u64> = pack_keys(&store)
+        .iter()
+        .filter_map(|k| keys().parse_pack(k).map(|(g, _)| g))
+        .collect();
+    assert_eq!(packs, BTreeSet::from([4, 5, 6]));
+    assert_eq!(log_gens(&store).first(), Some(&4));
+    let age = r.age.expect("the GC base's age");
+    assert!(age >= min_age() && age < min_age() + step, "{age:?}");
+}
+
+/// The pointer's pack and the pack below it both have codes younger than the pack keep time:
+/// there is no GC base, and GC keeps both packs and the log they need.
+#[test]
+fn gc_keeps_young_pointer_pack_the_pack_below_and_their_log() {
+    let store = mem();
+    switched(&store, 4);
+    put_pack(&store, 2, "a");
+    point(&store, 2, "a");
+    store.advance_clock(Duration::from_secs(300));
+    put_pack(&store, 4, "b");
+    point(&store, 4, "b");
+    store.advance_clock(Duration::from_secs(300));
+    let before = all_keys(&store);
+    let r = trimmer_pass(&*store, None, None);
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::TooYoung, 0), "{r:?}");
+    assert_eq!(all_keys(&store), before);
+    assert!(r.next_due.is_some(), "{r:?}");
+}
+
+/// I2: a codes object whose pack is gone (a crash between the two deletes, or a run that never
+/// finished) below the pointer never makes the GC base: only a complete pack does. GC keeps the
+/// older complete pack and its log.
+#[test]
+fn gc_orphan_codes_below_the_pointer_never_make_the_gc_base() {
+    let store = mem();
+    switched(&store, 4);
+    put_pack(&store, 2, "a");
+    point(&store, 2, "a");
+    store.advance_clock(Duration::from_secs(60));
+    let (lp, lc) = put_pack(&store, 3, "leftover");
+    store.delete(&lp).unwrap();
+    store.advance_clock(min_age());
+    put_pack(&store, 4, "b");
+    point(&store, 4, "b");
+    // Codes ages: 4 young, 3 (no pack) and 2 old: the GC base is 2.
+    let r = gc5(&store);
+    assert_eq!(r.outcome, GcOutcome::Trimmed, "{r:?}");
+    assert_eq!(r.packs_deleted, 0, "{r:?}");
+    assert!(exists(&store, &keys().pack(2, "a")), "{r:?}");
+    assert_eq!(log_gens(&store).first(), Some(&2), "{r:?}");
+    assert!(exists(&store, &lc), "the leftover codes stay");
+}
+
+/// Before it deletes log, GC HEADs the GC base's pack too: a GC base whose pack is gone between
+/// the listing and the HEAD deletes no log and logs an error.
+#[test]
+fn gc_with_missing_gc_base_pack_deletes_no_log() {
+    let store = mem();
+    switched(&store, 4);
+    let (ap, _) = put_pack(&store, 2, "a");
+    point(&store, 2, "a");
+    store.advance_clock(min_age());
+    put_pack(&store, 4, "b");
+    point(&store, 4, "b");
+    // The listing still shows pack 2; its HEAD finds nothing.
+    struct GoneOnHead {
+        inner: Arc<MemStore>,
+        gone: String,
+    }
+    impl ObjectStore for GoneOnHead {
+        fn put(&self, k: &str, b: &[u8]) -> std::result::Result<String, crate::store::StoreError> {
+            self.inner.put(k, b)
+        }
+        fn put_if_absent(
+            &self,
+            k: &str,
+            b: &[u8],
+        ) -> std::result::Result<crate::store::CondPut, crate::store::StoreError> {
+            self.inner.put_if_absent(k, b)
+        }
+        fn put_if_match(
+            &self,
+            k: &str,
+            b: &[u8],
+            e: &str,
+        ) -> std::result::Result<crate::store::CondPut, crate::store::StoreError> {
+            self.inner.put_if_match(k, b, e)
+        }
+        fn get(
+            &self,
+            k: &str,
+        ) -> std::result::Result<Option<crate::store::Object>, crate::store::StoreError> {
+            self.inner.get(k)
+        }
+        fn stat(
+            &self,
+            k: &str,
+        ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError>
+        {
+            if k == self.gone {
+                return Ok(None);
+            }
+            self.inner.stat(k)
+        }
+        fn list(&self, p: &str) -> std::result::Result<Vec<String>, crate::store::StoreError> {
+            self.inner.list(p)
+        }
+        fn delete(&self, k: &str) -> std::result::Result<(), crate::store::StoreError> {
+            self.inner.delete(k)
+        }
+        fn stats(&self) -> crate::store::StatsSnap {
+            self.inner.stats()
+        }
+    }
+    let s = GoneOnHead {
+        inner: store.clone(),
+        gone: ap.clone(),
+    };
+    let before = all_keys(&store);
+    let cap = crate::telemetry::testing::Capture::new();
+    let r = tracing::subscriber::with_default(cap.subscriber(), || {
+        gc_pass(&s, &keys().for_open(), ages(), None, None).unwrap()
+    });
+    assert_eq!((r.outcome, r.deleted), (GcOutcome::PackMissing, 0), "{r:?}");
+    assert_eq!(all_keys(&store), before);
+    let errors: Vec<_> = cap
+        .spans()
+        .events
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::ERROR)
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].field("key"), Some(ap.as_str()));
+}
+
+/// The pack keep time grows with the newest pack: a pointer of a 10 GB pack keeps the pack
+/// below it for 4 x 10 GB / 60 MB/s = 667 s, longer than the 641 s minimum age.
+#[test]
+fn gc_waits_the_keep_time_of_a_large_newest_pack() {
+    let store = mem();
+    switched(&store, 4);
+    put_pack(&store, 2, "a");
+    point(&store, 2, "a");
+    put_pack(&store, 4, "big");
+    let id = head(&*store).database_id;
+    store
+        .put(
+            &keys().pack_pointer(),
+            &pointer_body_sized(4, "big", id, 10_000_000_000),
+        )
+        .unwrap();
+    store.advance_clock(Duration::from_secs(650));
+    assert!(Duration::from_secs(650) > min_age());
+    let r = gc5(&store);
+    assert_eq!(
+        (r.outcome, r.packs_deleted),
+        (GcOutcome::TooYoung, 0),
+        "{r:?}"
+    );
+    store.advance_clock(Duration::from_secs(20));
+    let r = gc5(&store);
+    assert_eq!(
+        (r.outcome, r.packs_deleted),
+        (GcOutcome::Trimmed, 1),
+        "{r:?}"
+    );
+}
+
+/// The writer's GC never deletes the pack that its own background fetch still reads, past the
+/// pack keep time; the log below the GC base still goes. Once the fetch is done, the pack goes.
+#[test]
+fn writer_gc_keeps_the_pack_its_fetch_reads() {
+    let store = mem();
+    switched(&store, 4);
+    let (ap, ac) = put_pack(&store, 2, "a");
+    point(&store, 2, "a");
+    put_pack(&store, 4, "b");
+    point(&store, 4, "b");
+    store.advance_clock(3 * min_age());
+    let r = trimmer_pass(&*store, None, Some(&ap));
+    assert_eq!(
+        (r.outcome, r.packs_deleted),
+        (GcOutcome::Trimmed, 0),
+        "{r:?}"
+    );
+    assert!(exists(&store, &ap) && exists(&store, &ac));
+    assert_eq!(log_gens(&store).first(), Some(&4));
+    let mark = r.mark.clone();
+    assert!(mark.is_some(), "{r:?}");
+    // The fetch is done: the next pass is a whole one, and the pack goes.
+    let r = trimmer_pass(&*store, mark.as_ref(), None);
+    assert_eq!(r.packs_deleted, 1, "{r:?}");
+    assert!(!exists(&store, &ap) && !exists(&store, &ac));
+}
+
+/// With no GC base yet (the pointer's pack is young), an orphan older than the orphan grace
+/// still goes.
+#[test]
+fn gc_without_gc_base_still_deletes_orphans() {
+    let store = mem();
+    switched(&store, 3);
+    let (op, oc) = put_pack(&store, 5, "orphan");
+    store.advance_clock(orphan_grace() + Duration::from_secs(2));
+    put_pack(&store, 3, "named");
+    point(&store, 3, "named");
+    let r = gc5(&store);
+    assert_eq!(
+        (r.outcome, r.orphan_packs_deleted),
+        (GcOutcome::TooYoung, 1),
+        "{r:?}"
+    );
+    assert!(!exists(&store, &op) && !exists(&store, &oc));
 }

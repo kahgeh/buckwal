@@ -168,6 +168,7 @@ pub(crate) fn open_engine(
         mvcc: cfg.journal_mode == JournalMode::Mvcc,
         packed,
         blocks,
+        keep: (cfg.trim_grace, cfg.pack_keep),
     }));
     storage.adopt_persisted_dirty()?;
     // D16: page 1, as the engine will read it, against the encryption setting.

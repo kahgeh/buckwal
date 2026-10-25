@@ -830,20 +830,30 @@ fn restore_into_seen(
         buckwal.bytes = Empty,
         buckwal.seq = Empty,
         buckwal.retries = Empty,
+        buckwal.restore.restarts = Empty,
+        buckwal.restore.outcome = Empty,
         s3.status = Empty,
         buckwal.outcome = Empty,
     );
     let _in = span.enter();
     let retries = AtomicU64::new(0);
-    let r = restore_files(store, keys, dir, cfg, &retries);
+    let mut restarts = 0;
+    let r = restore_files(store, keys, dir, cfg, &retries, &mut restarts);
     span.record("buckwal.retries", retries.load(Relaxed));
+    span.record("buckwal.restore.restarts", restarts);
     let (r, page1) = match r {
         Ok(r) => r,
         Err(e) => {
+            if let Error::Timeout(m) = &e {
+                if m == GAVE_UP {
+                    span.record("buckwal.restore.outcome", "gave_up");
+                }
+            }
             span.record("buckwal.outcome", e.outcome());
             return Err(e);
         }
     };
+    span.record("buckwal.restore.outcome", "restored");
     span.record("buckwal.outcome", "ok");
     span.record("buckwal.generation", r.generation);
     span.record("buckwal.log_objects", r.log_objects);
@@ -865,15 +875,49 @@ fn restore_into_seen(
     Ok((r, page1))
 }
 
-/// How many times a restore starts again from a newer pack, when the pack it read is gone.
+/// How many times a restore starts again from the pointer, when a pack or a log object it
+/// still needs is gone (spec "Restore").
 const PACK_RESTARTS: u32 = 3;
 
+/// The error of a restore that met "not found" once more after `PACK_RESTARTS` restarts.
+const GAVE_UP: &str =
+    "restore: the pack changed 3 times while it was read; raise BUCKWAL_PACK_KEEP_SECS";
+
+/// Why a failed attempt may start again: what it found gone.
+fn restart_reason(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    e: &Error,
+    pack_gone: bool,
+    read: Option<&str>,
+) -> Option<&'static str> {
+    if pack_gone {
+        return Some("pack_missing");
+    }
+    let log_gone = matches!(e, Error::NotFound(k) if k.starts_with(&keys.log_root()));
+    // A log GC cut below a newer pack shows as a log the chain cannot follow (`Corrupt`) or an
+    // object gone (`NotFound`), while the pointer names another pack than the one read.
+    let cut = matches!(e, Error::NotFound(_) | Error::Corrupt(_))
+        && pointer_moved(store, keys, cfg, read);
+    (log_gone || cut).then_some("log_missing")
+}
+
+/// Restore into `dir`, attempt by attempt (`restore_attempt`). An attempt that finds its pack
+/// or a log object it still needs gone (GC deleted it after a newer pack replaced the one it
+/// read) starts again from the pointer, at most `PACK_RESTARTS` (3) times; each restart logs a
+/// WARN `restore restarted` with its attempt number, the pack key and the reason
+/// (`pack_missing` or `log_missing`). The next "not found" ends the restore with
+/// `Timeout(GAVE_UP)` and one ERROR `restore gave up`. Every restore uses this rule: a plain
+/// restore, the read-only open's, a takeover's and a replica's re-restore (`restore_staged`).
+/// `restarts` counts the restarts made.
 fn restore_files(
     store: Arc<dyn ObjectStore>,
     keys: &Keys,
     dir: &Path,
     cfg: &EngineConfig,
     retries: &AtomicU64,
+    restarts: &mut u32,
 ) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let start = Instant::now();
     let before = store.stats();
@@ -885,24 +929,47 @@ fn restore_files(
             )));
         }
     }
-    let mut restarts = 0;
     let (mut report, page1) = loop {
         let gone = Arc::new(AtomicBool::new(false));
         let read = Mutex::new(None);
-        match restore_attempt(&store, keys, dir, cfg, retries, &gone, &read) {
-            Err(e)
-                if restarts < PACK_RESTARTS
-                    && (gone.load(Relaxed)
-                        || pointer_moved(&*store, keys, cfg, read.into_inner().unwrap())) =>
-            {
-                // A newer pack replaced the one this restore read, and GC deleted it, or the
-                // log below the newer pack (spec "Restore"): start again from the newer pack.
-                tracing::warn!(target: "buckwal", error = %e, "restore: the pack is gone or replaced; starting again");
-                restarts += 1;
-                fs::remove_dir_all(dir).map_err(|e| io_err("clear the restore dir", e))?;
-            }
-            r => break r?,
+        let e = match restore_attempt(&store, keys, dir, cfg, retries, &gone, &read) {
+            Ok(r) => break r,
+            Err(e) => e,
+        };
+        let read = read.into_inner().unwrap();
+        let Some(reason) =
+            restart_reason(&*store, keys, cfg, &e, gone.load(Relaxed), read.as_deref())
+        else {
+            return Err(e);
+        };
+        let attempt = *restarts + 1;
+        let pack_key = read.unwrap_or_default();
+        // A failed attempt leaves no database behind, whatever happens next.
+        if dir.exists() {
+            fs::remove_dir_all(dir).map_err(|e| io_err("clear the restore dir", e))?;
         }
+        if *restarts >= PACK_RESTARTS {
+            tracing::error!(
+                target: "buckwal",
+                attempt = attempt,
+                pack_key = %pack_key,
+                reason,
+                error = %e,
+                "restore gave up"
+            );
+            return Err(Error::Timeout(GAVE_UP.into()));
+        }
+        // A newer pack replaced the one this restore read, and GC deleted it, or the log
+        // below the newer pack (spec "Restore"): start again from the pointer.
+        tracing::warn!(
+            target: "buckwal",
+            attempt = attempt,
+            pack_key = %pack_key,
+            reason,
+            error = %e,
+            "restore restarted"
+        );
+        *restarts += 1;
     };
     let delta = store.stats().since(&before);
     report.gets = delta.gets;
@@ -912,22 +979,20 @@ fn restore_files(
     Ok((report, page1))
 }
 
-/// Whether the pointer now names another pack than `read`, the pack an attempt read (false
-/// when it read none, or when the pointer cannot be read).
+/// Whether the pointer now names another pack of this database than `read`, the pack an
+/// attempt read (`None`: it read the log alone, and then any pack of this database is
+/// another). False when the pointer cannot be read.
 fn pointer_moved(
     store: &dyn ObjectStore,
     keys: &Keys,
     cfg: &EngineConfig,
-    read: Option<String>,
+    read: Option<&str>,
 ) -> bool {
-    let Some(read) = read else {
-        return false;
-    };
     let key = keys.pack_pointer();
     match with_retry(&cfg.retry, &key, |_| store.get(&key)) {
         Ok(Some(obj)) => keys
             .read_pointer(&obj.body)
-            .is_ok_and(|p| p.is_some_and(|p| p.pack_key != read)),
+            .is_ok_and(|p| p.is_some_and(|p| Some(p.pack_key.as_str()) != read)),
         _ => false,
     }
 }

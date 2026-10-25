@@ -99,6 +99,10 @@ pub(crate) fn no_writer_gc() -> bool {
     }
 }
 
+/// The key of the pack the writer's background fetch still reads, asked before each pass
+/// (`BucketDbStorage::reading_pack`): GC never deletes it.
+pub(crate) type Fetching = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// The writer's GC thread. It runs a GC pass (`gc::gc_pass`, with `ages`) at start, on every
 /// message (the open's, then one per seal or generation switch; messages queued together make
 /// one pass) and when the next manifest, pack or orphan comes of age (the pass's `next_due`).
@@ -112,6 +116,7 @@ pub(crate) fn spawn_trimmer(
     ages: GcAges,
     rx: Receiver<TrimSnapshot>,
     events: Option<EventHook>,
+    fetching: Fetching,
 ) -> JoinHandle<()> {
     // The thread reports to the subscriber of the thread that opened the database.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -119,7 +124,7 @@ pub(crate) fn spawn_trimmer(
         .name("buckwal-trimmer".into())
         .spawn(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                trimmer_loop(&*store, &keys, ages, &rx, events.as_ref())
+                trimmer_loop(&*store, &keys, ages, &rx, events.as_ref(), &fetching)
             })
         })
         .expect("spawn trimmer thread")
@@ -131,15 +136,21 @@ fn trimmer_loop(
     ages: GcAges,
     rx: &Receiver<TrimSnapshot>,
     events: Option<&EventHook>,
+    fetching: &Fetching,
 ) {
     // The open's message is the pass at start: it is not run twice.
     while rx.try_recv().is_ok() {}
     let mut last = None;
     loop {
-        let wait = match gc_pass(store, keys, ages, last.as_ref()) {
+        let reading = fetching();
+        let wait = match gc_pass(store, keys, ages, last.as_ref(), reading.as_deref()) {
             Ok(pass) => {
                 if pass.outcome == GcOutcome::Trimmed {
                     last = pass.mark;
+                }
+                // A pass that deleted nothing is not reported: the trimmer wakes on every
+                // generation switch.
+                if pass.deleted > 0 {
                     if let Some(hook) = events {
                         hook(&Event::Trimmed {
                             deleted: pass.deleted,

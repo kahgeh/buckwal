@@ -32,6 +32,7 @@ pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
         lease: crate::config::defaults::LEASE,
         request_timeout: crate::config::defaults::REQUEST_TIMEOUT,
         trim_grace: crate::config::defaults::TRIM_GRACE,
+        pack_keep: None,
         events: None,
         read_only: false,
         io_mode: crate::io::IoMode::Writer,
@@ -976,6 +977,7 @@ fn restore_after_many_checkpoints_reads_only_current_generation() {
         crate::gc::GcAges::new(Duration::ZERO, crate::config::defaults::PACK_ORPHAN_GRACE),
         rx,
         Some(hook),
+        Arc::new(|| None),
     );
     let d = tempfile::tempdir().unwrap();
     let (e, conn) = writer_trimmed(mem.clone(), d.path(), &cfg, Some(tx));

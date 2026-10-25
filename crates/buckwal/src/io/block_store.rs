@@ -311,6 +311,16 @@ impl BlockStore {
         self.source.lock().unwrap().pointer.pack_key.clone()
     }
 
+    /// The size of the pack the blocks come from now, in bytes.
+    pub(crate) fn pack_size(&self) -> u64 {
+        self.source.lock().unwrap().pointer.size
+    }
+
+    /// The bytes of the blocks that are not local yet (each block counted whole).
+    pub(crate) fn bytes_left(&self) -> u64 {
+        (0..self.local.len()).filter(|&b| !self.done(b)).count() as u64 * BLOCK_SIZE
+    }
+
     /// The pointer's page size (checked against the header with the first block).
     pub(crate) fn page_size(&self) -> u32 {
         self.source.lock().unwrap().pointer.page_size

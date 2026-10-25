@@ -25,6 +25,7 @@ use std::sync::atomic::{
     Ordering::{Relaxed, SeqCst},
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use turso_core::io::FileSyncType;
 use turso_core::{Buffer, Completion, DatabaseStorage, File, IOContext, IO};
 
@@ -110,6 +111,9 @@ pub(crate) struct BucketDbStorage {
     packed: bool,
     /// A format 5 copy restored from a pack whose blocks are not all local yet.
     blocks: Option<Arc<BlockStore>>,
+    /// The trim grace and `Config::pack_keep`: the pack keep time a background fetch is
+    /// measured against (`config::pack_keep_time`).
+    keep: (Duration, Option<Duration>),
 }
 
 pub(crate) struct StorageParts {
@@ -130,6 +134,8 @@ pub(crate) struct StorageParts {
     pub packed: bool,
     /// The pack's blocks (`BucketDbStorage::blocks`).
     pub blocks: Option<Arc<BlockStore>>,
+    /// `BucketDbStorage::keep`.
+    pub keep: (Duration, Option<Duration>),
 }
 
 impl BucketDbStorage {
@@ -162,12 +168,23 @@ impl BucketDbStorage {
             mvcc: p.mvcc,
             packed: p.packed,
             blocks: p.blocks,
+            keep: p.keep,
         }
     }
 
     /// The copy reads blocks from a pack: the background fetch completes it.
     pub(crate) fn has_blocks(&self) -> bool {
         self.blocks.is_some()
+    }
+
+    /// The key of the pack the copy still reads blocks from: some block is not local yet.
+    /// `None` once every block is local (or the copy reads no pack). The writer's GC never
+    /// deletes this pack (spec "GC").
+    pub(crate) fn reading_pack(&self) -> Option<String> {
+        self.blocks
+            .as_ref()
+            .filter(|b| !b.is_complete())
+            .map(|b| b.pack_key())
     }
 
     /// The bucket is format 5: a WAL restart is a generation switch (`switch_generation`).
@@ -289,17 +306,53 @@ impl BucketDbStorage {
     /// A copy restored from a pack: fetch every block that is not local, in 16 MiB ranges, 8
     /// at once (`BlockStore::fetch_all`); once all are local, record the copy complete, and a
     /// writer removes the pack files. The `buckwal.prefetch` span as `prefetch` makes it, its
-    /// `buckwal.pages` the pages of the bytes fetched.
+    /// `buckwal.pages` the pages of the bytes fetched, and `buckwal.prefetch.past_half_keep`
+    /// true when the fetch still ran at half the pack keep time. A copy on another machine than
+    /// the writer (a read-only open, a replica) then logs a WARN `background fetch slower than
+    /// the pack keep time` with the bytes left: GC can delete its pack once the keep time has
+    /// passed (spec "Restore"). The writer's own GC keeps the pack it reads.
     fn fetch_pack(&self, blocks: &BlockStore, stop: &AtomicBool) {
         let span = tracing::info_span!(
             target: "buckwal",
             "buckwal.prefetch",
             buckwal.pages = tracing::field::Empty,
+            buckwal.prefetch.past_half_keep = tracing::field::Empty,
             buckwal.outcome = tracing::field::Empty,
         );
         let _run = span.enter();
         let before = blocks.fetched();
-        let outcome = match blocks.fetch_all(stop) {
+        let half = crate::config::pack_keep_time(self.keep.0, self.keep.1, blocks.pack_size()) / 2;
+        let past_half = AtomicBool::new(false);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let fetched = std::thread::scope(|s| {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let span = span.clone();
+            let past_half = &past_half;
+            s.spawn(move || {
+                // Ends at once when the fetch ends first (its sender is dropped).
+                if done_rx.recv_timeout(half) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    return;
+                }
+                past_half.store(true, SeqCst);
+                if self.mode != IoMode::Writer {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let _in = span.enter();
+                        tracing::warn!(
+                            target: "buckwal",
+                            pack_key = %blocks.pack_key(),
+                            bytes_left = blocks.bytes_left(),
+                            keep_ms = (half * 2).as_millis() as u64,
+                            "background fetch slower than the pack keep time"
+                        );
+                    });
+                }
+            });
+            let r = blocks.fetch_all(stop);
+            drop(done_tx);
+            r
+        });
+        span.record("buckwal.prefetch.past_half_keep", past_half.load(SeqCst));
+        let outcome = match fetched {
             Ok(true) => {
                 let r = self.mark_complete().and_then(|_| match self.mode {
                     IoMode::Writer => super::block_store::remove_files(&self.dir),

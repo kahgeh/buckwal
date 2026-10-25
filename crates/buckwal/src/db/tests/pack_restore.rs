@@ -917,8 +917,47 @@ fn restore_restarts_when_gc_deletes_its_pack_and_log_between_steps() {
     crash(db, vec![c]);
 }
 
+/// The log lines and the `buckwal.restore` span of a restore run under a capture.
+struct Seen {
+    restarted: Vec<crate::telemetry::testing::EventRec>,
+    gave_up: Vec<crate::telemetry::testing::EventRec>,
+    errors: usize,
+    restarts: Option<String>,
+    outcome: Option<String>,
+}
+
+fn seen<T>(f: impl FnOnce() -> T) -> (T, Seen) {
+    use crate::telemetry::testing::Capture;
+    let cap = Capture::new();
+    let out = tracing::subscriber::with_default(cap.subscriber(), f);
+    let spans = cap.spans();
+    let msg = |m: &str| -> Vec<_> {
+        spans
+            .events
+            .iter()
+            .filter(|e| e.field("message") == Some(m))
+            .cloned()
+            .collect()
+    };
+    let restore = spans.named("buckwal.restore");
+    let last = restore.last().expect("a buckwal.restore span");
+    let seen = Seen {
+        restarted: msg("restore restarted"),
+        gave_up: msg("restore gave up"),
+        errors: spans
+            .events
+            .iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .count(),
+        restarts: last.field("buckwal.restore.restarts").map(str::to_string),
+        outcome: last.field("buckwal.restore.outcome").map(str::to_string),
+    };
+    (out, seen)
+}
+
 /// A pointer that keeps naming a pack that is gone: the restore starts again at most 3 times,
-/// then fails with the pack's `NotFound`, and leaves no database.
+/// one WARN per restart with its attempt number, then stops with the `Timeout` of spec rev 14,
+/// one ERROR and the span outcome `gave_up`, and leaves no database.
 #[test]
 fn restore_of_a_pack_that_stays_gone_stops_after_its_restarts() {
     let store = mem();
@@ -928,8 +967,15 @@ fn restore_of_a_pack_that_stays_gone_stops_after_its_restarts() {
     store.delete(&p.pack_key).unwrap();
     let rec = Recording::new(store.clone());
     let r = tempdir();
-    let e = restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap_err();
-    assert_eq!(e, Error::NotFound(p.pack_key.clone()));
+    let (e, seen) =
+        seen(|| restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap_err());
+    assert_eq!(
+        e,
+        Error::Timeout(
+            "restore: the pack changed 3 times while it was read; raise BUCKWAL_PACK_KEEP_SECS"
+                .into()
+        )
+    );
     let tries = rec
         .take_ranges()
         .iter()
@@ -937,6 +983,144 @@ fn restore_of_a_pack_that_stays_gone_stops_after_its_restarts() {
         .count();
     assert_eq!(tries, 4, "one attempt and 3 restarts");
     assert!(!fresh(&r).join("app.db").exists());
+    assert_eq!(seen.restarted.len(), 3);
+    for (i, w) in seen.restarted.iter().enumerate() {
+        assert_eq!(w.level, tracing::Level::WARN);
+        assert_eq!(
+            w.field("attempt"),
+            Some((i + 1).to_string().as_str()),
+            "{w:?}"
+        );
+        assert_eq!(w.field("reason"), Some("pack_missing"), "{w:?}");
+        assert_eq!(w.field("pack_key"), Some(p.pack_key.as_str()), "{w:?}");
+    }
+    assert_eq!(seen.gave_up.len(), 1);
+    assert_eq!(seen.gave_up[0].field("attempt"), Some("4"));
+    assert_eq!(seen.errors, 1, "one ERROR");
+    assert_eq!(seen.restarts.as_deref(), Some("3"));
+    assert_eq!(seen.outcome.as_deref(), Some("gave_up"));
+    crash(db, vec![c]);
+}
+
+/// A restore of the log alone (no pack yet) meets a log object that GC deleted: a pack run and
+/// GC ran between its first log GET and the rest. It reads the pointer again, starts again from
+/// the new pack, logs one WARN `log_missing`, and records 1 restart and outcome `restored`.
+#[test]
+fn log_only_restore_whose_log_was_deleted_restarts_from_the_pointer() {
+    let store = mem();
+    let a = tempdir();
+    let cfg = config(a.path());
+    let db = open_with_store(cfg.clone(), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    insert_big(&c, 1..=20);
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    insert_big(&c, 21..=40);
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    insert_big(&c, 41..=45);
+    assert!(
+        store.get(&keys().pack_pointer()).unwrap().is_none(),
+        "no pack yet"
+    );
+    let want = rows(&c);
+    let rec = Recording::new(store.clone());
+    let (gc, packer) = (store.clone(), cfg.clone());
+    *rec.after_get.lock().unwrap() = Some((
+        keys().log_prefix(1),
+        Box::new(move || {
+            let r = pack_now(gc.clone(), &packer);
+            for g in 1..r.pack_generation {
+                for seq in log_seqs(&*gc, g) {
+                    gc.delete(&keys().log(g, seq)).unwrap();
+                }
+            }
+        }),
+    ));
+    let r = tempdir();
+    let (rep, seen) =
+        seen(|| restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap());
+    let p = pointer(&*store, &keys());
+    assert_eq!(rep.pack_key.as_deref(), Some(p.pack_key.as_str()));
+    assert_eq!(seen.restarted.len(), 1, "one restart");
+    let w = &seen.restarted[0];
+    assert_eq!(
+        (w.field("attempt"), w.field("reason"), w.field("pack_key")),
+        (Some("1"), Some("log_missing"), Some(""))
+    );
+    assert_eq!(seen.errors, 0);
+    assert_eq!(seen.restarts.as_deref(), Some("1"));
+    assert_eq!(seen.outcome.as_deref(), Some("restored"));
+    let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
+    let vc = v.connect().unwrap();
+    integrity_ok(&vc);
+    assert_eq!(rows(&vc), want);
+    drop(vc);
+    drop(v);
+    crash(db, vec![c]);
+}
+
+/// A restore from a pack meets a log object that GC deleted below a newer pack (the older pack
+/// is still there): it starts again from the newer pack with the reason `log_missing`.
+#[test]
+fn restore_whose_log_was_deleted_restarts_from_the_newer_pack() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    let old = pointer(&*store, &keys());
+    let old_body = store.get(&keys().pack_pointer()).unwrap().unwrap().body;
+    c.execute("UPDATE t SET v = 'q' WHERE id > 440", &[])
+        .unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    insert_big(&c, 451..=453);
+    pack_now(store.clone(), &config(a.path()));
+    let new = pointer(&*store, &keys());
+    let want = rows(&c);
+    let rec = Recording::new(store.clone());
+    *rec.first_pointer.lock().unwrap() = Some(old_body);
+    let (gc, below) = (store.clone(), new.pack_generation);
+    *rec.after_range.lock().unwrap() = Some(Box::new(move || {
+        for g in 1..below {
+            for seq in log_seqs(&*gc, g) {
+                gc.delete(&keys().log(g, seq)).unwrap();
+            }
+        }
+    }));
+    let r = tempdir();
+    let (rep, seen) =
+        seen(|| restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap());
+    assert!(
+        store.get(&old.pack_key).unwrap().is_some(),
+        "the old pack stays"
+    );
+    assert_eq!(rep.pack_key.as_deref(), Some(new.pack_key.as_str()));
+    assert_eq!(seen.restarted.len(), 1);
+    let w = &seen.restarted[0];
+    assert_eq!(
+        (w.field("attempt"), w.field("reason"), w.field("pack_key")),
+        (Some("1"), Some("log_missing"), Some(old.pack_key.as_str()))
+    );
+    assert_eq!(seen.outcome.as_deref(), Some("restored"));
+    let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
+    let vc = v.connect().unwrap();
+    integrity_ok(&vc);
+    assert_eq!(rows(&vc), want);
+    drop(vc);
+    drop(v);
+    crash(db, vec![c]);
+}
+
+/// A restore that meets no deletion records 0 restarts and the outcome `restored`.
+#[test]
+fn restore_without_restart_records_restored() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    let r = tempdir();
+    let (_, seen) =
+        seen(|| restore_with_store(&config(&fresh(&r)), store.clone(), &fresh(&r)).unwrap());
+    assert!(seen.restarted.is_empty());
+    assert_eq!(seen.restarts.as_deref(), Some("0"));
+    assert_eq!(seen.outcome.as_deref(), Some("restored"));
     crash(db, vec![c]);
 }
 
@@ -971,4 +1155,167 @@ fn read_only_open_restores_again_when_the_head_moves_during_its_restore() {
     drop(vc);
     drop(v);
     crash(db, vec![c]);
+}
+
+/// A copy on another machine than the writer (a read-only open) whose background fetch still
+/// runs at half the pack keep time logs one WARN `background fetch slower than the pack keep
+/// time` with the bytes left, and its `buckwal.prefetch` span says `past_half_keep`. The
+/// writer's own fetch records the attribute but logs no WARN (its GC keeps its pack).
+#[test]
+fn background_fetch_past_half_the_keep_time_warns_on_a_reader() {
+    for writer in [false, true] {
+        let store = mem();
+        let a = tempdir();
+        let (db, c) = packed_writer(&store, config(a.path()));
+        crash(db, vec![c]);
+        let rec = Recording::new(store.clone());
+        rec.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        let b = tempdir();
+        // Trim grace 1 s: the pack keep time is 1 s, half of it 0.5 s.
+        let cfg = config_with_lease(&fresh(&b), Duration::from_millis(300));
+        let cap = crate::telemetry::testing::Capture::new();
+        let db = tracing::subscriber::with_default(cap.subscriber(), || {
+            if writer {
+                open_with_store(cfg.clone(), rec.clone()).unwrap()
+            } else {
+                open_read_only_with_store(cfg.clone(), rec.clone()).unwrap()
+            }
+        });
+        std::thread::sleep(Duration::from_millis(900));
+        rec.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        let t = Instant::now();
+        let span = loop {
+            let spans = cap.spans();
+            if let Some(s) = spans
+                .named("buckwal.prefetch")
+                .into_iter()
+                .find(|s| s.closed.is_some())
+            {
+                break s.clone();
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "the fetch never ended"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(span.field("buckwal.prefetch.past_half_keep"), Some("true"));
+        let warns: Vec<_> = cap
+            .spans()
+            .events
+            .into_iter()
+            .filter(|e| {
+                e.field("message") == Some("background fetch slower than the pack keep time")
+            })
+            .collect();
+        if writer {
+            assert!(warns.is_empty(), "{warns:?}");
+        } else {
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert_eq!(warns[0].level, tracing::Level::WARN);
+            let left: u64 = warns[0].field("bytes_left").unwrap().parse().unwrap();
+            assert!(left > 0, "{warns:?}");
+        }
+        db.close().unwrap();
+    }
+}
+
+/// A fetch that ends well within half the keep time records `past_half_keep` false.
+#[test]
+fn background_fetch_within_the_keep_time_records_false() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    crash(db, vec![c]);
+    let b = tempdir();
+    let cap = crate::telemetry::testing::Capture::new();
+    let db = tracing::subscriber::with_default(cap.subscriber(), || {
+        open_read_only_with_store(config(&fresh(&b)), store.clone()).unwrap()
+    });
+    let t = Instant::now();
+    let span = loop {
+        if let Some(s) = cap
+            .spans()
+            .named("buckwal.prefetch")
+            .into_iter()
+            .find(|s| s.closed.is_some())
+        {
+            break s.clone();
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "the fetch never ended"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(span.field("buckwal.prefetch.past_half_keep"), Some("false"));
+    db.close().unwrap();
+}
+
+/// The writer's GC never deletes the pack that the writer still reads blocks from, past the
+/// pack keep time, while it deletes the log below the newer pack. (No background fetch here:
+/// the blocks past the first stay remote.)
+#[test]
+fn writer_gc_keeps_the_pack_its_own_copy_still_reads() {
+    let store = mem();
+    let a = tempdir();
+    let cfg_a = config(a.path());
+    let dba = open_with_store(cfg_a.clone(), store.clone()).unwrap();
+    let ca = dba.connect().unwrap();
+    create(&ca);
+    insert_big(&ca, 1..=1000);
+    ca.checkpoint(CheckpointMode::Truncate).unwrap();
+    pack_now(store.clone(), &cfg_a);
+    let first = pointer(&*store, &keys());
+    crash(dba, vec![ca]);
+
+    let _no_fetch = NoBackgroundFetch::on();
+    let trimmed: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let seen = trimmed.clone();
+    let b = tempdir();
+    let mut cfg_b = config(&fresh(&b));
+    cfg_b.on_event = Some(Arc::new(move |e: &crate::config::Event| {
+        if let crate::config::Event::Trimmed { deleted } = e {
+            seen.lock().unwrap().push(*deleted);
+        }
+    }));
+    let db = open_with_store(cfg_b.clone(), store.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert!(fresh(&b).join(BLOCKS_FILE).exists(), "blocks still remote");
+    insert_big(&c, 1001..=1002);
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    pack_now(store.clone(), &cfg_a);
+    let second = pointer(&*store, &keys());
+    assert!(second.pack_generation > first.pack_generation);
+    store.advance_clock(Duration::from_secs(3600));
+    // A switch wakes the writer's GC.
+    insert_big(&c, 1003..=1003);
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let t = Instant::now();
+    while trimmed.lock().unwrap().is_empty() {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "the writer's GC never trimmed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(fresh(&b).join(BLOCKS_FILE).exists(), "blocks still remote");
+    assert!(
+        store.get(&first.pack_key).unwrap().is_some(),
+        "the pack it reads stays"
+    );
+    assert!(store.get(&first.codes_key).unwrap().is_some());
+    for g in 1..second.pack_generation {
+        assert!(
+            log_seqs(&*store, g).is_empty(),
+            "log/{g} below the GC base goes"
+        );
+    }
+    // Every row still reads, from the pack it kept.
+    assert_eq!(rows(&c).len(), 1003);
+    // `gc` of another process does not know the writer's copy: it deletes the pack.
+    let r = crate::gc::gc_with_store(&config(a.path()), store.clone()).unwrap();
+    assert_eq!(r.packs_deleted, 1, "{r:?}");
+    drop(c);
+    db.close().unwrap();
 }
