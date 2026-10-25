@@ -292,7 +292,8 @@ pub(crate) fn pack_run(
     config.validate()?;
     let enc = encryption::load(config)?;
     let run_id = crate::db::new_writer_id()?;
-    let work = WorkDir::create(config.dir.join(format!("pack-work-{run_id}")))?;
+    sweep_work_dirs(config);
+    let work = WorkDir::create(config.dir.join(format!("{WORK_DIR_PREFIX}{run_id}")))?;
     let mut run = Run {
         store: &*store,
         keys: config.keys_for(enc.as_deref()),
@@ -333,6 +334,57 @@ pub(crate) fn pack_run(
 }
 
 /// The run's working directory, removed when the run ends, whatever the outcome.
+/// The name of a pack run's working directory in `config.dir` starts with this, then its
+/// run id.
+pub(crate) const WORK_DIR_PREFIX: &str = "pack-work-";
+
+/// Remove each `pack-work-*` directory in `dir` that nothing changed for `max_age` (half the
+/// orphan grace): a crashed run left it. No live run owns one so old: a run gives up at half
+/// the orphan grace after its upload starts, and it adds its last entry before the upload. A
+/// missing `dir` has nothing to remove. A pack run's start and a writer's open call it.
+pub(crate) fn remove_stale_work_dirs(dir: &Path, max_age: Duration) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_err("list pack working dirs", e)),
+    };
+    for e in entries {
+        let e = e.map_err(|e| io_err("list pack working dirs", e))?;
+        if !e.file_name().to_string_lossy().starts_with(WORK_DIR_PREFIX) {
+            continue;
+        }
+        let age = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map_err(|e| io_err("read pack working dir time", e))?
+            .elapsed()
+            .unwrap_or_default();
+        if age < max_age || !e.path().is_dir() {
+            continue;
+        }
+        tracing::info!(
+            target: "buckwal",
+            dir = %e.path().display(),
+            age_secs = age.as_secs(),
+            "removing the working dir of a pack run that did not finish"
+        );
+        match fs::remove_dir_all(e.path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("remove stale pack working dir", e)),
+        }
+    }
+    Ok(())
+}
+
+/// [`remove_stale_work_dirs`] with `config`'s orphan grace; a failure only warns (the next
+/// start tries again).
+pub(crate) fn sweep_work_dirs(config: &Config) {
+    if let Err(e) = remove_stale_work_dirs(&config.dir, config.pack_orphan_grace / 2) {
+        tracing::warn!(target: "buckwal", error = %e, "cannot remove an old pack working dir");
+    }
+}
+
 struct WorkDir(PathBuf);
 
 impl WorkDir {

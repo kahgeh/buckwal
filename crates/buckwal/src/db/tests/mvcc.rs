@@ -18,7 +18,6 @@ fn mvcc(dir: &Path) -> Config {
     let mut c = config(dir);
     c.journal_mode = JournalMode::Mvcc;
     c.retry_deadline = Duration::from_millis(300);
-    c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
     c
 }
@@ -570,7 +569,6 @@ pub(super) fn mvcc_enc(dir: &Path, keydir: &TempDir, hex: &str) -> Config {
     let m = mvcc(dir);
     c.journal_mode = m.journal_mode;
     c.retry_deadline = m.retry_deadline;
-    c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
     c
 }

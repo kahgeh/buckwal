@@ -154,8 +154,6 @@ pub(crate) struct Uploader {
     commits: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
     generation: Arc<AtomicU64>,
-    /// How many log objects the current generation holds (the bucket's next seq − 1).
-    log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
     /// The last bucket operation (a log upload, a seal, or a tick's catch-up or probe)
     /// failed; cleared by the next that succeeds. While set, the thread wakes every
@@ -181,7 +179,6 @@ impl Uploader {
     ) -> Arc<Uploader> {
         bucket.set_event_hook(events.clone());
         let generation = Arc::new(AtomicU64::new(bucket.head().generation));
-        let log_objects = Arc::new(AtomicU64::new(bucket.next_seq().saturating_sub(1)));
         let degraded = Arc::new(AtomicBool::new(bucket.degraded()));
         let last_failed = Arc::new(AtomicBool::new(false));
         let quiet_until = Arc::new(Mutex::new(bucket.quiet_until()));
@@ -198,7 +195,6 @@ impl Uploader {
             batch: Batch::default(),
             owed: VecDeque::new(),
             generation: generation.clone(),
-            log_objects: log_objects.clone(),
             degraded: degraded.clone(),
             last_failed: last_failed.clone(),
             quiet_until: quiet_until.clone(),
@@ -218,7 +214,6 @@ impl Uploader {
             commits: AtomicU64::new(0),
             thread: Mutex::new(Some(thread)),
             generation,
-            log_objects,
             degraded,
             last_failed,
             quiet_until,
@@ -344,12 +339,6 @@ impl Uploader {
         self.generation.load(SeqCst)
     }
 
-    /// How many log objects the current generation holds, as of the last job: what a
-    /// restore of it would read. Reset by each seal. The maintenance trigger reads it.
-    pub(crate) fn generation_log_objects(&self) -> u64 {
-        self.log_objects.load(SeqCst)
-    }
-
     /// Why the bucket looks unable to take a seal now, if it does: the uploader is degraded,
     /// or its last bucket operation failed. Maintenance does not start a run then.
     pub(crate) fn bucket_failing(&self) -> Option<&'static str> {
@@ -458,7 +447,6 @@ struct Worker {
     /// everything newer.
     owed: VecDeque<Pending>,
     generation: Arc<AtomicU64>,
-    log_objects: Arc<AtomicU64>,
     degraded: Arc<AtomicBool>,
     last_failed: Arc<AtomicBool>,
     quiet_until: Arc<Mutex<Option<Instant>>>,
@@ -542,7 +530,7 @@ impl Worker {
         }
     }
 
-    /// Publish `degraded`, the generation's log object count and its takeover quiet (every
+    /// Publish `degraded` and the generation's takeover quiet (every
     /// append and seal goes through here before its replies).
     fn publish_degraded(&mut self) {
         if !self.bucket.degraded() {
@@ -550,8 +538,6 @@ impl Worker {
         }
         let d = self.bucket.degraded() || !self.owed.is_empty();
         self.degraded.store(d, SeqCst);
-        self.log_objects
-            .store(self.bucket.next_seq().saturating_sub(1), SeqCst);
         *crate::db::lock(&self.quiet_until) = self.bucket.quiet_until();
     }
 

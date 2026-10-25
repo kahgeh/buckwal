@@ -706,29 +706,6 @@ fn uploader_is_degraded_while_window_syncs_are_owed() {
     assert_eq!(logged_ops(&store.inner, 1), vec![op(1)]);
 }
 
-/// The maintenance trigger's count: the generation's log objects, published before each
-/// reply, and back to 0 at a seal.
-#[test]
-fn generation_log_objects_counts_appends_and_resets_at_seal() {
-    let mem = Arc::new(MemStore::new());
-    let up = Uploader::spawn(bucket(mem.clone()), None, None, Arc::default());
-    assert_eq!(up.generation_log_objects(), 0);
-    for n in 1..=3 {
-        up.submit_log(op(n), Batching::Off).wait().unwrap();
-        assert_eq!(up.generation_log_objects(), n);
-    }
-    // Two Window syncs share one object.
-    let a = up.submit_log(op(4), window(10_000, 2));
-    let b = up.submit_log(op(5), window(10_000, 2));
-    a.wait().unwrap();
-    b.wait().unwrap();
-    assert_eq!(up.generation_log_objects(), 4);
-    assert_eq!(up.seal_generation(vec![(1, vec![1u8; 32])], 32, 1), Ok(2));
-    assert_eq!(up.generation_log_objects(), 0);
-    up.submit_log(op(6), Batching::Off).wait().unwrap();
-    assert_eq!(up.generation_log_objects(), 1);
-}
-
 /// Wait (at most `within`) until the uploader no longer reports the bucket failing.
 fn wait_not_failing(u: &Uploader, within: Duration) {
     let until = Instant::now() + within;

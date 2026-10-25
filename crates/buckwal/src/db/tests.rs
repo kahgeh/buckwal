@@ -3491,7 +3491,7 @@ fn encrypted_maintenance_checkpoint_seals() {
     let t = tempdir();
     let k = tempdir();
     let mut cfg = enc_config(t.path(), &k, &key_hex());
-    cfg.maintenance_log_objects = 5;
+    cfg.maintenance_wal_bytes = 16 << 10;
     let db = open_with_store(cfg, store.clone()).unwrap();
     let gen = db.generation();
     let c = db.connect().unwrap();

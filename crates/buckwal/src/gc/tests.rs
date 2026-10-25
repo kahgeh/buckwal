@@ -309,7 +309,6 @@ fn mvcc_config(dir: &Path) -> Config {
     let mut c = config(dir);
     c.journal_mode = crate::config::JournalMode::Mvcc;
     c.retry_deadline = Duration::from_millis(300);
-    c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
     c
 }

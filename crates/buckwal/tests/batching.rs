@@ -979,6 +979,10 @@ fn a_failed_commit_clears_its_override() {
 
 // ---- The maintenance checkpoint ----
 
+/// The bytes of one WAL frame of a 4 KiB page: the WAL size limit of a test is a number of
+/// frames (a small autocommit insert writes one).
+const FRAME: u64 = 4096 + 24;
+
 /// What one sustained run measured (printed whole; some fields are only printed).
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -1063,9 +1067,9 @@ fn seals(ev: &[Event]) -> usize {
 }
 
 /// `commits` inserts over THREADS connections committing with `batching` (log PUTs delayed
-/// `put_delay`), maintenance at `log_objects` (0 = off). Every call must succeed, but for
+/// `put_delay`), maintenance at the WAL size limit `wal_bytes` (0 = off). Every call must succeed, but for
 /// the engine's own busy refusals, which are counted and retried, and every row restore.
-fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Duration) -> Figures {
+fn sustained(batching: Batching, wal_bytes: u64, commits: usize, put_delay: Duration) -> Figures {
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));
     fault.only_keys_containing("log/");
@@ -1073,8 +1077,7 @@ fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Du
     let rec = Recorder::default();
     let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
         c.batching = batching;
-        c.maintenance_log_objects = log_objects;
-        c.maintenance_wal_bytes = 0;
+        c.maintenance_wal_bytes = wal_bytes;
     });
     let c = db.connect().unwrap();
     create(&c);
@@ -1170,9 +1173,10 @@ fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Du
     }
 }
 
-/// Under sustained Window commits from 8 connections, with maintenance the generation ends
-/// every ~200 log objects, and a restore reads at most that of the head's generation. Without
-/// maintenance (the baseline, for the record) only the engine's own WAL restarts end one.
+/// Under sustained Window commits from 8 connections, with maintenance at a WAL size limit of
+/// 200 frames the generation ends every 200 log objects at most (each object holds at least
+/// one frame), and a restore reads at most that of the head's generation. Without maintenance
+/// (the baseline, for the record) only the engine's own WAL restarts end one.
 #[test]
 fn sustained_window_load_seals_and_bounds_restore_gets() {
     const THRESHOLD: u64 = 200;
@@ -1182,7 +1186,7 @@ fn sustained_window_load_seals_and_bounds_restore_gets() {
     let win = w(1, 64, 1 << 20);
     let before = sustained(win, 0, COMMITS, Duration::from_millis(1));
     eprintln!("window before (maintenance off): {before:?}");
-    let after = sustained(win, THRESHOLD, COMMITS, Duration::from_millis(1));
+    let after = sustained(win, THRESHOLD * FRAME, COMMITS, Duration::from_millis(1));
     eprintln!("window after (maintenance at {THRESHOLD}): {after:?}");
     // A format 5 generation switch uploads no page, so the engine's own WAL restarts now end
     // generations under load too, at no fixed size: the baseline is for the record only.
@@ -1211,8 +1215,13 @@ fn off_with_eight_connections_figures() {
     const COMMITS: usize = 2400;
     let before = sustained(Batching::Off, 0, COMMITS, Duration::from_millis(1));
     eprintln!("off before (maintenance off): {before:?}");
-    let after = sustained(Batching::Off, 200, COMMITS, Duration::from_millis(1));
-    eprintln!("off after (maintenance at 200): {after:?}");
+    let after = sustained(
+        Batching::Off,
+        200 * FRAME,
+        COMMITS,
+        Duration::from_millis(1),
+    );
+    eprintln!("off after (maintenance at 200 frames): {after:?}");
     assert!(after.seals >= 1, "{after:?}");
 }
 
@@ -1223,8 +1232,7 @@ fn maintenance_waits_out_an_open_transaction_and_retries() {
     let rec = Recorder::default();
     let store = mem();
     let (_d, db) = open_with(store.clone(), rec.clone(), |c| {
-        c.maintenance_log_objects = 20;
-        c.maintenance_wal_bytes = 0;
+        c.maintenance_wal_bytes = 20 * FRAME;
         c.maintenance_gate_wait = Duration::from_millis(100);
     });
     let c = db.connect().unwrap();
@@ -1271,7 +1279,7 @@ fn window_transactions_from_eight_connections_still_seal() {
     let win = w(1, 64, 1 << 20);
     let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
         c.batching = win;
-        c.maintenance_log_objects = 200;
+        c.maintenance_wal_bytes = 200 * FRAME;
     });
     let c = db.connect().unwrap();
     create(&c);
@@ -1343,7 +1351,7 @@ fn maintenance_never_fails_a_commit() {
     let win = w(1, 64, 1 << 20);
     let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
         c.batching = win;
-        c.maintenance_log_objects = 20;
+        c.maintenance_wal_bytes = 20 * FRAME;
         c.retry_deadline = Duration::from_millis(200);
         c.request_timeout = Duration::from_millis(50);
     });
@@ -1392,8 +1400,8 @@ fn failed_maintenance_seal_passes_to_the_next_commit() {
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let rec = Recorder::default();
     // Off: each commit's object is in the bucket before its call pokes maintenance.
-    let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
-        c.maintenance_log_objects = 20;
+    let (d, db) = open_with(fault.clone(), rec.clone(), |c| {
+        c.maintenance_wal_bytes = 20 * FRAME;
         c.retry_deadline = Duration::from_millis(200);
         c.request_timeout = Duration::from_millis(50);
     });
@@ -1402,19 +1410,14 @@ fn failed_maintenance_seal_passes_to_the_next_commit() {
     fault.only_keys_containing("head");
     fault.fail_puts_after(0);
     // Up to the call whose poke starts the run, and no further, so no insert of ours races
-    // it.
-    let last_seq = || {
-        rec.events()
-            .iter()
-            .filter_map(|e| match e {
-                Event::LogUploaded { seq, .. } => Some(*seq),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
+    // it. Nothing restarted the WAL: its file size is the measure.
+    let wal_len = || {
+        std::fs::metadata(d.path().join("app.db-wal"))
+            .unwrap()
+            .len()
     };
     let mut x = 0;
-    while last_seq() < 20 {
+    while wal_len() < 20 * FRAME {
         insert(&c, x).unwrap();
         x += 1;
     }
@@ -1437,10 +1440,9 @@ fn failed_maintenance_seal_passes_to_the_next_commit() {
 }
 
 #[test]
-fn maintenance_off_when_both_thresholds_zero() {
+fn maintenance_off_when_the_wal_limit_is_zero() {
     let rec = Recorder::default();
     let (_d, db) = open_with(mem(), rec.clone(), |c| {
-        c.maintenance_log_objects = 0;
         c.maintenance_wal_bytes = 0;
         c.maintenance_gate_wait = Duration::ZERO;
     });
@@ -1467,14 +1469,13 @@ fn maintenance_off_when_both_thresholds_zero() {
     reader.execute("COMMIT", &[]).unwrap();
 }
 
-/// A read-only open never runs maintenance, even with the generation far past both
-/// thresholds: the restored copy is taken while the writer is open, so its generation holds
+/// A read-only open never runs maintenance, even with the `-wal` far past the WAL size
+/// limit: the restored copy is taken while the writer is open, so its generation holds
 /// every commit's log object and its `-wal` every frame.
 #[test]
 fn read_only_open_runs_no_maintenance() {
     let store = mem();
     let (_wd, writer) = open_with(store.clone(), Recorder::default(), |c| {
-        c.maintenance_log_objects = 0;
         c.maintenance_wal_bytes = 0;
     });
     let w = writer.connect().unwrap();
@@ -1488,7 +1489,6 @@ fn read_only_open_runs_no_maintenance() {
     let rec = Recorder::default();
     let mut cfg = config(dir.path());
     cfg.on_event = Some(rec.hook());
-    cfg.maintenance_log_objects = 1;
     cfg.maintenance_wal_bytes = 1;
     let db = open_read_only_with_store(cfg, store).unwrap();
     let c = db.connect().unwrap();
@@ -1522,8 +1522,7 @@ fn a_long_transaction_does_not_close_the_gate_back_to_back() {
     let store = mem();
     let gate_wait = Duration::from_millis(500);
     let (_d, db) = open_with(store.clone(), rec.clone(), |c| {
-        c.maintenance_log_objects = 20;
-        c.maintenance_wal_bytes = 0;
+        c.maintenance_wal_bytes = 20 * FRAME;
         c.maintenance_gate_wait = gate_wait;
     });
     let c = db.connect().unwrap();
@@ -1573,7 +1572,6 @@ fn maintenance_skips_while_the_bucket_fails_and_reads_never_wait() {
     let (_d, db) = open_with(fault.clone(), rec.clone(), |c| {
         c.retry_deadline = Duration::from_millis(200);
         c.request_timeout = Duration::from_millis(50);
-        c.maintenance_log_objects = 0;
         c.maintenance_wal_bytes = 64 << 10;
         c.maintenance_gate_wait = gate_wait;
     });

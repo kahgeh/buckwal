@@ -1,25 +1,35 @@
-//! The maintenance checkpoint: a writer open seals its generation itself once the log (or the
-//! local `-wal`) passes a threshold, because the engine restarts the WAL only when a writer
-//! finds it fully backfilled with no reader on it, which sustained concurrent commits (Window
-//! commits above all) never leave room for.
+//! The writer's checkpoints (spec "The writer"), on the `buckwal-maintenance` thread.
+//!
+//! - PASSIVE, often: in a format 5 WAL database, once the generation's `-wal` holds
+//!   `defaults::PASSIVE_CHECKPOINT_WAL_BYTES`, at most once per
+//!   `defaults::PASSIVE_CHECKPOINT_INTERVAL`. It never closes the gate and never waits for a
+//!   reader. When no reader holds the WAL, it backfills every frame, so the next commit
+//!   restarts the WAL (a generation switch). The engine runs its own PASSIVE checkpoint after
+//!   a commit only at 1000 frames past the backfill: a reader that held the newest frames at
+//!   that time can keep the engine from a new try for 1000 more frames.
+//! - The maintenance checkpoint, only at the WAL size limit (`maintenance_wal_bytes`): readers
+//!   that never leave keep the engine from a WAL restart, so the WAL grows. The run closes the
+//!   gate, waits for the calls in flight, and runs `checkpoint(TRUNCATE)`. The TRUNCATE ends
+//!   the generation at `truncate(0)` through the same path as a user's checkpoint
+//!   (`ShippingFile::truncate`), which flushes every batched commit first. In a format 5
+//!   bucket that is a generation switch, which uploads no page; formats 1 to 4 still seal.
 //!
 //! - [`Gate`]: every public `Connection` call enters it around its engine work (an open
 //!   explicit transaction stays inside until it ends). Maintenance closes it, waits for the
 //!   calls in flight to leave (at most `gate_wait`), checkpoints, and opens it again.
-//! - [`Maintenance`]: the `buckwal-maintenance` thread. `Connection::call` pokes it
-//!   after each call (a few atomic loads); it runs `checkpoint(TRUNCATE)` on its own engine
-//!   connection while the gate is drained. The TRUNCATE seals at `truncate(0)` through the
-//!   same path as a user's checkpoint (`ShippingFile::truncate`), which flushes every batched
-//!   commit first.
+//! - [`Maintenance`]: the thread. `Connection::call` pokes it after each call (a few atomic
+//!   loads); it runs each checkpoint on its own engine connection.
 //!
-//! No run starts while the bucket looks unable to take a seal (the uploader is degraded or
-//! its last upload failed): the gate would stay closed for the seal's whole retry deadline.
-//! Nor during a takeover quiet (`Uploader::seal_quiet_remaining`): the seal would wait it out
-//! with the gate closed; that run is retried once the quiet has passed. A run that is skipped, cannot drain the gate, finds the engine busy or fails backs off
-//! for `retry`; repeated gate timeouts and busy refusals double it up to `retry_max`
-//! (growth does not fix their cause), and a failed run is retried sooner only once the
-//! generation has grown by another threshold. Its outcome is an event, a
-//! `buckwal.maintenance` span and, on failure, a warning: never an error to any caller.
+//! No maintenance run starts while the bucket looks unable to take a seal (the uploader is
+//! degraded or its last upload failed): the gate would stay closed for the seal's whole retry
+//! deadline. Nor during a takeover quiet (`Uploader::seal_quiet_remaining`): the seal would
+//! wait it out with the gate closed; that run is retried once the quiet has passed. A run that
+//! is skipped, cannot drain the gate, finds the engine busy or fails backs off for `retry`;
+//! repeated gate timeouts and busy refusals double it up to `retry_max` (growth does not fix
+//! their cause), and a failed run is retried sooner only once the `-wal` has grown by another
+//! limit. Its outcome is an event, a `buckwal.maintenance` span and, on failure, a warning:
+//! never an error to any caller. A PASSIVE checkpoint has no event and no span; a failed one
+//! warns.
 use crate::batching::{ctx, Batching};
 use crate::config::{defaults, Config, Event};
 use crate::conn::BUSY_TIMEOUT;
@@ -35,13 +45,17 @@ use std::time::{Duration, Instant};
 use tracing::field::Empty;
 use turso_core::{LimboError, SyncMode};
 
-/// When maintenance runs, from [`Config`].
+/// When the checkpoints run, from [`Config`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MaintenanceConfig {
-    /// Run once the generation's log holds this many objects; 0 = never on this measure.
-    pub log_objects: u64,
-    /// Run once the generation's `-wal` reaches this many bytes; 0 = never on this measure.
+    /// The WAL size limit: a maintenance run once the generation's `-wal` reaches this many
+    /// bytes; 0 = never.
     pub wal_bytes: u64,
+    /// A PASSIVE checkpoint once the generation's `-wal` reaches this many bytes; 0 = never
+    /// (formats 1 to 4, where each WAL restart seals, and MVCC).
+    pub passive_wal_bytes: u64,
+    /// The least time between two PASSIVE checkpoints.
+    pub passive_interval: Duration,
     /// The longest a run holds the gate closed waiting for calls in flight.
     pub gate_wait: Duration,
     /// The least time between a skipped or failed run and the next.
@@ -51,42 +65,42 @@ pub(crate) struct MaintenanceConfig {
 }
 
 impl MaintenanceConfig {
-    pub(crate) fn from_config(c: &Config) -> MaintenanceConfig {
+    /// The settings of `c`. `passive`: the writer runs PASSIVE checkpoints (a format 5 WAL
+    /// database).
+    pub(crate) fn from_config(c: &Config, passive: bool) -> MaintenanceConfig {
         MaintenanceConfig {
-            log_objects: c.maintenance_log_objects,
             wal_bytes: c.maintenance_wal_bytes,
+            passive_wal_bytes: if passive {
+                defaults::PASSIVE_CHECKPOINT_WAL_BYTES
+            } else {
+                0
+            },
+            passive_interval: defaults::PASSIVE_CHECKPOINT_INTERVAL,
             gate_wait: c.maintenance_gate_wait,
             retry: defaults::MAINTENANCE_RETRY,
             retry_max: defaults::MAINTENANCE_RETRY_MAX,
         }
     }
 
-    /// At least one measure is on.
+    /// One of the two checkpoints is on.
     pub(crate) fn enabled(&self) -> bool {
-        self.log_objects > 0 || self.wal_bytes > 0
+        self.wal_bytes > 0 || self.passive_wal_bytes > 0
     }
 
-    /// The generation is due for maintenance.
-    pub(crate) fn due(&self, log_objects: u64, wal_bytes: u64) -> bool {
-        let over = |n: u64, threshold: u64| threshold > 0 && n >= threshold;
-        over(log_objects, self.log_objects) || over(wal_bytes, self.wal_bytes)
+    /// The generation's `-wal` is at the WAL size limit: a maintenance run is due.
+    pub(crate) fn due(&self, wal_bytes: u64) -> bool {
+        self.wal_bytes > 0 && wal_bytes >= self.wal_bytes
     }
 
-    /// The measures at which a run that failed at (`log_objects`, `wal_bytes`) may be retried
-    /// before its backoff ends: one more threshold of growth (`u64::MAX`: never, for a
-    /// measure that is off).
-    fn bypass_at(&self, log_objects: u64, wal_bytes: u64) -> (u64, u64) {
-        let at = |n: u64, threshold: u64| {
-            if threshold == 0 {
-                u64::MAX
-            } else {
-                n.saturating_add(threshold)
-            }
-        };
-        (
-            at(log_objects, self.log_objects),
-            at(wal_bytes, self.wal_bytes),
-        )
+    /// The generation's `-wal` is large enough for a PASSIVE checkpoint (the interval aside).
+    fn passive_due(&self, wal_bytes: u64) -> bool {
+        self.passive_wal_bytes > 0 && wal_bytes >= self.passive_wal_bytes
+    }
+
+    /// The `-wal` bytes at which a run that failed at `wal_bytes` may be retried before its
+    /// backoff ends: one more limit of growth.
+    fn bypass_at(&self, wal_bytes: u64) -> u64 {
+        wal_bytes.saturating_add(self.wal_bytes)
     }
 }
 
@@ -198,10 +212,12 @@ struct Signal {
     wake: Mutex<Wake>,
     cv: Condvar,
     phase: AtomicU8,
-    /// While backing off after a failed run: the log objects and `-wal` bytes at which a
-    /// poke retries at once (`u64::MAX`: wait out the backoff).
-    bypass_log: AtomicU64,
+    /// While backing off after a failed run: the `-wal` bytes at which a poke retries at once
+    /// (`u64::MAX`: wait out the backoff).
     bypass_wal: AtomicU64,
+    /// The time from which the next PASSIVE checkpoint may run, in milliseconds after `epoch`.
+    passive_after_ms: AtomicU64,
+    epoch: Instant,
     /// Tests: the next run panics.
     #[cfg(test)]
     panic_next: std::sync::atomic::AtomicBool,
@@ -216,13 +232,31 @@ impl Default for Signal {
             wake: Mutex::default(),
             cv: Condvar::new(),
             phase: AtomicU8::new(IDLE),
-            bypass_log: AtomicU64::new(u64::MAX),
             bypass_wal: AtomicU64::new(u64::MAX),
+            passive_after_ms: AtomicU64::new(0),
+            epoch: Instant::now(),
             #[cfg(test)]
             panic_next: Default::default(),
             #[cfg(test)]
             checkpoint_panic_next: Default::default(),
         }
+    }
+}
+
+impl Signal {
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// The interval after the last PASSIVE checkpoint has passed.
+    fn passive_allowed(&self) -> bool {
+        self.now_ms() >= self.passive_after_ms.load(SeqCst)
+    }
+
+    /// A PASSIVE checkpoint (or a maintenance run) ended now: the next waits `interval`.
+    fn passive_ran(&self, interval: Duration) {
+        let after = self.now_ms().saturating_add(interval.as_millis() as u64);
+        self.passive_after_ms.store(after, SeqCst);
     }
 }
 
@@ -235,7 +269,7 @@ pub(crate) struct Maintenance {
 
 /// How a run ended.
 #[derive(Debug, PartialEq, Eq)]
-enum Outcome {
+pub(crate) enum Outcome {
     Sealed,
     /// Not started: the bucket looked unable to take a seal.
     BucketFailing,
@@ -284,25 +318,28 @@ impl Maintenance {
         }
     }
 
-    /// After a call: wake the thread when the generation is due and no run is in progress,
-    /// nor backing off (unless a failed run's generation has grown by another threshold
-    /// since). Only atomic loads when nothing is due; it never blocks.
-    pub(crate) fn poke(&self, log_objects: u64, wal_bytes: u64) {
-        if !self.cfg.due(log_objects, wal_bytes) {
-            return;
-        }
+    /// After a call: wake the thread when the `-wal` is at the WAL size limit and no run is in
+    /// progress, nor backing off (unless a failed run's `-wal` has grown by another limit
+    /// since); or, with the thread idle, when a PASSIVE checkpoint is due and its interval
+    /// has passed. Only atomic loads when nothing is due; it never blocks.
+    pub(crate) fn poke(&self, wal_bytes: u64) {
         let s = &self.signal;
-        let grown =
-            || log_objects >= s.bypass_log.load(SeqCst) || wal_bytes >= s.bypass_wal.load(SeqCst);
-        let from = match s.phase.load(SeqCst) {
-            IDLE => IDLE,
-            BACKOFF if grown() => BACKOFF,
-            _ => return,
+        let from = if self.cfg.due(wal_bytes) {
+            match s.phase.load(SeqCst) {
+                IDLE => IDLE,
+                BACKOFF if wal_bytes >= s.bypass_wal.load(SeqCst) => BACKOFF,
+                _ => return,
+            }
+        } else if self.cfg.passive_due(wal_bytes)
+            && s.phase.load(SeqCst) == IDLE
+            && s.passive_allowed()
+        {
+            IDLE
+        } else {
+            return;
         };
         // Only the caller that moves it to RUNNING wakes it.
-        if self
-            .signal
-            .phase
+        if s.phase
             .compare_exchange(from, RUNNING, SeqCst, SeqCst)
             .is_ok()
         {
@@ -380,8 +417,22 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
         let Some(shared) = shared.upgrade() else {
             return;
         };
-        let (log_objects, wal_bytes) = shared.maintenance_measures();
-        let outcome = cfg.due(log_objects, wal_bytes).then(|| {
+        let wal_bytes = shared.maintenance_wal_bytes();
+        if !cfg.due(wal_bytes) {
+            if cfg.passive_due(wal_bytes) && signal.passive_allowed() {
+                run_passive(&shared);
+                signal.passive_ran(cfg.passive_interval);
+            }
+            drop(shared);
+            // Below the limit (a user's checkpoint or the engine restarted the WAL): no
+            // maintenance run waits.
+            held_off = 0;
+            retry_at = None;
+            signal.bypass_wal.store(u64::MAX, SeqCst);
+            signal.phase.store(IDLE, SeqCst);
+            continue;
+        }
+        let outcome = {
             // A panic must not end maintenance for good (the gate is reopened by `Reopen`).
             #[cfg(test)]
             let inject_panic = signal.panic_next.swap(false, SeqCst);
@@ -392,7 +443,6 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                 target: "buckwal",
                 "buckwal.maintenance",
                 buckwal.generation = generation,
-                buckwal.log_objects = log_objects,
                 buckwal.wal_bytes = wal_bytes,
                 buckwal.gate_wait_ms = Empty,
                 buckwal.outcome = Empty,
@@ -402,7 +452,6 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                 let run = Measured {
                     span: &span,
                     generation,
-                    log_objects,
                     wal_bytes,
                 };
                 run_once(&shared, cfg, run, inject_panic, signal)
@@ -424,26 +473,27 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                 }));
                 Outcome::Error
             })
-        });
+        };
         // Dropped here, not at the loop's end: when it is the last handle, the database
         // closes on this thread (`Shared::finish` then does not join it).
         drop(shared);
-        let (mut bypass_log, mut bypass_wal) = (u64::MAX, u64::MAX);
+        // The run checkpointed more than a PASSIVE checkpoint does.
+        signal.passive_ran(cfg.passive_interval);
+        let mut bypass_wal = u64::MAX;
         let delay = match outcome {
-            None | Some(Outcome::Sealed) => None,
-            Some(Outcome::GateTimeout | Outcome::Busy) => {
+            Outcome::Sealed => None,
+            Outcome::GateTimeout | Outcome::Busy => {
                 held_off = held_off.saturating_add(1);
                 Some(backoff(cfg.retry, held_off, cfg.retry_max))
             }
-            Some(Outcome::Error) => {
-                (bypass_log, bypass_wal) = cfg.bypass_at(log_objects, wal_bytes);
+            Outcome::Error => {
+                bypass_wal = cfg.bypass_at(wal_bytes);
                 Some(cfg.retry)
             }
-            Some(Outcome::BucketFailing | Outcome::Closed) => Some(cfg.retry),
+            Outcome::BucketFailing | Outcome::Closed => Some(cfg.retry),
             // Retried once the quiet has passed, not every `retry` meanwhile.
-            Some(Outcome::TakeoverQuiet(left)) => Some(cfg.retry.max(left)),
+            Outcome::TakeoverQuiet(left) => Some(cfg.retry.max(left)),
         };
-        signal.bypass_log.store(bypass_log, SeqCst);
         signal.bypass_wal.store(bypass_wal, SeqCst);
         match delay {
             None => {
@@ -463,7 +513,6 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
 struct Measured<'a> {
     span: &'a tracing::Span,
     generation: u64,
-    log_objects: u64,
     wal_bytes: u64,
 }
 
@@ -471,7 +520,7 @@ struct Measured<'a> {
 /// checkpoint, reopen.
 ///
 /// It runs inside its `buckwal.maintenance` `span`, which the caller made (for
-/// `generation`, `log_objects` and `wal_bytes`) and entered, so a panic's outcome is
+/// `generation` and `wal_bytes`) and entered, so a panic's outcome is
 /// recorded on it too.
 fn run_once(
     shared: &Shared,
@@ -483,7 +532,6 @@ fn run_once(
     let Measured {
         span,
         generation,
-        log_objects,
         wal_bytes,
     } = run;
     let quiet = shared.uploader.seal_quiet_remaining();
@@ -508,7 +556,6 @@ fn run_once(
     }
     shared.emit(Event::MaintenanceStarted {
         generation,
-        log_objects,
         wal_bytes,
     });
     if inject_panic {
@@ -570,10 +617,55 @@ fn run_once(
     outcome
 }
 
-/// `checkpoint(TRUNCATE)` on a fresh engine connection (not a public `Connection`: not
+/// `checkpoint(TRUNCATE)` on a fresh engine connection ([`engine_checkpoint`]).
+fn checkpoint(shared: &Shared) -> Result<(), (Outcome, String)> {
+    engine_checkpoint(
+        shared,
+        turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    )
+}
+
+/// The writer's PASSIVE checkpoint: no gate, and no wait for a reader (the engine copies only
+/// the frames that no reader needs; a busy engine is `Busy` at once).
+pub(crate) fn passive_checkpoint(shared: &Shared) -> Result<(), (Outcome, String)> {
+    engine_checkpoint(
+        shared,
+        turso_core::CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    )
+}
+
+/// [`passive_checkpoint`] on the thread. A failure only warns: the next poke tries again after
+/// the interval. A busy engine or a closing database is routine.
+fn run_passive(shared: &Shared) {
+    let generation = shared.uploader.generation();
+    match passive_checkpoint(shared) {
+        Ok(()) => {}
+        Err((Outcome::Error, reason)) => tracing::warn!(
+            target: "buckwal",
+            generation,
+            reason = %reason,
+            "passive checkpoint failed; retrying later"
+        ),
+        Err((_, reason)) => tracing::debug!(
+            target: "buckwal",
+            generation,
+            reason = %reason,
+            "passive checkpoint skipped"
+        ),
+    }
+}
+
+/// A checkpoint in `mode` on a fresh engine connection (not a public `Connection`: not
 /// counted, no gate; with the database's key, `EngineDb::connect`), set up as
 /// `Connection::new` sets one up, inside an `Off` commit context.
-fn checkpoint(shared: &Shared) -> Result<(), (Outcome, String)> {
+fn engine_checkpoint(
+    shared: &Shared,
+    mode: turso_core::CheckpointMode,
+) -> Result<(), (Outcome, String)> {
     let error = |e: Error| (Outcome::Error, format!("error: {e}"));
     // `Database::close` took the engine and waits for this run (`Shared::finish`).
     let Some(db) = shared.engine_db() else {
@@ -585,9 +677,7 @@ fn checkpoint(shared: &Shared) -> Result<(), (Outcome, String)> {
     core.set_busy_timeout(BUSY_TIMEOUT);
     core.set_sync_mode(SyncMode::Full);
     let r = core
-        .checkpoint(turso_core::CheckpointMode::Truncate {
-            upper_bound_inclusive: None,
-        })
+        .checkpoint(mode)
         .map(|_| ())
         .map_err(|e| match (stash::take(), e) {
             (Some(stashed), _) => error(stashed),

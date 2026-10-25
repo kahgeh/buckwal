@@ -27,7 +27,6 @@ fn config(dir: &Path, mode: JournalMode) -> Config {
     c.lease = Duration::from_secs(5);
     c.journal_mode = mode;
     // Every checkpoint is the test's.
-    c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
     c
 }

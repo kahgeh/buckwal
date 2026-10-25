@@ -374,7 +374,6 @@ mod tests {
         );
         let started = Event::MaintenanceStarted {
             generation: 1,
-            log_objects: 1000,
             wal_bytes: 0,
         };
         let finished = |gate_ms: u64| Event::MaintenanceFinished {

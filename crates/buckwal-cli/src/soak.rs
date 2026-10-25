@@ -31,11 +31,9 @@ fn commit_list(commits: &[u64]) -> String {
 /// The `event maintenance-…` line for a maintenance event (`None` for any other event).
 fn maintenance_line(e: &Event) -> Option<String> {
     Some(match e {
-        Event::MaintenanceStarted {
-            log_objects,
-            wal_bytes,
-            ..
-        } => format!("event maintenance-started log_objects={log_objects} wal_bytes={wal_bytes}"),
+        Event::MaintenanceStarted { wal_bytes, .. } => {
+            format!("event maintenance-started wal_bytes={wal_bytes}")
+        }
         Event::MaintenanceFinished {
             gate_wait, elapsed, ..
         } => format!(
@@ -395,7 +393,6 @@ mod tests {
         let g = 3;
         let started = Event::MaintenanceStarted {
             generation: g,
-            log_objects: 1000,
             wal_bytes: 4096,
         };
         let finished = Event::MaintenanceFinished {
@@ -420,7 +417,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                Some("event maintenance-started log_objects=1000 wal_bytes=4096".into()),
+                Some("event maintenance-started wal_bytes=4096".into()),
                 Some("event maintenance-finished gate_wait_ms=12.345 ms=250.500".into()),
                 Some("event maintenance-skipped gate_timeout".into()),
                 Some("event maintenance-skipped error: two lines".into()),

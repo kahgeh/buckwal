@@ -89,29 +89,40 @@ fn gate_blocks_new_calls_and_drains_in_flight() {
     gate.open();
 }
 
-/// The thresholds decide when a generation is due; 0 turns a measure off.
+/// The WAL size limit alone makes a maintenance run due (0 turns it off); the PASSIVE
+/// threshold alone makes a PASSIVE checkpoint due (0, formats 1 to 4 and MVCC, turns it off).
 #[test]
 fn due_follows_the_thresholds() {
-    let cfg = |log_objects, wal_bytes| MaintenanceConfig {
-        log_objects,
+    let cfg = |wal_bytes, passive_wal_bytes| MaintenanceConfig {
         wal_bytes,
+        passive_wal_bytes,
+        passive_interval: Duration::from_secs(1),
         gate_wait: Duration::from_millis(500),
         retry: Duration::from_secs(1),
         retry_max: Duration::from_secs(30),
     };
-    let c = cfg(200, 1 << 20);
+    let c = cfg(1 << 20, 0);
     assert!(c.enabled());
-    assert!(!c.due(199, (1 << 20) - 1));
-    assert!(c.due(200, 0));
-    assert!(c.due(0, 1 << 20));
-    assert_eq!(c.bypass_at(250, 7), (450, 7 + (1 << 20)));
-    let c = cfg(0, 1 << 20);
-    assert!(c.enabled() && !c.due(u64::MAX, 0));
-    assert_eq!(c.bypass_at(5, 5).0, u64::MAX);
-    let c = cfg(200, 0);
-    assert!(c.enabled() && !c.due(0, u64::MAX));
+    assert!(!c.due((1 << 20) - 1));
+    assert!(c.due(1 << 20));
+    assert!(!c.passive_due(u64::MAX));
+    assert_eq!(c.bypass_at(7), 7 + (1 << 20));
+    let c = cfg(0, 4 << 20);
+    assert!(c.enabled() && !c.due(u64::MAX));
+    assert!(!c.passive_due((4 << 20) - 1) && c.passive_due(4 << 20));
     let c = cfg(0, 0);
-    assert!(!c.enabled() && !c.due(u64::MAX, u64::MAX));
+    assert!(!c.enabled() && !c.due(u64::MAX) && !c.passive_due(u64::MAX));
+    // From the settings: PASSIVE only when the caller says so.
+    let s = crate::config::Config::new("/d", "http://e", "b", "k", "s");
+    let on = MaintenanceConfig::from_config(&s, true);
+    assert_eq!(
+        (on.wal_bytes, on.passive_wal_bytes, on.passive_interval),
+        (64 << 20, 4 << 20, Duration::from_secs(1))
+    );
+    assert_eq!(
+        MaintenanceConfig::from_config(&s, false).passive_wal_bytes,
+        0
+    );
 }
 
 /// The maintenance thread can end up holding the last handle (the app dropped everything
@@ -136,7 +147,7 @@ fn last_handle_dropped_on_the_maintenance_thread_closes_the_database() {
     });
     let mut c = Config::new(dir.path(), "http://127.0.0.1:1", "b", "k", "s");
     c.on_event = Some(hook);
-    c.maintenance_log_objects = 5;
+    c.maintenance_wal_bytes = 16 << 10;
     let store = Arc::new(MemStore::new());
     let db = crate::open_with_store(c.clone(), store.clone()).unwrap();
     let conn = db.connect().unwrap();
@@ -177,7 +188,7 @@ fn last_handle_dropped_on_the_maintenance_thread_closes_the_database() {
 fn open_small(dir: &std::path::Path, hook: crate::config::EventHook) -> crate::Database {
     let mut c = crate::config::Config::new(dir, "http://127.0.0.1:1", "b", "k", "s");
     c.on_event = Some(hook);
-    c.maintenance_log_objects = 5;
+    c.maintenance_wal_bytes = 16 << 10;
     crate::open_with_store(c, Arc::new(crate::store::MemStore::new())).unwrap()
 }
 
@@ -302,7 +313,6 @@ fn ack_wait_runs_outside_the_gate() {
         crate::store::MemStore::new(),
     )));
     let mut c = crate::config::Config::new(dir.path(), "http://127.0.0.1:1", "b", "k", "s");
-    c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
     c.batching = Batching::Window {
         max_wait: Duration::from_millis(1),
@@ -431,7 +441,7 @@ fn maintenance_skips_during_takeover_quiet() {
     assert_eq!(rep.quiet, Duration::from_millis(2500), "{rep:?}");
     let (hook, seen) = recorder();
     cb.on_event = Some(hook);
-    cb.maintenance_log_objects = 5;
+    cb.maintenance_wal_bytes = 16 << 10;
     let db = crate::open_with_store(cb, store.clone()).unwrap();
     let conn = db.connect().unwrap();
     for x in 0..10 {
@@ -472,4 +482,231 @@ fn maintenance_skips_during_takeover_quiet() {
 fn db_generation(store: &dyn crate::store::ObjectStore, keys: &crate::format::Keys) -> u64 {
     let body = store.get(&keys.head()).unwrap().unwrap().body;
     crate::format::Head::decode(&body).unwrap().generation
+}
+
+// --- Checkpoints of a format 5 writer (spec "The writer") ---------------------------------
+
+/// A writer on an in-memory store, with the trimmer off (its GC pass reads the bucket on its
+/// own thread), and its first connection with table `t(id, b)`.
+fn writer_with(
+    c: impl FnOnce(&mut crate::config::Config),
+    store: Arc<crate::store::MemStore>,
+    dir: &std::path::Path,
+) -> (crate::Database, crate::Connection) {
+    let mut cfg = crate::config::Config::new(dir, "http://127.0.0.1:1", "b", "k", "s");
+    c(&mut cfg);
+    let db = crate::open_with_store(cfg, store).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)", &[])
+        .unwrap();
+    (db, conn)
+}
+
+/// Insert one row with a blob of `bytes` (about `bytes / 4096` frames).
+fn insert_blob(conn: &crate::Connection, bytes: usize) {
+    conn.execute(
+        &format!("INSERT INTO t(b) VALUES (randomblob({bytes}))"),
+        &[],
+    )
+    .unwrap();
+}
+
+/// A reader kept the engine's own PASSIVE checkpoint (after a commit, at 1000 frames past the
+/// backfill) from the newest frames. Then the reader left, and the WAL is less than 1000
+/// frames past the backfill: the engine does not try again for 1000 more frames. The writer's
+/// own PASSIVE checkpoint backfills the rest, so a later commit restarts the WAL (a generation
+/// switch), long before the WAL size limit.
+#[test]
+fn writer_runs_passive_checkpoints_so_wal_restarts_without_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let _no_gc = crate::trim::NoWriterGc::on();
+    let store = Arc::new(crate::store::MemStore::new());
+    let (db, w) = writer_with(|_| {}, store, dir.path());
+    // About 590 frames.
+    insert_blob(&w, 2_400_000);
+    let r = db.connect().unwrap();
+    r.execute("BEGIN", &[]).unwrap();
+    assert_eq!(
+        r.query("SELECT count(*) FROM t", &[]).unwrap()[0][0].as_int(),
+        Some(1)
+    );
+    // About 1180 frames: the engine's checkpoint backfills only up to the reader's snapshot.
+    insert_blob(&w, 2_400_000);
+    r.execute("COMMIT", &[]).unwrap();
+    assert_eq!(db.generation(), 1);
+    // Each small commit adds a frame or two: far fewer than the 1000 that the engine waits for.
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut commits = 0;
+    while db.generation() == 1 {
+        assert!(
+            Instant::now() < until,
+            "no WAL restart after {commits} small commits"
+        );
+        w.execute("INSERT INTO t(b) VALUES (1)", &[]).unwrap();
+        commits += 1;
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(db.generation(), 2);
+    drop((r, w));
+    db.close().unwrap();
+}
+
+/// The writer's PASSIVE checkpoint never waits for a reader: with a read transaction open on
+/// frames older than the newest, it returns at once (well under the 5 s busy timeout and the
+/// 500 ms gate wait), and the reader still reads its snapshot.
+#[test]
+fn passive_checkpoint_with_reader_never_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::store::MemStore::new());
+    let (db, w) = writer_with(|_| {}, store, dir.path());
+    for _ in 0..50 {
+        w.execute("INSERT INTO t(b) VALUES (1)", &[]).unwrap();
+    }
+    let r = db.connect().unwrap();
+    r.execute("BEGIN", &[]).unwrap();
+    assert_eq!(
+        r.query("SELECT count(*) FROM t", &[]).unwrap()[0][0].as_int(),
+        Some(50)
+    );
+    for _ in 0..50 {
+        w.execute("INSERT INTO t(b) VALUES (1)", &[]).unwrap();
+    }
+    let start = Instant::now();
+    let res = passive_checkpoint(&db.shared);
+    let took = start.elapsed();
+    assert!(
+        !matches!(res, Err((Outcome::Error, _))),
+        "the PASSIVE checkpoint failed: {res:?}"
+    );
+    assert!(took < Duration::from_millis(250), "it waited {took:?}");
+    assert_eq!(
+        r.query("SELECT count(*) FROM t", &[]).unwrap()[0][0].as_int(),
+        Some(50)
+    );
+    r.execute("COMMIT", &[]).unwrap();
+    drop((r, w));
+    db.close().unwrap();
+}
+
+/// Only the WAL size limit starts the maintenance checkpoint. More log objects than the old
+/// `BUCKWAL_MAINTENANCE_LOG_OBJECTS` default (1000) start nothing while the WAL stays below
+/// the limit (a reader keeps the engine from restarting it); the commit that takes the WAL past
+/// the limit does.
+#[test]
+fn maintenance_runs_only_at_wal_size_limit() {
+    use crate::config::Event;
+    let dir = tempfile::tempdir().unwrap();
+    let (hook, seen) = recorder();
+    let store = Arc::new(crate::store::MemStore::new());
+    let limit: u64 = 16 << 20;
+    let (db, w) = writer_with(
+        |c| {
+            c.on_event = Some(hook);
+            c.maintenance_wal_bytes = limit;
+        },
+        store,
+        dir.path(),
+    );
+    let r = db.connect().unwrap();
+    r.execute("BEGIN", &[]).unwrap();
+    r.query("SELECT count(*) FROM t", &[]).unwrap();
+    for x in 0..1100 {
+        w.execute("INSERT INTO t(b) VALUES (?)", &[crate::Value::from_i64(x)])
+            .unwrap();
+    }
+    // A poke after the last call would have woken the thread by now.
+    thread::sleep(Duration::from_millis(200));
+    let started = |seen: &Mutex<Vec<Event>>| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::MaintenanceStarted { wal_bytes, .. } => Some(*wal_bytes),
+                _ => None,
+            })
+            .collect::<Vec<u64>>()
+    };
+    assert_eq!(
+        started(&seen),
+        Vec::<u64>::new(),
+        "a run started below the limit"
+    );
+    assert_eq!(db.generation(), 1);
+    insert_blob(&w, 10 << 20);
+    wait_event(&seen, |e| matches!(e, Event::MaintenanceStarted { .. }));
+    let at = started(&seen);
+    assert!(at.iter().all(|b| *b >= limit), "{at:?}");
+    // The reader holds the gate: the run waits it out, then a retry checkpoints.
+    r.execute("COMMIT", &[]).unwrap();
+    wait_event(&seen, |e| matches!(e, Event::MaintenanceFinished { .. }));
+    assert_eq!(db.generation(), 2);
+    drop((r, w));
+    db.close().unwrap();
+}
+
+/// The maintenance checkpoint uploads no page and no manifest: from its start to its end the
+/// bucket sees only three small PUTs, the generation switch's seal-start record and head move,
+/// and the `-wal` truncate as the new generation's first record.
+#[test]
+fn maintenance_uploads_nothing() {
+    use crate::config::{Event, EventHook};
+    use crate::store::{ObjectStore, StatsSnap};
+    let dir = tempfile::tempdir().unwrap();
+    let _no_gc = crate::trim::NoWriterGc::on();
+    let store = Arc::new(crate::store::MemStore::new());
+    let snaps: Arc<Mutex<Vec<StatsSnap>>> = Arc::default();
+    let (s, st) = (snaps.clone(), store.clone());
+    let hook: EventHook = Arc::new(move |e: &Event| {
+        if matches!(
+            e,
+            Event::MaintenanceStarted { .. } | Event::MaintenanceFinished { .. }
+        ) {
+            s.lock().unwrap().push(st.stats());
+        }
+    });
+    let (db, w) = writer_with(
+        |c| {
+            c.on_event = Some(hook);
+            c.maintenance_wal_bytes = 1 << 20;
+        },
+        store.clone(),
+        dir.path(),
+    );
+    insert_blob(&w, 1_200_000);
+    let until = Instant::now() + Duration::from_secs(10);
+    while snaps.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < until, "no maintenance run ended");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let s = snaps.lock().unwrap().clone();
+    let d = s[1].since(&s[0]);
+    assert_eq!((d.puts, d.lists, d.deletes), (3, 0, 0), "{d:?}");
+    assert!(d.bytes_up < 4096, "{d:?}");
+    assert_eq!(db.generation(), 2);
+    // The new generation's first record is the `-wal` truncate: no frame, no page.
+    let keys = crate::format::Keys::new("");
+    assert_eq!(
+        store.list(&keys.log_prefix(2)).unwrap(),
+        vec![keys.log(2, 1)]
+    );
+    let body = store.get(&keys.log(2, 1)).unwrap().unwrap().body;
+    match crate::format::decode_record(&body).unwrap() {
+        crate::format::LogRecord::Extents { syncs, .. } => assert!(
+            syncs
+                .iter()
+                .flatten()
+                .all(|op| matches!(op, crate::format::Op::Truncate { len: 0 })),
+            "{syncs:?}"
+        ),
+        r => panic!("{r:?}"),
+    }
+    let bad: Vec<String> = store
+        .list("")
+        .unwrap()
+        .into_iter()
+        .filter(|k| k.starts_with(&keys.page_root()) || k.starts_with(&keys.manifest_root()))
+        .collect();
+    assert!(bad.is_empty(), "{bad:?}");
+    drop(w);
+    db.close().unwrap();
 }

@@ -1439,3 +1439,78 @@ fn pack_run_on_a_real_writer_bucket_equals_restore() {
     assert_eq!(rows_of(&body, Some(&images.wal), None), w.ids());
     w.crash();
 }
+
+/// Make `path` look last changed `age` ago.
+fn age_dir(path: &Path, age: Duration) {
+    let when = std::time::SystemTime::now() - age;
+    File::open(path).unwrap().set_modified(when).unwrap();
+}
+
+/// A crashed pack run leaves `pack-work-<run id>` behind. A directory older than half the
+/// orphan grace has no live run (a run gives up at half the orphan grace): a pack run's start
+/// and a writer's open remove it, and keep a newer one and every other entry. A newer one does
+/// not stop a takeover or a restore into the directory.
+#[test]
+fn stale_pack_work_directory_is_removed() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let half = config(Path::new("/x")).pack_orphan_grace / 2;
+    let stale = |dir: &Path, name: &str| {
+        let p = dir.join(name);
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join(DB_FILE), b"copy").unwrap();
+        age_dir(&p, half + Duration::from_secs(60));
+        p
+    };
+    let fresh = |dir: &Path, name: &str| {
+        let p = dir.join(name);
+        fs::create_dir_all(&p).unwrap();
+        p
+    };
+
+    // The rule alone.
+    let t = tempdir();
+    let old = stale(t.path(), "pack-work-old");
+    let new = fresh(t.path(), "pack-work-new");
+    let other = stale(t.path(), "other");
+    remove_stale_work_dirs(t.path(), half).unwrap();
+    assert!(!old.exists() && new.exists() && other.exists());
+    // A missing directory has nothing to remove.
+    remove_stale_work_dirs(&t.path().join("missing"), half).unwrap();
+
+    // A pack run's start.
+    let t = tempdir();
+    let cfg = packer(&t);
+    let old = stale(&cfg.dir, "pack-work-old");
+    let new = fresh(&cfg.dir, "pack-work-new");
+    packed(&run_dirty(&cfg, mem.clone()));
+    assert!(!old.exists() && new.exists());
+
+    // A takeover into a directory that holds only a newer one, then its open.
+    let t = tempdir();
+    let cfg = config(&t.path().join("b"));
+    let new = fresh(&cfg.dir, "pack-work-new");
+    crate::takeover_with_store(cfg.clone(), mem.clone()).unwrap();
+    let old = stale(&cfg.dir, "pack-work-old");
+    let db = open_with_store(cfg.clone(), mem.clone()).unwrap();
+    assert!(!old.exists() && new.exists());
+    assert_eq!(query_ids(&db.connect().unwrap()), vec![1, 2, 3]);
+    drop(db);
+
+    // A writer's open that restores into a directory that holds only a newer one.
+    let t = tempdir();
+    let cfg = config(&t.path().join("c"));
+    fresh(&cfg.dir, "pack-work-new");
+    let db = open_with_store(cfg, mem.clone()).unwrap();
+    assert_eq!(query_ids(&db.connect().unwrap()), vec![1, 2, 3]);
+    drop(db);
+    drop(w);
+}
+
+/// A pack run that does not check for left-over `pack-work-*` directories (other than its own).
+fn run_dirty(cfg: &Config, store: Arc<dyn ObjectStore>) -> PackReport {
+    let (_, clock) = fake_clock();
+    pack_run(cfg, store, clock).unwrap()
+}

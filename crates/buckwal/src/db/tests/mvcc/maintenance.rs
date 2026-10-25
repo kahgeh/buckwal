@@ -38,7 +38,7 @@ fn log_len_after(n: i64) -> u64 {
     len
 }
 
-/// A config whose maintenance fires when the log passes `bytes` (no object-count measure).
+/// A config whose maintenance fires when the log passes `bytes`.
 fn maintained(dir: &Path, bytes: u64, hook: EventHook) -> Config {
     let mut c = mvcc(dir);
     c.maintenance_wal_bytes = bytes;
@@ -57,7 +57,7 @@ fn maintenance_checkpoints_mvcc_when_log_bytes_exceed_threshold() {
     let (hook, seen) = recorder();
     let (db, c) = mvcc_with_rows(mem.clone(), maintained(&dir, threshold, hook), 3);
     assert_eq!(db.generation(), 2, "not due yet");
-    assert_eq!(db.shared.maintenance_measures().1, log_len_after(3));
+    assert_eq!(db.shared.maintenance_wal_bytes(), log_len_after(3));
     insert_c(&c, 4).unwrap();
     wait_event(&seen, "MaintenanceFinished", |e| {
         matches!(e, Event::MaintenanceFinished { .. })
@@ -87,7 +87,7 @@ fn maintenance_checkpoints_mvcc_when_log_bytes_exceed_threshold() {
     assert_eq!(b.kinds, Vec::<u8>::new());
     assert!(b.log.is_empty());
     assert_eq!(read(&dir, "app.db-log"), Vec::<u8>::new());
-    assert_eq!(db.shared.maintenance_measures().1, 0);
+    assert_eq!(db.shared.maintenance_wal_bytes(), 0);
     assert_eq!(bucket_rows(&*mem, None), vec![1, 2, 3, 4]);
     // Commits go on into the new generation.
     insert_c(&c, 5).unwrap();
@@ -105,17 +105,12 @@ fn log_high_water_is_the_file_size_at_open() {
     let dir = fresh(&t);
     let (db, c) = mvcc_with_rows(mem.clone(), mvcc(&dir), 3);
     let len = read(&dir, "app.db-log").len() as u64;
-    assert_eq!(db.shared.maintenance_measures().1, len);
-    assert_eq!(
-        db.shared.maintenance_measures().0,
-        4,
-        "kind-3 objects of the generation"
-    );
+    assert_eq!(db.shared.maintenance_wal_bytes(), len);
     c.close().unwrap();
     db.close().unwrap();
     let on_disk = read(&dir, "app.db-log").len() as u64;
     let db = open_mvcc(mem, mvcc(&dir));
-    assert_eq!(db.shared.maintenance_measures().1, on_disk);
+    assert_eq!(db.shared.maintenance_wal_bytes(), on_disk);
     db.close().unwrap();
 }
 

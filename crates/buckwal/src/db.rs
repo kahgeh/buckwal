@@ -148,20 +148,16 @@ impl Shared {
         }
     }
 
-    /// The current generation's log objects and `-wal` bytes: what maintenance measures.
-    pub(crate) fn maintenance_measures(&self) -> (u64, u64) {
-        (
-            self.uploader.generation_log_objects(),
-            self.wal_bytes.load(SeqCst),
-        )
+    /// The current generation's `-wal` bytes: what the checkpoints of `maintenance` measure.
+    pub(crate) fn maintenance_wal_bytes(&self) -> u64 {
+        self.wal_bytes.load(SeqCst)
     }
 
-    /// After a `Connection` call: wake maintenance if the generation is due (atomic loads
-    /// only, unless it is).
+    /// After a `Connection` call: wake the maintenance thread if a checkpoint is due (atomic
+    /// loads only, unless one is).
     pub(crate) fn poke_maintenance(&self) {
         if let Some(m) = &self.maintenance {
-            let (log_objects, wal_bytes) = self.maintenance_measures();
-            m.poke(log_objects, wal_bytes);
+            m.poke(self.maintenance_wal_bytes());
         }
     }
 
@@ -304,6 +300,9 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     cfg.encryption = encryption;
     clear_interrupted_restore(&dir)?;
     clear_interrupted_create(&dir)?;
+    if !read_only {
+        crate::pack::run::sweep_work_dirs(&config);
+    }
     let local = LocalState::read(&dir)?;
     // The recorded mode first: an MVCC directory opened as WAL is "switching back", not just
     // an MVCC file. Before the claim, the epoch raise or any other write to the bucket.
@@ -389,7 +388,9 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     });
     let uploader = engine.uploader.clone();
     let wal_bytes = engine.wal_bytes.clone();
-    let maintenance = MaintenanceConfig::from_config(&config);
+    // PASSIVE checkpoints only where a WAL restart uploads no page: format 5, WAL mode.
+    let passive = engine.storage.packed() && config.journal_mode == JournalMode::Wal;
+    let maintenance = MaintenanceConfig::from_config(&config, passive);
     tracing::info!(
         target: "buckwal",
         generation = uploader.generation(),

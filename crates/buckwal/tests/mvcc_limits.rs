@@ -32,7 +32,6 @@ fn mvcc(dir: &Path) -> Config {
     c.lease = Duration::from_secs(60);
     c.journal_mode = JournalMode::Mvcc;
     // Every checkpoint is the test's.
-    c.maintenance_log_objects = 0;
     c.maintenance_wal_bytes = 0;
     c
 }

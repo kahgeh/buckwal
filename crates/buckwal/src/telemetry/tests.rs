@@ -767,7 +767,7 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
     let dir = tempfile::tempdir().unwrap();
     let spans = tracing::subscriber::with_default(cap.subscriber(), || {
         let mut c = config(dir.path());
-        c.maintenance_log_objects = 5;
+        c.maintenance_wal_bytes = 16 << 10;
         let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
@@ -796,19 +796,14 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
         .unwrap();
     assert_eq!((m.target.as_str(), m.level), ("buckwal", Level::INFO));
     assert_eq!(m.field("buckwal.generation"), Some("1"));
-    assert!(
-        m.field("buckwal.log_objects")
-            .unwrap()
-            .parse::<u64>()
-            .unwrap()
-            >= 5
-    );
+    // Only the WAL size limit starts a run: the span has no log object count.
+    assert_eq!(m.field("buckwal.log_objects"), None);
     assert!(
         m.field("buckwal.wal_bytes")
             .unwrap()
             .parse::<u64>()
             .unwrap()
-            > 0
+            >= 16 << 10
     );
     assert!(m.field("buckwal.gate_wait_ms").is_some());
     assert_eq!(m.field("buckwal.outcome"), Some("sealed"));
@@ -835,7 +830,7 @@ fn a_panicking_maintenance_run_closes_its_span_as_error() {
     let dir = tempfile::tempdir().unwrap();
     let spans = tracing::subscriber::with_default(cap.subscriber(), || {
         let mut c = config(dir.path());
-        c.maintenance_log_objects = 5;
+        c.maintenance_wal_bytes = 16 << 10;
         let db = crate::open_with_store(c, Arc::new(MemStore::new())).unwrap();
         db.shared.maintenance().unwrap().panic_next_run();
         let conn = db.connect().unwrap();
@@ -1545,7 +1540,7 @@ fn a_failed_maintenance_checkpoint_records_error_on_its_span() {
     let outcomes = tracing::subscriber::with_default(sub, || {
         let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
         let mut c = config(dir.path());
-        c.maintenance_log_objects = 5;
+        c.maintenance_wal_bytes = 16 << 10;
         c.retry_deadline = Duration::from_millis(100);
         c.request_timeout = Duration::from_millis(50);
         let db = crate::open_with_store(c, fault.clone()).unwrap();

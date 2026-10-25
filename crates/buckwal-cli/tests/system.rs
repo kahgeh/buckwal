@@ -354,9 +354,9 @@ fn delta(a: &Stats, b: &Stats, key: &str) -> f64 {
     b[key] - a[key]
 }
 
-/// 150 acks under 4 Window connections write about 39 log objects, so 100 would not seal before
-/// the first kill; 20 does, and yields the `kill_after / 100 - 1` seals the later kills need.
-const WINDOW_SEAL_LOG_OBJECTS: &str = "20";
+/// The smallest WAL size limit (`BUCKWAL_MAINTENANCE_WAL_MIB`, in MiB): about 254 frames of
+/// 4 KiB pages.
+const WINDOW_SEAL_WAL_MIB: &str = "1";
 
 /// The crash matrix for one mode: three runs, killed after `150`, `600` and `1500` acks.
 /// `auto` is the engine's own checkpoint (no `--checkpoint`). With `batching`, soak runs four
@@ -368,7 +368,7 @@ fn crash_matrix(mode: &str, batching: Option<&str>) {
         // Under 4 Window connections the engine never restarts the WAL after PASSIVE/FULL, so
         // the maintenance checkpoint ends the generation (README "Maintenance checkpoint").
         if batching.is_some() && matches!(mode, "passive" | "full") {
-            ctx = ctx.set("BUCKWAL_MAINTENANCE_LOG_OBJECTS", WINDOW_SEAL_LOG_OBJECTS);
+            ctx = ctx.set("BUCKWAL_MAINTENANCE_WAL_MIB", WINDOW_SEAL_WAL_MIB);
         }
         let dir = ctx.dir("db");
         let mut args = Vec::new();
@@ -627,21 +627,23 @@ fn crash_during_seal_upload() {
 /// connections, under which the engine never restarts the WAL by itself.
 const MAINTENANCE_ARGS: [&str; 4] = ["--connections", "8", "--batching", "window 1ms 64 1MiB"];
 
-/// The maintenance threshold of the maintenance tests (`BUCKWAL_MAINTENANCE_LOG_OBJECTS`).
-const MAINTENANCE_LOG_OBJECTS: usize = 200;
+/// The WAL size limit of the maintenance tests (`BUCKWAL_MAINTENANCE_WAL_MIB`, in MiB).
+const MAINTENANCE_WAL_MIB: usize = 1;
+
+/// The most frames (of 4 KiB pages, 4120 bytes each) that `MAINTENANCE_WAL_MIB` holds, so the
+/// most log objects of a generation the limit ends (each object holds at least one frame).
+const MAINTENANCE_FRAMES: usize = (MAINTENANCE_WAL_MIB << 20) / 4120;
 
 fn is_maintenance_end(l: &str) -> bool {
     l.starts_with("event maintenance-finished ") || l.starts_with("event maintenance-skipped ")
 }
 
-/// How far past the threshold a run's `log_objects` may be. The run reads its measures
-/// right after the poke of the call whose commit crossed the threshold; only the few log
-/// objects the uploader appends in between can land first. (bench at threshold 200 saw at
-/// most 202-209 objects in a generation, and that also counts those landing while a run
-/// drains and seals.)
+/// How far past the limit a run's `wal_bytes` may be, in frames. The run reads its measure
+/// right after the poke of the call whose commit crossed the limit; only the few frames that
+/// other connections write in between can land first.
 const MAINTENANCE_START_SLACK: usize = 10;
 
-/// The `log_objects=<n>` of each `event maintenance-started` line, with the number of acks
+/// The `wal_bytes=<n>` of each `event maintenance-started` line, with the number of acks
 /// printed before it.
 fn maintenance_starts(lines: &[String]) -> Vec<(usize, usize)> {
     let mut acks = 0;
@@ -650,7 +652,7 @@ fn maintenance_starts(lines: &[String]) -> Vec<(usize, usize)> {
         if l.starts_with("ack ") {
             acks += 1;
         } else if l.starts_with("event maintenance-started ") {
-            starts.push((field(l, "log_objects"), acks));
+            starts.push((field(l, "wal_bytes"), acks));
         }
     }
     starts
@@ -658,10 +660,10 @@ fn maintenance_starts(lines: &[String]) -> Vec<(usize, usize)> {
 
 /// Sustained Window load (8 connections, `window 1ms`, at least 3000 acks). Without
 /// maintenance the generation never ends (the "before" run reports its seals and restore
-/// GETs, and asserts only that every ack restores). With it (log-object threshold 200, the
-/// `-wal` measure off), every run starts at 200 to 200 + `MAINTENANCE_START_SLACK` log
-/// objects, at least 2 runs start within the first 3000 acks, and a restore right after a
-/// maintenance seal reads at most 200 + 4 objects. Both: every acked id restores,
+/// GETs, and asserts only that every ack restores). With it (WAL size limit 1 MiB), every run
+/// starts at the limit to `MAINTENANCE_START_SLACK` frames past it, at least 2 runs start
+/// within the first 3000 acks, and a restore right after a maintenance run reads at most
+/// `MAINTENANCE_FRAMES` + 4 objects. Both: every acked id restores,
 /// integrity ok, the log contiguous.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
@@ -673,24 +675,19 @@ fn maintenance_bounds_generations_under_window_load() {
             if on { "on" } else { "off" }
         );
         let ctx = if on {
-            // Only the log-object threshold can trigger a run.
-            Ctx::new(&name)
-                .set(
-                    "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
-                    &MAINTENANCE_LOG_OBJECTS.to_string(),
-                )
-                .set("BUCKWAL_MAINTENANCE_WAL_MIB", "0")
+            Ctx::new(&name).set(
+                "BUCKWAL_MAINTENANCE_WAL_MIB",
+                &MAINTENANCE_WAL_MIB.to_string(),
+            )
         } else {
-            Ctx::new(&name)
-                .set("BUCKWAL_MAINTENANCE_LOG_OBJECTS", "0")
-                .set("BUCKWAL_MAINTENANCE_WAL_MIB", "0")
+            Ctx::new(&name).set("BUCKWAL_MAINTENANCE_WAL_MIB", "0")
         };
         let dir = ctx.dir("db");
         let mut soak = Soak::spawn(&ctx, &dir, &MAINTENANCE_ARGS);
         soak.wait_acks(acks);
         if on {
             // Kill right after a maintenance seal: the restore then reads the new
-            // generation, which a run seals again once it holds 200 objects.
+            // generation, which a run ends again once its `-wal` reaches the limit.
             soak.wait_prefixed("event maintenance-finished ");
         }
         soak.kill();
@@ -718,11 +715,12 @@ fn maintenance_bounds_generations_under_window_load() {
         );
         if on {
             let starts = maintenance_starts(&soak.lines);
-            eprintln!("{name}: maintenance runs started at (log_objects, acks before): {starts:?}");
-            let range = MAINTENANCE_LOG_OBJECTS..=MAINTENANCE_LOG_OBJECTS + MAINTENANCE_START_SLACK;
+            eprintln!("{name}: maintenance runs started at (wal_bytes, acks before): {starts:?}");
+            let limit = MAINTENANCE_WAL_MIB << 20;
+            let range = limit..=limit + MAINTENANCE_START_SLACK * 4120;
             assert!(
                 starts.iter().all(|(n, _)| range.contains(n)),
-                "{name}: a run started outside {range:?} log objects: {starts:?}"
+                "{name}: a run started outside {range:?} -wal bytes: {starts:?}"
             );
             let early = starts.iter().filter(|(_, a)| *a < acks).count();
             assert!(
@@ -735,7 +733,7 @@ fn maintenance_bounds_generations_under_window_load() {
                 soak.tail()
             );
             assert!(
-                gets <= MAINTENANCE_LOG_OBJECTS + 4,
+                gets <= MAINTENANCE_FRAMES + 4,
                 "{name}: the restore read {gets} objects: {}",
                 v.restored
             );
@@ -752,8 +750,8 @@ fn maintenance_bounds_generations_under_window_load() {
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_during_maintenance_checkpoint_restores_every_ack() {
     let ctx = Ctx::new("crash_during_maintenance_checkpoint").set(
-        "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
-        &MAINTENANCE_LOG_OBJECTS.to_string(),
+        "BUCKWAL_MAINTENANCE_WAL_MIB",
+        &MAINTENANCE_WAL_MIB.to_string(),
     );
     let dir = ctx.dir("db");
     let mut args = MAINTENANCE_ARGS.to_vec();

@@ -1,11 +1,12 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! The database file: a local page cache backed by the bucket's sealed pages. Pages not yet
-//! local are fetched on first read; pages the engine writes are recorded dirty (in memory and
-//! in `<dir>/app.db-dirty`) and uploaded only when the generation is sealed (D6).
+//! local are fetched on first read. Formats 1 to 4 only: pages the engine writes are recorded
+//! dirty (in memory and in `<dir>/app.db-dirty`) and uploaded only when the generation is
+//! sealed (D6). The legacy seal needs the dirty set, so this code stays for those formats.
 //!
-//! A format 5 bucket (`packed`) holds no page: no dirty page is recorded and no dirty file is
-//! written, and its WAL restart is a generation switch (`switch_generation`), which uploads no
-//! page. A copy restored from a pack reads the blocks that are not local yet from the pack
+//! A format 5 bucket (`packed`) holds no page: no dirty page is recorded, and the dirty file
+//! is never read or written. Its WAL restart is a generation switch (`switch_generation`),
+//! which uploads no page. A copy restored from a pack reads the blocks that are not local yet from the pack
 //! (`blocks`, the `BlockStore`) until every block is local; then nothing is fetched.
 use super::block_store::{page_bytes, BlockStore};
 use super::stash::stash;
@@ -271,6 +272,10 @@ impl BucketDbStorage {
     /// file holds a version newer than the bucket's: never fetch them over it. Called at open,
     /// before the engine reads anything.
     pub(crate) fn adopt_persisted_dirty(&self) -> Result<()> {
+        if self.packed {
+            // Formats 1 to 4 only: nothing uploads pages.
+            return Ok(());
+        }
         let persisted = read_dirty_file(&self.dirty_path())?;
         let pages: BTreeSet<u32> = persisted_pages(&persisted).collect();
         // A replica never seals, so nothing truncates the file: every sync appends its pages
@@ -474,6 +479,9 @@ impl BucketDbStorage {
 
     /// Append the pages dirtied since the last append to the dirty file and fsync it.
     fn persist_dirty(&self) -> Result<()> {
+        if self.packed {
+            return Ok(());
+        }
         let mut d = self.dirty.lock().unwrap();
         if d.unpersisted.is_empty() {
             return Ok(());
@@ -659,8 +667,8 @@ impl DatabaseStorage for BucketDbStorage {
             .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
-        // Uploads nothing: the pages go up when the generation is sealed. Their numbers are
-        // made durable before the database file is.
+        // Uploads nothing. Formats 1 to 4: the pages go up when the generation is sealed, and
+        // their numbers are made durable before the database file is.
         self.persist_dirty().map_err(stash)?;
         self.inner.sync(c, sync_type)
     }
