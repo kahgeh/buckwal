@@ -620,4 +620,71 @@ mod tests {
             "the truncate of a generation change is not recorded"
         );
     }
+
+    /// A `ShippingFile` over a fresh local file, on the engine `e`'s uploader.
+    fn shipping_over_local(
+        e: &crate::engine::Engine,
+        dir: &std::path::Path,
+    ) -> (ShippingFile, Arc<dyn IO>) {
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let path = dir.join("race-wal");
+        let local = io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+        let f = ShippingFile::new(
+            local,
+            io.clone(),
+            e.uploader.clone(),
+            e.storage.clone(),
+            Arc::default(),
+            IoMode::Writer,
+        )
+        .unwrap();
+        (f, io)
+    }
+
+    /// A checkpoint on another thread syncs the `-wal` while connection A's commit has written
+    /// its frames and not yet synced. The checkpoint's upload fails. A's own sync must then
+    /// return an error, never Ok with A's record missing from the bucket.
+    #[test]
+    fn checkpoint_sync_does_not_ship_another_threads_commit() {
+        use crate::store::FaultStore;
+        use std::sync::mpsc::channel;
+        let mem = Arc::new(MemStore::new());
+        let fault = Arc::new(FaultStore::new(mem));
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(fault.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let (wrote_tx, wrote_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let sync = |f: &ShippingFile| -> turso_core::Result<()> {
+            let c = f.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?;
+            io.wait_for_completion(c)
+        };
+        let a_result = std::thread::scope(|s| {
+            let fr = &f;
+            let (io, sync) = (&io, &sync);
+            let a = s.spawn(move || {
+                let mut h = vec![0u8; WAL_HEADER];
+                h[8..12].copy_from_slice(&4096u32.to_be_bytes());
+                let c = fr
+                    .pwrite(0, Arc::new(Buffer::new(h)), Completion::new_write(|_| {}))
+                    .unwrap();
+                io.wait_for_completion(c).unwrap();
+                wrote_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                sync(fr)
+            });
+            wrote_rx.recv().unwrap();
+            // The checkpoint's sync, on this thread, while A waits before its own sync.
+            fault.fail_next_puts_permanently(1);
+            let _ = sync(&f);
+            go_tx.send(()).unwrap();
+            a.join().unwrap()
+        });
+        assert!(
+            a_result.is_err(),
+            "A got Ok but its record never reached the bucket"
+        );
+    }
 }
