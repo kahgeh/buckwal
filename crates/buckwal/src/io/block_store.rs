@@ -398,7 +398,10 @@ impl BlockStore {
         let Some(obj) = with_retry(&self.retry, &key, |_| self.store.get(&key))? else {
             return Ok(false);
         };
-        let p = self.keys.decode_pointer(&obj.body)?;
+        // Another database's pointer is no pointer (spec rev 11, rule 3).
+        let Some(p) = self.keys.read_pointer(&obj.body)? else {
+            return Ok(false);
+        };
         if p.pack_key == old.pack_key || p.pack_generation > self.generation.load(SeqCst) {
             return Ok(false);
         }

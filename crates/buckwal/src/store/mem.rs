@@ -284,6 +284,23 @@ impl ObjectStore for MemStore {
         Ok(())
     }
 
+    fn delete_if_match(&self, key: &str, etag: &str) -> Result<bool, StoreError> {
+        self.deletes.fetch_add(1, Relaxed);
+        let mut inner = self.inner.lock().unwrap();
+        match inner.objects.get(key) {
+            Some(o) if o.etag != etag => {
+                status(412);
+                Ok(false)
+            }
+            _ => {
+                inner.objects.remove(key);
+                inner.written.remove(key);
+                status(204);
+                Ok(true)
+            }
+        }
+    }
+
     fn stats(&self) -> StatsSnap {
         StatsSnap {
             puts: self.puts.load(Relaxed),

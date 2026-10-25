@@ -1,8 +1,10 @@
-//! `pack-latest`: flat JSON that names the newest pack. The pack key and the codes key are
-//! stored relative to the database's prefix (`pack/0000000015/<run id>`, spec rev 8), so a
-//! database copied with its head to another prefix still names its pack;
-//! `Keys::encode_pointer` and `Keys::decode_pointer` convert. In an encrypted bucket it also
-//! carries an integrity code over every field.
+//! `pack-latest`: flat JSON that names the newest pack (spec rev 11, "Contract changes"). The
+//! pack key and the codes key are stored relative to the database's prefix
+//! (`pack/0000000015/<run id>`), so a database copied with its head to another prefix still
+//! names its pack; `Keys::encode_pointer` and `Keys::decode_pointer` convert. A random
+//! `write_id`, new at each pointer write, gives each write other bytes and so another ETag. The
+//! `database_id` is the head's, in every bucket. In an encrypted bucket it also carries an
+//! integrity code over every field.
 use crate::error::{Error, Result};
 use crate::format::json::{escape, Obj};
 
@@ -12,10 +14,13 @@ pub(crate) const POINTER_FORMAT: u32 = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PackPointer {
     pub format: u32,
-    /// The key of the pack, for example `pack/0000000015/<run id>`.
+    /// The key of the pack, for example `<prefix>/pack/0000000015/<run id>` (in the object:
+    /// relative to the prefix).
     pub pack_key: String,
     /// The key of the pack's codes object (`<pack key>.codes`).
     pub codes_key: String,
+    /// Random bytes (hex), new at each write of the pointer (spec rev 11, rule 2).
+    pub write_id: String,
     pub pack_generation: u64,
     /// The pack's total size, in bytes.
     pub size: u64,
@@ -24,7 +29,8 @@ pub(crate) struct PackPointer {
     pub part_size: u64,
     /// The size of a block that one code covers.
     pub block_size: u64,
-    /// The database id of an encrypted bucket; `None` in a plaintext one.
+    /// The head's database id (every format 5 head has one; a pointer of a bucket of format 1
+    /// to 4 without one has `None`).
     pub database_id: Option<String>,
 }
 
@@ -36,10 +42,11 @@ impl PackPointer {
     /// The fields as JSON, without the closing brace (a coded pointer adds its code).
     pub(crate) fn encode_fields(&self) -> String {
         let mut out = format!(
-            "{{\"format\":{},\"pack_key\":{},\"codes_key\":{},\"pack_generation\":{},\"size\":{},\"page_size\":{},\"part_size\":{},\"block_size\":{}",
+            "{{\"format\":{},\"pack_key\":{},\"codes_key\":{},\"write_id\":{},\"pack_generation\":{},\"size\":{},\"page_size\":{},\"part_size\":{},\"block_size\":{}",
             self.format,
             escape(&self.pack_key),
             escape(&self.codes_key),
+            escape(&self.write_id),
             self.pack_generation,
             self.size,
             self.page_size,
@@ -73,6 +80,7 @@ impl PackPointer {
             format: POINTER_FORMAT,
             pack_key: o.str("pack_key")?.to_string(),
             codes_key: o.str("codes_key")?.to_string(),
+            write_id: o.str("write_id")?.to_string(),
             pack_generation: o.num("pack_generation")?,
             size: o.num("size")?,
             page_size: narrow("page_size")?,

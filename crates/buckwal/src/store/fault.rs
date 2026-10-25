@@ -243,6 +243,10 @@ impl ObjectStore for FaultStore {
         self.record("delete", key);
         self.inner.delete(key)
     }
+    fn delete_if_match(&self, key: &str, etag: &str) -> Result<bool, StoreError> {
+        self.record("delete_if_match", key);
+        self.inner.delete_if_match(key, etag)
+    }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()
     }
@@ -373,6 +377,9 @@ impl ObjectStore for HoldStore {
     }
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete(key)
+    }
+    fn delete_if_match(&self, key: &str, etag: &str) -> Result<bool, StoreError> {
+        self.inner.delete_if_match(key, etag)
     }
     fn stats(&self) -> StatsSnap {
         self.inner.stats()

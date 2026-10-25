@@ -497,7 +497,8 @@ impl Bucket {
     }
 
     /// Start a new database: `put_if_absent(head)` at generation 1 and epoch 1, with no
-    /// manifest.
+    /// manifest. In format 5 a leftover `pack-latest` is removed first and one that appeared is
+    /// removed after the head (`pack::first`, spec rev 11 rules 1 and 2).
     ///
     /// A create that times out may still have stored its head. A later `create` then finds a
     /// head and returns `Config` (its first attempt gets a 412, which is never compared);
@@ -511,8 +512,14 @@ impl Bucket {
         own: Timeouts,
     ) -> Result<Bucket> {
         check_writer_id(&writer_id)?;
+        let format = keys.new_wal_format();
+        let packed = format == FORMAT_V5;
+        if packed {
+            // Rule 1 (spec rev 11): a pointer that no head names is not this database's.
+            crate::pack::first::clear_leftover_pointer(&*store, &keys, &retry)?;
+        }
         let head = own.stamp(Head {
-            format: keys.new_wal_format(),
+            format,
             generation: 1,
             manifest: None,
             writer_id,
@@ -521,10 +528,25 @@ impl Bucket {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
-            // A new encrypted database gets its id here, at its first head write.
-            database_id: keys.init_database_id()?,
+            // A new database gets its id here, at its first head write: every format 5 one
+            // (spec rev 11, rule 3), and an encrypted one of the seal formats.
+            database_id: if packed {
+                keys.init_packed_database_id()?
+            } else {
+                keys.init_database_id()?
+            },
         });
-        let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
+        let mut b = Bucket::create_head(
+            store.clone(),
+            keys.clone(),
+            retry.clone(),
+            concurrency,
+            head,
+        )?;
+        if packed {
+            // Rule 2: a pointer that a racing MVCC creator wrote after rule 1 goes.
+            crate::pack::first::delete_after_head(&*store, &keys, &retry)?;
+        }
         b.timeouts = own;
         Ok(b)
     }

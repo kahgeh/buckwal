@@ -1177,6 +1177,20 @@ impl ObjectStore for S3Store {
         }
     }
 
+    fn delete_if_match(&self, key: &str, etag: &str) -> Result<bool, StoreError> {
+        let r = self.send("DELETE", key, &[], &[], &[("if-match", etag)])?;
+        self.deletes.fetch_add(1, Relaxed);
+        let what = format!("DELETE {key} (if-match)");
+        match r.status {
+            200 | 204 => Ok(true),
+            412 => Ok(false),
+            // The key is gone, as a 404 `NoSuchKey` says (any other 404 is no evidence).
+            404 if error_code(&r.body).as_deref() == Some("NoSuchKey") => Ok(true),
+            409 => Err(StoreError::Transient(format!("{what}: HTTP 409 conflict"))),
+            _ => Err(status_error(&what, &r)),
+        }
+    }
+
     fn stats(&self) -> StatsSnap {
         StatsSnap {
             puts: self.puts.load(Relaxed),

@@ -49,6 +49,7 @@ fn put_pack(
     let codes_body = codes.encode(&k, &pack_key, gen, size).unwrap();
     let p = PackPointer {
         format: POINTER_FORMAT,
+        write_id: "w1".into(),
         codes_key: k.pack_codes(gen, run),
         pack_key: pack_key.clone(),
         pack_generation: gen,

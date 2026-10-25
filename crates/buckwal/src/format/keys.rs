@@ -80,6 +80,9 @@ enum Identity {
     Format3,
     /// A format 4 head: its `database_id`, and the database integrity key made from it.
     Format4 { id: String, key: Arc<IntegrityKey> },
+    /// A plaintext format 5 head: its `database_id` (no key; readers compare a pointer's id
+    /// with it, spec rev 11 rule 3).
+    Plain { id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +135,16 @@ impl Keys {
         }
     }
 
+    /// Tests: these keys once they read the head `store` holds (when it holds one that
+    /// decodes), so they know the database id a pointer must carry (`read_pointer`).
+    #[cfg(test)]
+    pub(crate) fn adopting(self, store: &dyn crate::store::ObjectStore) -> Self {
+        if let Ok(Some(o)) = store.get(&self.head()) {
+            let _ = self.decode_head_open(&o.body);
+        }
+        self
+    }
+
     /// Tests: these keys at another prefix, with the same integrity key and the same known
     /// database id (a whole database copied to another prefix).
     #[cfg(test)]
@@ -181,14 +194,24 @@ impl Keys {
         Ok(Some(id))
     }
 
+    /// A new format 5 database: its database id, in a plaintext bucket too (spec rev 11, rule
+    /// 3). Encrypted: `init_database_id`. Plaintext: 16 random bytes, hex, taken as this
+    /// database's.
+    pub(crate) fn init_packed_database_id(&self) -> Result<Option<String>> {
+        if self.integrity.is_some() {
+            return self.init_database_id();
+        }
+        let id = crate::db::new_writer_id()?;
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) =
+            Identity::Plain { id: id.clone() };
+        Ok(Some(id))
+    }
+
     /// The database id these keys know (a format 4 head read or made), for tests that build
     /// heads by hand.
     #[cfg(test)]
     pub(crate) fn database_id(&self) -> Option<String> {
-        match &*self.identity.lock().unwrap_or_else(|e| e.into_inner()) {
-            Identity::Format4 { id, .. } => Some(id.clone()),
-            _ => None,
-        }
+        self.known_database_id()
     }
 
     /// Take `head`, a head that verified, as this database's format and id, or refuse it when
@@ -197,7 +220,7 @@ impl Keys {
     /// format 3 one is `Corrupt("integrity: <key>")` and the record.
     fn adopt_head(&self, head: &Head) -> Result<()> {
         let Some(base) = &self.integrity else {
-            return Ok(());
+            return self.adopt_plain_id(head);
         };
         let mut known = self.identity.lock().unwrap_or_else(|e| e.into_inner());
         let key = || self.head();
@@ -230,8 +253,30 @@ impl Keys {
                 return Err(integrity_failed(&key(), Kind::Head, head.generation, 0));
             }
             (Identity::Unknown, _) => {}
+            // Only plaintext keys hold `Plain`.
+            (Identity::Plain { .. }, _) => {}
         }
         Ok(())
+    }
+
+    /// A plaintext head's `database_id` (format 5): taken when none is known yet; another id
+    /// than the one known is `Corrupt` (another database's head replaced this one's).
+    fn adopt_plain_id(&self, head: &Head) -> Result<()> {
+        let Some(id) = &head.database_id else {
+            return Ok(());
+        };
+        let mut known = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+        match &*known {
+            Identity::Plain { id: k } if k != id => Err(crate::error::Error::Corrupt(format!(
+                "{}: the head names another database_id than the one read before",
+                self.head()
+            ))),
+            Identity::Plain { .. } => Ok(()),
+            _ => {
+                *known = Identity::Plain { id: id.clone() };
+                Ok(())
+            }
+        }
     }
 
     /// These keys for a process's first read of the bucket (an open, a standalone GC): its head
@@ -475,35 +520,50 @@ impl Keys {
         out.into_bytes()
     }
 
-    /// The pack pointer in `body`. In an encrypted bucket its code must verify and its
-    /// `database_id` must be this database's, else `Corrupt("integrity: <pointer key>")`; a
-    /// pointer without a code or an id is that too. A coded pointer read without a key is
-    /// `Encryption`. In every bucket the pointer must be consistent: `pack_key` is
-    /// `pack/<generation>/<run id>` relative to the prefix, `codes_key` is it plus `.codes` and
-    /// `pack_generation` is its generation, else `Corrupt("pack pointer: ...")`. The pointer
-    /// returned has its keys under this prefix (the object holds them relative to it, spec
-    /// rev 8), so a database copied with its head to another prefix names its own pack.
+    /// The pack pointer in `body`, as [`Keys::read_pointer`] reads it; a pointer of another
+    /// database is `Corrupt("pack pointer: another database's ...")` here.
     pub(crate) fn decode_pointer(&self, body: &[u8]) -> Result<PackPointer> {
+        self.read_pointer(body)?.ok_or_else(|| {
+            crate::error::Error::Corrupt(
+                "pack pointer: another database's (its database_id is not the head's)".into(),
+            )
+        })
+    }
+
+    /// The pack pointer in `body`, its keys under this prefix (the object holds them relative
+    /// to it). `None` when its `database_id` is not the one these keys know from the head
+    /// (spec rev 11, rule 3): a pointer of another database is no pointer, with no error and no
+    /// record. The keys must have read the head first. Of this database's pointer: in an
+    /// encrypted bucket its code must verify, else `Corrupt("integrity: <pointer key>")`, and a
+    /// pointer without a code is that too; a coded pointer read without a key is `Encryption`.
+    /// In every bucket the pointer must be consistent: `pack_key` is `pack/<generation>/<run
+    /// id>` relative to the prefix, `codes_key` is it plus `.codes` and `pack_generation` is
+    /// its generation, else `Corrupt("pack pointer: ...")`.
+    pub(crate) fn read_pointer(&self, body: &[u8]) -> Result<Option<PackPointer>> {
         let (p, code) = PackPointer::decode_fields(body)?;
-        let full = |p: PackPointer| PackPointer {
-            pack_key: self.join(&p.pack_key),
-            codes_key: self.join(&p.codes_key),
-            ..p
-        };
         let key = self.pack_pointer();
+        if p.database_id != self.known_database_id() {
+            return Ok(None);
+        }
+        let full = |p: PackPointer| -> Result<PackPointer> {
+            let p = PackPointer {
+                pack_key: self.join(&p.pack_key),
+                codes_key: self.join(&p.codes_key),
+                ..p
+            };
+            self.check_pointer_fields(&p)?;
+            Ok(p)
+        };
         let Some(ik) = self.object_key() else {
             if code.is_some() {
                 return Err(crate::error::Error::Encryption(format!(
                     "{key} is an encrypted database's: set BUCKWAL_ENCRYPTION_KEY_FILE"
                 )));
             }
-            let p = full(p);
-            self.check_pointer_fields(&p)?;
-            return Ok(p);
+            return full(p).map(Some);
         };
         let fail = || integrity_failed(&key, Kind::Pointer, p.pack_generation, 0);
-        let known = self.known_database_id();
-        if p.database_id.is_none() || p.database_id != known {
+        if p.database_id.is_none() {
             return Err(fail());
         }
         let ok = code
@@ -512,9 +572,7 @@ impl Keys {
         if !ok {
             return Err(fail());
         }
-        let p = full(p);
-        self.check_pointer_fields(&p)?;
-        Ok(p)
+        full(p).map(Some)
     }
 
     /// `key` relative to the prefix (unchanged when it is not under it).
@@ -525,7 +583,7 @@ impl Keys {
     /// The database id these keys know (a format 4 or 5 head read or made).
     pub(crate) fn known_database_id(&self) -> Option<String> {
         match &*self.identity.lock().unwrap_or_else(|e| e.into_inner()) {
-            Identity::Format4 { id, .. } => Some(id.clone()),
+            Identity::Format4 { id, .. } | Identity::Plain { id } => Some(id.clone()),
             _ => None,
         }
     }

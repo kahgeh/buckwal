@@ -372,6 +372,25 @@ struct Run<'a> {
     step_start: Instant,
 }
 
+/// What `pack-latest` holds, for a run.
+enum Pointer {
+    None,
+    /// This database's pointer, and its ETag.
+    Own(PackPointer, String),
+    /// A pointer whose `database_id` is not the head's (spec rev 11, rule 3): no pointer for
+    /// the run, which replaces it with `If-Match` on this ETag.
+    Foreign(String),
+}
+
+impl Pointer {
+    fn own(&self) -> Option<&PackPointer> {
+        match self {
+            Pointer::Own(p, _) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 /// The pack this run uploads.
 struct NewPack {
     pointer: PackPointer,
@@ -402,13 +421,16 @@ impl Run<'_> {
         with_retry(&self.retry, what, |_| op())
     }
 
-    /// The pointer and its ETag; `None` when there is none.
-    fn read_pointer(&self) -> Result<Option<(PackPointer, String)>> {
+    /// The pointer as the run sees it (`Pointer`).
+    fn read_pointer(&self) -> Result<Pointer> {
         let key = self.keys.pack_pointer();
         let Some(obj) = self.req(&key, || self.store.get(&key))? else {
-            return Ok(None);
+            return Ok(Pointer::None);
         };
-        Ok(Some((self.keys.decode_pointer(&obj.body)?, obj.etag)))
+        Ok(match self.keys.read_pointer(&obj.body)? {
+            Some(p) => Pointer::Own(p, obj.etag),
+            None => Pointer::Foreign(obj.etag),
+        })
     }
 
     fn run(&mut self, config: &Config) -> Result<Ran> {
@@ -429,7 +451,8 @@ impl Run<'_> {
                 "a pack run of an encrypted bucket without a database id (format 3)",
             ));
         }
-        let base = self.read_pointer()?;
+        let pointer_now = self.read_pointer()?;
+        let base = pointer_now.own().cloned();
         if base.is_none() && head.journal_mode == JournalMode::Mvcc {
             // A new MVCC database is published as its first pack.
             return Err(Error::Corrupt(format!(
@@ -437,7 +460,7 @@ impl Run<'_> {
                 self.keys.pack_pointer()
             )));
         }
-        let from = base.as_ref().map_or(1, |(p, _)| p.pack_generation);
+        let from = base.as_ref().map_or(1, |p| p.pack_generation);
         self.step("read");
 
         // Steps 2 to 4: each ended generation, applied as the scan finds it. The newest pack
@@ -460,7 +483,7 @@ impl Run<'_> {
             }
             if !base_ready {
                 base_ready = true;
-                if let Some((p, _)) = &base {
+                if let Some(p) = &base {
                     if !download_pack(store, keys, retry, p, &db)? {
                         gone = Some(p.pack_key.clone());
                         return Ok(());
@@ -474,7 +497,7 @@ impl Run<'_> {
             Ok(())
         })?;
         self.step("apply");
-        let current = base.as_ref().map_or(0, |(p, _)| p.pack_generation);
+        let current = base.as_ref().map_or(0, |p| p.pack_generation);
         if let Some(key) = scanned.incomplete {
             tracing::warn!(target: "buckwal", key = %key, "pack run: the log is incomplete");
             return Ok((failed("log_incomplete", Some(&key)), current, None, 0.0));
@@ -500,6 +523,7 @@ impl Run<'_> {
             format: POINTER_FORMAT,
             codes_key: self.keys.pack_codes(pack_generation, &self.run_id),
             pack_key: pack_key.clone(),
+            write_id: crate::db::new_writer_id()?,
             pack_generation,
             size,
             page_size: facts.page_size,
@@ -507,81 +531,57 @@ impl Run<'_> {
             block_size: BLOCK_SIZE,
             database_id: self.keys.known_database_id(),
         };
-        let outcome =
-            self.upload_and_publish(pointer, &db, base.map(|(p, etag)| (p.pack_key, etag)));
+        let outcome = self.upload_and_publish(pointer, &db, pointer_now);
         Ok((outcome?, pack_generation, Some(pack_key), free))
     }
 
-    /// Steps 5 to 7 for the database file `db`. `base` is the pointer the run read: the key
-    /// of the pack it names and its ETag.
+    /// Steps 5 to 7 for the database file `db`. `base` is the pointer the run read.
     fn upload_and_publish(
         &mut self,
         pointer: PackPointer,
         db: &Path,
-        base: Option<(String, String)>,
+        base: Pointer,
     ) -> Result<PackOutcome> {
         let (pack_key, codes_key) = (pointer.pack_key.clone(), pointer.codes_key.clone());
-        let part_size = pointer.part_size as usize;
-        // The run's own part checksums and block codes, from the file it uploads.
-        let (part_sha256, codes) = digest(&self.keys, &pointer, db)?;
-        let codes_body =
-            codes.encode(&self.keys, &pack_key, pointer.pack_generation, pointer.size)?;
-        let source = FileSource::open(db)?;
-        // Step 5. The time limit starts here: a multipart object's Last-Modified time is the
-        // upload start, and GC measures an orphan from it.
+        // Steps 5 and 6. The time limit starts here: a multipart object's Last-Modified time
+        // is the upload start, and GC measures an orphan from it.
         let new = NewPack {
             upload_start: (self.clock)(),
             pointer,
         };
-        let mut source = source;
-        let up = self
-            .store
-            .put_multipart(&pack_key, &mut source, part_size, PART_CONCURRENCY);
-        self.step("upload");
-        let done = match up {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(target: "buckwal", key = %pack_key, error = %e, "pack upload failed");
+        let up = upload_verified(self.store, &self.keys, &self.retry, &new.pointer, db, false)?;
+        let now = Instant::now();
+        self.steps
+            .push(("upload", up.uploaded_at - self.step_start));
+        self.steps.push(("verify", now - up.uploaded_at));
+        self.step_start = now;
+        if let Err(f) = up.result {
+            tracing::warn!(target: "buckwal", key = %f.key, step = f.step, error = %f.error, "pack upload failed");
+            if f.step == "upload" {
                 // The parts of a failed upload stay hidden until an abort; GC aborts them
                 // after the orphan grace in any case.
                 let _ = self.store.abort_incomplete(&pack_key, Duration::ZERO);
-                return Ok(failed("upload", Some(&pack_key)));
+            } else {
+                self.discard(&pack_key, &codes_key);
             }
-        };
-        // Step 6. A part reply without a checksum is no proof: compare the store's part
-        // checksums with the run's own, and the HEAD size with the file's.
-        let st = self.req(&pack_key, || self.store.stat(&pack_key));
-        let size_ok = matches!(&st, Ok(Some(s)) if s.size == new.pointer.size);
-        if !size_ok {
-            self.discard(&pack_key, &codes_key);
-            return Ok(failed("verify size", Some(&pack_key)));
+            return Ok(failed(f.step, Some(&f.key)));
         }
-        if done.part_sha256 != part_sha256 {
-            self.discard(&pack_key, &codes_key);
-            return Ok(failed("verify checksum", Some(&pack_key)));
-        }
-        if self
-            .req(&codes_key, || self.store.put(&codes_key, &codes_body))
-            .is_err()
-        {
-            self.discard(&pack_key, &codes_key);
-            return Ok(failed("upload codes", Some(&codes_key)));
-        }
-        self.step("verify");
         let outcome = self.publish(&new, base);
         self.step("publish");
         Ok(outcome)
     }
 
     /// Step 7 and its retries (spec "Step 7 can fail in two ways").
-    fn publish(&self, new: &NewPack, base: Option<(String, String)>) -> PackOutcome {
+    fn publish(&self, new: &NewPack, base: Pointer) -> PackOutcome {
         let p = &new.pointer;
         let (pack_key, codes_key) = (p.pack_key.as_str(), p.codes_key.as_str());
         let pointer_key = self.keys.pack_pointer();
         let body = self.keys.encode_pointer(p);
+        // A foreign pointer is no pointer, but it is replaced on its ETag.
         let (old_key, mut expect) = match base {
-            Some((k, etag)) => (Some(k), Some(etag)),
-            None => (None, None),
+            Pointer::Own(o, etag) => (Some(o.pack_key), Some(etag)),
+            Pointer::Foreign(etag) => (None, Some(etag)),
+            Pointer::None => (None, None),
         };
         for _ in 0..MAX_POINTER_WRITES {
             if (self.clock)().saturating_sub(new.upload_start) >= self.limit {
@@ -614,17 +614,17 @@ impl Run<'_> {
                 }
             };
             match now {
-                Some((now, _)) if now.pack_key == pack_key => return PackOutcome::Packed,
-                Some((now, etag)) if Some(&now.pack_key) == old_key.as_ref() => {
+                Pointer::Own(now, _) if now.pack_key == pack_key => return PackOutcome::Packed,
+                Pointer::Own(now, etag) if Some(&now.pack_key) == old_key.as_ref() => {
                     expect = Some(etag);
                 }
-                Some((now, _)) if now.pack_generation >= p.pack_generation => {
+                Pointer::Own(now, _) if now.pack_generation >= p.pack_generation => {
                     self.discard(pack_key, codes_key);
                     return PackOutcome::Superseded;
                 }
                 // A slower run moved it to a lower pack generation: this pack is the newest.
-                Some((_, etag)) => expect = Some(etag),
-                None => expect = None,
+                Pointer::Own(_, etag) | Pointer::Foreign(etag) => expect = Some(etag),
+                Pointer::None => expect = None,
             }
         }
         self.discard(pack_key, codes_key);
@@ -634,7 +634,7 @@ impl Run<'_> {
     /// Delete the run's pack and codes, unless the pointer names the pack or cannot be read.
     fn discard(&self, pack_key: &str, codes_key: &str) {
         match self.read_pointer() {
-            Ok(Some((p, _))) if p.pack_key == pack_key => return,
+            Ok(Pointer::Own(p, _)) if p.pack_key == pack_key => return,
             Ok(_) => {}
             Err(_) => return,
         }
@@ -644,6 +644,89 @@ impl Run<'_> {
             }
         }
     }
+}
+
+/// Why an upload of a pack did not go through: the step, the key it concerns, the error.
+pub(crate) struct UploadFailed {
+    pub step: &'static str,
+    pub key: String,
+    pub error: Error,
+}
+
+/// What [`upload_verified`] did.
+pub(crate) struct Uploaded {
+    /// When the multipart upload returned.
+    pub uploaded_at: Instant,
+    /// `Err`: the step that failed. The caller cleans up (a pack run deletes its pack and
+    /// codes; a first pack leaves them for GC).
+    pub result: std::result::Result<(), UploadFailed>,
+}
+
+/// Steps 5 and 6 of a pack run, which a new MVCC database's first pack also makes
+/// (`pack::first`): upload `db` as the pack `pointer` names, in parts of `pointer.part_size`,
+/// `PART_CONCURRENCY` at once; check the size a HEAD returns and the SHA-256 of each part
+/// against this process's own (a part reply without a checksum is no proof); then put the
+/// codes. With `retry_upload` a failed multipart upload is sent again under the retry policy
+/// (the first pack: its key is its own); a pack run gives up at once (`upload`). `Err`: the
+/// codes could not be made (nothing was sent).
+pub(crate) fn upload_verified(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    pointer: &PackPointer,
+    db: &Path,
+    retry_upload: bool,
+) -> Result<Uploaded> {
+    let (pack_key, codes_key) = (pointer.pack_key.as_str(), pointer.codes_key.as_str());
+    let part_size = pointer.part_size as usize;
+    let (part_sha256, codes) = digest(keys, pointer, db)?;
+    let codes_body = codes.encode(keys, pack_key, pointer.pack_generation, pointer.size)?;
+    let mut source = FileSource::open(db)?;
+    let up = if retry_upload {
+        with_retry(retry, pack_key, |_| {
+            store.put_multipart(pack_key, &mut source, part_size, PART_CONCURRENCY)
+        })
+    } else {
+        store
+            .put_multipart(pack_key, &mut source, part_size, PART_CONCURRENCY)
+            .map_err(|e| Error::UploadFailed(format!("{pack_key}: {e}")))
+    };
+    let uploaded_at = Instant::now();
+    let fail = |step, key: &str, error| Uploaded {
+        uploaded_at,
+        result: Err(UploadFailed {
+            step,
+            key: key.to_string(),
+            error,
+        }),
+    };
+    let done = match up {
+        Ok(d) => d,
+        Err(e) => return Ok(fail("upload", pack_key, e)),
+    };
+    let size = pointer.size;
+    match with_retry(retry, pack_key, |_| store.stat(pack_key)) {
+        Ok(Some(s)) if s.size == size => {}
+        Ok(st) => {
+            let e = Error::UploadFailed(format!(
+                "{pack_key}: the store holds {:?} bytes, not {size}",
+                st.map(|s| s.size)
+            ));
+            return Ok(fail("verify size", pack_key, e));
+        }
+        Err(e) => return Ok(fail("verify size", pack_key, e)),
+    }
+    if done.part_sha256 != part_sha256 {
+        let e = Error::UploadFailed(format!("{pack_key}: a part's SHA-256 is not the file's"));
+        return Ok(fail("verify checksum", pack_key, e));
+    }
+    if let Err(e) = with_retry(retry, codes_key, |_| store.put(codes_key, &codes_body)) {
+        return Ok(fail("upload codes", codes_key, e));
+    }
+    Ok(Uploaded {
+        uploaded_at,
+        result: Ok(()),
+    })
 }
 
 /// The SHA-256 of each part of `db` (parts of `pointer.part_size`) and its block codes.
@@ -768,13 +851,13 @@ fn fetch_range(
 }
 
 /// A [`PartSource`] over a local file.
-pub(crate) struct FileSource {
+struct FileSource {
     file: Mutex<File>,
     len: u64,
 }
 
 impl FileSource {
-    pub(crate) fn open(path: &Path) -> Result<FileSource> {
+    fn open(path: &Path) -> Result<FileSource> {
         let file = File::open(path).map_err(|e| io_err("open pack file", e))?;
         let len = file
             .metadata()

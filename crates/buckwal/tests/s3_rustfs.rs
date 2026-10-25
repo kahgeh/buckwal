@@ -223,6 +223,29 @@ fn rustfs_delete() {
     assert_eq!(s.stats().deletes, 2);
 }
 
+/// A conditional delete (spec rev 11, rule 1: a create removes a leftover `pack-latest` with
+/// `If-Match`): a matching ETag deletes, another ETag is a 412 and keeps the object, and a
+/// missing key is no error.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn rustfs_delete_if_match() {
+    let s = store();
+    let p = prefix("delifmatch");
+    let k = format!("{p}k");
+    let e1 = s.put(&k, b"one").unwrap();
+    let e2 = s.put(&k, b"two").unwrap();
+    assert_ne!(e1, e2);
+    assert!(!s.delete_if_match(&k, &e1).unwrap(), "an old ETag");
+    assert_eq!(s.get(&k).unwrap().unwrap().body, b"two");
+    assert!(s.delete_if_match(&k, &e2).unwrap());
+    assert_eq!(s.get(&k).unwrap(), None);
+    // A missing key: RustFS answers 412 (`false`), S3 a 404 `NoSuchKey` (`true`). Either is
+    // no error, and a caller reads the key again (`pack::first`).
+    let gone = s.delete_if_match(&k, &e2).unwrap();
+    eprintln!("rustfs_delete_if_match: a missing key answers {gone}");
+    assert_eq!(s.get(&k).unwrap(), None);
+}
+
 /// `list_after` against the real server: only keys strictly greater than `start_after`, in
 /// order, and a listing past the 1,000 keys of one `ListObjectsV2` page comes back whole
 /// (the continuation token is followed) with `start-after` honoured. About 1,100 tiny

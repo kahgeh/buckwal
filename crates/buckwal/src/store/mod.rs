@@ -247,6 +247,16 @@ pub trait ObjectStore: Send + Sync {
         Ok(0)
     }
     fn delete(&self, key: &str) -> std::result::Result<(), StoreError>;
+    /// Delete `key` only while its ETag is `etag` (`If-Match`). `Ok(true)`: deleted, or the
+    /// key is gone (S3: 404 `NoSuchKey`); `Ok(false)`: a 412, the key holds another ETag, or
+    /// (RustFS) the key is gone; a caller reads the key again. The default refuses: a store
+    /// that has no conditional delete cannot remove a pointer with care (spec rev 11, rule 1).
+    fn delete_if_match(&self, key: &str, etag: &str) -> std::result::Result<bool, StoreError> {
+        let _ = etag;
+        Err(StoreError::Permanent(format!(
+            "DELETE {key} (if-match): this store has no conditional delete"
+        )))
+    }
     fn stats(&self) -> StatsSnap;
 }
 

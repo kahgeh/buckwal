@@ -1623,6 +1623,7 @@ mod packer_format {
     fn pointer(k: &Keys, id: Option<&str>) -> PackPointer {
         PackPointer {
             format: 5,
+            write_id: "w1".into(),
             pack_key: k.pack(15, "run1"),
             codes_key: k.pack_codes(15, "run1"),
             pack_generation: 15,
@@ -1739,13 +1740,11 @@ mod packer_format {
         // A pointer without a code, and one made under another key.
         let plain = Keys::new("p").encode_pointer(&p);
         assert_eq!(k.decode_pointer(&plain).unwrap_err(), fail);
-        assert!(matches!(
-            Keys::new("p").decode_pointer(&body),
-            Err(Error::Encryption(_))
-        ));
+        // Keys that know no id, or another database's id, see no pointer (spec rev 11, rule 3).
+        assert_eq!(Keys::new("p").read_pointer(&body).unwrap(), None);
         let other = coded(2);
         other.init_database_id().unwrap();
-        assert_eq!(other.decode_pointer(&body).unwrap_err(), fail);
+        assert_eq!(other.read_pointer(&body).unwrap(), None);
     }
 
     fn coded_with_id() -> (Keys, PackPointer) {
@@ -1763,6 +1762,7 @@ mod packer_format {
         let fail = Error::Corrupt(format!("integrity: {key}"));
         let body = String::from_utf8(k.encode_pointer(&p)).unwrap();
         for (from, to) in [
+            ("\"write_id\":\"w1\"", "\"write_id\":\"w2\""),
             ("\"page_size\":4096", "\"page_size\":8192"),
             ("\"part_size\":16777216", "\"part_size\":16777217"),
             ("\"block_size\":1048576", "\"block_size\":2097152"),
@@ -1793,8 +1793,9 @@ mod packer_format {
         let p = pointer(&a, a.database_id().as_deref());
         let body = a.encode_pointer(&p);
         let fail = Error::Corrupt(format!("integrity: {}", b.pack_pointer()));
-        assert_eq!(b.decode_pointer(&body).unwrap_err(), fail);
-        // B's keys with A's id in the pointer: the code is under A's key, so it fails too.
+        // A's pointer carries A's id: for B it is no pointer (spec rev 11, rule 3).
+        assert_eq!(b.read_pointer(&body).unwrap(), None);
+        // B's keys with B's id in the pointer, coded under A's key: it fails its code.
         let q = PackPointer {
             database_id: b.database_id(),
             ..p
@@ -1803,24 +1804,25 @@ mod packer_format {
     }
 
     #[test]
-    fn a_pointer_with_another_database_id_than_the_keys_hold_is_refused() {
+    fn a_pointer_with_another_database_id_than_the_keys_hold_is_no_pointer() {
         let (k, p) = coded_with_id();
         let other = PackPointer {
             database_id: Some(ID.into()),
             ..p
         };
         assert_ne!(k.database_id().as_deref(), Some(ID));
+        assert_eq!(k.read_pointer(&k.encode_pointer(&other)).unwrap(), None);
         assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&other))));
     }
 
     #[test]
-    fn a_coded_pointer_without_a_database_id_is_refused() {
+    fn a_coded_pointer_without_a_database_id_is_no_pointer() {
         let (k, p) = coded_with_id();
         let none = PackPointer {
             database_id: None,
             ..p
         };
-        assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&none))));
+        assert_eq!(k.read_pointer(&k.encode_pointer(&none)).unwrap(), None);
     }
 
     #[test]

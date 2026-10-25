@@ -719,11 +719,16 @@ fn apply_ended_generations(
 ) -> Result<Built> {
     let enc = cfg.encryption.as_deref();
     let pointer_key = keys.pack_pointer();
-    let (blocks, from) = match counted(retries, &cfg.retry, &pointer_key, || {
+    // A pointer of another database (its `database_id` is not the head's) is no pointer
+    // (spec rev 11, rule 3): the log is read from the first generation.
+    let own = match counted(retries, &cfg.retry, &pointer_key, || {
         store.get(&pointer_key)
     })? {
-        Some(obj) => {
-            let p = keys.decode_pointer(&obj.body)?;
+        Some(obj) => keys.read_pointer(&obj.body)?.map(|p| (p, obj)),
+        None => None,
+    };
+    let (blocks, from) = match own {
+        Some((p, obj)) => {
             *read.lock().unwrap() = Some(p.pack_key.clone());
             let from = p.pack_generation;
             let Some(codes) = counted(retries, &cfg.retry, &p.codes_key, || {
@@ -757,7 +762,8 @@ fn apply_ended_generations(
         // A new MVCC database is published as its first pack (`Bucket::create_packed_mvcc_with`).
         None if head.journal_mode == JournalMode::Mvcc => {
             return Err(Error::Corrupt(format!(
-                "{pointer_key} is missing: an MVCC bucket of format 5 starts with its first pack"
+                "{pointer_key} is missing or another database's: an MVCC bucket of format 5 \
+                 starts with its first pack"
             )))
         }
         None => (None, 1),
@@ -920,8 +926,8 @@ fn pointer_moved(
     let key = keys.pack_pointer();
     match with_retry(&cfg.retry, &key, |_| store.get(&key)) {
         Ok(Some(obj)) => keys
-            .decode_pointer(&obj.body)
-            .is_ok_and(|p| p.pack_key != read),
+            .read_pointer(&obj.body)
+            .is_ok_and(|p| p.is_some_and(|p| p.pack_key != read)),
         _ => false,
     }
 }

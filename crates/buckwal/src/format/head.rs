@@ -24,7 +24,8 @@ fn corrupt(m: &str) -> Error {
 const ACCEPTED: &[u32] = &[FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5];
 
 /// Whether a head of `format` always carries `key_check` and an integrity code (an encrypted
-/// database's). A format 5 head is coded when it has a `database_id` (`Head::is_coded`).
+/// database's). A format 5 head is coded when it carries `key_check` (an encrypted bucket's);
+/// every format 5 head has a `database_id` (spec rev 11, rule 3).
 fn coded_format(format: u32) -> bool {
     format == FORMAT_V3 || format == FORMAT_V4
 }
@@ -62,14 +63,14 @@ pub(crate) struct Head {
     /// only when `Some`.
     pub next_generation_floor: Option<u64>,
     /// The database's id (16 random bytes, hex), made at its first head write and kept by every
-    /// head after it. Encoded only in a format 4 head, where it is required, and in a format 5 head of an
-    /// encrypted bucket (a plaintext format 5 head has none).
+    /// head after it. Encoded only in a format 4 head, where it is required, and in a format 5
+    /// head, plaintext or encrypted (spec rev 11, rule 3).
     pub database_id: Option<String>,
 }
 
 impl Head {
-    /// Whether this head carries `key_check` and an integrity code: a format 3 or 4 head
-    /// always, a format 5 head when it has a `database_id`.
+    /// Whether this head can carry `key_check` and an integrity code: a format 3 or 4 head
+    /// always does, a format 5 head does in an encrypted bucket (it needs its `database_id`).
     pub(crate) fn is_coded(&self) -> bool {
         coded_format(self.format) || (self.format == FORMAT_V5 && self.database_id.is_some())
     }
@@ -161,9 +162,11 @@ impl Head {
         open: bool,
     ) -> Result<Head> {
         let (head, code, kc) = Head::decode_inner(b, ACCEPTED)?;
-        let key_check_present = kc.is_some();
+        // A format 5 head is an encrypted bucket's when it carries `key_check` or a code.
+        let coded = coded_format(head.format)
+            || (head.format == FORMAT_V5 && (kc.is_some() || code.is_some()));
         let Some(ik) = ik else {
-            if head.is_coded() || (head.format == FORMAT_V5 && key_check_present) {
+            if coded {
                 return Err(Error::Encryption(format!(
                     "{key} is a format {} head, an encrypted database's: set \
                      BUCKWAL_ENCRYPTION_KEY_FILE",
@@ -172,7 +175,7 @@ impl Head {
             }
             return Ok(head);
         };
-        if !head.is_coded() {
+        if !coded {
             // Before a good open this is a plaintext or pre-codes bucket; after one, someone
             // put back a plaintext-format head to strip the codes.
             return Err(if open {

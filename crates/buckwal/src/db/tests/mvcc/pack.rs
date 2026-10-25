@@ -448,3 +448,112 @@ fn mvcc_restore_of_a_pack_of_several_blocks_equals_writer_db() {
     let (_, ids) = restored_ids(mem.clone(), &mvcc);
     assert_eq!(ids, want.iter().map(|r| r.0).collect::<Vec<_>>());
 }
+
+/// Keys of `cfg` that read the bucket's head (they know its database id).
+fn keys_of(store: &MemStore, cfg: &Config) -> crate::format::Keys {
+    cfg.keys().unwrap().adopting(store)
+}
+
+/// The first pack and its codes moved to another relative key (`pack/2/moved`), with a pointer
+/// that names it there and verifies (made with the database's own keys): the codes bind the
+/// pack key relative to the prefix, so the codes fail and the restore is `Corrupt`, with the
+/// integrity text when encrypted and the checksum text when plain. Nothing is restored.
+#[test]
+fn a_pack_moved_to_another_relative_key_fails_its_codes() {
+    for encrypted in [false, true] {
+        let mem = mem();
+        let k = tempdir();
+        let cfg_for = |d: &Path| {
+            if encrypted {
+                mvcc_enc(d, &k, &key_hex())
+            } else {
+                mvcc(d)
+            }
+        };
+        let t = tempdir();
+        let (db, c) = mvcc_with_rows(mem.clone(), cfg_for(&fresh(&t)), 2);
+        let keys = keys_of(&mem, &cfg_for(&fresh(&t)));
+        let p = keys
+            .decode_pointer(&mem.get(&keys.pack_pointer()).unwrap().unwrap().body)
+            .unwrap();
+        let moved = PackPointer {
+            pack_key: keys.pack(2, "moved"),
+            codes_key: keys.pack_codes(2, "moved"),
+            ..p.clone()
+        };
+        for (from, to) in [
+            (&p.pack_key, &moved.pack_key),
+            (&p.codes_key, &moved.codes_key),
+        ] {
+            mem.put(to, &mem.get(from).unwrap().unwrap().body).unwrap();
+        }
+        mem.put(&keys.pack_pointer(), &keys.encode_pointer(&moved))
+            .unwrap();
+        let t2 = tempdir();
+        let r = restore_with_store(&cfg_for(&fresh(&t2)), mem.clone(), &fresh(&t2));
+        let want = if encrypted {
+            format!("integrity: {}", moved.codes_key)
+        } else {
+            format!("checksum mismatch: {}", moved.codes_key)
+        };
+        assert!(
+            matches!(&r, Err(Error::Corrupt(m)) if *m == want),
+            "encrypted={encrypted}: {r:?}"
+        );
+        assert!(!fresh(&t2).join("app.db").exists());
+        crash(db, vec![c]);
+    }
+}
+
+/// Two encrypted databases under one key file. A's pointer, made by someone with A's keys,
+/// names B's pack and codes copied into A's prefix: B's codes are bound to B's database id, so
+/// A's restore fails `Corrupt("integrity: ...")`. B's own pointer copied into A's prefix carries
+/// B's id, so for A it is no pointer (rule 3 of spec rev 11), and an MVCC bucket without its
+/// pack does not restore.
+#[test]
+fn a_pointer_naming_another_databases_pack_fails() {
+    let k = tempdir();
+    let (a, b) = (mem(), mem());
+    let (ta, tb) = (tempdir(), tempdir());
+    let (dba, ca) = mvcc_with_rows(a.clone(), mvcc_enc(&fresh(&ta), &k, &key_hex()), 2);
+    let (dbb, cb) = mvcc_with_rows(b.clone(), mvcc_enc(&fresh(&tb), &k, &key_hex()), 2);
+    let ka = keys_of(&a, &mvcc_enc(&fresh(&ta), &k, &key_hex()));
+    let kb = keys_of(&b, &mvcc_enc(&fresh(&tb), &k, &key_hex()));
+    let pa = ka
+        .decode_pointer(&a.get(&ka.pack_pointer()).unwrap().unwrap().body)
+        .unwrap();
+    let pb = kb
+        .decode_pointer(&b.get(&kb.pack_pointer()).unwrap().unwrap().body)
+        .unwrap();
+    for key in [&pb.pack_key, &pb.codes_key] {
+        a.put(key, &b.get(key).unwrap().unwrap().body).unwrap();
+    }
+    let forged = PackPointer {
+        pack_key: pb.pack_key.clone(),
+        codes_key: pb.codes_key.clone(),
+        size: pb.size,
+        ..pa.clone()
+    };
+    a.put(&ka.pack_pointer(), &ka.encode_pointer(&forged))
+        .unwrap();
+    let t = tempdir();
+    let r = restore_with_store(&mvcc_enc(&fresh(&t), &k, &key_hex()), a.clone(), &fresh(&t));
+    assert!(
+        matches!(&r, Err(Error::Corrupt(m)) if *m == format!("integrity: {}", pb.codes_key)),
+        "{r:?}"
+    );
+    // B's pointer itself.
+    a.put(
+        &ka.pack_pointer(),
+        &b.get(&kb.pack_pointer()).unwrap().unwrap().body,
+    )
+    .unwrap();
+    let t = tempdir();
+    let r = restore_with_store(&mvcc_enc(&fresh(&t), &k, &key_hex()), a.clone(), &fresh(&t));
+    assert!(
+        matches!(&r, Err(Error::Corrupt(m)) if m.contains("missing or another database's")),
+        "{r:?}"
+    );
+    crash(dba, vec![ca]);
+    crash(dbb, vec![cb]);
+}

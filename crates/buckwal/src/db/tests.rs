@@ -4158,8 +4158,9 @@ fn create_mvcc_makes_pack_pointer_head_and_local_files() {
     plain_mvcc_open_works(&image, &[], None);
 }
 
-/// The steps of a creation, in order.
-const STEPS: [&str; 4] = ["pack", "codes", "pointer", "head"];
+/// The steps of a creation, in order (rule 1 writes nothing in an empty bucket). The last,
+/// rule 2 of spec rev 11, writes the pointer again after the head.
+const STEPS: [&str; 5] = ["pack", "codes", "pointer", "head", "rewrite"];
 
 /// The step of a creation a write (a `FaultStore` event) belongs to.
 fn step_of(write: &str) -> &'static str {
@@ -4167,6 +4168,8 @@ fn step_of(write: &str) -> &'static str {
         "pack"
     } else if write.ends_with(".codes") {
         "codes"
+    } else if write.starts_with("put_if_match ") && write.ends_with("/pack-latest") {
+        "rewrite"
     } else if write.ends_with("/pack-latest") {
         "pointer"
     } else if write.ends_with("/head") {
@@ -4200,6 +4203,8 @@ fn new_mvcc_database_publishes_pack_pointer_head_in_that_order() {
         format!("put {}", p.codes_key),
         format!("put_if_absent {}", keys().pack_pointer()),
         format!("put_if_absent {}", keys().head()),
+        // Rule 2: the pointer again, a new `write_id`, `If-Match` on the ETag it read.
+        format!("put_if_match {}", keys().pack_pointer()),
     ];
     assert_eq!(writes(&fault), order);
     // The pack's size is checked (HEAD) before its codes go up.
@@ -4211,7 +4216,8 @@ fn new_mvcc_database_publishes_pack_pointer_head_in_that_order() {
     );
     created_bucket(&*clean);
 
-    for n in 0..order.len() as u64 {
+    // A failure at each step before the head lands (n = 0..3).
+    for n in 0..4u64 {
         let inner = mem();
         let fault = Arc::new(FaultStore::new(inner.clone()));
         fault.fail_puts_after(n);
@@ -4332,9 +4338,155 @@ fn stale_staging_dir_never_deletes_a_foreign_app_db() {
     }
 }
 
-/// A create where a database already exists (its head and pointer are there): the first
-/// pointer write gets a 412, the pointer read is not this creation's, and a head exists, so the
-/// create is `Config` and never writes the pointer with `If-Match`. The database is unchanged.
+/// The log keys of `store` (every generation).
+fn log_keys_of(store: &MemStore) -> Vec<String> {
+    store.list(&keys().log_root()).unwrap()
+}
+
+/// Spec rev 11, rule 1 and rule 3: an MVCC create that crashed after its pointer (its head PUT
+/// fails), then a WAL create at the same prefix. The WAL create removes the leftover pointer
+/// before its head, so its database is its own: 9 acked rows over two switches restore from its
+/// own log, a pack run packs it, and GC deletes none of its log. Plain and encrypted.
+#[test]
+fn wal_create_after_crashed_mvcc_create_restores() {
+    for encrypted in [false, true] {
+        let inner = mem();
+        let k = tempdir();
+        let wal_cfg = |d: &Path| {
+            if encrypted {
+                enc_config(d, &k, &key_hex())
+            } else {
+                config(d)
+            }
+        };
+        let mvcc_cfg = |d: &Path| {
+            let mut c = wal_cfg(d);
+            c.journal_mode = JournalMode::Mvcc;
+            c.retry_deadline = Duration::from_millis(100);
+            c
+        };
+        // The MVCC create: pack, codes and pointer land, the head PUT fails.
+        let fault = Arc::new(FaultStore::new(inner.clone()));
+        fault.fail_puts_after(3);
+        let t = tempdir();
+        assert!(create_mvcc(fault.clone(), &mvcc_cfg(&fresh(&t))).is_err());
+        assert!(inner.get(&keys().head()).unwrap().is_none());
+        assert!(
+            inner.get(&keys().pack_pointer()).unwrap().is_some(),
+            "a leftover pointer"
+        );
+        // The WAL create at the same prefix.
+        let t = tempdir();
+        let db = open_with_store(wal_cfg(&fresh(&t)), inner.clone()).unwrap();
+        let c = db.connect().unwrap();
+        create(&c);
+        for id in 1..=3 {
+            insert(&c, id).unwrap();
+        }
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        for id in 4..=6 {
+            insert(&c, id).unwrap();
+        }
+        c.checkpoint(CheckpointMode::Truncate).unwrap();
+        for id in 7..=9 {
+            insert(&c, id).unwrap();
+        }
+        let want = ids(&c);
+        assert_eq!(want.len(), 9);
+        crash(db, vec![c]);
+        let t2 = tempdir();
+        let rep = restore_with_store(&wal_cfg(&fresh(&t2)), inner.clone(), &fresh(&t2))
+            .unwrap_or_else(|e| panic!("encrypted={encrypted}: restore: {e}"));
+        assert_eq!(
+            rep.pack_key, None,
+            "encrypted={encrypted}: not the MVCC pack"
+        );
+        let ro = open_read_only_with_store(wal_cfg(&fresh(&t2)), inner.clone()).unwrap();
+        let rc = ro.connect().unwrap();
+        assert_eq!(ids(&rc), want, "encrypted={encrypted}");
+        rc.close().unwrap();
+        ro.close().unwrap();
+        // GC deletes none of its log.
+        let logs = log_keys_of(&inner);
+        let t3 = tempdir();
+        let gc = crate::gc_with_store(&wal_cfg(&fresh(&t3)), inner.clone()).unwrap();
+        assert_eq!(gc.deleted, 0, "encrypted={encrypted}: {gc:?}");
+        assert_eq!(log_keys_of(&inner), logs);
+        // A pack run packs it.
+        let t4 = tempdir();
+        let r = crate::pack::run::pack_with_store(&wal_cfg(&t4.path().join("p")), inner.clone())
+            .unwrap_or_else(|e| panic!("encrypted={encrypted}: pack run: {e}"));
+        assert_eq!(
+            (r.outcome, r.pack_generation),
+            (crate::pack::run::PackOutcome::Packed, 3),
+            "encrypted={encrypted}"
+        );
+        let t5 = tempdir();
+        let rep = restore_with_store(&wal_cfg(&fresh(&t5)), inner.clone(), &fresh(&t5)).unwrap();
+        assert_eq!(rep.pack_key, r.pack_key);
+        let ro = open_read_only_with_store(wal_cfg(&fresh(&t5)), inner.clone()).unwrap();
+        let rc = ro.connect().unwrap();
+        assert_eq!(ids(&rc), want, "encrypted={encrypted}: from the pack");
+        rc.close().unwrap();
+        ro.close().unwrap();
+    }
+}
+
+/// Spec rev 11, rule 3: a pointer whose `database_id` is not the head's (a late pointer of
+/// the creator that lost a race, written after the WAL winner's create) is no pointer: a
+/// restore reads the log from the first generation, and the packer replaces it with
+/// `If-Match` on its ETag.
+#[test]
+fn a_pointer_of_another_database_id_is_treated_as_no_pointer() {
+    let store = mem();
+    let t = tempdir();
+    let db = open_mem(&store, &fresh(&t));
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=4 {
+        insert(&c, id).unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    insert(&c, 5).unwrap();
+    // Another database's first MVCC pointer and pack land at this prefix.
+    let other = mem();
+    let to = tempdir();
+    create_mvcc(other.clone(), &mvcc_config(&fresh(&to))).unwrap();
+    for key in other.list(&keys().pack_root()).unwrap() {
+        store
+            .put(&key, &other.get(&key).unwrap().unwrap().body)
+            .unwrap();
+    }
+    let foreign = other.get(&keys().pack_pointer()).unwrap().unwrap().body;
+    store.put(&keys().pack_pointer(), &foreign).unwrap();
+    let want = ids(&c);
+    let t2 = tempdir();
+    let rep = restore_with_store(&config(&fresh(&t2)), store.clone(), &fresh(&t2))
+        .unwrap_or_else(|e| panic!("restore: {e}"));
+    assert_eq!(rep.pack_key, None, "the foreign pointer is no pointer");
+    let ro = open_read_only_with_store(config(&fresh(&t2)), store.clone()).unwrap();
+    let rc = ro.connect().unwrap();
+    assert_eq!(ids(&rc), want);
+    rc.close().unwrap();
+    ro.close().unwrap();
+    let t3 = tempdir();
+    let r = crate::pack::run::pack_with_store(&config(&t3.path().join("p")), store.clone())
+        .unwrap_or_else(|e| panic!("pack run: {e}"));
+    assert_eq!(
+        (r.outcome, r.pack_generation),
+        (crate::pack::run::PackOutcome::Packed, 2)
+    );
+    let now = store.get(&keys().pack_pointer()).unwrap().unwrap().body;
+    assert_ne!(now, foreign, "the packer replaced the foreign pointer");
+    let t4 = tempdir();
+    let rep = restore_with_store(&config(&fresh(&t4)), store.clone(), &fresh(&t4)).unwrap();
+    assert_eq!(rep.pack_key, r.pack_key);
+    crash(db, vec![c]);
+}
+
+/// A create that finds a head on its second read (rule 1 of spec rev 11: a database already
+/// exists, its head and pointer are there) deletes nothing and writes nothing: `Config`, and
+/// the database is unchanged.
 #[test]
 fn create_over_an_existing_database_changes_no_pointer() {
     let inner = mem();
@@ -4351,16 +4503,14 @@ fn create_over_an_existing_database_changes_no_pointer() {
             "a database already exists at this prefix".into()
         ))
     );
+    // Rule 1 (spec rev 11): the create reads the pointer, then the head again, finds the
+    // head and stops: it writes and deletes nothing.
     let w: Vec<String> = fault
         .events()
         .into_iter()
-        .filter(|e| e.starts_with("put_if_match") || e.starts_with("put_if_absent"))
+        .filter(|e| e.starts_with("put") || e.starts_with("delete"))
         .collect();
-    assert_eq!(
-        w,
-        [format!("put_if_absent {}", keys().pack_pointer())],
-        "no head write, no pointer replaced"
-    );
+    assert_eq!(w, Vec::<String>::new(), "no write, no delete");
     let now = inner.get(&keys().pack_pointer()).unwrap().unwrap();
     assert_eq!((now.body, now.etag), (pointer.body, pointer.etag));
     assert_eq!(
@@ -4475,6 +4625,7 @@ fn create_mvcc_encrypted_has_no_plaintext() {
 }
 
 mod checkpoint_race;
+mod create_race;
 mod integrity;
 mod mvcc;
 mod pack_restore;

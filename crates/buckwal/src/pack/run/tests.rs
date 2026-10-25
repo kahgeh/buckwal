@@ -312,7 +312,7 @@ fn head_of(store: &dyn ObjectStore) -> Head {
 
 fn pointer_of(store: &dyn ObjectStore) -> Option<PackPointer> {
     let body = store.get(&keys().pack_pointer()).unwrap()?.body;
-    Some(keys().decode_pointer(&body).unwrap())
+    Some(keys().adopting(store).decode_pointer(&body).unwrap())
 }
 
 /// Every key under `pack/`.
@@ -363,6 +363,7 @@ fn rows_of(db: &[u8], wal: Option<&[u8]>, enc: Option<&Config>) -> Vec<i64> {
 
 /// The pointer's pack, every block checked against its codes.
 fn pack_bytes(store: &dyn ObjectStore, k: &Keys) -> (PackPointer, Vec<u8>) {
+    let k = &k.clone().adopting(store);
     let p = k
         .decode_pointer(&store.get(&k.pack_pointer()).unwrap().unwrap().body)
         .unwrap();
@@ -475,7 +476,9 @@ fn pack_applies_one_generation() {
             "{}",
             p.pack_key
         );
-        assert_eq!(p.database_id.is_some(), encrypted);
+        // Every format 5 pointer carries the head's id (spec rev 11, rule 3).
+        assert_eq!(p.database_id, k.known_database_id());
+        assert!(p.database_id.is_some());
         assert_eq!(
             rows_of(&body, None, encrypted.then_some(&cfg)),
             vec![1, 2, 3, 4, 5]
@@ -1100,11 +1103,13 @@ fn pointer_412_names_this_run_is_packed() {
     w.crash();
 }
 
-/// A pointer naming another run's pack of `generation`, without the pack.
-fn other_pointer(generation: u64) -> Vec<u8> {
+/// A pointer of this database (the head's `database_id`) naming another run's pack of
+/// `generation`, without the pack.
+fn other_pointer(store: &dyn ObjectStore, generation: u64) -> Vec<u8> {
     let k = keys();
     k.encode_pointer(&PackPointer {
         format: POINTER_FORMAT,
+        write_id: "w1".into(),
         pack_key: k.pack(generation, "other"),
         codes_key: k.pack_codes(generation, "other"),
         pack_generation: generation,
@@ -1112,7 +1117,7 @@ fn other_pointer(generation: u64) -> Vec<u8> {
         page_size: 4096,
         part_size: PART_SIZE as u64,
         block_size: BLOCK_SIZE,
-        database_id: None,
+        database_id: head_of(store).database_id,
     })
 }
 
@@ -1125,7 +1130,7 @@ fn pointer_412_names_higher_generation_is_superseded_and_deletes_own_pack() {
     let hs = HookStore::new(mem.clone());
     on_first_pointer_write(&hs, Reply::Pass, |inner| {
         inner
-            .put(&keys().pack_pointer(), &other_pointer(9))
+            .put(&keys().pack_pointer(), &other_pointer(inner, 9))
             .unwrap();
     });
     let r = run(&cfg, hs.clone()).unwrap();
@@ -1170,7 +1175,7 @@ fn pointer_412_lower_generation_retries_with_new_etag() {
     // A slower run moves the pointer to another pack of generation 2.
     on_first_pointer_write(&hs, Reply::Pass, |inner| {
         inner
-            .put(&keys().pack_pointer(), &other_pointer(2))
+            .put(&keys().pack_pointer(), &other_pointer(inner, 2))
             .unwrap();
     });
     let r = run(&cfg, hs.clone()).unwrap();
@@ -1365,7 +1370,7 @@ fn discard_keeps_the_pack_the_pointer_names() {
     let (_, clock) = fake_clock();
     let r = Run {
         store: &*hs,
-        keys: keys(),
+        keys: keys().adopting(&*mem),
         retry: cfg.engine(crate::io::IoMode::Writer).retry,
         enc: None,
         clock,

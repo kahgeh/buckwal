@@ -1,46 +1,103 @@
-//! The first pack of a new MVCC database (spec "A new MVCC database is the one case that
-//! publishes a pack at once", ADR 0004 as changed by format 5). The creation built the empty
-//! database in its staging directory; this publishes that file before any head exists:
+//! The first pack of a new MVCC database, and the care every create takes with `pack-latest`
+//! (spec rev 11, "A new MVCC database is the one case that publishes a pack at once", and its
+//! three rules; ADR 0004 as format 5 changes it).
 //!
-//! 1. the pack, `pack/<G>/<run id>`, as a multipart upload in 16 MiB parts, its size (HEAD)
-//!    and the SHA-256 of each part checked as a pack run checks them;
-//! 2. its codes, `pack/<G>/<run id>.codes`;
-//! 3. the first pointer, with `If-None-Match`.
+//! A new MVCC database publishes the empty database file of its staging directory before any
+//! head exists: the pack `pack/<G>/<run id>` and its codes (`run::upload_verified`, the steps a
+//! pack run makes), then the first pointer with `If-None-Match`. The caller then writes the
+//! head with `If-None-Match` (`Bucket::create_packed_mvcc_with`), then rewrites the pointer
+//! (rule 2, [`rewrite_after_head`]). A crash between the steps leaves no head, so the next
+//! create starts again with a new run id, and GC deletes the orphan pack.
 //!
-//! The caller then writes the head with `If-None-Match` (`Bucket::create_packed_mvcc_with`). A
-//! crash between the steps leaves no head, so the next create starts again with a new run id,
-//! and GC deletes the orphan pack. A pointer that such a crash left (step 3 done, no head) gets
-//! a 412: the next create reads it and, while no head exists, replaces it with `If-Match`.
+//! How the first pack differs from a pack run: a failed check deletes nothing (the pack and its
+//! codes stay for GC; no pointer names them); there is no HEAD of the pack and codes just before
+//! the pointer write and no time limit (no pointer names an older pack that GC could trim
+//! against, and the head that makes the pointer count comes after it); a failed multipart
+//! upload is sent again under the retry policy, as the key is this creation's own.
+//!
+//! Every create, WAL or MVCC, that finds no head removes a leftover pointer first (rule 1,
+//! [`clear_leftover_pointer`]), and the WAL create deletes a pointer that appeared once its
+//! head landed (rule 2, [`delete_after_head`]). Readers treat a pointer of another
+//! `database_id` as no pointer (rule 3, `Keys::read_pointer`).
 use super::codes::BLOCK_SIZE;
 use super::pointer::{PackPointer, POINTER_FORMAT};
-use super::run::{digest, FileSource, PART_CONCURRENCY, PART_SIZE};
+use super::run::{upload_verified, PART_SIZE};
 use crate::error::{Error, Result};
 use crate::files::io_err;
 use crate::format::Keys;
 use crate::store::{part_size_for, with_retry, CondPut, ObjectStore, RetryPolicy};
 use std::path::Path;
-use std::time::Duration;
 
-/// The most pointer writes a creation sends when each gets a 412 from a pointer that changes
-/// between its reads (racing creators).
-const MAX_POINTER_WRITES: u32 = 10;
-
-/// What [`publish`] left in the bucket.
-pub(crate) struct FirstPack {
-    /// The pointer object's bytes and the ETag of this creation's write of it.
-    pub body: Vec<u8>,
-    pub etag: String,
-    /// The pointer object this creation replaced (one that no head named), if any.
-    pub replaced: Option<Vec<u8>>,
-}
+/// The most rounds a create makes of a read and a conditional write of `pack-latest` before it
+/// gives up, when each one finds that another creator changed it between the two (a race).
+const MAX_ROUNDS: u32 = 10;
 
 fn exists() -> Error {
     Error::Config("a database already exists at this prefix".into())
 }
 
+fn too_many(key: &str) -> Error {
+    Error::UploadFailed(format!(
+        "{key}: it changed at each of {MAX_ROUNDS} reads (another creator)"
+    ))
+}
+
+/// Rule 1: before a create writes anything that a head would name, remove a `pack-latest`
+/// that no head names. GET the pointer and keep its ETag; GET the head again: a head now is
+/// `Config` ("a database already exists"), and nothing is deleted; else delete the pointer
+/// with `If-Match` on that ETag. A 412 means another creator wrote a new pointer: read both
+/// again. The pack it named stays for GC.
+pub(crate) fn clear_leftover_pointer(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+) -> Result<()> {
+    let key = keys.pack_pointer();
+    let head_key = keys.head();
+    for _ in 0..MAX_ROUNDS {
+        let Some(pointer) = with_retry(retry, &key, |_| store.get(&key))? else {
+            return Ok(());
+        };
+        if with_retry(retry, &head_key, |_| store.get(&head_key))?.is_some() {
+            return Err(exists());
+        }
+        if with_retry(retry, &key, |_| store.delete_if_match(&key, &pointer.etag))? {
+            tracing::info!(target: "buckwal", key = %key, "create: removed a pointer that no head names");
+            return Ok(());
+        }
+    }
+    Err(too_many(&key))
+}
+
+/// Rule 2 of a WAL create, after its head landed: a pointer that appeared (a racing MVCC
+/// creator's, written after this create's rule 1) is deleted with `If-Match`. No pack run can
+/// have written one yet: a pack needs a generation that this new writer ended.
+pub(crate) fn delete_after_head(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+) -> Result<()> {
+    let key = keys.pack_pointer();
+    for _ in 0..MAX_ROUNDS {
+        let Some(pointer) = with_retry(retry, &key, |_| store.get(&key))? else {
+            return Ok(());
+        };
+        if with_retry(retry, &key, |_| store.delete_if_match(&key, &pointer.etag))? {
+            return Ok(());
+        }
+    }
+    Err(too_many(&key))
+}
+
+/// The first pointer this creation wrote (step 3), as rule 2 rewrites it.
+pub(crate) struct FirstPack {
+    pub pointer: PackPointer,
+}
+
 /// Steps 1 to 3 (module doc) for the database file `db` of `page_size`-byte pages, as the
-/// pack of `generation`. The keys must know the database id of an encrypted database
-/// (`Keys::init_database_id`): the codes and the pointer are coded under it.
+/// pack of `generation`. The keys must know the database id (`Keys::init_packed_database_id`):
+/// the pointer carries it, and the codes and the pointer are coded under it when encrypted.
+/// The caller made rule 1 first.
 pub(crate) fn publish(
     store: &dyn ObjectStore,
     keys: &Keys,
@@ -58,6 +115,7 @@ pub(crate) fn publish(
         format: POINTER_FORMAT,
         pack_key: keys.pack(generation, &run_id),
         codes_key: keys.pack_codes(generation, &run_id),
+        write_id: crate::db::new_writer_id()?,
         pack_generation: generation,
         size,
         page_size,
@@ -65,125 +123,67 @@ pub(crate) fn publish(
         block_size: BLOCK_SIZE,
         database_id: keys.known_database_id(),
     };
-    let (pack_key, codes_key) = (pointer.pack_key.clone(), pointer.codes_key.clone());
-    let (part_sha256, codes) = digest(keys, &pointer, db)?;
-    let codes_body = codes.encode(keys, &pack_key, generation, size)?;
-    // Step 1. An attempt that stored the pack but lost its reply is sent again: the key is
-    // this creation's own.
-    let mut source = FileSource::open(db)?;
-    let done = match with_retry(retry, &pack_key, |_| {
-        store.put_multipart(&pack_key, &mut source, part_size, PART_CONCURRENCY)
-    }) {
-        Ok(d) => d,
-        Err(e) => {
+    // Steps 1 and 2. A failed check leaves the pack and its codes for GC.
+    if let Err(f) = upload_verified(store, keys, retry, &pointer, db, true)?.result {
+        if f.step == "upload" {
             // The parts of a failed upload stay hidden until an abort; GC aborts them after
             // the orphan grace in any case.
-            let _ = store.abort_incomplete(&pack_key, Duration::ZERO);
-            return Err(e);
+            let _ = store.abort_incomplete(&pointer.pack_key, std::time::Duration::ZERO);
         }
-    };
-    let stat = with_retry(retry, &pack_key, |_| store.stat(&pack_key))?;
-    if !matches!(&stat, Some(s) if s.size == size) {
-        return Err(Error::UploadFailed(format!(
-            "{pack_key}: the store holds {:?} bytes, not {size}",
-            stat.map(|s| s.size)
-        )));
+        return Err(f.error);
     }
-    if done.part_sha256 != part_sha256 {
-        return Err(Error::UploadFailed(format!(
-            "{pack_key}: a part's SHA-256 is not the file's"
-        )));
-    }
-    // Step 2.
-    with_retry(retry, &codes_key, |_| store.put(&codes_key, &codes_body))?;
-    // Step 3.
+    // Step 3. A 412: another creator's pointer appeared since rule 1 (an earlier attempt of
+    // this one that landed has these bytes); rule 1 again, then the write again.
+    let key = keys.pack_pointer();
     let body = keys.encode_pointer(&pointer);
-    let (etag, replaced) = put_first_pointer(store, keys, retry, &body)?;
-    Ok(FirstPack {
-        body,
-        etag,
-        replaced,
-    })
-}
-
-/// The first pointer with `If-None-Match`. A 412 reads the pointer: this creation's own bytes
-/// (an earlier attempt landed) are its write; another pointer is replaced with `If-Match` on
-/// its ETag while no head exists (a crashed creation left it, and nothing names its pack), and
-/// refused as `Config` once a head exists. Returns the ETag of the write and the pointer it
-/// replaced.
-fn put_first_pointer(
-    store: &dyn ObjectStore,
-    keys: &Keys,
-    retry: &RetryPolicy,
-    body: &[u8],
-) -> Result<(String, Option<Vec<u8>>)> {
-    let key = keys.pack_pointer();
-    let head_key = keys.head();
-    // The pointer to replace: its ETag and its bytes.
-    let mut over: Option<(String, Vec<u8>)> = None;
-    for _ in 0..MAX_POINTER_WRITES {
-        let put = match &over {
-            None => with_retry(retry, &key, |_| store.put_if_absent(&key, body))?,
-            Some((etag, _)) => with_retry(retry, &key, |_| store.put_if_match(&key, body, etag))?,
-        };
-        if let CondPut::Created { etag } = put {
-            return Ok((etag, over.map(|(_, old)| old)));
+    for _ in 0..MAX_ROUNDS {
+        if let CondPut::Created { .. } =
+            with_retry(retry, &key, |_| store.put_if_absent(&key, &body))?
+        {
+            return Ok(FirstPack { pointer });
         }
-        let Some(now) = with_retry(retry, &key, |_| store.get(&key))? else {
-            over = None;
-            continue;
-        };
-        if now.body == body {
-            return Ok((now.etag, over.map(|(_, old)| old)));
+        if with_retry(retry, &key, |_| store.get(&key))?.is_some_and(|o| o.body == body) {
+            return Ok(FirstPack { pointer });
         }
-        if with_retry(retry, &head_key, |_| store.get(&head_key))?.is_some() {
-            return Err(exists());
-        }
-        over = Some((now.etag, now.body));
+        clear_leftover_pointer(store, keys, retry)?;
     }
-    Err(Error::UploadFailed(format!(
-        "{key}: the pointer changed at each of {MAX_POINTER_WRITES} writes"
-    )))
+    Err(too_many(&key))
 }
 
-/// After the head landed: the pointer must name this creation's pack. A racing creator that
-/// found no head yet may have replaced it; it is put back with `If-Match` on what is there.
-/// Best effort: a failure is logged, and the head stays.
-pub(crate) fn keep_pointer(store: &dyn ObjectStore, keys: &Keys, retry: &RetryPolicy, ours: &[u8]) {
-    let key = keys.pack_pointer();
-    for _ in 0..MAX_POINTER_WRITES {
-        let now = match with_retry(retry, &key, |_| store.get(&key)) {
-            Ok(Some(o)) if o.body == ours => return,
-            Ok(Some(o)) => o,
-            Ok(None) => match with_retry(retry, &key, |_| store.put_if_absent(&key, ours)) {
-                Ok(_) => continue,
-                Err(e) => return warn_pointer(&e),
-            },
-            Err(e) => return warn_pointer(&e),
-        };
-        if let Err(e) = with_retry(retry, &key, |_| store.put_if_match(&key, ours, &now.etag)) {
-            return warn_pointer(&e);
-        }
-    }
-}
-
-/// The loser of a creation race (its head got a 412): put back the pointer it replaced, with
-/// `If-Match` on its own write, so the winner's pointer is the one that stays. Best effort.
-pub(crate) fn give_back_pointer(
+/// Rule 2 of an MVCC create, after its head landed: write the pointer again with a new
+/// `write_id`, with `If-Match` on the ETag just read, or `If-None-Match` when there is none;
+/// then GET it once more and check that it names this creation's pack. A slow creator that read
+/// the first pointer before the head landed holds only its ETag: its late delete fails with a
+/// 412 once this rewrite (other bytes, another ETag) is in, and a delete before the rewrite is
+/// undone by it.
+pub(crate) fn rewrite_after_head(
     store: &dyn ObjectStore,
     keys: &Keys,
     retry: &RetryPolicy,
     first: &FirstPack,
-) {
-    let Some(old) = &first.replaced else {
-        return;
-    };
+) -> Result<()> {
     let key = keys.pack_pointer();
-    if let Err(e) = with_retry(retry, &key, |_| store.put_if_match(&key, old, &first.etag)) {
-        warn_pointer(&e);
+    for _ in 0..MAX_ROUNDS {
+        let body = keys.encode_pointer(&PackPointer {
+            write_id: crate::db::new_writer_id()?,
+            ..first.pointer.clone()
+        });
+        let put = match with_retry(retry, &key, |_| store.get(&key))? {
+            Some(o) => with_retry(retry, &key, |_| store.put_if_match(&key, &body, &o.etag))?,
+            None => with_retry(retry, &key, |_| store.put_if_absent(&key, &body))?,
+        };
+        if let CondPut::PreconditionFailed = put {
+            continue;
+        }
+        let now = with_retry(retry, &key, |_| store.get(&key))?;
+        let ours = now
+            .map(|o| keys.read_pointer(&o.body))
+            .transpose()?
+            .flatten()
+            .is_some_and(|p| p.pack_key == first.pointer.pack_key);
+        if ours {
+            return Ok(());
+        }
     }
-}
-
-fn warn_pointer(e: &Error) {
-    tracing::warn!(target: "buckwal", error = %e, "create: cannot make sure of the first pack pointer");
+    Err(too_many(&key))
 }

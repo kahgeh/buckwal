@@ -177,14 +177,17 @@ pub(crate) fn head_verifies(ik: &IntegrityKey, fields: &[u8], code: &[u8]) -> bo
     ik.verify(&[b"head", fields], code)
 }
 
-/// The parts of a pack pointer's code: every field of the pointer, so none can change without
-/// the code failing. The database id has a presence byte, so "none" differs from "empty".
-fn pointer_parts(p: &PackPointer) -> [Vec<u8>; 10] {
+/// The parts of a pack pointer's code: every field of the pointer as the object holds it (the
+/// keys relative to the prefix, the `write_id` included), so none can change without the code
+/// failing. The database id has a presence byte, so "none" differs from "empty".
+fn pointer_parts(p: &PackPointer) -> [Vec<u8>; 12] {
     let id = p.database_id.as_deref();
     [
         b"pack-latest".to_vec(),
+        p.format.to_be_bytes().to_vec(),
         p.pack_key.as_bytes().to_vec(),
         p.codes_key.as_bytes().to_vec(),
+        p.write_id.as_bytes().to_vec(),
         p.size.to_be_bytes().to_vec(),
         p.pack_generation.to_be_bytes().to_vec(),
         p.page_size.to_be_bytes().to_vec(),

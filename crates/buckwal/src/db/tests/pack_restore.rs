@@ -49,6 +49,7 @@ fn pack_now(store: Arc<dyn ObjectStore>, cfg: &Config) -> crate::PackReport {
 }
 
 fn pointer(store: &dyn ObjectStore, k: &Keys) -> PackPointer {
+    let k = k.clone().adopting(store);
     k.decode_pointer(&store.get(&k.pack_pointer()).unwrap().unwrap().body)
         .unwrap()
 }
