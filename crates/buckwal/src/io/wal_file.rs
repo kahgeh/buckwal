@@ -68,9 +68,6 @@ fn engine_io(e: turso_core::LimboError) -> Error {
 struct CommitSpans {
     commit: Span,
     local_write: Span,
-    /// The thread that recorded the first op: the commit's own sync runs on it. A sync on
-    /// another thread is a checkpoint's and leaves the ops pending.
-    owner: ThreadId,
 }
 
 impl CommitSpans {
@@ -89,7 +86,6 @@ impl CommitSpans {
         CommitSpans {
             commit,
             local_write,
-            owner: std::thread::current().id(),
         }
     }
 }
@@ -101,6 +97,11 @@ pub(crate) struct ShippingFile {
     storage: Arc<BucketDbStorage>,
     /// Ops written since the last sync.
     pending: Mutex<Vec<Op>>,
+    /// The thread that wrote the last of `pending`. Locked after `pending`. A commit writes
+    /// its frames and fsyncs them on one thread, and its commit frame comes last. A checkpoint
+    /// on another thread also fsyncs the `-wal` and must not ship a commit that waits for its
+    /// own fsync (`take_own_pending`).
+    last_writer: Mutex<Option<ThreadId>>,
     /// The spans of the commit those ops belong to; `Some` exactly when `pending` is not
     /// empty. Locked after `pending`.
     commit: Mutex<Option<CommitSpans>>,
@@ -145,6 +146,7 @@ impl ShippingFile {
             uploader,
             storage,
             pending: Mutex::new(Vec::new()),
+            last_writer: Mutex::new(None),
             commit: Mutex::new(None),
             header: Mutex::new(header),
             high_water,
@@ -188,8 +190,13 @@ impl ShippingFile {
     /// `buckwal.local_write` is closed here; `None` exactly when there are no ops).
     fn take_pending(&self) -> (Vec<Op>, Option<Span>) {
         let mut pending = self.pending.lock().unwrap();
+        self.take_locked(&mut pending)
+    }
+
+    /// `take_pending` with `pending` already locked.
+    fn take_locked(&self, pending: &mut Vec<Op>) -> (Vec<Op>, Option<Span>) {
         let spans = self.commit.lock().unwrap().take();
-        let ops = std::mem::take(&mut *pending);
+        let ops = std::mem::take(pending);
         let commit = spans.map(|s| {
             drop(s.local_write);
             s.commit
@@ -197,22 +204,18 @@ impl ShippingFile {
         (ops, commit)
     }
 
-    /// `take_pending` for a commit's own sync: `None` (the ops stay pending) when they belong
-    /// to a commit on another thread. Such a sync is a checkpoint's (the engine's passive
-    /// checkpoint fsyncs the `-wal` while another connection's commit waits for its own
-    /// fsync). It must not ship the commit's ops: a failed upload would fail the checkpoint,
-    /// and the commit's own sync would then find nothing pending and get Ok.
-    fn take_pending_of_this_thread(&self) -> Option<(Vec<Op>, Option<Span>)> {
-        let owned_elsewhere = self
-            .commit
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|s| s.owner != std::thread::current().id());
-        if owned_elsewhere {
-            return None;
+    /// `take_pending` for a sync, only when this thread wrote the last pending op. Else the
+    /// sync is a checkpoint's `-wal` fsync (the engine's passive checkpoint on another
+    /// connection) while a commit waits for its own fsync. It fsyncs locally only and leaves
+    /// the ops to that commit. If it shipped them, a failed upload would fail the checkpoint.
+    /// The commit's own sync would then find nothing pending and get Ok.
+    fn take_own_pending(&self) -> (Vec<Op>, Option<Span>) {
+        let mut pending = self.pending.lock().unwrap();
+        let mine = *self.last_writer.lock().unwrap() == Some(std::thread::current().id());
+        if !pending.is_empty() && !mine {
+            return (Vec::new(), None);
         }
-        Some(self.take_pending())
+        self.take_locked(&mut pending)
     }
 
     /// Hand `ops` to the uploader as one sync uploaded with `b`, with `commit` as its span,
@@ -255,9 +258,7 @@ impl ShippingFile {
     /// fsync does not run). A background commit's span ends with its `local_fsync` and has
     /// no outcome: its record is not in the bucket yet.
     fn ship_commit(&self) -> Result<Option<Span>> {
-        let Some((ops, span)) = self.take_pending_of_this_thread() else {
-            return Ok(None);
-        };
+        let (ops, span) = self.take_own_pending();
         if ops.is_empty() {
             return Ok(None);
         }
@@ -368,6 +369,7 @@ impl ShippingFile {
                 *self.commit.lock().unwrap() = Some(CommitSpans::start());
             }
             pending.extend(ops);
+            *self.last_writer.lock().unwrap() = Some(std::thread::current().id());
         }
         r
     }
@@ -673,6 +675,18 @@ mod tests {
     /// return an error, never Ok with A's record missing from the bucket.
     #[test]
     fn checkpoint_sync_does_not_ship_another_threads_commit() {
+        race(None);
+    }
+
+    /// The same, with the checkpoint on the `buckwal-maintenance` thread.
+    #[test]
+    fn maintenance_checkpoint_sync_does_not_ship_another_threads_commit() {
+        race(Some("buckwal-maintenance"));
+    }
+
+    /// The race: A writes and waits; a checkpoint thread (the test's thread, or a thread
+    /// named `name`) syncs with a failing upload; then A syncs.
+    fn race(name: Option<&str>) {
         use crate::store::FaultStore;
         use std::sync::mpsc::channel;
         let mem = Arc::new(MemStore::new());
@@ -701,9 +715,23 @@ mod tests {
                 sync(fr)
             });
             wrote_rx.recv().unwrap();
-            // The checkpoint's sync, on this thread, while A waits before its own sync.
+            // The checkpoint's sync, while A waits before its own sync.
             fault.fail_next_puts_permanently(1);
-            let _ = sync(&f);
+            match name {
+                None => {
+                    let _ = sync(&f);
+                }
+                Some(n) => {
+                    std::thread::Builder::new()
+                        .name(n.into())
+                        .spawn_scoped(s, move || {
+                            let _ = sync(fr);
+                        })
+                        .unwrap()
+                        .join()
+                        .unwrap();
+                }
+            }
             go_tx.send(()).unwrap();
             a.join().unwrap()
         });
@@ -744,5 +772,47 @@ mod tests {
         assert!(puts() > before, "the sync did not upload its ops");
         fault.fail_next_puts_permanently(1);
         assert!(commit(&f).is_err(), "a failed upload returned Ok");
+    }
+
+    /// The engine spills a large transaction's pages into the `-wal` with no sync, and
+    /// `COMMIT` can run on another thread (a pipeline of `serve`). The commit's sync is the
+    /// one that wrote the last (commit) frame: it ships every pending op, the spill included.
+    #[test]
+    fn a_commit_on_another_thread_ships_the_spill_of_the_first() {
+        use crate::store::FaultStore;
+        let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(fault.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let put = |f: &ShippingFile, bytes: Vec<u8>| {
+            let c = f
+                .pwrite(
+                    0,
+                    Arc::new(Buffer::new(bytes)),
+                    Completion::new_write(|_| {}),
+                )
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+        };
+        let mut h = vec![0u8; WAL_HEADER];
+        h[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        std::thread::scope(|s| {
+            s.spawn(|| put(&f, h.clone())).join().unwrap();
+        });
+        let puts = || {
+            fault
+                .events()
+                .iter()
+                .filter(|e| e.starts_with("put_if_absent ") && e.contains("/log/"))
+                .count()
+        };
+        let before = puts();
+        put(&f, h.clone());
+        let c = f
+            .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert!(puts() > before, "the commit's sync did not upload");
+        assert!(f.pending.lock().unwrap().is_empty());
     }
 }
