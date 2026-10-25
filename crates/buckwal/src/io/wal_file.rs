@@ -434,6 +434,11 @@ impl File for ShippingFile {
         if self.local_only() {
             return self.inner.sync(c, sync_type);
         }
+        #[cfg(test)]
+        {
+            let empty = self.pending.lock().unwrap().is_empty();
+            before_sync(empty);
+        }
         // Upload (or queue) before any completion exists: a failed upload is a synchronous
         // `Err`, which rolls the commit back, never a failed completion (which would panic,
         // D3). A queued Window commit is fsynced locally now and acked by its call later.
@@ -474,6 +479,27 @@ impl File for ShippingFile {
         }
         self.record_if_ok(vec![Op::Truncate { len }], r)
     }
+}
+
+/// Tests: a hook of `BEFORE_SYNC`.
+#[cfg(test)]
+pub(crate) type SyncHook = Option<Box<dyn FnMut(bool)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: called at the start of each shipping `sync` on this thread, with whether the
+    /// file had no pending op then.
+    pub(crate) static BEFORE_SYNC: std::cell::RefCell<SyncHook> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_sync(pending_empty: bool) {
+    BEFORE_SYNC.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f(pending_empty)
+        }
+    });
 }
 
 #[cfg(test)]

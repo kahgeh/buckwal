@@ -4291,6 +4291,7 @@ fn create_mvcc_encrypted_has_no_plaintext() {
     );
 }
 
+mod checkpoint_race;
 mod integrity;
 mod mvcc;
 mod telemetry;
