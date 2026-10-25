@@ -106,6 +106,13 @@ struct TestStore {
     uploads_started: std::sync::atomic::AtomicU64,
     /// Set once a log object of the bucket is read (a pack run's scan).
     on_log_get: Mutex<Option<Arc<AtomicBool>>>,
+    /// Set at the first HEAD of a pack (its size check, before the pointer write).
+    on_pack_stat: Mutex<Option<Arc<AtomicBool>>>,
+    /// When each multipart upload started.
+    upload_times: Mutex<Vec<Instant>>,
+    /// Bytes put and got around each multipart upload, outside any pack run, on the same
+    /// in-memory store (another thread's traffic, as a writer makes).
+    unrelated_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl TestStore {
@@ -117,6 +124,9 @@ impl TestStore {
             changed: Condvar::new(),
             uploads_started: Default::default(),
             on_log_get: Mutex::default(),
+            on_pack_stat: Mutex::default(),
+            upload_times: Mutex::default(),
+            unrelated_bytes: Default::default(),
         })
     }
 
@@ -176,6 +186,11 @@ impl ObjectStore for TestStore {
     }
     fn stat(&self, key: &str) -> std::result::Result<Option<ObjectStat>, StoreError> {
         self.record("stat", key);
+        if key.contains("/pack/") {
+            if let Some(flag) = self.on_pack_stat.lock().unwrap().take() {
+                flag.store(true, SeqCst);
+            }
+        }
         self.inner.stat(key)
     }
     fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError> {
@@ -194,6 +209,14 @@ impl ObjectStore for TestStore {
         self.record("list_sized", prefix);
         self.inner.list_sized(prefix)
     }
+    fn list_sized_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+        self.record("list_sized_after", prefix);
+        self.inner.list_sized_after(prefix, start_after)
+    }
     fn put_multipart(
         &self,
         key: &str,
@@ -202,10 +225,29 @@ impl ObjectStore for TestStore {
         concurrency: usize,
     ) -> std::result::Result<MultipartDone, StoreError> {
         self.record("put_multipart", key);
+        self.upload_times.lock().unwrap().push(Instant::now());
         self.uploads_started.fetch_add(1, SeqCst);
+        let n = self.unrelated_bytes.load(SeqCst) as usize;
+        if n > 0 {
+            let other = format!("{PREFIX}/unrelated");
+            self.inner.put(&other, &vec![7u8; n])?;
+            self.inner.get(&other)?;
+        }
         let mut u = self.upload.lock().unwrap();
         while *u == Upload::Hold {
-            u = self.changed.wait(u).unwrap();
+            // A held upload still reads its parts, as a slow link does: a part read that fails
+            // fails the upload.
+            let mut b = [0u8; 1];
+            if source.read_at(0, &mut b).is_err() {
+                return Err(StoreError::Permanent(format!(
+                    "PUT {key}: read part 1 of the source"
+                )));
+            }
+            u = self
+                .changed
+                .wait_timeout(u, Duration::from_millis(20))
+                .unwrap()
+                .0;
         }
         if *u == Upload::Fail {
             return Err(StoreError::Permanent(format!(
@@ -357,7 +399,11 @@ fn loop_starts_a_run_when_log_passes_10_percent() {
     }
     assert_eq!(check(&cfg, &*mem).unwrap(), None, "{log} of {}", p.size);
     cfg.pack_log_percent -= 1;
-    assert_eq!(check(&cfg, &*mem).unwrap(), Some(Reason::LogPercent));
+    let ts = TestStore::new(mem.clone());
+    assert_eq!(check(&cfg, &*ts).unwrap(), Some(Reason::LogPercent));
+    // It lists the log from the pack generation on, not the whole log.
+    assert_eq!(ts.calls_of("list_sized_after", "/log/"), 1);
+    assert_eq!(ts.calls_of("list_sized", ""), 0);
     // The default 10% of the real pack.
     let cfg = packer_cfg(&t, "p");
     let want = (log * 100 > p.size * 10).then_some(Reason::LogPercent);
@@ -627,7 +673,7 @@ fn stop_abandons_a_run_and_removes_its_working_dir() {
     assert_eq!(
         r.outcome,
         PackOutcome::Failed {
-            step: "stopped".into(),
+            step: "closed".into(),
             key: None
         }
     );
@@ -788,7 +834,7 @@ fn gauges_use_pointer_last_modified_and_listing_sizes() {
     crate::pack::pack_with_store(&packer_cfg(&t, "p"), mem.clone()).unwrap();
     let p = pointer_of(&*mem).unwrap();
     mem.advance_clock(Duration::from_secs(1800));
-    let listed_before = ts.calls_of("list_sized", "/log/");
+    let listed_before = ts.calls_of("list_sized_after", "/log/");
     ts.clear_calls();
     let gauges = |cap: &Capture| cap.spans().named("buckwal.pack.gauges").len();
     let before = gauges(&cap);
@@ -816,9 +862,14 @@ fn gauges_use_pointer_last_modified_and_listing_sizes() {
         s.field("buckwal.pack.generation"),
         Some(&*p.pack_generation.to_string())
     );
+    assert_eq!(
+        s.field("buckwal.pack.size_bytes"),
+        Some(&*p.size.to_string())
+    );
     // One listing in this open, and one pointer GET per gauge.
     let all = spans.named("buckwal.pack.gauges").len() - before;
-    assert_eq!(listed_before + ts.calls_of("list_sized", "/log/"), 1);
+    assert_eq!(listed_before + ts.calls_of("list_sized_after", "/log/"), 1);
+    assert_eq!(ts.calls_of("list_sized", ""), 0);
     assert_eq!(ts.calls_of("list", ""), 0);
     assert_eq!(ts.calls_of("list_after", ""), 0);
     let gets = ts.calls_of("get_aged", "pack-latest");
@@ -857,6 +908,7 @@ fn gauges_without_a_pack_count_the_whole_log() {
     );
     assert_eq!(s.field("buckwal.pack.age_seconds"), None, "no pack");
     assert_eq!(s.field("buckwal.pack.generation"), None);
+    assert_eq!(s.field("buckwal.pack.size_bytes"), None);
 }
 
 #[test]
@@ -872,15 +924,373 @@ fn a_failure_like_the_one_before_is_the_same_failure() {
         error_kind("bucket: GET t/head: HTTP 404: NoSuchBucket (request id 1)")
     );
     // A run's own pack key changes with each run: only the step counts.
+    let root = keys().pack_root();
     assert_eq!(
-        failure_kind("upload", Some("t/pack/0000000003/abc")),
-        failure_kind("upload", Some("t/pack/0000000003/def"))
+        failure_kind("upload", Some("t/pack/0000000003/abc"), &root),
+        failure_kind("upload", Some("t/pack/0000000003/def"), &root)
     );
     assert_ne!(
         failure_kind(
             "log_incomplete",
-            Some("t/log/0000000003/00000000000000000002")
+            Some("t/log/0000000003/00000000000000000002"),
+            &root
         ),
-        failure_kind("upload", None)
+        failure_kind("upload", None, &root)
     );
+    // Only a key under the pack root is a run's own pack.
+    assert_ne!(
+        failure_kind("head", Some("t/log/pack/1"), &root),
+        failure_kind("head", Some("t/log/pack/2"), &root)
+    );
+}
+
+// ---- Fix round 1 ----
+
+#[test]
+fn gauges_leave_out_the_generations_a_pack_run_packed() {
+    let _gc = crate::trim::NoWriterGc::on();
+    let mem = Arc::new(MemStore::new());
+    let cap = Capture::new();
+    let w = tracing::subscriber::with_default(cap.subscriber(), || {
+        writer_on(mem.clone(), |d| {
+            let mut c = config(d);
+            c.pack = false;
+            c.pack_gauge_interval = Duration::from_millis(50);
+            c
+        })
+    });
+    w.insert(1..=10);
+    w.end_generation();
+    w.insert(11..=20);
+    w.end_generation();
+    let gauges = || cap.spans().named("buckwal.pack.gauges").len();
+    let behind = || -> u64 {
+        let spans = cap.spans();
+        spans
+            .last_named("buckwal.pack.gauges")
+            .field("buckwal.pack.behind_bytes")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let n = gauges();
+    assert!(eventually(10, || gauges() >= n + 2));
+    let all = behind();
+    assert_eq!(all, log_bytes_from(&*mem, 1));
+    let t = tempdir();
+    crate::pack::pack_with_store(&packer_cfg(&t, "p"), mem.clone()).unwrap();
+    let p = pointer_of(&*mem).unwrap();
+    assert!(p.pack_generation > 2);
+    let n = gauges();
+    assert!(eventually(10, || gauges() >= n + 2));
+    let left = behind();
+    assert_eq!(left, log_bytes_from(&*mem, p.pack_generation));
+    assert!(left < all, "{left} of {all}");
+}
+
+#[test]
+fn gauges_wait_a_whole_interval_before_the_first_span() {
+    let mem = Arc::new(MemStore::new());
+    let ts = TestStore::new(mem.clone());
+    let cap = Capture::new();
+    let _w = tracing::subscriber::with_default(cap.subscriber(), || {
+        writer_on(ts.clone(), |d| {
+            let mut c = config(d);
+            c.pack = false;
+            c.pack_gauge_interval = Duration::from_secs(2);
+            c
+        })
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(cap.spans().named("buckwal.pack.gauges").is_empty());
+    assert_eq!(
+        ts.calls_of("list_sized_after", "/log/"),
+        0,
+        "no listing at open"
+    );
+    assert!(eventually(10, || !cap
+        .spans()
+        .named("buckwal.pack.gauges")
+        .is_empty()));
+}
+
+#[test]
+fn landed_record_is_bounded() {
+    let c = crate::bucket::Counters::default();
+    let pos = |g, s| crate::bucket::LogPos {
+        generation: g,
+        seq: s,
+    };
+    // Off: nothing is kept.
+    c.note_landed(pos(1, 1), 10);
+    c.track_landed();
+    assert_eq!(c.take_positions(), Some(vec![]));
+    // After the first merge, one sum per generation.
+    for s in 1..=50_000 {
+        c.note_landed(pos(1 + s % 3, s), 2);
+    }
+    let sums = c.take_sums();
+    assert_eq!(sums.len(), 3);
+    assert_eq!(sums.values().sum::<u64>(), 100_000);
+    assert!(c.take_sums().is_empty());
+    // A listing that does not come: the positions stop at the cap, and the next listing
+    // starts again.
+    c.track_landed();
+    for s in 1..=(crate::bucket::MAX_LANDED_POSITIONS as u64 + 10) {
+        c.note_landed(pos(4, s), 1);
+    }
+    assert_eq!(c.take_positions(), None, "too many: list again");
+    c.track_landed();
+    c.note_landed(pos(4, 1), 1);
+    assert_eq!(c.take_positions(), Some(vec![(4, 1, 1)]));
+}
+
+#[test]
+fn close_during_an_upload_returns_at_once_and_aborts_the_upload() {
+    let mem = Arc::new(MemStore::new());
+    let ts = TestStore::new(mem.clone());
+    ts.set_upload(Upload::Hold);
+    let cap = Capture::new();
+    let w =
+        tracing::subscriber::with_default(cap.subscriber(), || writer_on(ts.clone(), fast_packer));
+    w.insert(1..=3);
+    w.end_generation();
+    assert!(eventually(10, || ts.uploads_started.load(SeqCst) == 1));
+    let dir = w.dir.path().to_path_buf();
+    let at = Instant::now();
+    drop(w.c);
+    drop(w.db);
+    assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
+    assert!(pointer_of(&*mem).is_none());
+    assert!(ts.calls_of("abort_incomplete", "/pack/") >= 1);
+    assert_eq!(
+        mem.abort_incomplete(&keys().pack_root(), Duration::ZERO)
+            .unwrap(),
+        0,
+        "no upload is left"
+    );
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(WORK_DIR_PREFIX))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    let spans = cap.spans();
+    let s = spans.last_named("buckwal.pack");
+    assert_eq!(s.field("buckwal.outcome"), Some("failed"));
+    assert_eq!(s.field("buckwal.pack.failed_step"), Some("closed"));
+    // A close is not a fault: no WARN.
+    assert!(!spans.events.iter().any(|e| e.level == tracing::Level::WARN));
+}
+
+#[test]
+fn close_before_the_pointer_write_discards_the_pack() {
+    let mem = Arc::new(MemStore::new());
+    let w = plain_writer(mem.clone());
+    w.insert(1..=3);
+    w.end_generation();
+    let ts = TestStore::new(mem.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+    *ts.on_pack_stat.lock().unwrap() = Some(stop.clone());
+    let t = tempdir();
+    let r = pack_run_in(&packer_cfg(&t, "p"), ts.clone(), clock(), &stop, 0).unwrap();
+    assert!(
+        matches!(&r.outcome, PackOutcome::Failed { step, .. } if step == "closed"),
+        "{r:?}"
+    );
+    assert!(pointer_of(&*mem).is_none());
+    assert!(packs(&*mem).is_empty(), "{:?}", packs(&*mem));
+}
+
+#[test]
+fn back_off_doubles_from_the_interval_up_to_max_age() {
+    let m = Duration::from_secs(60);
+    let max = Duration::from_secs(3600);
+    let waits: Vec<u64> = (0..9).map(|n| next_wait(m, n, max).as_secs()).collect();
+    assert_eq!(waits, [60, 60, 120, 240, 480, 960, 1920, 3600, 3600]);
+    assert_eq!(next_wait(m, 200, max).as_secs(), 3600, "no overflow");
+    // A max age below the interval: the interval.
+    assert_eq!(next_wait(m, 5, Duration::from_secs(10)).as_secs(), 60);
+}
+
+#[test]
+fn failed_runs_back_off_and_a_success_resets_the_wait() {
+    let mem = Arc::new(MemStore::new());
+    let w = plain_writer(mem.clone());
+    w.insert(1..=3);
+    w.end_generation();
+    let ts = TestStore::new(mem.clone());
+    ts.set_upload(Upload::Fail);
+    let t = tempdir();
+    let mut cfg = packer_cfg(&t, "p");
+    let interval = Duration::from_millis(40);
+    cfg.pack_check_interval = interval;
+    cfg.pack_max_age = Duration::from_millis(320);
+    let max = cfg.pack_max_age;
+    let cap = Capture::new();
+    let (stop, h) =
+        tracing::subscriber::with_default(cap.subscriber(), || spawn_loop(cfg, ts.clone()));
+    assert!(eventually(20, || ts.uploads_started.load(SeqCst) >= 6));
+    let times = ts.upload_times.lock().unwrap().clone();
+    for k in 1..6 {
+        let gap = times[k] - times[k - 1];
+        let want = next_wait(interval, k as u64, max);
+        // The wait counts from the start of a check; the upload comes a little after it.
+        let slack = Duration::from_millis(15);
+        assert!(gap + slack >= want, "gap {k}: {gap:?} < {want:?}");
+    }
+    // A success resets the wait: the next failure counts from 0 again.
+    ts.set_upload(Upload::Pass);
+    assert!(eventually(20, || pointer_of(&*mem).is_some()));
+    ts.set_upload(Upload::Fail);
+    w.insert(4..=5);
+    w.end_generation();
+    let started = ts.uploads_started.load(SeqCst);
+    assert!(eventually(20, || ts.uploads_started.load(SeqCst) > started + 1));
+    stop.store(true, SeqCst);
+    h.join().unwrap();
+    let spans = cap.spans();
+    let after: Vec<String> = spans
+        .named("buckwal.pack")
+        .into_iter()
+        .skip_while(|s| s.field("buckwal.outcome") != Some("packed"))
+        .filter(|s| s.field("buckwal.outcome") == Some("failed"))
+        .map(|s| s.field("buckwal.pack.failures").unwrap().to_string())
+        .collect();
+    assert_eq!(&after[..2], ["0", "1"], "{after:?}");
+    // The back-off is logged when it starts, not at each doubling.
+    let backoffs = spans
+        .events
+        .iter()
+        .filter(|e| e.field("message") == Some("pack runs back off"))
+        .count();
+    assert!((1..=2).contains(&backoffs), "{backoffs}");
+}
+
+#[test]
+fn run_without_free_disk_fails_at_disk_and_writes_nothing() {
+    let mem = Arc::new(MemStore::new());
+    let w = plain_writer(mem.clone());
+    w.insert(1..=3);
+    w.end_generation();
+    let t = tempdir();
+    let cfg = packer_cfg(&t, "p");
+    crate::pack::pack_with_store(&cfg, mem.clone()).unwrap();
+    let p = pointer_of(&*mem).unwrap();
+    w.insert(4..=5);
+    w.end_generation();
+    let ts = TestStore::new(mem.clone());
+    let before = packs(&*mem);
+    // Just below the pack's size plus 10%.
+    let free = crate::pack::run::FreeDiskForTest::set(p.size + p.size / 10 - 1);
+    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0).unwrap();
+    let PackOutcome::Failed { step, .. } = &r.outcome else {
+        panic!("{r:?}")
+    };
+    assert_eq!(step, "disk");
+    assert!(
+        r.error.as_deref().is_some_and(|e| e.contains("free")),
+        "{r:?}"
+    );
+    assert_eq!(ts.calls_of("get_range", ""), 0, "no download");
+    assert_eq!(ts.calls_of("get", "/log/"), 0, "no log read");
+    assert_eq!(ts.calls_of("put", ""), 0);
+    assert_eq!(ts.calls_of("put_multipart", ""), 0);
+    assert_eq!(packs(&*mem), before);
+    let left: Vec<_> = std::fs::read_dir(&cfg.dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(WORK_DIR_PREFIX))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    drop(free);
+    // With enough room the run packs.
+    let _free = crate::pack::run::FreeDiskForTest::set(p.size + p.size / 10);
+    let r = pack_run_in(&cfg, ts.clone(), clock(), &AtomicBool::new(false), 0).unwrap();
+    assert_eq!(r.outcome, PackOutcome::Packed);
+}
+
+#[test]
+fn free_disk_of_a_real_directory_is_known() {
+    let t = tempdir();
+    assert!(crate::pack::run::free_disk(t.path()).unwrap() > 0);
+}
+
+#[test]
+fn run_counts_only_its_own_bytes() {
+    let mem = Arc::new(MemStore::new());
+    let w = plain_writer(mem.clone());
+    w.insert(1..=3);
+    w.end_generation();
+    let ts = TestStore::new(mem.clone());
+    // 4 MiB up and 4 MiB down by "another thread" during the run's upload.
+    ts.unrelated_bytes.store(4 << 20, SeqCst);
+    let t = tempdir();
+    let r = pack_run_in(
+        &packer_cfg(&t, "p"),
+        ts.clone(),
+        clock(),
+        &AtomicBool::new(false),
+        0,
+    )
+    .unwrap();
+    assert_eq!(r.outcome, PackOutcome::Packed);
+    let p = pointer_of(&*mem).unwrap();
+    assert!(
+        r.bytes_up >= p.size && r.bytes_up < p.size + (1 << 20),
+        "{r:?}"
+    );
+    assert!(r.bytes_down < 1 << 20, "{r:?}");
+}
+
+#[test]
+fn pack_span_failed_with_step_error() {
+    // No database in the bucket: the run fails before any step.
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cap = Capture::new();
+    let r = tracing::subscriber::with_default(cap.subscriber(), || {
+        crate::pack::pack_with_store(&packer_cfg(&t, "p"), mem.clone())
+    });
+    assert!(r.is_err());
+    let spans = cap.spans();
+    let s = spans.last_named("buckwal.pack");
+    assert_eq!(s.field("buckwal.outcome"), Some("failed"));
+    assert_eq!(s.field("buckwal.pack.failed_step"), Some("error"));
+    assert!(s.field("buckwal.error").is_some());
+}
+
+#[test]
+fn mvcc_seal_writer_and_replica_start_no_packer() {
+    // An MVCC bucket of format 2 seals: no packs.
+    let mvcc = {
+        let _legacy = crate::format::LegacySeal::on();
+        writer_on(Arc::new(MemStore::new()), |d| {
+            let mut c = fast_packer(d);
+            c.journal_mode = crate::JournalMode::Mvcc;
+            c
+        })
+    };
+    assert_eq!(mvcc.db.shared.packer_threads(), (false, false));
+    // A replica (of a format 1 bucket: replicas of format 5 come with task 13) only reads.
+    let mem = Arc::new(MemStore::new());
+    let w = {
+        let _legacy = crate::format::LegacySeal::on();
+        writer_on(mem.clone(), |d| {
+            let mut c = config(d);
+            c.pack = false;
+            c
+        })
+    };
+    w.insert(1..=3);
+    let ts = TestStore::new(mem.clone());
+    let t = tempdir();
+    let mut rc = fast_packer(&t.path().join("r"));
+    rc.pack_gauge_interval = Duration::from_millis(50);
+    rc.replica_poll_interval = Duration::from_millis(200);
+    let replica = crate::replica::open_replica_with_store(rc, ts.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(ts.calls_of("get_aged", "pack-latest"), 0);
+    assert_eq!(ts.calls_of("put_multipart", ""), 0);
+    drop(replica);
 }

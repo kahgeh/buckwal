@@ -124,7 +124,17 @@ pub(crate) fn publish(
         database_id: keys.known_database_id(),
     };
     // Steps 1 and 2. A failed check leaves the pack and its codes for GC.
-    if let Err(f) = upload_verified(store, keys, retry, &pointer, db, true)?.result {
+    if let Err(f) = upload_verified(
+        store,
+        keys,
+        retry,
+        &pointer,
+        db,
+        true,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?
+    .result
+    {
         if f.step == "upload" {
             // The parts of a failed upload stay hidden until an abort; GC aborts them after
             // the orphan grace in any case.

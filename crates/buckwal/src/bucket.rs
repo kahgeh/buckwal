@@ -31,6 +31,25 @@ pub(crate) struct LogPos {
     pub seq: u64,
 }
 
+/// The most log objects a pack gauge keeps by key while it waits for its first listing. Past
+/// it the record stops, and the next listing starts it again (`Counters::take_positions`).
+pub(crate) const MAX_LANDED_POSITIONS: usize = 100_000;
+
+/// What `Counters` records of the log objects that land, for the writer's pack gauges.
+#[derive(Debug, Default)]
+pub(crate) enum Landed {
+    /// Nothing (the default, and a writer with no gauges).
+    #[default]
+    Off,
+    /// Each object by its key, `(generation, seq, bytes)`, from just before the gauge's first
+    /// listing until it merges them: an object in both is then counted once.
+    Positions(Vec<(u64, u64, u64)>),
+    /// More than `MAX_LANDED_POSITIONS` came before the listing merged them.
+    Overflow,
+    /// After the first merge: the bytes per generation since the last gauge.
+    Sums(BTreeMap<u64, u64>),
+}
+
 /// Running totals, shared with the uploader so they can be read without blocking.
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
@@ -40,39 +59,52 @@ pub(crate) struct Counters {
     pub seals: AtomicU64,
     /// Extra attempts made by `with_retry` (attempt numbers above 0).
     pub retries: AtomicU64,
-    /// The log objects that landed since a pack gauge began to track them (`Some`):
-    /// `(generation, seq, bytes)`. `None` (the default) records nothing. The writer's gauge
-    /// takes them every 5 minutes (`pack::thread`), so it lists the log only once.
-    pub landed: Mutex<Option<Vec<(u64, u64, u64)>>>,
+    /// The log objects that landed, for the writer's pack gauges (`pack::thread`), so that
+    /// they list the log only once per open. Its size has a limit: one sum per generation
+    /// after the first listing, and at most `MAX_LANDED_POSITIONS` keys before it.
+    pub landed: Mutex<Landed>,
 }
 
 impl Counters {
-    /// From now on, record each log object that lands (`landed`).
+    fn landed(&self) -> std::sync::MutexGuard<'_, Landed> {
+        self.landed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// From now on, record each log object that lands by its key: a gauge calls it just
+    /// before each try of its first listing. It starts again from empty.
     pub(crate) fn track_landed(&self) {
-        self.landed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(Vec::new);
+        *self.landed() = Landed::Positions(Vec::new());
     }
 
-    /// The log objects recorded since the last call (the record goes on).
-    pub(crate) fn take_landed(&self) -> Vec<(u64, u64, u64)> {
-        self.landed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-            .map(std::mem::take)
-            .unwrap_or_default()
+    /// The keys recorded since `track_landed`, for the merge with the listing; from now on
+    /// only a sum per generation is kept. `None` when more than `MAX_LANDED_POSITIONS` came:
+    /// the gauge lists again (the record is off until its next `track_landed`).
+    pub(crate) fn take_positions(&self) -> Option<Vec<(u64, u64, u64)>> {
+        let mut l = self.landed();
+        match std::mem::take(&mut *l) {
+            Landed::Positions(v) => {
+                *l = Landed::Sums(BTreeMap::new());
+                Some(v)
+            }
+            _ => None,
+        }
     }
 
-    fn note_landed(&self, pos: LogPos, bytes: u64) {
-        if let Some(v) = self
-            .landed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-        {
-            v.push((pos.generation, pos.seq, bytes));
+    /// The bytes per generation that landed since the last call (after `take_positions`).
+    pub(crate) fn take_sums(&self) -> BTreeMap<u64, u64> {
+        match &mut *self.landed() {
+            Landed::Sums(m) => std::mem::take(m),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn note_landed(&self, pos: LogPos, bytes: u64) {
+        let mut l = self.landed();
+        match &mut *l {
+            Landed::Positions(v) if v.len() >= MAX_LANDED_POSITIONS => *l = Landed::Overflow,
+            Landed::Positions(v) => v.push((pos.generation, pos.seq, bytes)),
+            Landed::Sums(m) => *m.entry(pos.generation).or_default() += bytes,
+            Landed::Off | Landed::Overflow => {}
         }
     }
 }

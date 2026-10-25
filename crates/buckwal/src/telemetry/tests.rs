@@ -1446,6 +1446,26 @@ fn a_failure_outcome_ends_the_span_with_status_error() {
     }
 }
 
+/// A pack run that a close ended (`failed` at step `closed`) is not a fault.
+#[test]
+fn a_pack_run_ended_by_a_close_keeps_status_unset() {
+    let (sub, p, spans, _logs) = test_pipeline(None);
+    tracing::subscriber::with_default(sub, || {
+        let s = tracing::info_span!(
+            target: "buckwal",
+            "buckwal.probe",
+            buckwal.outcome = tracing::field::Empty,
+            buckwal.pack.failed_step = tracing::field::Empty,
+        );
+        s.record("buckwal.outcome", "failed");
+        s.record("buckwal.pack.failed_step", "closed");
+    });
+    p.force_flush();
+    let got = spans.get_finished_spans().unwrap();
+    let probe = got.into_iter().find(|s| s.name == "buckwal.probe").unwrap();
+    assert_eq!(probe.status, opentelemetry::trace::Status::Unset);
+}
+
 #[test]
 fn every_other_outcome_ends_the_span_with_status_unset() {
     for outcome in [

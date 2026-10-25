@@ -12,12 +12,19 @@
 //! `buckwal-pack-gauges` thread in any case ([`PackerThreads`]). Both only read the bucket and
 //! write packs, the pack pointer and their own working directory: they never take a lock or a
 //! gate of the writer, so they never block a commit. Each waits a whole interval before its
-//! first look, so a writer that is open for less than a minute makes no request for them. A
-//! failed run, an error and a panic end one check only: the loop logs one WARN per distinct
-//! failure (a failure like the one before it is only counted, on the next run's span) and
-//! tries again at the next check. `Database` drop stops both threads and joins them: a thread
-//! that waits stops at once, and a run in progress stops before its upload
-//! (`run::pack_run_in`), or finishes its pointer write once its upload has started.
+//! first look, so a writer that is open for less than a minute makes no request for them.
+//!
+//! A failed run, an error and a panic end one check only: the loop logs one WARN per distinct
+//! failure (a failure like the one before it is only counted, on the next run's span). After a
+//! failed run (or a run that returned an error or panicked) the loop backs off (spec rev 21):
+//! the next check comes one interval later, then the wait doubles after each further failure,
+//! up to `pack_max_age` ([`next_wait`]). A run that packs, finds nothing to do or is superseded
+//! resets the wait. A check that fails before any run (the head or the pointer cannot be read)
+//! keeps the one-minute cadence: it costs two small requests.
+//!
+//! `Database` drop stops both threads and joins them: a thread that waits wakes at once
+//! (`Thread::unpark`), and a run in progress ends as `failed` at the step `closed`
+//! (`run::pack_run_in`). A close is not a fault: it starts no back-off and logs no WARN.
 use super::run::{pack_run_in, PackOutcome, PackReport};
 use crate::bucket::Counters;
 use crate::clock::Stamp;
@@ -133,19 +140,48 @@ pub(crate) fn check(config: &Config, store: &dyn ObjectStore) -> Result<Option<R
     };
     let listing_decides = t.ended && t.pack.is_some_and(|p| p.age < config.pack_max_age);
     if listing_decides {
-        let root = keys.log_root();
-        let listed = with_retry(&retry, &root, |_| store.list_sized(&root))?;
-        t.log_bytes = log_bytes_from(&keys, &listed, from);
+        t.log_bytes = list_log_from(store, &keys, &retry, from)?.values().sum();
     }
     Ok(due(&t, config.pack_log_percent, config.pack_max_age))
 }
 
-fn log_bytes_from(keys: &Keys, listed: &[(String, u64)], from: u64) -> u64 {
-    listed
-        .iter()
-        .filter(|(k, _)| keys.parse_log(k).is_some_and(|(g, _)| g >= from))
-        .map(|(_, n)| n)
-        .sum()
+/// One listing of the log of the generations from `from` on (`list_sized_after`, so the log
+/// below the pack is not listed): the bytes per generation.
+fn list_log_from(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    from: u64,
+) -> Result<BTreeMap<u64, u64>> {
+    let root = keys.log_root();
+    // Every key of the generations below `from` sorts before this one.
+    let after = format!("{}~", keys.log_prefix(from.saturating_sub(1)));
+    let listed = with_retry(retry, &root, |_| store.list_sized_after(&root, &after))?;
+    let mut per_generation = BTreeMap::new();
+    for (k, n) in listed {
+        if let Some((g, _)) = keys.parse_log(&k).filter(|(g, _)| *g >= from) {
+            *per_generation.entry(g).or_default() += n;
+        }
+    }
+    Ok(per_generation)
+}
+
+/// The keys of one listing of the log from `from` on, with their sizes (the gauge's first
+/// merge needs the keys).
+fn list_log_keys_from(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    from: u64,
+) -> Result<Vec<((u64, u64), u64)>> {
+    let root = keys.log_root();
+    let after = format!("{}~", keys.log_prefix(from.saturating_sub(1)));
+    let listed = with_retry(retry, &root, |_| store.list_sized_after(&root, &after))?;
+    Ok(listed
+        .into_iter()
+        .filter_map(|(k, n)| keys.parse_log(&k).map(|pos| (pos, n)))
+        .filter(|((g, _), _)| *g >= from)
+        .collect())
 }
 
 /// Run the packer loop against the bucket `config` names until `stop` is set: a check at
@@ -170,9 +206,14 @@ pub fn run_packer_with_store(
     Ok(())
 }
 
-/// Sleep until `at`, or until `stop` is set. True when `at` came first.
+/// The longest a loop of `run_packer` sleeps before it looks at `stop` again: the caller's
+/// flag (a signal handler, say) cannot wake it. A writer's threads are woken at once.
+const STOP_POLL: Duration = Duration::from_millis(250);
+
+/// Sleep until `at`, or until `stop` is set. True when `at` came first. The thread parks: the
+/// writer's `PackerThreads::signal_stop` unparks it, and it looks at `stop` at least every
+/// `STOP_POLL` for a flag that nobody unparks for.
 fn wait_until(at: Instant, stop: &AtomicBool) -> bool {
-    const SLICE: Duration = Duration::from_millis(20);
     loop {
         if stop.load(SeqCst) {
             return false;
@@ -181,8 +222,20 @@ fn wait_until(at: Instant, stop: &AtomicBool) -> bool {
         if now >= at {
             return true;
         }
-        std::thread::sleep(SLICE.min(at - now));
+        std::thread::park_timeout(STOP_POLL.min(at - now));
     }
+}
+
+/// The wait before the next check after `failures` failed runs in a row: one `interval`
+/// after none or one, then doubled after each further failure, up to `max` (`pack_max_age`),
+/// and never below `interval`.
+pub(crate) fn next_wait(interval: Duration, failures: u64, max: Duration) -> Duration {
+    let doublings = failures.saturating_sub(1).min(32) as u32;
+    interval
+        .checked_mul(1u32 << doublings.min(31))
+        .unwrap_or(Duration::MAX)
+        .min(max)
+        .max(interval)
 }
 
 /// The failures in a row of a loop, logged once per distinct failure.
@@ -218,9 +271,9 @@ impl Failures {
 
 /// What a failed run is, for the rule "one WARN per distinct failure": its step, and its key
 /// unless the key is the run's own pack (each run has its own run id).
-fn failure_kind(step: &str, key: Option<&str>) -> String {
+fn failure_kind(step: &str, key: Option<&str>, pack_root: &str) -> String {
     match key {
-        Some(k) if !k.contains("pack/") => format!("{step} {k}"),
+        Some(k) if !k.starts_with(pack_root) => format!("{step} {k}"),
         _ => step.to_string(),
     }
 }
@@ -248,21 +301,28 @@ fn error_kind(text: &str) -> String {
     kind
 }
 
-/// The loop: a check at `first`, then one every `config.pack_check_interval`.
+/// The loop: a check at `first`, then one every `config.pack_check_interval`, longer after
+/// failed runs ([`next_wait`]).
 fn packer_loop(config: &Config, store: &Arc<dyn ObjectStore>, stop: &AtomicBool, first: Instant) {
+    let pack_root = config.keys_for(None).pack_root();
     let mut failures = Failures::default();
+    // Failed runs in a row: the back-off counts them (a failed check does not).
+    let mut failed_runs = 0u64;
     let mut next = first;
     while wait_until(next, stop) {
-        next = Instant::now() + config.pack_check_interval;
+        let started = Instant::now();
         let n = failures.count;
         let r = catch_unwind(AssertUnwindSafe(|| check_and_run(config, store, stop, n)));
-        match r {
+        let run_failed = match r {
             // No run is due: a failure before it does not continue.
-            Ok(Ok(None)) => failures.ok("pack runs succeed again"),
+            Ok(Ok(None)) => {
+                failures.ok("pack runs succeed again");
+                false
+            }
             Ok(Ok(Some(report))) => match &report.outcome {
-                PackOutcome::Failed { step, .. } if step == "stopped" => return,
+                PackOutcome::Failed { step, .. } if step == CLOSED => return,
                 PackOutcome::Failed { step, key } => {
-                    let kind = failure_kind(step, key.as_deref());
+                    let kind = failure_kind(step, key.as_deref(), &pack_root);
                     failures.fail("pack run failed", kind, |count| {
                         tracing::warn!(
                             target: "buckwal",
@@ -273,18 +333,62 @@ fn packer_loop(config: &Config, store: &Arc<dyn ObjectStore>, stop: &AtomicBool,
                             "pack run failed"
                         );
                     });
+                    true
                 }
-                _ => failures.ok("pack runs succeed again"),
+                _ => {
+                    failures.ok("pack runs succeed again");
+                    false
+                }
             },
-            Ok(Err(e)) => failures.fail("pack check failed", error_kind(&e.to_string()), |count| {
-                tracing::warn!(target: "buckwal", step = "error", error = %e, failures = count, "pack run failed");
-            }),
+            Ok(Err(e)) => {
+                failures.fail("pack check failed", error_kind(&e.to_string()), |count| {
+                    tracing::warn!(target: "buckwal", step = "error", error = %e, failures = count, "pack run failed");
+                });
+                // An error of the run itself (not of the check) backs off as a failed run.
+                matches!(e, RunError::Run(_))
+            }
             Err(panic) => {
                 let what = panic_text(&panic);
                 failures.fail("pack check panicked", format!("panic {what}"), |count| {
                     tracing::error!(target: "buckwal", error = %what, failures = count, "packer panicked");
                 });
+                true
             }
+        };
+        if stop.load(SeqCst) {
+            return;
+        }
+        if run_failed {
+            failed_runs += 1;
+        } else {
+            failed_runs = 0;
+        }
+        let wait = next_wait(config.pack_check_interval, failed_runs, config.pack_max_age);
+        if failed_runs == 2 {
+            tracing::info!(
+                target: "buckwal",
+                wait_secs = wait.as_secs_f64(),
+                max_secs = config.pack_max_age.as_secs_f64(),
+                "pack runs back off"
+            );
+        }
+        next = started + wait;
+    }
+}
+
+/// The step of a run that a close ended (`run::pack_run_in`).
+const CLOSED: &str = super::run::CLOSED_STEP;
+
+/// Why `check_and_run` returned no report: the check failed, or the run did.
+enum RunError {
+    Check(crate::error::Error),
+    Run(crate::error::Error),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Check(e) | RunError::Run(e) => e.fmt(f),
         }
     }
 }
@@ -302,8 +406,8 @@ fn check_and_run(
     store: &Arc<dyn ObjectStore>,
     stop: &AtomicBool,
     failures: u64,
-) -> Result<Option<PackReport>> {
-    let Some(reason) = check(config, &**store)? else {
+) -> std::result::Result<Option<PackReport>, RunError> {
+    let Some(reason) = check(config, &**store).map_err(RunError::Check)? else {
         return Ok(None);
     };
     tracing::info!(target: "buckwal", reason = reason.as_str(), "pack run due");
@@ -314,26 +418,30 @@ fn check_and_run(
         Arc::new(move || origin.age()),
         stop,
         failures,
-    )?;
+    )
+    .map_err(RunError::Run)?;
     Ok(Some(report))
 }
 
 /// The writer's pack gauges (spec "Observability"): each interval, one GET of the pointer,
 /// with its age by the bucket's clock. `behind_bytes` is the log bytes in generations at or
-/// above the pack generation: the sizes one listing returned (at the first gauge), plus the
-/// writer's own log objects since (`Counters::take_landed`), each counted once by its key.
+/// above the pack generation. The first gauge lists the log once, from the pack generation on,
+/// and merges the writer's own log objects that landed meanwhile by their keys
+/// (`Counters::take_positions`). After that it keeps one sum per generation and adds the
+/// writer's own uploads to their generation (`Counters::take_sums`). When the pointer moves
+/// to a newer pack, it drops the generations below the new pack generation.
 struct Gauges {
     store: Arc<dyn ObjectStore>,
     keys: Keys,
     retry: RetryPolicy,
     counters: Arc<Counters>,
-    /// The log objects at or above the last pack generation: (generation, seq) to bytes.
-    /// `None` before the first gauge lists the log.
-    log: Option<BTreeMap<(u64, u64), u64>>,
+    /// The log bytes per generation, at or above the last pack generation. `None` before
+    /// the first listing.
+    log: Option<BTreeMap<u64, u64>>,
 }
 
-/// One gauge: the pointer's pack generation, its age (`None` without a pack) and the bytes
-/// behind it.
+/// One gauge: the pointer's pack generation and newest pack (`None` without a pack) and the
+/// bytes behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gauge {
     pack: Option<(u64, NewestPack)>,
@@ -342,55 +450,68 @@ struct Gauge {
 
 impl Gauges {
     fn measure(&mut self) -> Result<Gauge> {
-        let log = match &mut self.log {
-            Some(log) => log,
-            None => {
-                // Record from before the listing: an object that is in both is counted once,
-                // by its key. A failed listing leaves the record on, and the next gauge lists.
-                self.counters.track_landed();
-                let root = self.keys.log_root();
-                let listed = with_retry(&self.retry, &root, |_| self.store.list_sized(&root))?;
-                let log = listed
-                    .into_iter()
-                    .filter_map(|(k, n)| self.keys.parse_log(&k).map(|pos| (pos, n)))
-                    .collect();
-                self.log.insert(log)
-            }
-        };
-        for (g, s, n) in self.counters.take_landed() {
-            log.insert((g, s), n);
+        let first = self.log.is_none();
+        if first {
+            // Record from before the listing: an object that is in both is counted once, by
+            // its key.
+            self.counters.track_landed();
         }
         let pointer = read_pointer_aged(&*self.store, &self.keys, &self.retry)?;
         let from = pointer.own.map_or(1, |(g, _)| g);
-        // GC deletes the log below the pack generation: it is not behind any more.
-        log.retain(|(g, _), _| *g >= from);
+        if first {
+            let listed = list_log_keys_from(&*self.store, &self.keys, &self.retry, from)?;
+            let Some(own) = self.counters.take_positions() else {
+                // More of the writer's own objects than the record keeps: list again.
+                return Err(crate::error::Error::Bucket(
+                    "pack gauges: the log grew too much during the first listing".into(),
+                ));
+            };
+            let mut seen: std::collections::BTreeSet<(u64, u64)> = Default::default();
+            let mut log = BTreeMap::new();
+            for (pos, n) in listed {
+                seen.insert(pos);
+                *log.entry(pos.0).or_default() += n;
+            }
+            for (g, seq, n) in own {
+                if seen.insert((g, seq)) {
+                    *log.entry(g).or_default() += n;
+                }
+            }
+            self.log = Some(log);
+        }
+        let log = self.log.as_mut().expect("listed above");
+        for (g, n) in self.counters.take_sums() {
+            *log.entry(g).or_default() += n;
+        }
+        // The pack holds the generations below its pack generation: they are not behind.
+        log.retain(|g, _| *g >= from);
         Ok(Gauge {
             pack: pointer.own,
             behind_bytes: log.values().sum(),
         })
     }
 
-    /// One gauge in its `buckwal.pack.gauges` span: `buckwal.pack.behind_bytes`,
-    /// `buckwal.pack.age_seconds` and `buckwal.pack.generation` (both absent without a pack),
-    /// `buckwal.pack.size` and `buckwal.outcome` (`ok`, or `error` and `integrity` as other
-    /// spans).
+    /// One gauge in its `buckwal.pack.gauges` span: `buckwal.pack.behind_bytes`, and with a
+    /// pack `buckwal.pack.age_seconds`, `buckwal.pack.size_bytes` (the newest pack's size,
+    /// from the pointer) and `buckwal.pack.generation`, then `buckwal.outcome` (`ok`, or
+    /// `error` and `integrity` as other spans).
     fn emit(&mut self) -> Result<()> {
         let span = tracing::info_span!(
             target: "buckwal",
             "buckwal.pack.gauges",
             buckwal.pack.behind_bytes = Empty,
             buckwal.pack.age_seconds = Empty,
+            buckwal.pack.size_bytes = Empty,
             buckwal.pack.generation = Empty,
-            buckwal.pack.size = Empty,
             buckwal.outcome = Empty,
         );
         let r = span.in_scope(|| self.measure());
         match &r {
             Ok(g) => {
                 span.record("buckwal.pack.behind_bytes", g.behind_bytes);
-                span.record("buckwal.pack.size", g.pack.map_or(0, |(_, p)| p.size));
                 if let Some((generation, p)) = g.pack {
                     span.record("buckwal.pack.age_seconds", p.age.as_secs());
+                    span.record("buckwal.pack.size_bytes", p.size);
                     span.record("buckwal.pack.generation", generation);
                 }
                 span.record("buckwal.outcome", "ok");
@@ -475,9 +596,12 @@ impl PackerThreads {
         }
     }
 
-    /// Ask both threads to stop, without waiting.
+    /// Ask both threads to stop, without waiting: a thread that waits wakes at once.
     pub(crate) fn signal_stop(&self) {
         self.stop.store(true, SeqCst);
+        for t in [&self.packer, &self.gauges].into_iter().flatten() {
+            t.thread().unpark();
+        }
     }
 
     /// Stop both threads and wait for them.

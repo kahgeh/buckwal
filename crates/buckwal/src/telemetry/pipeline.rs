@@ -36,7 +36,7 @@ const SCOPE: &str = "buckwal";
 const RUN_ID: &str = "test_run_id";
 
 /// The `buckwal.outcome` values that are failures: their span ends with status Error
-/// (`failed` is a pack run's, `buckwal.pack`). The maintenance skips, `sealed`, the replica's
+/// (`failed` is a pack run's, `buckwal.pack`, except at the step `closed`). The maintenance skips, `sealed`, the replica's
 /// outcomes, the prefetch's `stopped` and `complete`, a pack run's `packed`, `nothing_to_do`
 /// and `superseded`, and the server's client-side outcomes are not failures.
 const FAILURE_OUTCOMES: [&str; 4] = ["error", "integrity", "fenced", "failed"];
@@ -121,6 +121,11 @@ impl<P: SpanProcessor> SpanProcessor for RunIdSpans<P> {
             kv.key.as_str() == "buckwal.outcome"
                 && FAILURE_OUTCOMES.contains(&kv.value.as_str().as_ref())
         });
+        // A pack run that a close ended is `failed` at `closed`: not a fault.
+        let closed = span.attributes.iter().any(|kv| {
+            kv.key.as_str() == "buckwal.pack.failed_step" && kv.value.as_str() == "closed"
+        });
+        let failed = failed && !closed;
         if failed {
             span.status = Status::error("");
         }

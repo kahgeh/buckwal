@@ -323,10 +323,23 @@ pub(crate) fn pack_run(
 /// One pack run in its `buckwal.pack` span: [`pack_run`] that `stop` can end early, and
 /// `failures` (the failed runs in a row before this one, from the packer loop) on the span.
 ///
-/// A run that sees `stop` before its upload ends as `Failed` at `stopped` with nothing
-/// uploaded; it looks at `stop` between the ranges of its download and between generations.
-/// Once the upload has started, the run goes on to its pointer write: the upload is then
-/// already paid for, and the pointer write is a few small requests.
+/// `stop` is a close of the writer (spec rev 21, "Close does not wait for an upload"). The run
+/// looks at it between generations, between the ranges of its download, before its upload,
+/// before each part of its upload (a part read fails) and before each pointer write. Then it
+/// ends as `Failed` at the step `closed` ([`CLOSED_STEP`]): it aborts its multipart upload
+/// (when the abort fails, GC aborts the upload after the orphan grace), deletes its pack and
+/// codes when they are complete, moves no pointer, and its working directory goes with it. A
+/// close during the local apply leaves the kept copy's `applying` flag on, so the next run
+/// downloads the pack (the flag is reserved for the kept copy of task 11b; this run keeps no
+/// copy yet). A `closed` span keeps status Unset: a close is not a fault.
+///
+/// Before it downloads a pack or applies the log, the run checks that the working
+/// directory's disk has the pointer's pack size plus 10% free ([`free_disk`]). If not, it
+/// ends as `Failed` at the step `disk` and changes nothing. The first pack of a database has
+/// no pack size to check against: its run makes no check.
+///
+/// The run counts its own bytes (`CountingStore`): other traffic on the same store (the
+/// writer's commits) is not in `bytes_down` and `bytes_up`.
 ///
 /// The span (spec "Observability"): `buckwal.pack.generation`, `buckwal.pack.key`,
 /// `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
@@ -436,8 +449,9 @@ fn pack_run_inner(
     let run_id = crate::db::new_writer_id()?;
     sweep_work_dirs(config);
     let work = WorkDir::create(config.dir.join(format!("{WORK_DIR_PREFIX}{run_id}")))?;
+    let counting = CountingStore::new(&**store);
     let mut run = Run {
-        store: &**store,
+        store: &counting,
         keys: config.keys_for(enc.as_deref()),
         retry: config.engine(crate::io::IoMode::Writer).retry,
         enc: enc.as_deref(),
@@ -451,16 +465,13 @@ fn pack_run_inner(
         error: None,
     };
     let start = Instant::now();
-    let before = store.stats();
-    let r = run.run(config);
-    let delta = store.stats().since(&before);
-    let ran = r?;
+    let ran = run.run(config)?;
     let report = PackReport {
         outcome: ran.outcome,
         pack_generation: ran.pack_generation,
         pack_key: ran.pack_key,
-        bytes_down: delta.bytes_down,
-        bytes_up: delta.bytes_up,
+        bytes_down: counting.down.load(Relaxed),
+        bytes_up: counting.up.load(Relaxed),
         step_times: run.steps,
         free_page_share: ran.free_page_share,
         pack_size: ran.size,
@@ -477,6 +488,165 @@ fn pack_run_inner(
         "pack run finished"
     );
     Ok(report)
+}
+
+/// The step of a run that a close of the writer ended.
+pub(crate) const CLOSED_STEP: &str = "closed";
+
+/// The bytes free for this process on the filesystem that holds `dir` (`statvfs`:
+/// `f_bavail × f_frsize`).
+pub(crate) fn free_disk(dir: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(n) = FREE_DISK.with(|f| f.get()) {
+        return Ok(n);
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| Error::Io(format!("{} holds a NUL byte", dir.display())))?;
+    // SAFETY: `path` is a NUL-terminated string and `st` a writable statvfs that the call
+    // fills; both live across the call.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return Err(io_err(
+            &format!("free disk of {}", dir.display()),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    #[allow(clippy::useless_conversion)] // the field types differ between systems
+    let (blocks, size) = (u64::from(st.f_bavail), u64::from(st.f_frsize));
+    Ok(blocks.saturating_mul(size))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FREE_DISK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: while alive, `free_disk` on this thread answers this many bytes.
+#[cfg(test)]
+pub(crate) struct FreeDiskForTest;
+
+#[cfg(test)]
+impl FreeDiskForTest {
+    pub(crate) fn set(n: u64) -> FreeDiskForTest {
+        FREE_DISK.with(|f| f.set(Some(n)));
+        FreeDiskForTest
+    }
+}
+
+#[cfg(test)]
+impl Drop for FreeDiskForTest {
+    fn drop(&mut self) {
+        FREE_DISK.with(|f| f.set(None));
+    }
+}
+
+/// The store a run uses: it counts the run's own bytes down and up, so the span does not
+/// count other traffic on a store that the writer shares (spec rev 21).
+struct CountingStore<'a> {
+    inner: &'a dyn ObjectStore,
+    down: AtomicU64,
+    up: AtomicU64,
+}
+
+impl<'a> CountingStore<'a> {
+    fn new(inner: &'a dyn ObjectStore) -> Self {
+        CountingStore {
+            inner,
+            down: AtomicU64::new(0),
+            up: AtomicU64::new(0),
+        }
+    }
+
+    fn sent(&self, n: usize) {
+        self.up.fetch_add(n as u64, Relaxed);
+    }
+
+    fn got(&self, n: usize) {
+        self.down.fetch_add(n as u64, Relaxed);
+    }
+}
+
+type StoreResult<T> = std::result::Result<T, crate::store::StoreError>;
+
+impl ObjectStore for CountingStore<'_> {
+    fn put(&self, key: &str, body: &[u8]) -> StoreResult<String> {
+        self.sent(body.len());
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(&self, key: &str, body: &[u8]) -> StoreResult<CondPut> {
+        self.sent(body.len());
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(&self, key: &str, body: &[u8], etag: &str) -> StoreResult<CondPut> {
+        self.sent(body.len());
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> StoreResult<Option<crate::store::Object>> {
+        let r = self.inner.get(key);
+        if let Ok(Some(o)) = &r {
+            self.got(o.body.len());
+        }
+        r
+    }
+    fn get_aged(&self, key: &str) -> StoreResult<Option<(crate::store::Object, Duration)>> {
+        let r = self.inner.get_aged(key);
+        if let Ok(Some((o, _))) = &r {
+            self.got(o.body.len());
+        }
+        r
+    }
+    fn stat(&self, key: &str) -> StoreResult<Option<crate::store::ObjectStat>> {
+        self.inner.stat(key)
+    }
+    fn list(&self, prefix: &str) -> StoreResult<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn list_after(&self, prefix: &str, start_after: &str) -> StoreResult<Vec<String>> {
+        self.inner.list_after(prefix, start_after)
+    }
+    fn list_sized(&self, prefix: &str) -> StoreResult<Vec<(String, u64)>> {
+        self.inner.list_sized(prefix)
+    }
+    fn list_sized_after(&self, prefix: &str, start_after: &str) -> StoreResult<Vec<(String, u64)>> {
+        self.inner.list_sized_after(prefix, start_after)
+    }
+    fn put_multipart(
+        &self,
+        key: &str,
+        source: &mut dyn PartSource,
+        part_size: usize,
+        concurrency: usize,
+    ) -> StoreResult<crate::store::MultipartDone> {
+        let len = source.len();
+        let r = self
+            .inner
+            .put_multipart(key, source, part_size, concurrency);
+        if r.is_ok() {
+            self.sent(len as usize);
+        }
+        r
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Option<Vec<u8>>> {
+        let r = self.inner.get_range(key, offset, len);
+        if let Ok(Some(b)) = &r {
+            self.got(b.len());
+        }
+        r
+    }
+    fn abort_incomplete(&self, prefix: &str, older_than: Duration) -> StoreResult<u64> {
+        self.inner.abort_incomplete(prefix, older_than)
+    }
+    fn delete(&self, key: &str) -> StoreResult<()> {
+        self.inner.delete(key)
+    }
+    fn delete_if_match(&self, key: &str, etag: &str) -> StoreResult<bool> {
+        self.inner.delete_if_match(key, etag)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.inner.stats()
+    }
 }
 
 /// The name of a pack run's working directory in `config.dir` starts with this, then its
@@ -592,7 +762,7 @@ struct Run<'a> {
     work: PathBuf,
     steps: Vec<(&'static str, Duration)>,
     step_start: Instant,
-    /// Set: the run stops before its upload (`Failed` at `stopped`).
+    /// Set by a close: the run ends as `Failed` at `closed` (`pack_run_in`).
     stop: &'a AtomicBool,
     /// The error behind a `Failed` outcome, when there is one.
     error: Option<String>,
@@ -691,6 +861,18 @@ impl Run<'_> {
         }
         let from = base.as_ref().map_or(1, |p| p.pack_generation);
         self.step("read");
+        if let Some(p) = &base {
+            // Free disk first (spec rev 21): the pack's size plus 10%, before any download.
+            let need = p.size.saturating_add(p.size / 10);
+            let free = free_disk(&self.work)?;
+            if free < need {
+                self.error = Some(format!(
+                    "free disk: {free} bytes free in {}, a pack run needs {need} (the pack's size plus 10%)",
+                    self.work.display()
+                ));
+                return Ok(Ran::without_pack(failed("disk", None), p.pack_generation));
+            }
+        }
 
         // Steps 2 to 4: each ended generation, applied as the scan finds it. The newest pack
         // is downloaded before the first one.
@@ -718,7 +900,7 @@ impl Run<'_> {
                 return Ok(());
             }
             if stop.load(Relaxed) {
-                return Err(Error::Io("pack run stopped".into()));
+                return Err(Error::Io("pack run closed".into()));
             }
             if !base_ready {
                 base_ready = true;
@@ -738,7 +920,7 @@ impl Run<'_> {
         self.step("apply");
         if self.stop.load(Relaxed) {
             // The working directory goes with the run; nothing was uploaded.
-            return Ok(Ran::without_pack(failed("stopped", None), current));
+            return Ok(Ran::without_pack(failed(CLOSED_STEP, None), current));
         }
         let scanned = scanned?;
         if let Some(key) = scanned.incomplete {
@@ -756,7 +938,7 @@ impl Run<'_> {
             return Ok(Ran::without_pack(PackOutcome::NothingToDo, current));
         }
         if self.stop.load(Relaxed) {
-            return Ok(Ran::without_pack(failed("stopped", None), current));
+            return Ok(Ran::without_pack(failed(CLOSED_STEP, None), current));
         }
         let pack_generation = scanned.pack_generation.expect("a generation was applied");
         let facts = db_facts(&self.work, self.enc)?;
@@ -803,21 +985,35 @@ impl Run<'_> {
             upload_start: (self.clock)(),
             pointer,
         };
-        let up = upload_verified(self.store, &self.keys, &self.retry, &new.pointer, db, false)?;
+        let up = upload_verified(
+            self.store,
+            &self.keys,
+            &self.retry,
+            &new.pointer,
+            db,
+            false,
+            self.stop,
+        )?;
         let now = Instant::now();
         self.steps
             .push(("upload", up.uploaded_at - self.step_start));
         self.steps.push(("verify", now - up.uploaded_at));
         self.step_start = now;
         if let Err(f) = up.result {
-            self.error = Some(f.error.to_string());
+            let closed = self.stop.load(Relaxed);
             if f.step == "upload" {
                 // The parts of a failed upload stay hidden until an abort; GC aborts them
-                // after the orphan grace in any case.
-                let _ = self.store.abort_incomplete(&pack_key, Duration::ZERO);
+                // after the orphan grace in any case. One try only, also at a close.
+                if let Err(e) = self.store.abort_incomplete(&pack_key, Duration::ZERO) {
+                    tracing::warn!(target: "buckwal", key = %pack_key, error = %e, "pack run: cannot abort its upload; GC aborts it after the orphan grace");
+                }
             } else {
                 self.discard(&pack_key, &codes_key);
             }
+            if closed {
+                return Ok(failed(CLOSED_STEP, None));
+            }
+            self.error = Some(f.error.to_string());
             return Ok(failed(f.step, Some(&f.key)));
         }
         let outcome = self.publish(&new, base);
@@ -838,6 +1034,10 @@ impl Run<'_> {
             Pointer::None => (None, None),
         };
         for _ in 0..MAX_POINTER_WRITES {
+            if self.stop.load(Relaxed) {
+                self.discard(pack_key, codes_key);
+                return failed(CLOSED_STEP, None);
+            }
             if (self.clock)().saturating_sub(new.upload_start) >= self.limit {
                 self.discard(pack_key, codes_key);
                 return failed("time limit", Some(pack_key));
@@ -930,12 +1130,13 @@ pub(crate) fn upload_verified(
     pointer: &PackPointer,
     db: &Path,
     retry_upload: bool,
+    stop: &AtomicBool,
 ) -> Result<Uploaded> {
     let (pack_key, codes_key) = (pointer.pack_key.as_str(), pointer.codes_key.as_str());
     let part_size = pointer.part_size as usize;
     let (part_sha256, codes) = digest(keys, pointer, db)?;
     let codes_body = codes.encode(keys, pack_key, pointer.pack_generation, pointer.size)?;
-    let mut source = FileSource::open(db)?;
+    let mut source = FileSource::open(db, stop)?;
     let up = if retry_upload {
         with_retry(retry, pack_key, |_| {
             store.put_multipart(pack_key, &mut source, part_size, PART_CONCURRENCY)
@@ -1073,7 +1274,7 @@ fn download_pack(
         return Err(e);
     }
     if stop.load(Relaxed) {
-        return Err(Error::Io("pack run stopped".into()));
+        return Err(Error::Io("pack run closed".into()));
     }
     if missing.load(Relaxed) {
         return Ok(false);
@@ -1108,14 +1309,16 @@ fn fetch_range(
     Ok(true)
 }
 
-/// A [`PartSource`] over a local file.
-struct FileSource {
+/// A [`PartSource`] over a local file. A part read after `stop` is set fails, so the upload
+/// stops between two parts.
+struct FileSource<'a> {
     file: Mutex<File>,
     len: u64,
+    stop: &'a AtomicBool,
 }
 
-impl FileSource {
-    fn open(path: &Path) -> Result<FileSource> {
+impl<'a> FileSource<'a> {
+    fn open(path: &Path, stop: &'a AtomicBool) -> Result<FileSource<'a>> {
         let file = File::open(path).map_err(|e| io_err("open pack file", e))?;
         let len = file
             .metadata()
@@ -1124,15 +1327,19 @@ impl FileSource {
         Ok(FileSource {
             file: Mutex::new(file),
             len,
+            stop,
         })
     }
 }
 
-impl PartSource for FileSource {
+impl PartSource for FileSource<'_> {
     fn len(&self) -> u64 {
         self.len
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        if self.stop.load(Relaxed) {
+            return Err(std::io::Error::other("the database is closing"));
+        }
         let mut f = self.file.lock().unwrap();
         f.seek(SeekFrom::Start(offset))?;
         f.read_exact(buf)

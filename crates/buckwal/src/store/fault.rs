@@ -216,6 +216,14 @@ impl ObjectStore for FaultStore {
         self.record("list_sized", prefix);
         self.inner.list_sized(prefix)
     }
+    fn list_sized_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        self.record("list_sized_after", &format!("{prefix} {start_after}"));
+        self.inner.list_sized_after(prefix, start_after)
+    }
     fn put_multipart(
         &self,
         key: &str,

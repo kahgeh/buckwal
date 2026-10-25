@@ -250,6 +250,20 @@ fn s3_get_aged_is_one_get_with_the_stat_age() {
     assert_eq!(s.get_aged(&format!("{p}nope")).unwrap(), None);
 }
 
+/// `list_sized_after` (the packer's check lists the log from the pack generation on): only the
+/// keys after `start_after`, each with its size.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn s3_list_sized_after_returns_keys_after_with_sizes() {
+    let s = store();
+    let p = prefix("lsafter");
+    for (k, n) in [("a", 1), ("b", 22), ("c", 333)] {
+        s.put(&format!("{p}{k}"), &vec![0u8; n]).unwrap();
+    }
+    let got = s.list_sized_after(&p, &format!("{p}a")).unwrap();
+    assert_eq!(got, [(format!("{p}b"), 22), (format!("{p}c"), 333)]);
+}
+
 /// A conditional delete (spec rev 11, rule 1: a create removes a leftover `pack-latest` with
 /// `If-Match`): a matching ETag deletes, another ETag is a 412 and keeps the object, and a
 /// missing key is no error.

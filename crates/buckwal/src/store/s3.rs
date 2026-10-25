@@ -1087,6 +1087,14 @@ impl ObjectStore for S3Store {
         self.list_sized_from(prefix, None)
     }
 
+    fn list_sized_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        self.list_sized_from(prefix, Some(start_after))
+    }
+
     /// `concurrency` parts go up at once, each read from `source` when its turn comes. A
     /// failure stops new parts and leaves the upload in the bucket, hidden; see
     /// [`ObjectStore::abort_incomplete`].

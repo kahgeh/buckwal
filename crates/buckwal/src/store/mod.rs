@@ -208,6 +208,17 @@ pub trait ObjectStore: Send + Sync {
         }
         Ok(out)
     }
+    /// [`ObjectStore::list_sized`] of the keys strictly greater than `start_after`. The default
+    /// lists the whole prefix and filters; S3 asks its server (`start-after`).
+    fn list_sized_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+        let mut keys = self.list_sized(prefix)?;
+        keys.retain(|(k, _)| k.as_str() > start_after);
+        Ok(keys)
+    }
     /// Upload `source` as one object `key` in parts of `part_size` bytes (the last is smaller;
     /// see [`part_size_for`]), up to `concurrency` parts at once. The object is invisible until
     /// the upload completes. A failed upload can leave its parts in the store, hidden, until
