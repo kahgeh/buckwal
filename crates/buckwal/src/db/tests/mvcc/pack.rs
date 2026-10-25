@@ -557,3 +557,46 @@ fn a_pointer_naming_another_databases_pack_fails() {
     crash(dba, vec![ca]);
     crash(dbb, vec![cb]);
 }
+
+/// The create gap (task 9b): an MVCC create that stopped after its head landed leaves a head of
+/// format 5 with no pointer, or with another database's. Restore and the pack run refuse it,
+/// and the text of both says how to get out: delete the head and create again. The text names
+/// keys only.
+#[test]
+fn mvcc_create_gap_refusal_names_the_way_out() {
+    let way_out = "the create of this database did not finish; delete the object 'head' under the \
+                   prefix and create the database again";
+    let k = tempdir();
+    // Case 1: the pointer is absent. Case 2: the pointer is another database's.
+    for foreign in [false, true] {
+        let a = mem();
+        let cfg_a = |d: &Path| mvcc_enc(d, &k, &key_hex());
+        let ta = tempdir();
+        let (dba, ca) = mvcc_with_rows(a.clone(), cfg_a(&fresh(&ta)), 2);
+        let ka = keys_of(&a, &cfg_a(&fresh(&ta)));
+        if foreign {
+            let b = mem();
+            let tb = tempdir();
+            let (dbb, cb) = mvcc_with_rows(b.clone(), cfg_a(&fresh(&tb)), 2);
+            let kb = keys_of(&b, &cfg_a(&fresh(&tb)));
+            let body = b.get(&kb.pack_pointer()).unwrap().unwrap().body;
+            a.put(&ka.pack_pointer(), &body).unwrap();
+            crash(dbb, vec![cb]);
+        } else {
+            a.delete(&ka.pack_pointer()).unwrap();
+        }
+        let t = tempdir();
+        let r = restore_with_store(&cfg_a(&fresh(&t)), a.clone(), &fresh(&t));
+        assert!(
+            matches!(&r, Err(Error::Corrupt(m)) if m.contains(way_out)),
+            "foreign={foreign} restore: {r:?}"
+        );
+        let t = tempdir();
+        let r = crate::pack::run::pack_with_store(&cfg_a(&t.path().join("packer")), a.clone());
+        assert!(
+            matches!(&r, Err(Error::Corrupt(m)) if m.contains(way_out)),
+            "foreign={foreign} pack run: {r:?}"
+        );
+        crash(dba, vec![ca]);
+    }
+}

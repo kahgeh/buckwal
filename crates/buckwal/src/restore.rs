@@ -763,7 +763,8 @@ fn apply_ended_generations(
         None if head.journal_mode == JournalMode::Mvcc => {
             return Err(Error::Corrupt(format!(
                 "{pointer_key} is missing or another database's: an MVCC bucket of format 5 \
-                 starts with its first pack"
+                 starts with its first pack; the create of this database did not finish; \
+                 delete the object 'head' under the prefix and create the database again"
             )))
         }
         None => (None, 1),
