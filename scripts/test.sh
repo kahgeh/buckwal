@@ -5,9 +5,10 @@
 #               1. plain HTTP, no encryption (the tls_* tests skipped), then a whole-bucket
 #                  scan that must find `CREATE TABLE` (the control);
 #               2. HTTPS with encryption (TLS material and key made in a temp directory),
-#                  every test, a short workload with a marker row, a whole-bucket scan that
-#                  must find no plaintext, and the ClickHouse check (scripts/otel-check.sh;
-#                  SKIPPED when the observability stack is down).
+#                  every test, a short workload with a marker row and a `buckwal pack`, a
+#                  whole-bucket scan that must find no plaintext (packs included), and the
+#                  ClickHouse check (scripts/otel-check.sh; SKIPPED when the observability
+#                  stack is down).
 #             Tests keep their bucket prefixes (BUCKWAL_KEEP_PREFIXES=1) so the scans see
 #             everything. Both passes run the `serve` system tests
 #             (crates/buckwal-cli/tests/server.rs): plain HTTP without a token in pass 1,
@@ -240,6 +241,8 @@ serial_main() {
   cli sql --dir "$WORK/bench" "CREATE TABLE marker(t TEXT)"
   cli sql --dir "$WORK/bench" "INSERT INTO marker VALUES ('$MARKER')"
   cli sql --dir "$WORK/bench" "PRAGMA wal_checkpoint(TRUNCATE)"
+  # The marker row's generation ended: a pack run puts it into a pack, which the scan reads.
+  cli pack --dir "$WORK/packer"
   cli restore --dir "$WORK/restored"
   cli takeover --dir "$WORK/took"
   cli gc
@@ -437,6 +440,8 @@ parallel_main() {
   cli sql --dir "$WORK/bench" "CREATE TABLE marker(t TEXT)"
   cli sql --dir "$WORK/bench" "INSERT INTO marker VALUES ('$MARKER')"
   cli sql --dir "$WORK/bench" "PRAGMA wal_checkpoint(TRUNCATE)"
+  # The marker row's generation ended: a pack run puts it into a pack, which the scan reads.
+  cli pack --dir "$WORK/packer"
   cli restore --dir "$WORK/restored"
   cli takeover --dir "$WORK/took"
   cli gc

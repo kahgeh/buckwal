@@ -2801,8 +2801,41 @@ fn mvcc_takeover_fences_a_running_soak() {
     );
 }
 
-/// GC after several MVCC checkpoints (each ends a generation): it trims every log below the
-/// head's manifest, and the restore afterwards still has every row.
+/// Run `gc` every second until `log/` holds no generation below `generation`, at most
+/// `limit`: the last `gc` line. A format 5 GC deletes the log below its GC base only once the
+/// codes of the pack are older than the pack keep time.
+fn gc_until_no_log_below(ctx: &Ctx, generation: u64, limit: Duration) -> String {
+    let start = Instant::now();
+    loop {
+        let out = ctx.ok(&["gc"]).stdout;
+        let below: Vec<u64> = log_generations(ctx)
+            .into_iter()
+            .filter(|g| *g < generation)
+            .collect();
+        if out.contains("outcome=trimmed") && below.is_empty() {
+            return out.trim().to_string();
+        }
+        assert!(
+            start.elapsed() < limit,
+            "{}: gc left the log of generations {below:?} (below {generation}) after {limit:?}: \
+             {out}",
+            ctx.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The value of `key=` in a `key=value` line.
+fn line_field<'a>(line: &'a str, key: &str) -> &'a str {
+    let at = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(&at))
+        .unwrap_or_else(|| panic!("no {key}= in {line}"))
+}
+
+/// GC after several MVCC checkpoints (each ends a generation) and a `buckwal pack`: it deletes
+/// every log below the pack and every older pack, and the restore afterwards still has every
+/// row.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn mvcc_gc_across_generations() {
@@ -2820,13 +2853,25 @@ fn mvcc_gc_across_generations() {
     soak.finish();
     assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     let head = ctx.head();
-    assert!(head.generation >= 8, "checkpoints sealed: {head:?}");
+    assert!(head.generation >= 8, "checkpoints switched: {head:?}");
     let before = log_generations(&ctx);
     assert!(
         before.len() > 1,
         "log/ holds several generations: {before:?}"
     );
-    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(40));
+    // One pack run now holds every ended generation. The writer's packer thread may have
+    // packed them first: then the run has nothing to do.
+    let p = ctx.dir("packer");
+    let pack = ctx.ok(&["pack", "--dir", p.to_str().unwrap()]).stdout;
+    let pack = pack.trim();
+    let outcome = line_field(pack, "outcome");
+    assert!(outcome == "packed" || outcome == "nothing_to_do", "{pack}");
+    assert_eq!(
+        line_field(pack, "pack_generation"),
+        head.generation.to_string(),
+        "the pack holds every generation below the head's: {pack}"
+    );
+    let gc = gc_until_no_log_below(&ctx, head.generation, Duration::from_secs(40));
     let logs = ctx.list("log/");
     let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
     assert!(
@@ -2834,11 +2879,13 @@ fn mvcc_gc_across_generations() {
         "only generation {} logs remain: {logs:?}",
         head.generation
     );
+    let packs = ctx.list("pack/");
+    assert_eq!(packs.len(), 2, "one pack and its codes remain: {packs:?}");
     let v = restore_verify(&ctx, &soak.lines);
     assert_eq!(v.acked, 400);
     eprintln!(
-        "mvcc_gc_across_generations: head {head:?}; log generations before {before:?}; {gc}; \
-         log/ holds {} keys after; {}",
+        "mvcc_gc_across_generations: head {head:?}; log generations before {before:?}; \
+         {pack}; {gc}; log/ holds {} keys after; {}",
         logs.len(),
         v.restored
     );

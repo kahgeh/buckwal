@@ -318,11 +318,10 @@ fn verify_with(
     head: Option<Vec<u8>>,
     acked: &[i64],
 ) -> CliResult<Vec<String>> {
-    // The bucket first: a local copy that was restored before shows nothing of it.
-    let checked = buckwal::check_bucket_with_store(&cfg, store.clone())
-        .map_err(|e| format!("verify: bucket: {e}"))?;
     let mut lines = Vec::new();
-    let db = buckwal::open_read_only_with_store(cfg, store).map_err(err)?;
+    // The open comes first, so a restore into an empty `dir` starts at once: it must end
+    // before the writer switches the generation.
+    let db = buckwal::open_read_only_with_store(cfg.clone(), store.clone()).map_err(err)?;
     let conn = db.connect().map_err(err)?;
     let rows = conn.query("PRAGMA integrity_check", &[]).map_err(err)?;
     let verdict = rows
@@ -346,6 +345,11 @@ fn verify_with(
     if let Some(head) = head {
         lines.push(head_summary(&head));
     }
+    conn.close().map_err(err)?;
+    db.close().map_err(err)?;
+    // Then the bucket: a copy that was restored before shows nothing of a changed pack block.
+    let checked = buckwal::check_bucket_with_store(&cfg, store)
+        .map_err(|e| format!("verify: bucket: {e}"))?;
     if let Some(key) = &checked.pack_key {
         lines.push(format!(
             "verify pack key={key} pack_generation={} size={} blocks={} log_generations={} \
@@ -357,8 +361,6 @@ fn verify_with(
             checked.log_objects
         ));
     }
-    conn.close().map_err(err)?;
-    db.close().map_err(err)?;
     Ok(lines)
 }
 
@@ -920,7 +922,7 @@ mod tests {
             mem.delete(k).unwrap();
         }
         let e =
-            verify_with(mem_config(&t.path().join("r2")), store, head_of(&mem), &[]).unwrap_err();
+            verify_with(mem_config(&t.path().join("r1")), store, head_of(&mem), &[]).unwrap_err();
         assert!(
             e.starts_with("verify: bucket: ") && e.contains("log_incomplete"),
             "{e}"
