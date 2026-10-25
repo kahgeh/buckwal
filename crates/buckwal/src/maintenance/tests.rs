@@ -710,3 +710,130 @@ fn maintenance_uploads_nothing() {
     drop(w);
     db.close().unwrap();
 }
+
+// --- A checkpoint's WAL fsync and another connection's commit -----------------------------
+
+/// What a paused commit thread tells the test, and waits for.
+struct Pause {
+    paused: mpsc::Receiver<()>,
+    go: mpsc::Sender<()>,
+}
+
+/// Run `f` on a new thread whose first shipping `-wal` sync with `pending_empty` as given
+/// waits for the test's go. Returns the pause and the thread.
+fn paused_at_sync<T: Send + 'static>(
+    pending_empty: bool,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (Pause, thread::JoinHandle<T>) {
+    let (paused_tx, paused) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let h = thread::spawn(move || {
+        let mut once = Some((paused_tx, go_rx));
+        crate::io::wal_file::BEFORE_SYNC.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |empty| {
+                if empty != pending_empty {
+                    return;
+                }
+                if let Some((tx, rx)) = once.take() {
+                    tx.send(()).unwrap();
+                    rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                }
+            }))
+        });
+        let r = f();
+        crate::io::wal_file::BEFORE_SYNC.with(|h| *h.borrow_mut() = None);
+        r
+    });
+    (Pause { paused, go }, h)
+}
+
+impl Pause {
+    fn wait(&self) {
+        self.paused
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the thread never reached its sync");
+    }
+}
+
+/// A writer on a fault store whose log PUTs fail fast, with a table `t(id, b)`.
+fn faulty_writer(
+    dir: &std::path::Path,
+) -> (
+    crate::Database,
+    Arc<crate::store::FaultStore>,
+    Arc<crate::store::MemStore>,
+) {
+    let mem = Arc::new(crate::store::MemStore::new());
+    let fault = Arc::new(crate::store::FaultStore::new(mem.clone()));
+    let mut c = crate::config::Config::new(dir, "http://127.0.0.1:1", "b", "k", "s");
+    c.retry_deadline = Duration::from_millis(200);
+    c.request_timeout = Duration::from_millis(50);
+    let db = crate::open_with_store(c, fault.clone()).unwrap();
+    db.connect()
+        .unwrap()
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)", &[])
+        .unwrap();
+    (db, fault, mem)
+}
+
+/// The ids a restore of the bucket holds.
+fn restored_ids(mem: Arc<crate::store::MemStore>) -> Vec<i64> {
+    let to = tempfile::tempdir().unwrap();
+    let c = crate::config::Config::new(to.path(), "http://127.0.0.1:1", "b", "k", "s");
+    let db = crate::open_read_only_with_store(c, mem).unwrap();
+    let conn = db.connect().unwrap();
+    let ids = conn
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    drop(conn);
+    db.close().unwrap();
+    ids
+}
+
+/// Connection A wrote its commit's frames and waits for its own `-wal` fsync. The writer's
+/// PASSIVE checkpoint fsyncs the WAL then, and the bucket refuses its upload for good. The checkpoint must not ship
+/// (and lose) A's frames: A's own sync ships them, and A's acked commit restores.
+#[test]
+fn passive_checkpoint_never_ships_another_connections_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, fault, mem) = faulty_writer(dir.path());
+    let w = db.connect().unwrap();
+    for id in 1..=20 {
+        w.execute(
+            "INSERT INTO t(id) VALUES (?)",
+            &[crate::Value::from_i64(id)],
+        )
+        .unwrap();
+    }
+    let a_db = db.clone();
+    let (pause, a) = paused_at_sync(false, move || {
+        let c = a_db.connect().unwrap();
+        c.execute("INSERT INTO t(id) VALUES (100)", &[])
+    });
+    pause.wait();
+    // A permanent failure: the uploader drops a record it could not send.
+    fault.only_keys_containing("log/");
+    fault.fail_next_puts_permanently(u64::MAX);
+    let checkpoint = passive_checkpoint(&db.shared);
+    fault.fail_next_puts_permanently(0);
+    pause.go.send(()).unwrap();
+    let acked = a.join().unwrap();
+    eprintln!("checkpoint: {checkpoint:?}, A: {acked:?}");
+    // The ack means the record is in the bucket now, with the writer still open.
+    let open_ids = restored_ids(mem.clone());
+    drop(w);
+    db.close().unwrap();
+    let ids = restored_ids(mem);
+    if acked.is_ok() {
+        assert!(
+            open_ids.contains(&100) && ids.contains(&100),
+            "acked commit 100: in the bucket at its ack {}, after the close {}",
+            open_ids.contains(&100),
+            ids.contains(&100)
+        );
+    }
+    assert!(acked.is_ok(), "{acked:?}");
+}
