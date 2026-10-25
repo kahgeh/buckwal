@@ -333,15 +333,18 @@ pub(crate) fn pack_run(
     Ok(report)
 }
 
-/// The run's working directory, removed when the run ends, whatever the outcome.
 /// The name of a pack run's working directory in `config.dir` starts with this, then its
 /// run id.
 pub(crate) const WORK_DIR_PREFIX: &str = "pack-work-";
 
 /// Remove each `pack-work-*` directory in `dir` that nothing changed for `max_age` (half the
-/// orphan grace): a crashed run left it. No live run owns one so old: a run gives up at half
-/// the orphan grace after its upload starts, and it adds its last entry before the upload. A
-/// missing `dir` has nothing to remove. A pack run's start and a writer's open call it.
+/// orphan grace): a crashed run left it. The age is the directory's modified time: a run adds
+/// its last entry before its upload starts, and gives up at half the orphan grace after that
+/// start. So a live run can own a directory this old only while it is past its own limit, in
+/// its last step: its next time check fails it, or, with its files removed under it, its next
+/// read fails it. Either way it ends `failed` with no pointer write, and nothing in the bucket
+/// changes. A missing `dir` has nothing to remove. A pack run's start and a writer's open call
+/// it.
 pub(crate) fn remove_stale_work_dirs(dir: &Path, max_age: Duration) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -385,6 +388,7 @@ pub(crate) fn sweep_work_dirs(config: &Config) {
     }
 }
 
+/// The run's working directory, removed when the run ends, whatever the outcome.
 struct WorkDir(PathBuf);
 
 impl WorkDir {

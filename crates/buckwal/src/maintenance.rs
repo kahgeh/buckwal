@@ -7,7 +7,8 @@
 //!   restarts the WAL (a generation switch). The engine runs its own PASSIVE checkpoint after
 //!   a commit only at 1000 frames past the backfill: a reader that held the newest frames at
 //!   that time can keep the engine from a new try for 1000 more frames.
-//! - The maintenance checkpoint, only at the WAL size limit (`maintenance_wal_bytes`): readers
+//! - The maintenance checkpoint, only at the WAL size limit (`maintenance_wal_bytes`; formats
+//!   1 to 4 also at a fixed `defaults::LEGACY_SEAL_LOG_OBJECTS`, as they never get packs): readers
 //!   that never leave keep the engine from a WAL restart, so the WAL grows. The run closes the
 //!   gate, waits for the calls in flight, and runs `checkpoint(TRUNCATE)`. The TRUNCATE ends
 //!   the generation at `truncate(0)` through the same path as a user's checkpoint
@@ -51,6 +52,10 @@ pub(crate) struct MaintenanceConfig {
     /// The WAL size limit: a maintenance run once the generation's `-wal` reaches this many
     /// bytes; 0 = never.
     pub wal_bytes: u64,
+    /// Formats 1 to 4 only (no packs): a maintenance run also once the generation's log holds
+    /// this many objects, so a restore of such a bucket stays bounded as before; 0 = never
+    /// (format 5).
+    pub log_objects: u64,
     /// A PASSIVE checkpoint once the generation's `-wal` reaches this many bytes; 0 = never
     /// (formats 1 to 4, where each WAL restart seals, and MVCC).
     pub passive_wal_bytes: u64,
@@ -65,11 +70,18 @@ pub(crate) struct MaintenanceConfig {
 }
 
 impl MaintenanceConfig {
-    /// The settings of `c`. `passive`: the writer runs PASSIVE checkpoints (a format 5 WAL
-    /// database).
-    pub(crate) fn from_config(c: &Config, passive: bool) -> MaintenanceConfig {
+    /// The settings of `c` for a bucket of format 5 (`packed`) or of formats 1 to 4. A format 5
+    /// WAL database runs PASSIVE checkpoints; formats 1 to 4 keep the fixed log-object
+    /// trigger.
+    pub(crate) fn from_config(c: &Config, packed: bool) -> MaintenanceConfig {
+        let passive = packed && c.journal_mode == crate::config::JournalMode::Wal;
         MaintenanceConfig {
             wal_bytes: c.maintenance_wal_bytes,
+            log_objects: if packed {
+                0
+            } else {
+                defaults::LEGACY_SEAL_LOG_OBJECTS
+            },
             passive_wal_bytes: if passive {
                 defaults::PASSIVE_CHECKPOINT_WAL_BYTES
             } else {
@@ -84,12 +96,14 @@ impl MaintenanceConfig {
 
     /// One of the two checkpoints is on.
     pub(crate) fn enabled(&self) -> bool {
-        self.wal_bytes > 0 || self.passive_wal_bytes > 0
+        self.wal_bytes > 0 || self.log_objects > 0 || self.passive_wal_bytes > 0
     }
 
-    /// The generation's `-wal` is at the WAL size limit: a maintenance run is due.
-    pub(crate) fn due(&self, wal_bytes: u64) -> bool {
-        self.wal_bytes > 0 && wal_bytes >= self.wal_bytes
+    /// The generation's `-wal` is at the WAL size limit (or, formats 1 to 4, its log holds
+    /// `log_objects`): a maintenance run is due.
+    pub(crate) fn due(&self, log_objects: u64, wal_bytes: u64) -> bool {
+        let over = |n: u64, threshold: u64| threshold > 0 && n >= threshold;
+        over(log_objects, self.log_objects) || over(wal_bytes, self.wal_bytes)
     }
 
     /// The generation's `-wal` is large enough for a PASSIVE checkpoint (the interval aside).
@@ -97,10 +111,21 @@ impl MaintenanceConfig {
         self.passive_wal_bytes > 0 && wal_bytes >= self.passive_wal_bytes
     }
 
-    /// The `-wal` bytes at which a run that failed at `wal_bytes` may be retried before its
-    /// backoff ends: one more limit of growth.
-    fn bypass_at(&self, wal_bytes: u64) -> u64 {
-        wal_bytes.saturating_add(self.wal_bytes)
+    /// The measures at which a run that failed at (`log_objects`, `wal_bytes`) may be retried
+    /// before its backoff ends: one more threshold of growth (`u64::MAX`: never, for a measure
+    /// that is off).
+    fn bypass_at(&self, log_objects: u64, wal_bytes: u64) -> (u64, u64) {
+        let at = |n: u64, threshold: u64| {
+            if threshold == 0 {
+                u64::MAX
+            } else {
+                n.saturating_add(threshold)
+            }
+        };
+        (
+            at(log_objects, self.log_objects),
+            at(wal_bytes, self.wal_bytes),
+        )
     }
 }
 
@@ -212,8 +237,9 @@ struct Signal {
     wake: Mutex<Wake>,
     cv: Condvar,
     phase: AtomicU8,
-    /// While backing off after a failed run: the `-wal` bytes at which a poke retries at once
-    /// (`u64::MAX`: wait out the backoff).
+    /// While backing off after a failed run: the log objects and `-wal` bytes at which a poke
+    /// retries at once (`u64::MAX`: wait out the backoff).
+    bypass_log: AtomicU64,
     bypass_wal: AtomicU64,
     /// The time from which the next PASSIVE checkpoint may run, in milliseconds after `epoch`.
     passive_after_ms: AtomicU64,
@@ -232,6 +258,7 @@ impl Default for Signal {
             wake: Mutex::default(),
             cv: Condvar::new(),
             phase: AtomicU8::new(IDLE),
+            bypass_log: AtomicU64::new(u64::MAX),
             bypass_wal: AtomicU64::new(u64::MAX),
             passive_after_ms: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -322,12 +349,14 @@ impl Maintenance {
     /// progress, nor backing off (unless a failed run's `-wal` has grown by another limit
     /// since); or, with the thread idle, when a PASSIVE checkpoint is due and its interval
     /// has passed. Only atomic loads when nothing is due; it never blocks.
-    pub(crate) fn poke(&self, wal_bytes: u64) {
+    pub(crate) fn poke(&self, log_objects: u64, wal_bytes: u64) {
         let s = &self.signal;
-        let from = if self.cfg.due(wal_bytes) {
+        let grown =
+            || log_objects >= s.bypass_log.load(SeqCst) || wal_bytes >= s.bypass_wal.load(SeqCst);
+        let from = if self.cfg.due(log_objects, wal_bytes) {
             match s.phase.load(SeqCst) {
                 IDLE => IDLE,
-                BACKOFF if wal_bytes >= s.bypass_wal.load(SeqCst) => BACKOFF,
+                BACKOFF if grown() => BACKOFF,
                 _ => return,
             }
         } else if self.cfg.passive_due(wal_bytes)
@@ -417,8 +446,8 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
         let Some(shared) = shared.upgrade() else {
             return;
         };
-        let wal_bytes = shared.maintenance_wal_bytes();
-        if !cfg.due(wal_bytes) {
+        let (log_objects, wal_bytes) = shared.maintenance_measures();
+        if !cfg.due(log_objects, wal_bytes) {
             if cfg.passive_due(wal_bytes) && signal.passive_allowed() {
                 run_passive(&shared);
                 signal.passive_ran(cfg.passive_interval);
@@ -428,6 +457,7 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
             // maintenance run waits.
             held_off = 0;
             retry_at = None;
+            signal.bypass_log.store(u64::MAX, SeqCst);
             signal.bypass_wal.store(u64::MAX, SeqCst);
             signal.phase.store(IDLE, SeqCst);
             continue;
@@ -479,7 +509,7 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
         drop(shared);
         // The run checkpointed more than a PASSIVE checkpoint does.
         signal.passive_ran(cfg.passive_interval);
-        let mut bypass_wal = u64::MAX;
+        let (mut bypass_log, mut bypass_wal) = (u64::MAX, u64::MAX);
         let delay = match outcome {
             Outcome::Sealed => None,
             Outcome::GateTimeout | Outcome::Busy => {
@@ -487,13 +517,14 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
                 Some(backoff(cfg.retry, held_off, cfg.retry_max))
             }
             Outcome::Error => {
-                bypass_wal = cfg.bypass_at(wal_bytes);
+                (bypass_log, bypass_wal) = cfg.bypass_at(log_objects, wal_bytes);
                 Some(cfg.retry)
             }
             Outcome::BucketFailing | Outcome::Closed => Some(cfg.retry),
             // Retried once the quiet has passed, not every `retry` meanwhile.
             Outcome::TakeoverQuiet(left) => Some(cfg.retry.max(left)),
         };
+        signal.bypass_log.store(bypass_log, SeqCst);
         signal.bypass_wal.store(bypass_wal, SeqCst);
         match delay {
             None => {

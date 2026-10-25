@@ -89,40 +89,53 @@ fn gate_blocks_new_calls_and_drains_in_flight() {
     gate.open();
 }
 
-/// The WAL size limit alone makes a maintenance run due (0 turns it off); the PASSIVE
-/// threshold alone makes a PASSIVE checkpoint due (0, formats 1 to 4 and MVCC, turns it off).
+/// The WAL size limit makes a maintenance run due (0 turns it off), and in formats 1 to 4 the
+/// fixed log-object trigger too; the PASSIVE threshold alone makes a PASSIVE checkpoint due (0,
+/// formats 1 to 4 and MVCC, turns it off).
 #[test]
 fn due_follows_the_thresholds() {
-    let cfg = |wal_bytes, passive_wal_bytes| MaintenanceConfig {
+    let cfg = |wal_bytes, log_objects, passive_wal_bytes| MaintenanceConfig {
         wal_bytes,
+        log_objects,
         passive_wal_bytes,
         passive_interval: Duration::from_secs(1),
         gate_wait: Duration::from_millis(500),
         retry: Duration::from_secs(1),
         retry_max: Duration::from_secs(30),
     };
-    let c = cfg(1 << 20, 0);
+    let c = cfg(1 << 20, 0, 0);
     assert!(c.enabled());
-    assert!(!c.due((1 << 20) - 1));
-    assert!(c.due(1 << 20));
+    assert!(!c.due(u64::MAX, (1 << 20) - 1));
+    assert!(c.due(0, 1 << 20));
     assert!(!c.passive_due(u64::MAX));
-    assert_eq!(c.bypass_at(7), 7 + (1 << 20));
-    let c = cfg(0, 4 << 20);
-    assert!(c.enabled() && !c.due(u64::MAX));
+    assert_eq!(c.bypass_at(5, 7), (u64::MAX, 7 + (1 << 20)));
+    let c = cfg(1 << 20, 1000, 0);
+    assert!(!c.due(999, 0) && c.due(1000, 0));
+    assert_eq!(c.bypass_at(1000, 7), (2000, 7 + (1 << 20)));
+    let c = cfg(0, 0, 4 << 20);
+    assert!(c.enabled() && !c.due(u64::MAX, u64::MAX));
     assert!(!c.passive_due((4 << 20) - 1) && c.passive_due(4 << 20));
-    let c = cfg(0, 0);
-    assert!(!c.enabled() && !c.due(u64::MAX) && !c.passive_due(u64::MAX));
-    // From the settings: PASSIVE only when the caller says so.
+    let c = cfg(0, 0, 0);
+    assert!(!c.enabled() && !c.due(u64::MAX, u64::MAX) && !c.passive_due(u64::MAX));
+    // From the settings: format 5 WAL gets PASSIVE and no log-object trigger; formats 1 to 4
+    // the reverse; format 5 MVCC neither.
     let s = crate::config::Config::new("/d", "http://e", "b", "k", "s");
-    let on = MaintenanceConfig::from_config(&s, true);
+    let f5 = MaintenanceConfig::from_config(&s, true);
     assert_eq!(
-        (on.wal_bytes, on.passive_wal_bytes, on.passive_interval),
-        (64 << 20, 4 << 20, Duration::from_secs(1))
+        (
+            f5.wal_bytes,
+            f5.log_objects,
+            f5.passive_wal_bytes,
+            f5.passive_interval
+        ),
+        (64 << 20, 0, 4 << 20, Duration::from_secs(1))
     );
-    assert_eq!(
-        MaintenanceConfig::from_config(&s, false).passive_wal_bytes,
-        0
-    );
+    let legacy = MaintenanceConfig::from_config(&s, false);
+    assert_eq!((legacy.log_objects, legacy.passive_wal_bytes), (1000, 0));
+    let mut m = s.clone();
+    m.journal_mode = crate::config::JournalMode::Mvcc;
+    let f5m = MaintenanceConfig::from_config(&m, true);
+    assert_eq!((f5m.log_objects, f5m.passive_wal_bytes), (0, 0));
 }
 
 /// The maintenance thread can end up holding the last handle (the app dropped everything
@@ -534,12 +547,15 @@ fn writer_runs_passive_checkpoints_so_wal_restarts_without_readers() {
     insert_blob(&w, 2_400_000);
     r.execute("COMMIT", &[]).unwrap();
     assert_eq!(db.generation(), 1);
-    // Each small commit adds a frame or two: far fewer than the 1000 that the engine waits for.
-    let until = Instant::now() + Duration::from_secs(3);
+    // Each small commit adds a frame or two. The engine's own next try needs about 400 more
+    // frames (1000 past its backfill at about 590); the PASSIVE interval is 1 s, so about 20
+    // commits at 50 ms apart are enough, and the 8 s deadline (about 160 commits, under 320
+    // frames) leaves room on a slow machine while staying below the engine's 400.
+    let until = Instant::now() + Duration::from_secs(8);
     let mut commits = 0;
     while db.generation() == 1 {
         assert!(
-            Instant::now() < until,
+            Instant::now() < until && commits < 160,
             "no WAL restart after {commits} small commits"
         );
         w.execute("INSERT INTO t(b) VALUES (1)", &[]).unwrap();
@@ -547,6 +563,7 @@ fn writer_runs_passive_checkpoints_so_wal_restarts_without_readers() {
         thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(db.generation(), 2);
+    eprintln!("WAL restart after {commits} small commits");
     drop((r, w));
     db.close().unwrap();
 }
@@ -571,14 +588,20 @@ fn passive_checkpoint_with_reader_never_waits() {
     for _ in 0..50 {
         w.execute("INSERT INTO t(b) VALUES (1)", &[]).unwrap();
     }
+    let db_len = || std::fs::metadata(dir.path().join("app.db")).map_or(0, |m| m.len());
+    let before = db_len();
     let start = Instant::now();
     let res = passive_checkpoint(&db.shared);
     let took = start.elapsed();
-    assert!(
-        !matches!(res, Err((Outcome::Error, _))),
-        "the PASSIVE checkpoint failed: {res:?}"
-    );
+    // PASSIVE copies the frames below the reader's mark and returns Ok; a TRUNCATE or RESTART
+    // in its place is `Busy` (or waits) with the reader open.
+    assert_eq!(res, Ok(()), "{took:?}");
     assert!(took < Duration::from_millis(250), "it waited {took:?}");
+    assert!(
+        db_len() > before,
+        "no frame copied: app.db {before} bytes, then {}",
+        db_len()
+    );
     assert_eq!(
         r.query("SELECT count(*) FROM t", &[]).unwrap()[0][0].as_int(),
         Some(50)
@@ -640,6 +663,47 @@ fn maintenance_runs_only_at_wal_size_limit() {
     r.execute("COMMIT", &[]).unwrap();
     wait_event(&seen, |e| matches!(e, Event::MaintenanceFinished { .. }));
     assert_eq!(db.generation(), 2);
+    drop((r, w));
+    db.close().unwrap();
+}
+
+/// A bucket of formats 1 to 4 never gets a pack, so its maintenance keeps the fixed trigger
+/// of 1000 log objects (no setting): with the WAL far below its limit (a reader keeps the
+/// engine from restarting it), a run starts once the generation's log holds 1000 objects, and
+/// not before. (Format 5 does not: `maintenance_runs_only_at_wal_size_limit`.)
+#[test]
+fn legacy_maintenance_still_runs_at_1000_log_objects() {
+    use crate::config::Event;
+    let _legacy = crate::format::LegacySeal::on();
+    let dir = tempfile::tempdir().unwrap();
+    let (hook, seen) = recorder();
+    let store = Arc::new(crate::store::MemStore::new());
+    let (db, w) = writer_with(|c| c.on_event = Some(hook), store, dir.path());
+    let r = db.connect().unwrap();
+    r.execute("BEGIN", &[]).unwrap();
+    r.query("SELECT count(*) FROM t", &[]).unwrap();
+    let started = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::MaintenanceStarted { .. }))
+    };
+    let mut x = 0;
+    while db.shared.maintenance_measures().0 < 990 {
+        w.execute("INSERT INTO t(b) VALUES (?)", &[crate::Value::from_i64(x)])
+            .unwrap();
+        x += 1;
+    }
+    thread::sleep(Duration::from_millis(200));
+    assert!(!started(), "a run started below 1000 log objects");
+    while db.shared.maintenance_measures().0 < 1000 {
+        w.execute("INSERT INTO t(b) VALUES (?)", &[crate::Value::from_i64(x)])
+            .unwrap();
+        x += 1;
+    }
+    wait_event(&seen, |e| matches!(e, Event::MaintenanceStarted { .. }));
+    assert!(db.shared.maintenance_wal_bytes() < 64 << 20);
+    r.execute("COMMIT", &[]).unwrap();
     drop((r, w));
     db.close().unwrap();
 }

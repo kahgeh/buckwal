@@ -59,6 +59,10 @@ pub mod defaults {
     /// runs its own after a commit, so the WAL restarts about as often as the engine's own
     /// checkpoint makes it restart. Fixed.
     pub const PASSIVE_CHECKPOINT_WAL_BYTES: u64 = 4 << 20;
+    /// Formats 1 to 4 (no packs): the maintenance checkpoint also runs once the generation's
+    /// log holds this many objects, so a restore of such a bucket reads about this many log
+    /// objects at most. Format 5 never uses it. Fixed.
+    pub const LEGACY_SEAL_LOG_OBJECTS: u64 = 1000;
     /// The least time between two PASSIVE checkpoints of the writer. Fixed.
     pub const PASSIVE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
     /// How long maintenance waits for in-flight calls (and open transactions) to end, with
@@ -186,8 +190,9 @@ pub struct Config {
     /// The WAL size limit (`BUCKWAL_MAINTENANCE_WAL_MIB`): once the local `-wal` holds this
     /// many bytes of the generation, the library runs one checkpoint (TRUNCATE) that waits for
     /// readers to leave and holds new statements back meanwhile, because readers that never
-    /// leave keep the engine from restarting the WAL. It uploads no page. 0 turns maintenance
-    /// off.
+    /// leave keep the engine from restarting the WAL. It uploads no page. 0 turns this
+    /// checkpoint off; the maintenance thread still runs its PASSIVE checkpoints (format 5,
+    /// WAL mode) and, in formats 1 to 4, the seal at 1000 log objects.
     pub maintenance_wal_bytes: u64,
     /// How long a maintenance run holds new calls back while it waits for the ones in flight
     /// (and open transactions) to end; then it gives up and retries later.
@@ -262,9 +267,20 @@ impl fmt::Debug for Config {
     }
 }
 
-/// Variables of earlier versions that [`Config::from_env`] no longer reads: a set one gets a
-/// warning, never an error, so an old deployment still opens.
-const REMOVED_ENV_VARS: [&str; 1] = ["BUCKWAL_MAINTENANCE_LOG_OBJECTS"];
+/// Variables of earlier versions that [`Config::from_env`] no longer reads, each with its
+/// reason: a set one gets a warning, never an error, so an old deployment still opens.
+const REMOVED_ENV_VARS: [(&str, &str); 2] = [
+    (
+        "BUCKWAL_MAINTENANCE_LOG_OBJECTS",
+        "the maintenance checkpoint runs at the WAL size limit (BUCKWAL_MAINTENANCE_WAL_MIB); a \
+         bucket of formats 1 to 4 also seals at a fixed 1000 log objects, and 0 no longer turns \
+         that off",
+    ),
+    (
+        "BUCKWAL_GC_AFTER_SEAL",
+        "a writer always runs GC on its own thread; `buckwal gc` still runs it on demand",
+    ),
+];
 
 /// Every environment variable [`Config::from_env`] reads.
 const ENV_VARS: [&str; 26] = [
@@ -442,13 +458,9 @@ impl Config {
                 e => e,
             })?;
         }
-        for var in REMOVED_ENV_VARS {
+        for (var, reason) in REMOVED_ENV_VARS {
             if get(var).is_some() {
-                tracing::warn!(
-                    target: "buckwal",
-                    "{var} is no longer read: the maintenance checkpoint runs only at the WAL size \
-                     limit (BUCKWAL_MAINTENANCE_WAL_MIB)"
-                );
+                tracing::warn!(target: "buckwal", "{var} is no longer read: {reason}");
             }
         }
         if let Some(v) = get("BUCKWAL_MAINTENANCE_WAL_MIB") {
@@ -1204,29 +1216,39 @@ mod tests {
     }
 
     /// `BUCKWAL_MAINTENANCE_LOG_OBJECTS` is gone (spec "Contract changes"): it is not parsed,
-    /// so any value opens, and a set variable gets one warning that names it.
+    /// so any value opens, and a set variable gets one warning that names it and its reason.
+    /// `BUCKWAL_GC_AFTER_SEAL` (gone in task 9) gets its own.
     #[test]
     fn log_objects_setting_is_gone() {
-        let cap = crate::telemetry::testing::Capture::new();
-        let mut env = required();
-        env.insert("BUCKWAL_MAINTENANCE_LOG_OBJECTS", "-1");
-        let r = tracing::subscriber::with_default(cap.subscriber(), || {
-            Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string()))
-        });
-        assert!(r.is_ok(), "{r:?}");
-        assert!(!ENV_VARS.contains(&"BUCKWAL_MAINTENANCE_LOG_OBJECTS"));
-        let warned: Vec<_> = cap
-            .spans()
-            .events
-            .into_iter()
-            .filter(|e| e.level == tracing::Level::WARN)
-            .filter_map(|e| e.field("message").map(str::to_string))
-            .collect();
-        assert!(
-            warned.len() == 1 && warned[0].contains("BUCKWAL_MAINTENANCE_LOG_OBJECTS"),
-            "{warned:?}"
-        );
-        // Not set: no warning.
+        for (var, reason) in [
+            ("BUCKWAL_MAINTENANCE_LOG_OBJECTS", "WAL size limit"),
+            ("BUCKWAL_GC_AFTER_SEAL", "always runs GC"),
+        ] {
+            let cap = crate::telemetry::testing::Capture::new();
+            let mut env = required();
+            env.insert(var, "-1");
+            let r = tracing::subscriber::with_default(cap.subscriber(), || {
+                Config::from_lookup("/d", |k| env.get(k).map(|v| v.to_string()))
+            });
+            assert!(r.is_ok(), "{var}: {r:?}");
+            assert!(!ENV_VARS.contains(&var));
+            let warned: Vec<_> = cap
+                .spans()
+                .events
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .filter_map(|e| e.field("message").map(str::to_string))
+                .collect();
+            assert!(
+                warned.len() == 1 && warned[0].contains(var) && warned[0].contains(reason),
+                "{warned:?}"
+            );
+        }
+    }
+
+    /// A removed variable that is not set gets no warning.
+    #[test]
+    fn removed_setting_unset_warns_nothing() {
         let cap = crate::telemetry::testing::Capture::new();
         let env = required();
         tracing::subscriber::with_default(cap.subscriber(), || {

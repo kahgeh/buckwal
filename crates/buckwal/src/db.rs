@@ -153,11 +153,21 @@ impl Shared {
         self.wal_bytes.load(SeqCst)
     }
 
+    /// The current generation's log objects (formats 1 to 4 measure them too) and `-wal`
+    /// bytes.
+    pub(crate) fn maintenance_measures(&self) -> (u64, u64) {
+        (
+            self.uploader.generation_log_objects(),
+            self.maintenance_wal_bytes(),
+        )
+    }
+
     /// After a `Connection` call: wake the maintenance thread if a checkpoint is due (atomic
     /// loads only, unless one is).
     pub(crate) fn poke_maintenance(&self) {
         if let Some(m) = &self.maintenance {
-            m.poke(self.maintenance_wal_bytes());
+            let (log_objects, wal_bytes) = self.maintenance_measures();
+            m.poke(log_objects, wal_bytes);
         }
     }
 
@@ -388,9 +398,9 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     });
     let uploader = engine.uploader.clone();
     let wal_bytes = engine.wal_bytes.clone();
-    // PASSIVE checkpoints only where a WAL restart uploads no page: format 5, WAL mode.
-    let passive = engine.storage.packed() && config.journal_mode == JournalMode::Wal;
-    let maintenance = MaintenanceConfig::from_config(&config, passive);
+    // PASSIVE checkpoints only where a WAL restart uploads no page (format 5, WAL mode); the
+    // fixed log-object trigger only where no pack bounds a restore (formats 1 to 4).
+    let maintenance = MaintenanceConfig::from_config(&config, engine.storage.packed());
     tracing::info!(
         target: "buckwal",
         generation = uploader.generation(),
