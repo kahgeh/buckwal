@@ -173,6 +173,15 @@ pub trait ObjectStore: Send + Sync {
     /// it as unknown, never as old. The age comes from two headers of 1 s resolution, so it
     /// can exceed the truth by just under 1 s; a caller acting on age adds 1 s for that.
     fn stat(&self, key: &str) -> std::result::Result<Option<ObjectStat>, StoreError>;
+    /// The object and its age by the store's own clock, as `stat` measures it. S3 and the
+    /// in-memory store answer it with one GET; the default makes a GET, then a `stat` (`None`
+    /// when the key is gone between the two).
+    fn get_aged(&self, key: &str) -> std::result::Result<Option<(Object, Duration)>, StoreError> {
+        let Some(o) = self.get(key)? else {
+            return Ok(None);
+        };
+        Ok(self.stat(key)?.map(|st| (o, st.age)))
+    }
     /// Every key under `prefix`, sorted ascending.
     fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StoreError>;
     /// The keys under `prefix` strictly greater than `start_after`, sorted ascending. The

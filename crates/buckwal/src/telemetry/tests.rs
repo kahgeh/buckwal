@@ -1434,7 +1434,8 @@ fn status_of_outcome(outcome: &'static str) -> opentelemetry::trace::Status {
 
 #[test]
 fn a_failure_outcome_ends_the_span_with_status_error() {
-    for outcome in ["error", "integrity", "fenced"] {
+    // `failed`: a pack run that ended without a new pointer (`buckwal.pack`).
+    for outcome in ["error", "integrity", "fenced", "failed"] {
         assert!(
             matches!(
                 status_of_outcome(outcome),
@@ -1468,6 +1469,9 @@ fn every_other_outcome_ends_the_span_with_status_unset() {
         "not_ready",
         "shutting_down",
         "too_many_streams",
+        "packed",
+        "nothing_to_do",
+        "superseded",
     ] {
         assert_eq!(
             status_of_outcome(outcome),

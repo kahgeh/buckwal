@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
 use crate::format::{Head, Keys, LocalState, LogRecord, FORMAT, FORMAT_V2};
 use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
+use crate::pack::thread::PackerThreads;
 use crate::reconcile::{reconcile, Reconciled};
 use crate::restore::{clear_interrupted_restore, remove_restored, restore_staged, sealed_page_one};
 use crate::stats::{StatsCell, UploadStats};
@@ -98,6 +99,9 @@ impl Drop for DirGuard {
 struct Open {
     engine: Engine,
     trimmer: Option<JoinHandle<()>>,
+    /// The packer thread and the pack gauges (a writer of a format 5 bucket). Stopped first
+    /// and joined before the lock drops: a pack run works in this directory.
+    packer: Option<PackerThreads>,
     /// Dropped last: the lock outlives every file of the engine.
     guard: Option<DirGuard>,
 }
@@ -171,6 +175,15 @@ impl Shared {
         }
     }
 
+    /// Whether the packer thread and the pack gauges run (tests).
+    #[cfg(test)]
+    pub(crate) fn packer_threads(&self) -> (bool, bool) {
+        lock(&self.open)
+            .as_ref()
+            .and_then(|o| o.packer.as_ref())
+            .map_or((false, false), PackerThreads::running)
+    }
+
     #[cfg(test)]
     pub(crate) fn maintenance(&self) -> Option<&Maintenance> {
         self.maintenance.as_ref()
@@ -202,8 +215,13 @@ impl Shared {
         let Open {
             engine,
             trimmer,
+            packer,
             guard,
         } = open;
+        // Now, so that a pack run in progress stops while the rest shuts down.
+        if let Some(p) = &packer {
+            p.signal_stop();
+        }
         // Before the engine drops: a run in progress ends first (it holds its own engine
         // connection), and none starts after this.
         if let Some(m) = &self.maintenance {
@@ -214,6 +232,9 @@ impl Shared {
         self.uploader.shutdown();
         if let Some(t) = trimmer {
             let _ = t.join();
+        }
+        if let Some(p) = packer {
+            p.join();
         }
         drop(guard);
     }
@@ -396,6 +417,17 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             Arc::new(move || storage.reading_pack()),
         )
     });
+    // Packs only in a format 5 bucket (formats 1 to 4 and MVCC formats 2 and 4 seal), and only
+    // on a writer. The packer thread only with `config.pack` (`BUCKWAL_PACK`); the gauges
+    // always. Neither does anything before its first interval has passed.
+    let packer = (!read_only && engine.storage.packed()).then(|| {
+        PackerThreads::spawn(
+            &config,
+            store.clone(),
+            keys.clone(),
+            engine.uploader.bucket_counters(),
+        )
+    });
     let uploader = engine.uploader.clone();
     let wal_bytes = engine.wal_bytes.clone();
     // PASSIVE checkpoints only where a WAL restart uploads no page (format 5, WAL mode); the
@@ -423,6 +455,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             open: Mutex::new(Some(Open {
                 engine,
                 trimmer,
+                packer,
                 guard: Some(guard),
             })),
             connections: AtomicUsize::new(0),
@@ -461,6 +494,7 @@ pub(crate) fn replica_database(
             open: Mutex::new(Some(Open {
                 engine,
                 trimmer: None,
+                packer: None,
                 guard: None,
             })),
             connections: AtomicUsize::new(0),

@@ -404,6 +404,11 @@ impl Uploader {
         self.durable.behind()
     }
 
+    /// The bucket's running totals (the writer's pack gauges read its landed log objects).
+    pub(crate) fn bucket_counters(&self) -> Arc<Counters> {
+        self.counters.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn counters(&self) -> UploaderCounters {
         use std::sync::atomic::Ordering::Relaxed;

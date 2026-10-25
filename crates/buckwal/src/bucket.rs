@@ -40,6 +40,41 @@ pub(crate) struct Counters {
     pub seals: AtomicU64,
     /// Extra attempts made by `with_retry` (attempt numbers above 0).
     pub retries: AtomicU64,
+    /// The log objects that landed since a pack gauge began to track them (`Some`):
+    /// `(generation, seq, bytes)`. `None` (the default) records nothing. The writer's gauge
+    /// takes them every 5 minutes (`pack::thread`), so it lists the log only once.
+    pub landed: Mutex<Option<Vec<(u64, u64, u64)>>>,
+}
+
+impl Counters {
+    /// From now on, record each log object that lands (`landed`).
+    pub(crate) fn track_landed(&self) {
+        self.landed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Vec::new);
+    }
+
+    /// The log objects recorded since the last call (the record goes on).
+    pub(crate) fn take_landed(&self) -> Vec<(u64, u64, u64)> {
+        self.landed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn note_landed(&self, pos: LogPos, bytes: u64) {
+        if let Some(v) = self
+            .landed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            v.push((pos.generation, pos.seq, bytes));
+        }
+    }
 }
 
 /// A log record that `append_log` confirmed in the bucket.
@@ -1416,6 +1451,7 @@ impl Bucket {
             Ok(()) => {
                 self.seq += 1;
                 self.counters.log_puts.fetch_add(1, Relaxed);
+                self.counters.note_landed(pos, body.len() as u64);
                 Ok(pos)
             }
             Err(e @ Error::Fenced(_)) => Err(self.fence(e)),

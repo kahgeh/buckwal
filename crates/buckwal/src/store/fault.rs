@@ -196,6 +196,14 @@ impl ObjectStore for FaultStore {
         }
         self.inner.stat(key)
     }
+    fn get_aged(&self, key: &str) -> Result<Option<(Object, Duration)>, StoreError> {
+        self.record("get_aged", key);
+        let d = *self.get_delay.lock().unwrap();
+        if !d.is_zero() && key.contains(self.only_keys.lock().unwrap().as_str()) {
+            std::thread::sleep(d);
+        }
+        self.inner.get_aged(key)
+    }
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         self.record("list", prefix);
         self.inner.list(prefix)

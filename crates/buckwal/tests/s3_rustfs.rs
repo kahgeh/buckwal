@@ -223,6 +223,33 @@ fn rustfs_delete() {
     assert_eq!(s.stats().deletes, 2);
 }
 
+/// `get_aged` (the writer's pack gauges read the pointer with it) is one GET whose age is the
+/// age a HEAD reports, by the server's clock, and a missing key is `None`.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn s3_get_aged_is_one_get_with_the_stat_age() {
+    let s = store();
+    let p = prefix("getaged");
+    let k = format!("{p}k");
+    let etag = s.put(&k, b"pointer").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let before = s.stats();
+    let (o, age) = s.get_aged(&k).unwrap().unwrap();
+    let after = s.stats().since(&before);
+    assert_eq!((after.gets, after.requests()), (1, 1), "{after:?}");
+    assert_eq!(
+        (o.body.as_slice(), o.etag.as_str()),
+        (&b"pointer"[..], etag.as_str())
+    );
+    let st = s.stat(&k).unwrap().unwrap();
+    assert!(
+        age.as_secs() >= 1 && age <= st.age,
+        "{age:?} vs {:?}",
+        st.age
+    );
+    assert_eq!(s.get_aged(&format!("{p}nope")).unwrap(), None);
+}
+
 /// A conditional delete (spec rev 11, rule 1: a create removes a leftover `pack-latest` with
 /// `If-Match`): a matching ETag deletes, another ETag is a 412 and keeps the object, and a
 /// missing key is no error.

@@ -150,6 +150,24 @@ impl ObjectStore for MemStore {
         Ok(v)
     }
 
+    /// One GET, aged as `stat` ages it.
+    fn get_aged(&self, key: &str) -> Result<Option<(Object, Duration)>, StoreError> {
+        let v = {
+            let inner = self.inner.lock().unwrap();
+            inner.objects.get(key).cloned().map(|o| {
+                let age = inner.written.get(key).map_or(Duration::ZERO, |w| {
+                    (Instant::now() + inner.clock_offset).saturating_duration_since(*w)
+                });
+                (o, age)
+            })
+        };
+        self.gets.fetch_add(1, Relaxed);
+        self.bytes_down
+            .fetch_add(v.as_ref().map_or(0, |(o, _)| o.body.len()) as u64, Relaxed);
+        status(if v.is_some() { 200 } else { 404 });
+        Ok(v)
+    }
+
     fn stat(&self, key: &str) -> Result<Option<ObjectStat>, StoreError> {
         let st = {
             let inner = self.inner.lock().unwrap();

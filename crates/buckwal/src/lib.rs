@@ -40,9 +40,9 @@ pub use error::{Error, Result};
 #[doc(hidden)]
 pub use gc::gc_with_store;
 pub use gc::{gc, GcOutcome, GcReport};
+pub use pack::{pack, run_packer, PackOutcome, PackReport};
 #[doc(hidden)]
-pub use pack::pack_with_store;
-pub use pack::{pack, PackOutcome, PackReport};
+pub use pack::{pack_with_store, run_packer_with_store};
 #[doc(hidden)]
 pub use replica::open_replica_with_store;
 pub use replica::{

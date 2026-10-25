@@ -646,13 +646,6 @@ fn stat_reply(what: &str, r: &Reply) -> Result<Option<ObjectStat>, StoreError> {
         404 => return Ok(None),
         _ => return Err(status_error(what, r)),
     }
-    let date_of = |name: &str, v: &Option<String>| {
-        let v = v
-            .as_deref()
-            .ok_or_else(|| StoreError::Permanent(format!("{what}: no {name} header")))?;
-        parse_http_date(v)
-            .ok_or_else(|| StoreError::Permanent(format!("{what}: bad {name} header {v:?}")))
-    };
     let etag = r
         .etag
         .clone()
@@ -660,10 +653,26 @@ fn stat_reply(what: &str, r: &Reply) -> Result<Option<ObjectStat>, StoreError> {
     let size = r
         .content_length
         .ok_or_else(|| StoreError::Permanent(format!("{what}: no Content-Length header")))?;
+    Ok(Some(ObjectStat {
+        etag,
+        age: reply_age(what, r)?,
+        size,
+    }))
+}
+
+/// `Date - Last-Modified` of a 200 reply (a HEAD or a GET): the object's age by the store's
+/// clock. Either header missing is permanent.
+fn reply_age(what: &str, r: &Reply) -> Result<Duration, StoreError> {
+    let date_of = |name: &str, v: &Option<String>| {
+        let v = v
+            .as_deref()
+            .ok_or_else(|| StoreError::Permanent(format!("{what}: no {name} header")))?;
+        parse_http_date(v)
+            .ok_or_else(|| StoreError::Permanent(format!("{what}: bad {name} header {v:?}")))
+    };
     let modified = date_of("Last-Modified", &r.last_modified)?;
     let now = date_of("Date", &r.date)?;
-    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-    Ok(Some(ObjectStat { etag, age, size }))
+    Ok(now.duration_since(modified).unwrap_or(Duration::ZERO))
 }
 
 /// The reply to a conditional PUT (`If-None-Match: *` or `If-Match`).
@@ -1035,6 +1044,25 @@ impl ObjectStore for S3Store {
             }
             404 if String::from_utf8_lossy(&r.body).contains("NoSuchKey") => Ok(None),
             _ => Err(status_error(&format!("GET {key}"), &r)),
+        }
+    }
+
+    /// One signed GET, aged from its reply's `Date` and `Last-Modified` as `stat` ages a HEAD.
+    fn get_aged(&self, key: &str) -> Result<Option<(Object, Duration)>, StoreError> {
+        let r = self.send("GET", key, &[], &[], &[])?;
+        self.gets.fetch_add(1, Relaxed);
+        let what = format!("GET {key}");
+        match r.status {
+            200 => {
+                self.bytes_down.fetch_add(r.body.len() as u64, Relaxed);
+                let age = reply_age(&what, &r)?;
+                let etag = r
+                    .etag
+                    .ok_or_else(|| StoreError::Permanent(format!("{what}: no ETag")))?;
+                Ok(Some((Object { body: r.body, etag }, age)))
+            }
+            404 if String::from_utf8_lossy(&r.body).contains("NoSuchKey") => Ok(None),
+            _ => Err(status_error(&what, &r)),
         }
     }
 

@@ -1379,6 +1379,8 @@ fn discard_keeps_the_pack_the_pointer_names() {
         work: t.path().join("w"),
         steps: Vec::new(),
         step_start: Instant::now(),
+        stop: &AtomicBool::new(false),
+        error: None,
     };
     r.discard(&p.pack_key, &p.codes_key);
     assert!(mem.get(&p.pack_key).unwrap().is_some() && mem.get(&p.codes_key).unwrap().is_some());

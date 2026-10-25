@@ -104,6 +104,12 @@ pub mod defaults {
     /// The default pack keep time is this many times the newest pack's download time at
     /// `PACK_KEEP_SPEED`, and never below the trim grace.
     pub const PACK_KEEP_FACTOR: u32 = 4;
+    /// How often the packer checks whether a pack run is due. Fixed (`Config` holds it only
+    /// for tests).
+    pub const PACK_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+    /// How often the writer reports `buckwal.pack.behind_bytes` and `buckwal.pack.age_seconds`.
+    /// Fixed (`Config` holds it only for tests).
+    pub const PACK_GAUGE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
     /// Export traces and logs over OTLP (`BUCKWAL_OTEL`): off in the library.
     pub const OTEL: bool = false;
@@ -227,6 +233,14 @@ pub struct Config {
     /// fixed time (`BUCKWAL_PACK_KEEP_SECS`), which must not be below `trim_grace` (`Config`
     /// otherwise).
     pub pack_keep: Option<Duration>,
+    /// A test hook, not part of the supported API (hidden from the docs): how often the
+    /// packer checks whether a pack run is due (`defaults::PACK_CHECK_INTERVAL`). Above 0.
+    #[doc(hidden)]
+    pub pack_check_interval: Duration,
+    /// A test hook, not part of the supported API (hidden from the docs): how often the
+    /// writer reports its pack gauges (`defaults::PACK_GAUGE_INTERVAL`). Above 0.
+    #[doc(hidden)]
+    pub pack_gauge_interval: Duration,
     /// A test and diagnostics hook, not part of the supported API (hidden from the docs).
     #[doc(hidden)]
     pub on_event: Option<EventHook>,
@@ -262,6 +276,8 @@ impl fmt::Debug for Config {
             .field("pack_max_age", &self.pack_max_age)
             .field("pack_orphan_grace", &self.pack_orphan_grace)
             .field("pack_keep", &self.pack_keep)
+            .field("pack_check_interval", &self.pack_check_interval)
+            .field("pack_gauge_interval", &self.pack_gauge_interval)
             .field("on_event", &self.on_event.as_ref().map(|_| "<hook>"))
             .finish()
     }
@@ -394,6 +410,8 @@ impl Config {
             pack_max_age: defaults::PACK_MAX_AGE,
             pack_orphan_grace: defaults::PACK_ORPHAN_GRACE,
             pack_keep: None,
+            pack_check_interval: defaults::PACK_CHECK_INTERVAL,
+            pack_gauge_interval: defaults::PACK_GAUGE_INTERVAL,
             on_event: None,
         }
     }
@@ -578,6 +596,11 @@ impl Config {
                 "pack_orphan_grace (BUCKWAL_PACK_ORPHAN_GRACE_SECS) must be above 0".into(),
             ));
         }
+        if self.pack_check_interval.is_zero() || self.pack_gauge_interval.is_zero() {
+            return Err(Error::Config(
+                "pack_check_interval and pack_gauge_interval must be above 0".into(),
+            ));
+        }
         if let Some(keep) = self.pack_keep.filter(|k| *k < self.trim_grace) {
             return Err(Error::Config(format!(
                 "pack_keep (BUCKWAL_PACK_KEEP_SECS, {keep:?}) must not be below trim_grace ({:?})",
@@ -691,6 +714,13 @@ pub enum Event {
     },
     /// The trimmer deleted `deleted` objects no head can reach any more.
     Trimmed { deleted: u64 },
+    /// A pack run moved the pack pointer to its new pack: `pack_generation` is the first
+    /// generation the pack does not hold, `bytes` the pack's size, `elapsed` the whole run.
+    Packed {
+        pack_generation: u64,
+        bytes: u64,
+        elapsed: Duration,
+    },
     /// A maintenance checkpoint of `generation` began: the local `-wal` held `wal_bytes`
     /// bytes, at or above the WAL size limit.
     MaintenanceStarted { generation: u64, wal_bytes: u64 },
@@ -1141,7 +1171,18 @@ mod tests {
         assert_eq!(c.pack_log_percent, 10);
         assert_eq!(c.pack_max_age, Duration::from_secs(3600));
         assert_eq!(c.pack_orphan_grace, Duration::from_secs(21600));
+        assert_eq!(c.pack_check_interval, Duration::from_secs(60));
+        assert_eq!(c.pack_gauge_interval, Duration::from_secs(300));
         assert_eq!(c.validate(), Ok(()));
+        for zero in [true, false] {
+            let mut c = c.clone();
+            if zero {
+                c.pack_check_interval = Duration::ZERO;
+            } else {
+                c.pack_gauge_interval = Duration::ZERO;
+            }
+            assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("interval")));
+        }
 
         let mut env = required();
         env.insert("BUCKWAL_PACK", "0");

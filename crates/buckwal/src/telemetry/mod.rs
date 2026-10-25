@@ -24,7 +24,16 @@
 //!   `buckwal.next_generation_floor`), around a takeover's head write and
 //!   fence, or around the fence of a takeover an `open` resumes (`db.rs`), and
 //!   `buckwal.fence` (`buckwal.generation`, `buckwal.seq`, `buckwal.epoch`,
-//!   `buckwal.retries`, `s3.status`) around each fence record (`bucket.rs`).
+//!   `buckwal.retries`, `s3.status`) around each fence record (`bucket.rs`);
+//! - `buckwal.pack`, one per pack run (`buckwal.pack.generation`, `buckwal.pack.key`,
+//!   `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
+//!   `buckwal.pack.free_page_share`, `buckwal.pack.<step>_ms` for each step it made,
+//!   `buckwal.elapsed_ms`, `buckwal.pack.failures`, `buckwal.outcome`: `packed`,
+//!   `nothing_to_do`, `superseded` or `failed`, with `buckwal.pack.failed_step`,
+//!   `buckwal.pack.failed_key` and `buckwal.error`) (`pack/run.rs`), and
+//!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes (`buckwal.pack.behind_bytes`,
+//!   `buckwal.pack.age_seconds`, `buckwal.pack.generation`, `buckwal.pack.size`,
+//!   `buckwal.outcome`) (`pack/thread.rs`).
 //!
 //! `buckwal.outcome = integrity` marks a span whose read failed an integrity check, next to
 //! the ERROR record `integrity check failed` (`format/integrity.rs`).

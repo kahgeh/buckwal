@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::field::Empty;
 
 /// The size of each part of a pack's multipart upload (it grows only above 10,000 parts), and
 /// of each range a run downloads.
@@ -85,7 +86,24 @@ pub struct PackReport {
     /// The share of the new pack's pages that are on the database's free list (0 without a
     /// new pack): `buckwal vacuum` gives them back.
     pub free_page_share: f64,
+    /// The size of the run's new pack in bytes (0 without a new pack).
+    pub pack_size: u64,
+    /// With `Failed`, the error behind it, when there is one (the store's error code and
+    /// request id, never a response body or a secret).
+    pub error: Option<String>,
     pub elapsed: Duration,
+}
+
+impl PackOutcome {
+    /// `packed`, `nothing_to_do`, `superseded` or `failed`: the span's `buckwal.outcome`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PackOutcome::Packed => "packed",
+            PackOutcome::NothingToDo => "nothing_to_do",
+            PackOutcome::Superseded => "superseded",
+            PackOutcome::Failed { .. } => "failed",
+        }
+    }
 }
 
 /// A generation that a pack can hold.
@@ -280,7 +298,17 @@ pub fn pack(config: &Config) -> Result<PackReport> {
 #[doc(hidden)]
 pub fn pack_with_store(config: &Config, store: Arc<dyn ObjectStore>) -> Result<PackReport> {
     let origin = Stamp::now();
-    pack_run(config, store, Arc::new(move || origin.age()))
+    let r = pack_run(config, store, Arc::new(move || origin.age()));
+    // The packer loop logs a failure once (`pack::thread`); a single run logs its own.
+    if let Ok(PackReport {
+        outcome: PackOutcome::Failed { step, key },
+        error,
+        ..
+    }) = &r
+    {
+        tracing::warn!(target: "buckwal", step = %step, key = ?key, error = ?error, "pack run failed");
+    }
+    r
 }
 
 /// [`pack_with_store`] with the clock that measures the run's time limit.
@@ -289,13 +317,127 @@ pub(crate) fn pack_run(
     store: Arc<dyn ObjectStore>,
     clock: Clock,
 ) -> Result<PackReport> {
+    pack_run_in(config, store, clock, &AtomicBool::new(false), 0)
+}
+
+/// One pack run in its `buckwal.pack` span: [`pack_run`] that `stop` can end early, and
+/// `failures` (the failed runs in a row before this one, from the packer loop) on the span.
+///
+/// A run that sees `stop` before its upload ends as `Failed` at `stopped` with nothing
+/// uploaded; it looks at `stop` between the ranges of its download and between generations.
+/// Once the upload has started, the run goes on to its pointer write: the upload is then
+/// already paid for, and the pointer write is a few small requests.
+///
+/// The span (spec "Observability"): `buckwal.pack.generation`, `buckwal.pack.key`,
+/// `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
+/// `buckwal.pack.free_page_share`, the time of each step (`buckwal.pack.read_ms`,
+/// `buckwal.pack.apply_ms`, `buckwal.pack.upload_ms`, `buckwal.pack.verify_ms`,
+/// `buckwal.pack.publish_ms`; only the steps the run made), `buckwal.elapsed_ms`,
+/// `buckwal.pack.failures`, `buckwal.outcome` (`packed`, `nothing_to_do`, `superseded` or
+/// `failed`; `integrity` for a read that failed its integrity code) and, when it failed,
+/// `buckwal.pack.failed_step`, `buckwal.pack.failed_key` and `buckwal.error`. A run that
+/// moves the pointer emits `Event::Packed`.
+pub(crate) fn pack_run_in(
+    config: &Config,
+    store: Arc<dyn ObjectStore>,
+    clock: Clock,
+    stop: &AtomicBool,
+    failures: u64,
+) -> Result<PackReport> {
+    let span = tracing::info_span!(
+        target: "buckwal",
+        "buckwal.pack",
+        buckwal.pack.generation = Empty,
+        buckwal.pack.key = Empty,
+        buckwal.pack.bytes_down = Empty,
+        buckwal.pack.bytes_up = Empty,
+        buckwal.pack.size = Empty,
+        buckwal.pack.free_page_share = Empty,
+        buckwal.pack.read_ms = Empty,
+        buckwal.pack.apply_ms = Empty,
+        buckwal.pack.upload_ms = Empty,
+        buckwal.pack.verify_ms = Empty,
+        buckwal.pack.publish_ms = Empty,
+        buckwal.elapsed_ms = Empty,
+        buckwal.pack.failures = failures,
+        buckwal.pack.failed_step = Empty,
+        buckwal.pack.failed_key = Empty,
+        buckwal.error = Empty,
+        buckwal.outcome = Empty,
+    );
+    let start = Instant::now();
+    let r = span.in_scope(|| pack_run_inner(config, &store, clock, stop));
+    span.record("buckwal.elapsed_ms", start.elapsed().as_millis() as u64);
+    match &r {
+        Ok(report) => record_report(&span, report),
+        Err(e) => {
+            span.record("buckwal.error", e.to_string().as_str());
+            if e.outcome() == "integrity" {
+                span.record("buckwal.outcome", "integrity");
+            } else {
+                span.record("buckwal.outcome", "failed");
+                span.record("buckwal.pack.failed_step", "error");
+            }
+        }
+    }
+    if let (Ok(report), Some(hook)) = (&r, &config.on_event) {
+        if report.outcome == PackOutcome::Packed {
+            hook(&crate::config::Event::Packed {
+                pack_generation: report.pack_generation,
+                bytes: report.pack_size,
+                elapsed: report.elapsed,
+            });
+        }
+    }
+    r
+}
+
+/// The fields of the `buckwal.pack` span that a report gives.
+fn record_report(span: &tracing::Span, r: &PackReport) {
+    span.record("buckwal.pack.generation", r.pack_generation);
+    if let Some(k) = &r.pack_key {
+        span.record("buckwal.pack.key", k.as_str());
+    }
+    span.record("buckwal.pack.bytes_down", r.bytes_down);
+    span.record("buckwal.pack.bytes_up", r.bytes_up);
+    span.record("buckwal.pack.size", r.pack_size);
+    span.record("buckwal.pack.free_page_share", r.free_page_share);
+    for (name, t) in &r.step_times {
+        let field = match *name {
+            "read" => "buckwal.pack.read_ms",
+            "apply" => "buckwal.pack.apply_ms",
+            "upload" => "buckwal.pack.upload_ms",
+            "verify" => "buckwal.pack.verify_ms",
+            "publish" => "buckwal.pack.publish_ms",
+            _ => continue,
+        };
+        span.record(field, t.as_millis() as u64);
+    }
+    span.record("buckwal.outcome", r.outcome.as_str());
+    if let PackOutcome::Failed { step, key } = &r.outcome {
+        span.record("buckwal.pack.failed_step", step.as_str());
+        if let Some(k) = key {
+            span.record("buckwal.pack.failed_key", k.as_str());
+        }
+        if let Some(e) = &r.error {
+            span.record("buckwal.error", e.as_str());
+        }
+    }
+}
+
+fn pack_run_inner(
+    config: &Config,
+    store: &Arc<dyn ObjectStore>,
+    clock: Clock,
+    stop: &AtomicBool,
+) -> Result<PackReport> {
     config.validate()?;
     let enc = encryption::load(config)?;
     let run_id = crate::db::new_writer_id()?;
     sweep_work_dirs(config);
     let work = WorkDir::create(config.dir.join(format!("{WORK_DIR_PREFIX}{run_id}")))?;
     let mut run = Run {
-        store: &*store,
+        store: &**store,
         keys: config.keys_for(enc.as_deref()),
         retry: config.engine(crate::io::IoMode::Writer).retry,
         enc: enc.as_deref(),
@@ -305,20 +447,24 @@ pub(crate) fn pack_run(
         work: work.0.clone(),
         steps: Vec::new(),
         step_start: Instant::now(),
+        stop,
+        error: None,
     };
     let start = Instant::now();
     let before = store.stats();
     let r = run.run(config);
     let delta = store.stats().since(&before);
-    let (outcome, pack_generation, pack_key, free_page_share) = r?;
+    let ran = r?;
     let report = PackReport {
-        outcome,
-        pack_generation,
-        pack_key,
+        outcome: ran.outcome,
+        pack_generation: ran.pack_generation,
+        pack_key: ran.pack_key,
         bytes_down: delta.bytes_down,
         bytes_up: delta.bytes_up,
         step_times: run.steps,
-        free_page_share,
+        free_page_share: ran.free_page_share,
+        pack_size: ran.size,
+        error: run.error,
         elapsed: start.elapsed(),
     };
     tracing::info!(
@@ -410,8 +556,28 @@ impl Drop for WorkDir {
     }
 }
 
-/// What the run returns before the report: outcome, pack generation, pack key, free share.
-type Ran = (PackOutcome, u64, Option<String>, f64);
+/// What the run returns before the report.
+struct Ran {
+    outcome: PackOutcome,
+    pack_generation: u64,
+    pack_key: Option<String>,
+    free_page_share: f64,
+    /// The new pack's size (0 without one).
+    size: u64,
+}
+
+impl Ran {
+    /// An outcome with no new pack, at the pointer's pack generation `current`.
+    fn without_pack(outcome: PackOutcome, current: u64) -> Ran {
+        Ran {
+            outcome,
+            pack_generation: current,
+            pack_key: None,
+            free_page_share: 0.0,
+            size: 0,
+        }
+    }
+}
 
 struct Run<'a> {
     store: &'a dyn ObjectStore,
@@ -426,6 +592,10 @@ struct Run<'a> {
     work: PathBuf,
     steps: Vec<(&'static str, Duration)>,
     step_start: Instant,
+    /// Set: the run stops before its upload (`Failed` at `stopped`).
+    stop: &'a AtomicBool,
+    /// The error behind a `Failed` outcome, when there is one.
+    error: Option<String>,
 }
 
 /// What `pack-latest` holds, for a run.
@@ -534,16 +704,26 @@ impl Run<'_> {
         let mut base_ready = false;
         let mut gone: Option<String> = None;
         let mut applied = 0u64;
-        let (work, enc, store, keys, retry) =
-            (&self.work, self.enc, self.store, &self.keys, &self.retry);
+        let (work, enc, store, keys, retry, stop) = (
+            &self.work,
+            self.enc,
+            self.store,
+            &self.keys,
+            &self.retry,
+            self.stop,
+        );
+        let current = base.as_ref().map_or(0, |p| p.pack_generation);
         let scanned = scan_generations(&reader, from, &head, &mut |e, records| {
             if gone.is_some() {
                 return Ok(());
             }
+            if stop.load(Relaxed) {
+                return Err(Error::Io("pack run stopped".into()));
+            }
             if !base_ready {
                 base_ready = true;
                 if let Some(p) = &base {
-                    if !download_pack(store, keys, retry, p, &db)? {
+                    if !download_pack(store, keys, retry, p, &db, stop)? {
                         gone = Some(p.pack_key.clone());
                         return Ok(());
                     }
@@ -554,20 +734,29 @@ impl Run<'_> {
             apply_images_over(work, &images, &head, enc, None)?;
             applied += 1;
             Ok(())
-        })?;
+        });
         self.step("apply");
-        let current = base.as_ref().map_or(0, |p| p.pack_generation);
+        if self.stop.load(Relaxed) {
+            // The working directory goes with the run; nothing was uploaded.
+            return Ok(Ran::without_pack(failed("stopped", None), current));
+        }
+        let scanned = scanned?;
         if let Some(key) = scanned.incomplete {
-            tracing::warn!(target: "buckwal", key = %key, "pack run: the log is incomplete");
-            return Ok((failed("log_incomplete", Some(&key)), current, None, 0.0));
+            return Ok(Ran::without_pack(
+                failed("log_incomplete", Some(&key)),
+                current,
+            ));
         }
         if let Some(key) = gone {
             // A newer pack replaced it and GC deleted it: the next run reads the new pointer.
-            return Ok((failed("download", Some(&key)), current, None, 0.0));
+            return Ok(Ran::without_pack(failed("download", Some(&key)), current));
         }
         let size = fs::metadata(&db).map_or(0, |m| m.len());
         if applied == 0 || size == 0 {
-            return Ok((PackOutcome::NothingToDo, current, None, 0.0));
+            return Ok(Ran::without_pack(PackOutcome::NothingToDo, current));
+        }
+        if self.stop.load(Relaxed) {
+            return Ok(Ran::without_pack(failed("stopped", None), current));
         }
         let pack_generation = scanned.pack_generation.expect("a generation was applied");
         let facts = db_facts(&self.work, self.enc)?;
@@ -590,8 +779,14 @@ impl Run<'_> {
             block_size: BLOCK_SIZE,
             database_id: self.keys.known_database_id(),
         };
-        let outcome = self.upload_and_publish(pointer, &db, pointer_now);
-        Ok((outcome?, pack_generation, Some(pack_key), free))
+        let outcome = self.upload_and_publish(pointer, &db, pointer_now)?;
+        Ok(Ran {
+            outcome,
+            pack_generation,
+            pack_key: Some(pack_key),
+            free_page_share: free,
+            size,
+        })
     }
 
     /// Steps 5 to 7 for the database file `db`. `base` is the pointer the run read.
@@ -615,7 +810,7 @@ impl Run<'_> {
         self.steps.push(("verify", now - up.uploaded_at));
         self.step_start = now;
         if let Err(f) = up.result {
-            tracing::warn!(target: "buckwal", key = %f.key, step = f.step, error = %f.error, "pack upload failed");
+            self.error = Some(f.error.to_string());
             if f.step == "upload" {
                 // The parts of a failed upload stay hidden until an abort; GC aborts them
                 // after the orphan grace in any case.
@@ -838,6 +1033,7 @@ fn download_pack(
     retry: &RetryPolicy,
     p: &PackPointer,
     path: &Path,
+    stop: &AtomicBool,
 ) -> Result<bool> {
     let Some(body) = with_retry(retry, &p.codes_key, |_| store.get(&p.codes_key))? else {
         return Ok(false);
@@ -855,7 +1051,7 @@ fn download_pack(
     std::thread::scope(|s| {
         for _ in 0..(PART_CONCURRENCY as u64).min(ranges) {
             s.spawn(|| loop {
-                if missing.load(Relaxed) || failed.lock().unwrap().is_some() {
+                if missing.load(Relaxed) || failed.lock().unwrap().is_some() || stop.load(Relaxed) {
                     return;
                 }
                 let i = next.fetch_add(1, Relaxed);
@@ -875,6 +1071,9 @@ fn download_pack(
     });
     if let Some(e) = failed.into_inner().unwrap() {
         return Err(e);
+    }
+    if stop.load(Relaxed) {
+        return Err(Error::Io("pack run stopped".into()));
     }
     if missing.load(Relaxed) {
         return Ok(false);
