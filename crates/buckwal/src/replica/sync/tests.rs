@@ -56,6 +56,10 @@ fn head(keys: &Keys, generation: u64, mode: JournalMode) -> Head {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        // A hand-built head of an encrypted database carries the id its keys know, made once.
+        database_id: keys
+            .database_id()
+            .or_else(|| keys.init_database_id().unwrap()),
     }
 }
 

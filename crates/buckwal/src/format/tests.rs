@@ -166,6 +166,7 @@ fn head_json_round_trip_and_null_manifest() {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
+            database_id: None,
         }
     );
     // A head without `epoch` reads as 0 and is written back with it.
@@ -185,6 +186,7 @@ fn head_json_round_trip_and_null_manifest() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     assert_eq!(
         String::from_utf8(n.encode()).unwrap(),
@@ -491,6 +493,7 @@ fn json_escapes_decode_and_encode() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     let enc = nasty.encode();
     assert!(enc.iter().all(|b| *b >= 0x20));
@@ -509,6 +512,7 @@ fn head_encodes_epoch_last() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     let want =
         br#"{"format":1,"generation":3,"manifest":"manifest/0000000002","writer_id":"ab","epoch":7}"#;
@@ -621,6 +625,7 @@ fn v1_head_bytes_are_unchanged() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     // Golden: exactly today's encoding, no journal_mode key.
     assert_eq!(
@@ -647,6 +652,7 @@ fn v2_head_roundtrip_has_journal_mode_mvcc() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     assert_eq!(
         String::from_utf8(h.encode()).unwrap(),
@@ -660,9 +666,9 @@ fn v2_head_roundtrip_has_journal_mode_mvcc() {
     assert!(is_corrupt(Head::decode(
         br#"{"format":2,"generation":1,"manifest":null,"writer_id":"w1","epoch":1,"journal_mode":"x"}"#
     )));
-    // Format 4 is unknown.
+    // Format 5 is unknown.
     assert!(is_corrupt(Head::decode(
-        br#"{"format":4,"generation":1,"manifest":null,"writer_id":"w1","journal_mode":"mvcc"}"#
+        br#"{"format":5,"generation":1,"manifest":null,"writer_id":"w1","journal_mode":"mvcc"}"#
     )));
 }
 
@@ -689,6 +695,7 @@ fn v1_decoder_style_refusal() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     assert_eq!(
         Head::decode_accepting(&h.encode(), &[FORMAT]),
@@ -783,7 +790,7 @@ fn local_state_v2_roundtrip() {
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s));
     assert!(is_corrupt(LocalState::decode(
-        br#"{"format":4,"writer_id":"w1","generation":3,"complete":true}"#
+        br#"{"format":5,"writer_id":"w1","generation":3,"complete":true}"#
     )));
 }
 
@@ -798,6 +805,7 @@ fn head_v1(lease: Option<u64>, rt: Option<u64>, floor: Option<u64>) -> Head {
         lease_ms: lease,
         request_timeout_ms: rt,
         next_generation_floor: floor,
+        database_id: None,
     }
 }
 
@@ -931,7 +939,7 @@ mod integrity_codes {
     };
     use super::*;
     use crate::encryption::{Encryption, IntegrityKey};
-    use crate::format::{decode_record, encode_record, Op, FORMAT_V3};
+    use crate::format::{decode_record, encode_record, Op, FORMAT_V3, FORMAT_V4};
     use crate::telemetry::testing::Capture;
     use turso_core::{CipherMode, EncryptionKey};
 
@@ -973,6 +981,7 @@ mod integrity_codes {
             lease_ms: Some(30_000),
             request_timeout_ms: Some(10_000),
             next_generation_floor: Some(7),
+            database_id: None,
         }
     }
 
@@ -1187,6 +1196,145 @@ mod integrity_codes {
         }
     }
 
+    const ID_A: &str = "0123456789abcdef0123456789abcdef";
+    const ID_B: &str = "fedcba9876543210fedcba9876543210";
+
+    fn head4(mode: JournalMode, id: &str) -> Head {
+        Head {
+            format: FORMAT_V4,
+            database_id: Some(id.into()),
+            ..head3(mode)
+        }
+    }
+
+    #[test]
+    fn a_format_4_head_round_trips_with_its_database_id_and_is_coded_under_the_database_key() {
+        let k = coded(1);
+        for mode in [JournalMode::Wal, JournalMode::Mvcc] {
+            let h = head4(mode, ID_A);
+            let body = k.encode_head(&h);
+            let text = String::from_utf8(body.clone()).unwrap();
+            assert!(text.starts_with("{\"format\":4,"), "{text}");
+            assert!(
+                text.contains(&format!(",\"database_id\":\"{ID_A}\",")),
+                "{text}"
+            );
+            assert_eq!(k.decode_head_open(&body).unwrap(), h);
+            // The same fields under another id, or as a format 3 head, carry another code.
+            let other = k.encode_head(&head4(mode, ID_B));
+            assert_ne!(body, other);
+            // Keys that have read no head take the other id (the first head decides).
+            assert_eq!(
+                coded(1)
+                    .decode_head_open(&other)
+                    .unwrap()
+                    .database_id
+                    .as_deref(),
+                Some(ID_B)
+            );
+        }
+        // Another key file is the wrong key, not tampering, even with a database id.
+        let body = k.encode_head(&head4(JournalMode::Wal, ID_A));
+        assert!(matches!(
+            coded(2).decode_head_open(&body),
+            Err(Error::Encryption(_))
+        ));
+    }
+
+    #[test]
+    fn a_format_4_head_with_an_edited_removed_or_malformed_database_id_fails_its_code() {
+        let k = coded(1);
+        let body = k.encode_head(&head4(JournalMode::Wal, ID_A));
+        let text = String::from_utf8(body).unwrap();
+        let removed = text.replace(&format!(",\"database_id\":\"{ID_A}\""), "");
+        for (what, bad) in [
+            ("edited", text.replace(ID_A, ID_B)),
+            ("removed", removed),
+            ("malformed", text.replace(ID_A, "not-hex")),
+            ("short", text.replace(ID_A, &ID_A[..30])),
+        ] {
+            assert_ne!(bad, text, "{what}");
+            assert_failed(k.decode_head_open(bad.as_bytes()), "p/head");
+            assert_failed(k.decode_head(bad.as_bytes()), "p/head");
+        }
+    }
+
+    #[test]
+    fn a_database_id_is_allowed_only_in_a_format_4_head() {
+        let body = coded(1).encode_head(&head3(JournalMode::Wal));
+        let text = String::from_utf8(body).unwrap();
+        let with = text.replace(
+            ",\"journal_mode\"",
+            &format!(",\"database_id\":\"{ID_A}\",\"journal_mode\""),
+        );
+        assert!(is_corrupt(Head::decode(with.as_bytes())), "{with}");
+        let plain = br#"{"format":1,"generation":1,"manifest":null,"writer_id":"w1","database_id":"0123456789abcdef0123456789abcdef"}"#;
+        assert!(is_corrupt(Head::decode(plain)));
+    }
+
+    #[test]
+    fn older_decoders_refuse_a_format_4_head_and_a_keyless_open_names_the_key_file() {
+        let body = coded(1).encode_head(&head4(JournalMode::Mvcc, ID_A));
+        for accepted in [
+            &[FORMAT][..],
+            &[FORMAT, FORMAT_V2][..],
+            &[FORMAT, FORMAT_V2, FORMAT_V3][..],
+        ] {
+            assert_eq!(
+                Head::decode_accepting(&body, accepted),
+                Err(Error::Corrupt("head: unsupported format 4".into()))
+            );
+        }
+        match Keys::new("p").decode_head_open(&body) {
+            Err(Error::Encryption(m)) => {
+                assert!(
+                    m.contains("format 4") && m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"),
+                    "{m}"
+                )
+            }
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn the_database_key_differs_per_id_and_from_the_integrity_key() {
+        let parts: &[&[u8]] = &[b"record", b"x"];
+        let a = ik(1).database_key(&[1; 16]);
+        let b = ik(1).database_key(&[2; 16]);
+        assert_eq!(a.code(parts), ik(1).database_key(&[1; 16]).code(parts));
+        assert_ne!(a.code(parts), b.code(parts));
+        assert_ne!(a.code(parts), ik(1).code(parts));
+        assert_ne!(a.code(parts), ik(2).database_key(&[1; 16]).code(parts));
+    }
+
+    /// The keys learn the database's format from its first head; another id, or the other
+    /// format, after that is tampering.
+    #[test]
+    fn keys_refuse_a_head_of_another_id_or_format_after_the_first() {
+        let h3 = head3(JournalMode::Wal);
+        let (a, b) = (head4(JournalMode::Wal, ID_A), head4(JournalMode::Wal, ID_B));
+        let enc = |k: &Keys, h: &Head| k.encode_head(h);
+        // Format 4, then another id, then format 3.
+        let k = coded(1);
+        k.decode_head_open(&enc(&k, &a)).unwrap();
+        k.decode_head(&enc(&k, &a)).unwrap();
+        assert_failed(k.decode_head(&enc(&k, &b)), "p/head");
+        assert_eq!(
+            k.decode_head(&enc(&k, &h3)).unwrap_err(),
+            Error::Corrupt("integrity: p/head format downgraded".into())
+        );
+        // Format 3, then format 4.
+        let k = coded(1);
+        k.decode_head_open(&enc(&k, &h3)).unwrap();
+        k.decode_head(&enc(&k, &h3)).unwrap();
+        assert_failed(k.decode_head(&enc(&k, &a)), "p/head");
+        // Clones share what was learned (they are the same database).
+        let k = coded(1);
+        let c = k.clone();
+        k.decode_head_open(&enc(&k, &a)).unwrap();
+        assert_failed(c.decode_head(&enc(&c, &b)), "p/head");
+    }
+
     #[test]
     fn encrypted_open_refuses_heads_written_before_integrity_codes() {
         let k = coded(1);
@@ -1304,7 +1452,7 @@ mod integrity_codes {
         assert_eq!(plain.new_format(JournalMode::Wal), FORMAT);
         assert_eq!(plain.new_format(JournalMode::Mvcc), FORMAT_V2);
         for mode in [JournalMode::Wal, JournalMode::Mvcc] {
-            assert_eq!(coded(1).new_format(mode), FORMAT_V3);
+            assert_eq!(coded(1).new_format(mode), FORMAT_V4);
         }
     }
 

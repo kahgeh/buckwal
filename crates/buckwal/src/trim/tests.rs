@@ -23,6 +23,7 @@ fn head(generation: u64, manifest: Option<u64>) -> Head {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     }
 }
 

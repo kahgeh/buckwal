@@ -125,6 +125,7 @@ fn create_then_attach_round_trip() {
         lease_ms: Some(30_000),
         request_timeout_ms: Some(10_000),
         next_generation_floor: None,
+        database_id: None,
     };
     assert_eq!(b.head(), &want);
     assert_eq!(f.stored_head(), want);
@@ -351,6 +352,7 @@ fn seal_start_with_moved_head_fences_before_any_upload() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -386,6 +388,7 @@ fn seal_start_accepts_our_own_late_head() {
         lease_ms: Some(30_000),
         request_timeout_ms: Some(10_000),
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(b.seal_generation(pages(2), 4096, 2), Ok(2));
@@ -487,6 +490,7 @@ fn a_record_landing_past_the_lease_checks_the_head() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     f.fault.only_keys_containing("/log/");
@@ -569,6 +573,7 @@ fn a_writer_that_slept_checks_the_head() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     b.age_lease(Duration::ZERO, Duration::from_secs(1));
@@ -884,6 +889,7 @@ fn lapsed_append_with_moved_head_is_fenced_and_writes_nothing() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     f.mem.delete(&keys().log(1, 1)).unwrap();
@@ -942,6 +948,7 @@ fn lapsed_append_with_our_head_proceeds() {
 
         request_timeout_ms: Some(10_000),
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &late.encode()).unwrap();
     assert_eq!(
@@ -1387,6 +1394,7 @@ fn head_write_in_doubt_blocks_appends_until_resolved() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -1522,6 +1530,7 @@ fn reseal_after_uncertain_head_write_adopts_without_reupload() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&k.head(), &other.encode()).unwrap();
     let before = f.fault.events().len();
@@ -1604,6 +1613,7 @@ fn head_conflict_fences() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     f.mem.put(&keys().head(), &other.encode()).unwrap();
     assert!(matches!(
@@ -2073,6 +2083,7 @@ fn refused_before_the_record_is_built_hands_the_syncs_back() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     mem.put(&keys().head(), &other.encode()).unwrap();
     let f = b.append_log(LogFile::Wal, vec![op(1)]).unwrap_err();
@@ -2840,4 +2851,110 @@ fn kind3_record_is_refused_in_a_format1_bucket() {
         b.append_log(LogFile::Wal, syncs(2)).map(|a| a.pos.seq).ok(),
         Some(1)
     );
+}
+
+/// A store that runs a hook once, right after the first `head` PUT that created the object.
+struct AfterHead {
+    inner: Arc<MemStore>,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl ObjectStore for AfterHead {
+    fn put(&self, key: &str, body: &[u8]) -> std::result::Result<String, crate::store::StoreError> {
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(
+        &self,
+        key: &str,
+        body: &[u8],
+    ) -> std::result::Result<crate::store::CondPut, crate::store::StoreError> {
+        let r = self.inner.put_if_absent(key, body)?;
+        if key.ends_with("/head") && matches!(r, crate::store::CondPut::Created { .. }) {
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+        }
+        Ok(r)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> std::result::Result<crate::store::CondPut, crate::store::StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::Object>, crate::store::StoreError> {
+        self.inner.get(key)
+    }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::store::ObjectStat>, crate::store::StoreError> {
+        self.inner.stat(key)
+    }
+    fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, crate::store::StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> std::result::Result<(), crate::store::StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> crate::store::StatsSnap {
+        self.inner.stats()
+    }
+}
+
+/// Two encrypted creators race: the loser's pages and manifest (coded under its own database
+/// id) land after the winner's head. The winner puts its own again, so everything its head
+/// names verifies under its id.
+#[test]
+fn a_racing_creators_objects_do_not_stay_under_the_winners_head() {
+    use crate::encryption::Encryption;
+    use turso_core::{CipherMode, EncryptionKey};
+    fn coded() -> Keys {
+        let ik =
+            Encryption::new(CipherMode::Aegis256, EncryptionKey::new_256([7; 32])).integrity_key();
+        Keys::new(PREFIX).with_integrity(Some(ik))
+    }
+    let image = || crate::create::Image {
+        page_size: 4096,
+        pages: vec![(1, vec![1u8; 4096]), (2, vec![2u8; 4096])],
+    };
+    let mem = Arc::new(MemStore::new());
+    let loser_mem = mem.clone();
+    let store: Arc<dyn ObjectStore> = Arc::new(AfterHead {
+        inner: mem.clone(),
+        hook: std::sync::Mutex::new(Some(Box::new(move || {
+            let r = Bucket::create_sealed(
+                loser_mem as Arc<dyn ObjectStore>,
+                coded(),
+                fast(),
+                4,
+                "w2".into(),
+                image(),
+            );
+            assert!(
+                matches!(&r, Err(Error::Config(m)) if m.contains("already exists")),
+                "the loser: {:?}",
+                r.map(|_| ())
+            );
+        }))),
+    });
+    let winner = coded();
+    let b = Bucket::create_sealed(store, winner.clone(), fast(), 4, "w1".into(), image()).unwrap();
+    assert_eq!(b.head().writer_id, "w1");
+    // A fresh reader of the bucket: the head, then the manifest and every page it names.
+    let reader = coded();
+    let head_body = mem.get(&reader.head()).unwrap().unwrap().body;
+    let head = reader.decode_head_open(&head_body).unwrap();
+    assert_eq!(head.database_id, b.head().database_id);
+    let m = mem.get(&reader.manifest(1)).unwrap().unwrap().body;
+    let manifest = reader.decode_manifest(&m, 1).unwrap();
+    for (p, g) in &manifest.pages {
+        let obj = mem.get(&reader.page(*g, *p)).unwrap().unwrap().body;
+        reader.open_page(*p, *g, &obj).unwrap();
+    }
 }

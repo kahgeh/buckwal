@@ -1304,6 +1304,72 @@ fn replica_encrypted_bucket_edited_behind_back_stops_with_integrity() {
 }
 
 // ---------------------------------------------------------------------------------------
+// replica_encrypted_stops_on_a_record_copied_from_another_database
+// ---------------------------------------------------------------------------------------
+
+/// Pass 2 only (a key). Two encrypted databases share one key file, under two prefixes of
+/// the bucket, and make the same commits. The replica of A is level at 5 rows; A commits row
+/// 6; the test overwrites A's record for it with B's record at the same seq (same
+/// coordinates, another database). Under one integrity key that would verify; under each
+/// database's own key (format 4) the replica stops with `stats().stopped == Some("integrity")`
+/// and row 6 is never visible. With A's record put back, a restarted replica catches up.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn replica_encrypted_stops_on_a_record_copied_from_another_database() {
+    let name = "replica_encrypted_stops_on_a_record_copied_from_another_database";
+    let ctx = Ctx::new(name);
+    if pass_key(&ctx).is_none() {
+        eprintln!("{name}: pass 1, no key: skipped");
+        return;
+    }
+    let ctx_b = Ctx::new(&format!("{name}_b"));
+    let mut w = Writer::open(ctx.config(&ctx.dir("a")));
+    w.insert_range(1..=5);
+    let mut wb = Writer::open(ctx_b.config(&ctx_b.dir("b")));
+    wb.insert_range(1..=6);
+    let r = ctx.dir("r");
+    let rep = Rep::open(&ctx, &r, Duration::from_secs(60));
+    rep.wait_equal(&w, BOUND);
+    wait_first_pass(&rep);
+    w.insert_range(6..=6);
+    let keys_a = log_keys(&ctx, ctx.head().generation);
+    let keys_b = log_keys(&ctx_b, ctx_b.head().generation);
+    let (k6a, k6b) = (
+        keys_a.last().unwrap().clone(),
+        keys_b.last().unwrap().clone(),
+    );
+    let suffix = |k: &str| k.rsplit_once("/log/").map(|(_, s)| s.to_string());
+    assert_eq!(
+        suffix(&k6a),
+        suffix(&k6b),
+        "the two records sit at the same coordinates"
+    );
+    let real = ctx.store().get(&k6a).unwrap().expect("record 6").body;
+    let foreign = ctx_b.store().get(&k6b).unwrap().expect("B's record 6").body;
+    assert_ne!(real, foreign);
+    ctx.store().put(&k6a, &foreign).unwrap();
+
+    rep.waker().wake();
+    let stopped = wait_until("the replica to stop", Duration::from_secs(60), || {
+        rep.stats().stopped
+    });
+    assert_eq!(stopped, "integrity");
+    assert_eq!(rep.count(), 5, "nothing of the foreign record is applied");
+    assert_eq!(rep.integrity(), "ok");
+    assert_no_writes(&rep, "stopped replica");
+    rep.close();
+
+    // Restarted with the bucket put right, it catches up.
+    ctx.store().put(&k6a, &real).unwrap();
+    let rep = Rep::open(&ctx, &r, Duration::from_secs(2));
+    rep.wait_equal(&w, BOUND);
+    assert_eq!(rep.stats().stopped, None);
+    w.close().expect("close writer");
+    let _ = wb.close();
+    rep.close();
+}
+
+// ---------------------------------------------------------------------------------------
 // replica_missing_seq_waits
 // ---------------------------------------------------------------------------------------
 

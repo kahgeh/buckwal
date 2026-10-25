@@ -7,7 +7,7 @@ use crate::db::{refuse_mode_mismatch, DirGuard};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
 use crate::format::{
-    apply_ops, Head, Keys, LocalState, LogFile, LogRecord, FORMAT, FORMAT_V2, FORMAT_V3,
+    apply_ops, Head, Keys, LocalState, LogFile, LogRecord, FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4,
 };
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
@@ -416,8 +416,8 @@ pub(crate) fn restore_into(
 /// against page 1).
 pub(crate) fn local_format(head: &Head) -> u32 {
     match (head.format, head.journal_mode) {
-        (FORMAT_V3, JournalMode::Mvcc) => FORMAT_V2,
-        (FORMAT_V3, JournalMode::Wal) => FORMAT,
+        (FORMAT_V3 | FORMAT_V4, JournalMode::Mvcc) => FORMAT_V2,
+        (FORMAT_V3 | FORMAT_V4, JournalMode::Wal) => FORMAT,
         (f, _) => f,
     }
 }

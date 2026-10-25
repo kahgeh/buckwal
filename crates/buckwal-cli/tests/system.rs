@@ -1049,7 +1049,7 @@ fn encrypted_downgraded_head_after_open_is_tampering() {
     let store = ctx.store();
     let key = format!("{}/head", ctx.prefix());
     let real = String::from_utf8(store.get(&key).unwrap().expect("head").body).unwrap();
-    assert!(real.contains("\"format\":3"), "{real}");
+    assert!(real.contains("\"format\":4"), "{real}");
     let old = format_1_head(&real);
     store.put(&key, old.as_bytes()).unwrap();
     // The soak does not exit when fenced: it prints `error ... fenced ...` and retries. Its
@@ -1085,7 +1085,7 @@ fn encrypted_downgraded_head_after_open_is_tampering() {
     );
 }
 
-/// A format 3 head's JSON as a format 1 head: `format` 1, without `journal_mode`, `key_check`
+/// A format 3 or 4 head's JSON as a format 1 head: `format` 1, without `journal_mode`, `key_check`
 /// and `integrity` (each a `"name":"value"` pair, whatever its place in the object).
 fn format_1_head(real: &str) -> String {
     let mut pairs: Vec<String> = Vec::new();
@@ -1094,7 +1094,7 @@ fn format_1_head(real: &str) -> String {
     for pair in inner.split(',') {
         let name = pair.split(':').next().unwrap().trim().trim_matches('"');
         match name {
-            "journal_mode" | "key_check" | "integrity" => {}
+            "journal_mode" | "key_check" | "integrity" | "database_id" => {}
             "format" => pairs.push("\"format\":1".to_string()),
             _ => pairs.push(pair.to_string()),
         }

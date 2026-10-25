@@ -46,8 +46,15 @@ fn put_row(mode: Mode, c: &Connection, id: i64) {
 /// An encrypted writer left running: rows 1..=20, a seal, rows 21..=40 (the same pages again),
 /// a second seal, then rows 41..=45 that stay in the log. Its objects are the tamper targets.
 fn writer(mode: Mode, store: &Arc<MemStore>, k: &TempDir) -> TempDir {
+    writer_at(mode, PREFIX, store, k)
+}
+
+/// `writer` for the database at bucket prefix `prefix`.
+fn writer_at(mode: Mode, prefix: &str, store: &Arc<MemStore>, k: &TempDir) -> TempDir {
     let dir = tempdir();
-    let db = open_with_store(cfg_for(mode, dir.path(), k), store.clone()).unwrap();
+    let mut c = cfg_for(mode, dir.path(), k);
+    c.prefix = prefix.to_string();
+    let db = open_with_store(c, store.clone()).unwrap();
     let c = db.connect().unwrap();
     create(&c);
     for id in 1..=20 {
@@ -101,8 +108,25 @@ fn read_with_key(
     k: &TempDir,
     hex: &str,
 ) -> Result<usize> {
+    read_at(reader, mode, PREFIX, store, k, hex)
+}
+
+/// `read_with_key` for the database at bucket prefix `prefix`.
+fn read_at(
+    reader: Reader,
+    mode: Mode,
+    prefix: &str,
+    store: &Arc<MemStore>,
+    k: &TempDir,
+    hex: &str,
+) -> Result<usize> {
     let t = tempdir();
-    let mut c = cfg_with(mode, &fresh(&t), k, hex);
+    let at = |dir: &Path| {
+        let mut c = cfg_with(mode, dir, k, hex);
+        c.prefix = prefix.to_string();
+        c
+    };
+    let mut c = at(&fresh(&t));
     c.prefetch = false;
     match reader {
         Reader::ReadOnly => {
@@ -117,7 +141,7 @@ fn read_with_key(
         Reader::Verify => {
             let dir = fresh(&t);
             restore_with_store(&c, store.clone(), &dir)?;
-            let db = open_read_only_with_store(cfg_with(mode, &dir, k, hex), store.clone())?;
+            let db = open_read_only_with_store(at(&dir), store.clone())?;
             let conn = db.connect()?;
             let rows = conn.query("SELECT id, v FROM t ORDER BY id", &[])?;
             conn.query("PRAGMA integrity_check", &[])?;
@@ -360,16 +384,16 @@ fn a_page_object_shorter_than_a_code_fails_without_a_panic() {
     }
 }
 
-/// The encrypted bucket's head is format 3 in both modes, naming the mode; a plaintext open
+/// The encrypted bucket's head is format 4 in both modes, naming the mode; a plaintext open
 /// of it is refused.
 #[test]
-fn an_encrypted_bucket_has_a_format_3_head_and_a_keyless_open_is_refused() {
+fn an_encrypted_bucket_has_a_format_4_head_and_a_keyless_open_is_refused() {
     for mode in MODES {
         let store = mem();
         let k = tempdir();
         let _w = writer(mode, &store, &k);
         let h = head(&*store);
-        assert_eq!(h.format, 3, "{mode:?}");
+        assert_eq!(h.format, 4, "{mode:?}");
         assert_eq!(
             h.journal_mode,
             match mode {
@@ -384,7 +408,7 @@ fn an_encrypted_bucket_has_a_format_3_head_and_a_keyless_open_is_refused() {
         match r {
             Err(Error::Encryption(m)) => {
                 assert!(
-                    m.contains("format 3") && m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"),
+                    m.contains("format 4") && m.contains("BUCKWAL_ENCRYPTION_KEY_FILE"),
                     "{m}"
                 )
             }
@@ -748,6 +772,353 @@ fn after_a_good_open_a_downgraded_or_stripped_head_is_tampering() {
         }
         put(&store, &key, &good);
         pass().unwrap_or_else(|e| panic!("{mode:?}: the head put back: {e}"));
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// bind-objects-to-database: the database id and the database integrity key (format 4).
+// ---------------------------------------------------------------------------------------
+
+/// The head at bucket prefix `prefix`, decoded without a key.
+fn head_at(store: &MemStore, prefix: &str) -> Head {
+    Head::decode(&body(store, &Keys::new(prefix).head())).unwrap()
+}
+
+/// The newest manifest at `prefix`, decoded as an attacker without the key reads it.
+fn manifest_at(store: &MemStore, prefix: &str) -> (u64, Manifest) {
+    let g = head_at(store, prefix).manifest.expect("sealed");
+    let real = body(store, &Keys::new(prefix).manifest(g));
+    let mut plain = real[..real.len() - 32].to_vec();
+    plain.extend(Sha256::digest(&plain));
+    (g, Manifest::decode(&plain).unwrap())
+}
+
+/// Every key under `prefix/`, sorted.
+fn keys_under(store: &MemStore, prefix: &str) -> Vec<String> {
+    store.list(&format!("{prefix}/")).unwrap()
+}
+
+/// Copy every object under `from/` of `src` to the same place under `to/` of `dst`, the head
+/// included: a whole database copied (`aws s3 sync`).
+fn copy_database(src: &MemStore, from: &str, dst: &MemStore, to: &str) {
+    for key in keys_under(src, from) {
+        let rest = key.strip_prefix(&format!("{from}/")).unwrap();
+        put(dst, &format!("{to}/{rest}"), &body(src, &key));
+    }
+}
+
+/// The three kinds of object of a sealed database at `prefix` that one database can hold at
+/// the coordinates of another: (what, key).
+fn copy_targets(store: &MemStore, prefix: &str) -> Vec<(&'static str, Vec<String>)> {
+    let k = Keys::new(prefix);
+    let (g, m) = manifest_at(store, prefix);
+    // Every page the manifest maps: the read fetches those it needs, and the first copied one
+    // it fetches fails.
+    let pages: Vec<String> = m.pages.iter().map(|(p, pg)| k.page(*pg, *p)).collect();
+    let head_gen = head_at(store, prefix).generation;
+    let last_record = keys_under(store, prefix)
+        .into_iter()
+        .rfind(|x| k.parse_log(x).is_some_and(|(lg, _)| lg == head_gen))
+        .expect("a record in the current generation");
+    vec![
+        ("page", pages),
+        ("record", vec![last_record]),
+        ("manifest", vec![k.manifest(g)]),
+    ]
+}
+
+#[test]
+fn an_object_copied_from_another_database_with_the_same_key_fails_its_code() {
+    for mode in MODES {
+        // Two databases, one key file, two prefixes of one bucket; and the same prefix in
+        // another bucket.
+        let store = mem();
+        let other_bucket = mem();
+        let k = tempdir();
+        let _x = writer_at(mode, "x", &store, &k);
+        let _y = writer_at(mode, "y", &store, &k);
+        let _b = writer_at(mode, "x", &other_bucket, &k);
+        for (what, into) in [("prefix", "y"), ("bucket", "x")] {
+            let (dst, src_store, src_prefix) = if what == "prefix" {
+                (&store, &store, "x")
+            } else {
+                (&other_bucket, &store, "x")
+            };
+            // For the bucket case the destination database is the one in `other_bucket`
+            // and the source object comes from `store`'s x; for the prefix case it is y.
+            let (dst, dst_prefix) = if what == "prefix" {
+                (dst, into)
+            } else {
+                // Copy `store/x` objects into a third database in the other bucket.
+                (&other_bucket, "x")
+            };
+            let reader = |m: Mode| read_at(Reader::ReadOnly, m, dst_prefix, dst, &k, &key_hex());
+            assert_eq!(reader(mode).unwrap(), 45, "{mode:?} {what}: untouched");
+            for (kind, targets) in copy_targets(dst, dst_prefix) {
+                let originals: Vec<Vec<u8>> = targets.iter().map(|key| body(dst, key)).collect();
+                for key in &targets {
+                    let source_key = key.replacen(dst_prefix, src_prefix, 1);
+                    put(dst, key, &body(src_store, &source_key));
+                }
+                assert_integrity(
+                    reader(mode),
+                    &targets,
+                    &format!("{mode:?} {what}: {kind} copied in"),
+                );
+                for (key, original) in targets.iter().zip(&originals) {
+                    put(dst, key, original);
+                }
+                assert_eq!(
+                    reader(mode).unwrap(),
+                    45,
+                    "{mode:?} {what}: {kind} put back"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_whole_database_copied_with_its_head_still_opens_and_restores() {
+    for mode in MODES {
+        let store = mem();
+        let other_bucket = mem();
+        let k = tempdir();
+        let _x = writer_at(mode, "x", &store, &k);
+        copy_database(&store, "x", &store, "z");
+        copy_database(&store, "x", &other_bucket, "x");
+        let hex = key_hex();
+        for (dst, prefix) in [(&store, "z"), (&other_bucket, "x")] {
+            for r in [Reader::ReadOnly, Reader::Restore, Reader::Verify] {
+                let rows = read_at(r, mode, prefix, dst, &k, &hex)
+                    .unwrap_or_else(|e| panic!("{mode:?} {prefix} {r:?}: {e}"));
+                if matches!(r, Reader::ReadOnly | Reader::Verify) {
+                    assert_eq!(rows, 45, "{mode:?} {prefix} {r:?}");
+                }
+            }
+            assert_eq!(
+                head_at(dst, prefix).database_id,
+                head_at(&store, "x").database_id,
+                "the id travels with the head"
+            );
+        }
+    }
+}
+
+/// An encrypted database written and left unsealed: rows in the log, no manifest.
+fn unsealed_writer(prefix: &str, store: &Arc<MemStore>, k: &TempDir) -> TempDir {
+    let dir = tempdir();
+    let mut c = cfg_for(Mode::Wal, dir.path(), k);
+    c.prefix = prefix.to_string();
+    let db = open_with_store(c, store.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    create(&conn);
+    for id in 1..=3 {
+        put_row(Mode::Wal, &conn, id);
+    }
+    std::mem::forget(conn);
+    std::mem::forget(db);
+    dir
+}
+
+#[test]
+fn a_whole_head_copied_over_another_database_fails_at_the_first_object_read() {
+    let k = tempdir();
+    let hex = key_hex();
+    // Over a sealed database: the manifest GET fails.
+    {
+        let store = mem();
+        let _x = writer_at(Mode::Wal, "x", &store, &k);
+        let _y = writer_at(Mode::Wal, "y", &store, &k);
+        let xh = body(&store, &Keys::new("x").head());
+        put(&store, &Keys::new("y").head(), &xh);
+        let g = head_at(&store, "y")
+            .manifest
+            .expect("the copied head names a manifest");
+        let want = Keys::new("y").manifest(g);
+        for r in [Reader::ReadOnly, Reader::Restore] {
+            assert_integrity(
+                read_at(r, Mode::Wal, "y", &store, &k, &hex),
+                std::slice::from_ref(&want),
+                &format!("sealed y, {r:?}"),
+            );
+        }
+    }
+    // Over a database that holds log records but no manifest: the first record fails.
+    {
+        let store = mem();
+        let _x = unsealed_writer("x", &store, &k);
+        let _y = unsealed_writer("y", &store, &k);
+        let xh = body(&store, &Keys::new("x").head());
+        put(&store, &Keys::new("y").head(), &xh);
+        let h = head_at(&store, "y");
+        assert_eq!(h.manifest, None);
+        let yk = Keys::new("y");
+        let first = keys_under(&store, "y")
+            .into_iter()
+            .find(|x| yk.parse_log(x).is_some_and(|(g, _)| g == h.generation))
+            .expect("y holds a log record");
+        assert_integrity(
+            read_at(Reader::ReadOnly, Mode::Wal, "y", &store, &k, &hex),
+            std::slice::from_ref(&first),
+            "unsealed y",
+        );
+    }
+    // Over a database with no objects: nothing is read under y's id, the open succeeds and
+    // shows an empty database, which is x's now.
+    {
+        let store = mem();
+        let _x = unsealed_writer("x", &store, &k);
+        let dir = tempdir();
+        let mut c = cfg_for(Mode::Wal, dir.path(), &k);
+        c.prefix = "y".to_string();
+        let db = open_with_store(c, store.clone()).unwrap();
+        std::mem::forget(db);
+        // y's own records are removed too: only its head is left.
+        for key in keys_under(&store, "y") {
+            if key != Keys::new("y").head() {
+                store.delete(&key).unwrap();
+            }
+        }
+        let xh = body(&store, &Keys::new("x").head());
+        put(&store, &Keys::new("y").head(), &xh);
+        let t = tempdir();
+        let mut c = cfg_for(Mode::Wal, &fresh(&t), &k);
+        c.prefix = "y".to_string();
+        c.prefetch = false;
+        let db = open_read_only_with_store(c, store.clone());
+        match db {
+            Ok(db) => {
+                let conn = db.connect().unwrap();
+                let tables = conn
+                    .query("SELECT count(*) FROM sqlite_master", &[])
+                    .unwrap();
+                assert_eq!(tables[0][0].as_int(), Some(0), "an empty database");
+            }
+            Err(e) => panic!("the open of y with x's head: {e}"),
+        }
+        assert_eq!(
+            head_at(&store, "y").database_id,
+            head_at(&store, "x").database_id,
+            "the empty database is x's"
+        );
+    }
+}
+
+#[test]
+fn a_format_4_head_with_its_database_id_edited_or_removed_fails_its_code() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _w = writer(mode, &store, &k);
+        let key = keys().head();
+        let good = body(&store, &key);
+        let id = head(&*store)
+            .database_id
+            .expect("a format 4 head has an id");
+        let edited = if id.starts_with('0') {
+            id.replacen('0', "1", 1)
+        } else {
+            id.replacen(&id[..1], "0", 1)
+        };
+        for what in ["edited", "removed"] {
+            let text = String::from_utf8(good.clone()).unwrap();
+            let bad = if what == "edited" {
+                text.replace(&id, &edited)
+            } else {
+                text.replace(&format!(",\"database_id\":\"{id}\""), "")
+            };
+            assert_ne!(bad, text, "{mode:?} {what}: the edit changed nothing");
+            put(&store, &key, bad.as_bytes());
+            let (r, records) = integrity_records(|| read_with(Reader::Restore, mode, &store, &k));
+            assert_integrity(r, std::slice::from_ref(&key), &format!("{mode:?} {what}"));
+            assert_eq!(records, 1, "{mode:?} {what}");
+        }
+        put(&store, &key, &good);
+        assert_eq!(read_with(Reader::ReadOnly, mode, &store, &k).unwrap(), 45);
+    }
+}
+
+#[test]
+fn after_a_good_open_a_format_3_head_over_a_format_4_database_is_a_downgrade() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let w = writer(mode, &store, &k);
+        let enc_keys = cfg_for(mode, w.path(), &k).keys().unwrap();
+        let key = keys().head();
+        let good = body(&store, &key);
+        let h = head(&*store);
+        let pass = || crate::gc::gc_once(&*store, &enc_keys, Duration::ZERO, None);
+        pass().unwrap_or_else(|e| panic!("{mode:?}: the untouched head: {e}"));
+        // A valid format 3 head (coded under the integrity key), put over the format 4 one.
+        let v3 = Head {
+            format: crate::format::FORMAT_V3,
+            database_id: None,
+            ..h.clone()
+        };
+        put(&store, &key, &enc_keys.encode_head(&v3));
+        let (got, records) = integrity_records(pass);
+        match got {
+            Err(Error::Corrupt(m)) => {
+                assert_eq!(m, format!("integrity: {key} format downgraded"), "{mode:?}")
+            }
+            r => panic!("{mode:?}: expected Corrupt, got {:?}", r.map(|_| ())),
+        }
+        assert_eq!(records, 1, "{mode:?}");
+        put(&store, &key, &good);
+        pass().unwrap_or_else(|e| panic!("{mode:?}: the head put back: {e}"));
+    }
+}
+
+#[test]
+fn a_format_3_database_opens_writes_seals_and_restores_as_before() {
+    for mode in MODES {
+        let store = mem();
+        let k = tempdir();
+        let _dir = {
+            let _legacy = crate::format::LegacyFormat3::on();
+            writer(mode, &store, &k)
+        };
+        let h = head(&*store);
+        assert_eq!((h.format, h.database_id.clone()), (3, None), "{mode:?}");
+        for r in [Reader::ReadOnly, Reader::Restore, Reader::Verify] {
+            let rows =
+                read_with(r, mode, &store, &k).unwrap_or_else(|e| panic!("{mode:?} {r:?}: {e}"));
+            if !matches!(r, Reader::Restore) {
+                assert_eq!(rows, 45, "{mode:?} {r:?}");
+            }
+        }
+        // A writer reopens it writes and seals.
+        let dir2 = tempdir();
+        let db = crate::takeover_with_store(cfg_for(mode, &fresh(&dir2), &k), store.clone());
+        let db = db.map(|_| ());
+        assert!(
+            db.is_ok(),
+            "{mode:?}: takeover of a format 3 database: {db:?}"
+        );
+        let w = open_with_store(cfg_for(mode, &fresh(&dir2), &k), store.clone()).unwrap();
+        let c = w.connect().unwrap();
+        for id in 46..=50 {
+            put_row(mode, &c, id);
+        }
+        match mode {
+            Mode::Wal => c.checkpoint(CheckpointMode::Truncate).unwrap(),
+            Mode::Mvcc => truncate_checkpoint(&c).unwrap(),
+        }
+        c.close().unwrap();
+        w.close().unwrap();
+        let h = head(&*store);
+        assert_eq!(
+            (h.format, h.database_id),
+            (3, None),
+            "{mode:?}: still format 3"
+        );
+        assert_eq!(
+            read_with(Reader::ReadOnly, mode, &store, &k).unwrap(),
+            50,
+            "{mode:?}"
+        );
     }
 }
 

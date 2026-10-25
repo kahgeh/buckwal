@@ -703,6 +703,7 @@ mod fence_image {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
+            database_id: None,
         };
         generation_image(&mem, &keys(), &head, &cfg()).map(|i| (i.wal, i.records))
     }

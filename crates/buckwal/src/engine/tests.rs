@@ -629,6 +629,7 @@ fn restore_with_manifest_missing_page_one_is_corrupt() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     mem.put(&k.head(), &h.encode()).unwrap();
     let r = tempfile::tempdir().unwrap();

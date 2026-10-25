@@ -3780,6 +3780,7 @@ fn refuse_mode_mismatch_table() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     let wal_page = Some([2, 2]);
     let mvcc_page = Some([255, 255]);
@@ -3881,9 +3882,9 @@ fn mvcc_fast_config(dir: &Path) -> Config {
 /// no log object. Returns the head and the `app.db` image the pages make.
 fn created_bucket(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
     let h = head(store);
-    // Format 2, or 3 for an encrypted database.
+    // Format 2, or 4 for an encrypted database.
     assert!(
-        h.format == crate::format::FORMAT_V2 || h.format == crate::format::FORMAT_V3,
+        h.format == crate::format::FORMAT_V2 || h.format == crate::format::FORMAT_V4,
         "{h:?}"
     );
     assert_eq!(

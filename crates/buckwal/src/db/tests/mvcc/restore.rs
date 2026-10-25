@@ -706,6 +706,7 @@ fn restore_wal_bucket_bytes_identical_to_before() {
         lease_ms: None,
         request_timeout_ms: None,
         next_generation_floor: None,
+        database_id: None,
     };
     store.put(&keys().head(), &h.encode()).unwrap();
 

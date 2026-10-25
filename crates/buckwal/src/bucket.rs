@@ -571,6 +571,8 @@ impl Bucket {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
+            // A new encrypted database gets its id here, at its first head write.
+            database_id: keys.init_database_id()?,
         });
         let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
         b.timeouts = own;
@@ -592,7 +594,11 @@ impl Bucket {
     /// sent with `put_if_absent` but the head (a seal-start record, say, would be a key a
     /// crashed attempt may hold). Two racing creators: the head decides, and the loser
     /// returns `Config` as `create` does; its pages may have overwritten the winner's (the
-    /// same empty database).
+    /// same empty database). In an encrypted database the loser's objects are coded under the
+    /// loser's database id, so the winner, once its head has landed, puts its own pages and
+    /// manifest again: the objects the head names are the winner's. (A loser that is slow
+    /// enough to land a PUT after that leaves a database that fails its first restore with
+    /// `integrity`; it holds no data yet, and a new create at an emptied prefix replaces it.)
     pub(crate) fn create_sealed_with(
         store: Arc<dyn ObjectStore>,
         keys: Keys,
@@ -603,16 +609,22 @@ impl Bucket {
         own: Timeouts,
     ) -> Result<Bucket> {
         check_writer_id(&writer_id)?;
+        // The id first: the pages and the manifest below are coded under its key.
+        let database_id = keys.init_database_id()?;
         let gen = 1;
         let (page_size, page_count) = (image.page_size, image.page_count());
         let pages = image.pages;
         let counters = Counters::default();
-        for (p, body) in &pages {
-            let key = keys.page(gen, *p);
-            let obj = keys.seal_page(*p, gen, body);
-            retrying(&counters, &retry, &key, || store.put(&key, &obj))?;
-            counters.page_puts.fetch_add(1, Relaxed);
-        }
+        let put_pages = || -> Result<()> {
+            for (p, body) in &pages {
+                let key = keys.page(gen, *p);
+                let obj = keys.seal_page(*p, gen, body);
+                retrying(&counters, &retry, &key, || store.put(&key, &obj))?;
+                counters.page_puts.fetch_add(1, Relaxed);
+            }
+            Ok(())
+        };
+        put_pages()?;
         let dirty: BTreeSet<u32> = pages.iter().map(|(p, _)| *p).collect();
         let manifest = Manifest {
             page_size,
@@ -633,8 +645,22 @@ impl Bucket {
             lease_ms: None,
             request_timeout_ms: None,
             next_generation_floor: None,
+            database_id,
         });
-        let mut b = Bucket::create_head(store, keys, retry, concurrency, head)?;
+        let coded = keys.coded();
+        let mut b = Bucket::create_head(
+            store.clone(),
+            keys.clone(),
+            retry.clone(),
+            concurrency,
+            head,
+        )?;
+        if coded {
+            // The head is ours: put the pages and the manifest again, so a racing creator's
+            // objects (coded under its own database id) do not stay under the keys it names.
+            put_pages()?;
+            retrying(&counters, &retry, &key, || store.put(&key, &manifest_body))?;
+        }
         b.timeouts = own;
         b.manifest = Some(manifest);
         b.counters
@@ -1474,6 +1500,8 @@ impl Bucket {
             // Every head after a takeover carries the floor (GC keeps off manifests below
             // `floor - 1`), the skip seal's included.
             next_generation_floor: self.head.next_generation_floor,
+            // The database id never changes.
+            database_id: self.head.database_id.clone(),
         })
     }
 

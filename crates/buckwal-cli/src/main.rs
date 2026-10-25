@@ -99,25 +99,62 @@ fn head_journal_mode(head: &[u8]) -> JournalMode {
 }
 
 /// Set `cfg.journal_mode` from the bucket's head. Without a head nothing changes (a new
-/// database: the configured mode, wal by default).
-fn follow_head(cfg: &mut Config) -> CliResult<()> {
+/// database: the configured mode, wal by default). Returns the head's bytes, when there are
+/// any.
+fn follow_head(cfg: &mut Config) -> CliResult<Option<Vec<u8>>> {
     let store = s3_store(cfg)?;
     let key = format!("{}/head", cfg.prefix);
     let policy = buckwal::store::RetryPolicy::default();
     let head = buckwal::store::with_retry(&policy, &format!("get {key}"), |_| store.get(&key))
         .map_err(err)?;
-    if let Some(head) = head {
+    Ok(head.map(|head| {
         cfg.journal_mode = head_journal_mode(&head.body);
-    }
-    Ok(())
+        head.body
+    }))
 }
 
 /// The config for a command that only reads the bucket (`restore`, `verify`): the bucket's
 /// head decides the journal mode, whatever `BUCKWAL_JOURNAL_MODE` says.
 fn reader_config(dir: &Path) -> CliResult<Config> {
+    reader_config_with_head(dir).map(|(cfg, _)| cfg)
+}
+
+/// [`reader_config`], and the head's bytes.
+fn reader_config_with_head(dir: &Path) -> CliResult<(Config, Option<Vec<u8>>)> {
     let mut cfg = config(dir)?;
-    follow_head(&mut cfg)?;
-    Ok(cfg)
+    let head = follow_head(&mut cfg)?;
+    Ok((cfg, head))
+}
+
+/// `head format=<n>` and, for a format 4 head, ` database_id=<id>`: the head's JSON read as
+/// text (a head is plaintext in every format; the library's decoder is crate-internal). Format
+/// 3 is an encrypted bucket made before format 4: it has no database id, and an object copied
+/// in from another database of the same key file verifies (README, Encryption).
+fn head_summary(head: &[u8]) -> String {
+    let text = String::from_utf8_lossy(head);
+    let field = |name: &str, quoted: bool| -> Option<String> {
+        let at = text.find(&format!("\"{name}\":"))? + name.len() + 3;
+        let rest = &text[at..];
+        let rest = if quoted {
+            rest.strip_prefix('"')?
+        } else {
+            rest
+        };
+        let end = rest.find(|c: char| {
+            if quoted {
+                c == '"'
+            } else {
+                !c.is_ascii_digit()
+            }
+        })?;
+        Some(rest[..end].to_string())
+    };
+    let format = field("format", false).unwrap_or_else(|| "?".into());
+    let mut out = format!("head format={format}");
+    if let Some(id) = field("database_id", true) {
+        out.push_str(&format!(" database_id={id}"));
+    }
+    out
 }
 
 /// Whether the environment (through `is_set`) names a journal mode.
@@ -262,7 +299,8 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
         ),
         None => Vec::new(),
     };
-    let db = buckwal::open_read_only(reader_config(dir)?).map_err(err)?;
+    let (cfg, head) = reader_config_with_head(dir)?;
+    let db = buckwal::open_read_only(cfg).map_err(err)?;
     let conn = db.connect().map_err(err)?;
     let rows = conn.query("PRAGMA integrity_check", &[]).map_err(err)?;
     let verdict = rows
@@ -283,6 +321,9 @@ fn verify(dir: &Path, acked: Option<&Path>) -> CliResult<()> {
         Err(e) => return Err(err(e)),
     };
     say(&check_ids(&acked, &ids)?);
+    if let Some(head) = head {
+        say(&head_summary(&head));
+    }
     conn.close().map_err(err)?;
     db.close().map_err(err)
 }
@@ -547,6 +588,20 @@ mod tests {
     fn writer_config_reads_buckwal_journal_mode() {
         assert!(journal_mode_in_env(|k| k == "BUCKWAL_JOURNAL_MODE"));
         assert!(!journal_mode_in_env(|_| false));
+    }
+
+    #[test]
+    fn head_summary_names_the_format_and_the_database_id() {
+        let v4 = br#"{"format":4,"generation":2,"manifest":"manifest/0000000001","writer_id":"w","epoch":1,"journal_mode":"wal","database_id":"0123456789abcdef0123456789abcdef","key_check":"aa","integrity":"bb"}"#;
+        assert_eq!(
+            head_summary(v4),
+            "head format=4 database_id=0123456789abcdef0123456789abcdef"
+        );
+        let v3 = br#"{"format":3,"generation":2,"manifest":null,"writer_id":"w","epoch":1,"journal_mode":"wal","key_check":"aa","integrity":"bb"}"#;
+        assert_eq!(head_summary(v3), "head format=3");
+        let v1 = br#"{"format":1,"generation":1,"manifest":null,"writer_id":"w","epoch":1}"#;
+        assert_eq!(head_summary(v1), "head format=1");
+        assert_eq!(head_summary(b"not json"), "head format=?");
     }
 
     #[test]

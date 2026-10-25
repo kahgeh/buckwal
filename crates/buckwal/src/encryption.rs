@@ -56,6 +56,8 @@ impl Encryption {
 
 /// HKDF info label of the integrity key.
 const INTEGRITY_LABEL: &[u8] = b"buckwal integrity v1";
+/// HKDF info label of the database integrity key (format 4).
+const DATABASE_LABEL: &[u8] = b"buckwal database integrity v4";
 
 /// A 32-byte HMAC-SHA256 key for integrity codes. Wiped on drop; `Debug` prints no bytes.
 #[derive(Clone)]
@@ -64,6 +66,17 @@ pub(crate) struct IntegrityKey([u8; 32]);
 impl IntegrityKey {
     fn derive(page_key: &[u8]) -> Self {
         let mut okm = hkdf_sha256(&[], page_key, INTEGRITY_LABEL, 32);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&okm);
+        wipe(&mut okm);
+        Self(k)
+    }
+
+    /// The database integrity key of the database with `database_id` (16 bytes): HKDF-SHA256
+    /// of this key, salted with the id. It makes every integrity code of a format 4 database,
+    /// so an object copied in from another database fails its code even under one key file.
+    pub(crate) fn database_key(&self, database_id: &[u8]) -> IntegrityKey {
+        let mut okm = hkdf_sha256(database_id, &self.0, DATABASE_LABEL, 32);
         let mut k = [0u8; 32];
         k.copy_from_slice(&okm);
         wipe(&mut okm);

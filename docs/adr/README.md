@@ -2,7 +2,7 @@
 
 Each ADR is in Michael Nygard's form (Title, Status, Context, Decision, Consequences), numbered and named `NNNN-<slug>.md`. An ADR keeps its words as written; where older text uses a word the glossary (`../glossary.md`) says not to use, `../glossary.md` lists it under "Not yet consistent".
 
-D1 to D29 stay in the README, Decisions, with their evidence, and the decisions of the earlier stages (`durable-library` stages 1 to 4 and `durable-server`) are not back-filled here. The first four ADRs record the decisions of `mvcc-durability` that most shape the design, ADR 0005 the decisions of `durable-hardening`, and ADRs 0006 and 0007 the two decisions of `read-replicas` that most shape the design, and ADR 0008 the decision of `background-commit`; each names its README section or row.
+D1 to D29 stay in the README, Decisions, each with its evidence, and the decisions of the earlier stages (`durable-library` stages 1 to 4 and `durable-server`) are not back-filled here. The first four ADRs record the decisions of `mvcc-durability` that most shape the design, ADR 0005 the decisions of `durable-hardening`, and ADRs 0006 and 0007 the two decisions of `read-replicas` that most shape the design, ADR 0008 the decision of `background-commit` and ADR 0009 the decision of `bind-objects-to-database`; each names its README section or row.
 
 | # | Title | Status | Date |
 |---|---|---|---|
@@ -14,3 +14,4 @@ D1 to D29 stay in the README, Decisions, with their evidence, and the decisions 
 | [0006](0006-a-third-io-mode-for-replicas.md) | A third IO mode for replicas | Accepted | 2026-10-23 |
 | [0007](0007-the-notification-listener-reuses-the-server-crates-listener.md) | The notification listener reuses the server crate's listener | Accepted | 2026-10-23 |
 | [0008](0008-background-commits.md) | Background commits are a batching setting | Accepted | 2026-10-25 |
+| [0009](0009-integrity-codes-bound-to-a-database-id.md) | Integrity codes are bound to a database id | Accepted | 2026-10-25 |
