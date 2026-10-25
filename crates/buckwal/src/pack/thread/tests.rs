@@ -1175,8 +1175,8 @@ fn run_without_free_disk_fails_at_disk_and_writes_nothing() {
     w.end_generation();
     let t = tempdir();
     crate::pack::pack_with_store(&packer_cfg(&t, "other"), mem.clone()).unwrap();
-    // A packer with no kept copy: it must download the pack, so it needs the pack's size
-    // plus 10% (a kept copy that it can use needs only room for the log).
+    // A packer with no kept copy: the free bytes alone must be the pack's size plus 10% (a
+    // run counts a kept copy as free space, so with one these free bytes would be enough).
     let cfg = packer_cfg(&t, "p");
     let p = pointer_of(&*mem).unwrap();
     w.insert(4..=5);

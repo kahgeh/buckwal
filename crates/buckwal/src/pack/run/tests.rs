@@ -2090,20 +2090,30 @@ fn copy_size(cfg: &Config) -> u64 {
         .len()
 }
 
-/// A kept copy that passes its checks is applied in place: the disk check counts only the
-/// log (twice its images plus 10%), not a second whole file. On a disk with only the pack
-/// size plus 10% in all (so a tenth of the pack free beside the copy), the run uses the copy
-/// and packs. With almost no free byte beside the copy it fails at `disk` and writes nothing
-/// to the bucket.
+/// The free disk a run that holds the lock needs (spec rev 24): free bytes plus the length of
+/// its kept copy at least the pack's size plus 10%, for a copy it uses too. With exactly that
+/// beside a usable copy, the run uses the copy and packs, also with a generation of about 9%
+/// of the pack. With one byte less it fails at `disk`: no download, no PUT, and the copy is
+/// deleted.
 #[test]
 fn disk_check_counts_a_usable_kept_copy_as_free() {
     let mem = Arc::new(MemStore::new());
     let t = tempdir();
     let cfg = packer(&t);
     let w = big_copy(&mem, &cfg);
-    let s = copy_size(&cfg);
+    // About 9% of the pack changes in the next generation (40 of 450 rows).
+    w.c.execute("UPDATE t SET v = 'y' || v WHERE id <= 40", &[])
+        .unwrap();
+    w.end_generation();
+    // A disk with exactly the pack's size plus 10%, less the copy, free beside the copy.
+    let exact = |cfg: &Config| {
+        let p = pointer_of(&*mem).unwrap();
+        let used = bytes_under(&cfg.pack_directory());
+        assert_eq!(copy_size(cfg), p.size);
+        used + (p.size + p.size / 10 - p.size)
+    };
     let r = {
-        let _disk = FreeDiskForTest::disk_of(s + s / 10);
+        let _disk = FreeDiskForTest::disk_of(exact(&cfg));
         run(&cfg, mem.clone()).unwrap()
     };
     packed(&r);
@@ -2113,24 +2123,62 @@ fn disk_check_counts_a_usable_kept_copy_as_free() {
     w.c.execute("UPDATE t SET v = 'again' WHERE id = 9", &[])
         .unwrap();
     w.end_generation();
-    let s = copy_size(&cfg);
     let before = (pointer_of(&*mem), packs(&*mem));
     let hs = HookStore::new(mem.clone());
     let r = {
-        let _disk = FreeDiskForTest::disk_of(s + 1024);
+        let _disk = FreeDiskForTest::disk_of(exact(&cfg) - 1);
         run(&cfg, hs.clone()).unwrap()
     };
     failed_at(&r, "disk");
+    assert_eq!(source_of(&r), KEPT);
     assert!(
         r.error.as_deref().is_some_and(|e| e.contains("free")),
         "{r:?}"
     );
+    assert!(
+        !hs.calls()
+            .iter()
+            .any(|c| c.starts_with("put") || c.starts_with("get_range")),
+        "{:?}",
+        hs.calls()
+    );
+    assert_eq!((pointer_of(&*mem), packs(&*mem)), before);
+    assert_no_copy(&cfg);
+    w.crash();
+}
+
+/// A disk that fills during the in-place apply (ENOSPC from the apply): the run ends with
+/// that error, writes nothing to the bucket and leaves no kept copy; the next run downloads
+/// and packs.
+#[test]
+fn a_full_disk_during_the_in_place_apply_deletes_the_copy() {
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = big_copy(&mem, &cfg);
+    let before = (pointer_of(&*mem), packs(&*mem));
+    let hs = HookStore::new(mem.clone());
+    let r = {
+        let _full = NoSpaceInApplyForTest::set();
+        run(&cfg, hs.clone())
+    };
+    match &r {
+        Err(Error::Io(m)) => assert!(m.contains("No space left"), "{m}"),
+        r => panic!("{r:?}"),
+    }
     assert!(
         !hs.calls().iter().any(|c| c.starts_with("put")),
         "{:?}",
         hs.calls()
     );
     assert_eq!((pointer_of(&*mem), packs(&*mem)), before);
+    assert_no_copy(&cfg);
+    assert_eq!(left_in_pack_dir(&cfg), Vec::<String>::new());
+    let at_pack = w.ids();
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
+    assert_eq!(pack_rows(&*mem), at_pack);
     w.crash();
 }
 
