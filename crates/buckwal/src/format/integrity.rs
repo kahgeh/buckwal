@@ -5,6 +5,7 @@
 //! generation, seq or page number it covers ties the object to its place.
 use crate::encryption::IntegrityKey;
 use crate::error::{Error, Result};
+use crate::pack::PackPointer;
 
 /// The length of an integrity code.
 pub(crate) const CODE_LEN: usize = 32;
@@ -16,6 +17,7 @@ pub(crate) enum Kind {
     Record,
     Manifest,
     Head,
+    #[allow(dead_code)] // used from task 5 on
     Pointer,
 }
 
@@ -170,42 +172,37 @@ pub(crate) fn head_verifies(ik: &IntegrityKey, fields: &[u8], code: &[u8]) -> bo
     ik.verify(&[b"head", fields], code)
 }
 
-/// The code of a pack pointer: it covers the pack key, the codes key, the size and the pack
-/// generation. The key is the database integrity key, so the code is tied to the database.
-pub(crate) fn pointer_code(
-    ik: &IntegrityKey,
-    pack_key: &str,
-    codes_key: &str,
-    size: u64,
-    pack_generation: u64,
-) -> [u8; 32] {
-    ik.code(&[
-        b"pack-latest",
-        pack_key.as_bytes(),
-        codes_key.as_bytes(),
-        &size.to_be_bytes(),
-        &pack_generation.to_be_bytes(),
-    ])
+/// The parts of a pack pointer's code: every field of the pointer, so none can change without
+/// the code failing. The database id has a presence byte, so "none" differs from "empty".
+fn pointer_parts(p: &PackPointer) -> [Vec<u8>; 10] {
+    let id = p.database_id.as_deref();
+    [
+        b"pack-latest".to_vec(),
+        p.pack_key.as_bytes().to_vec(),
+        p.codes_key.as_bytes().to_vec(),
+        p.size.to_be_bytes().to_vec(),
+        p.pack_generation.to_be_bytes().to_vec(),
+        p.page_size.to_be_bytes().to_vec(),
+        p.part_size.to_be_bytes().to_vec(),
+        p.block_size.to_be_bytes().to_vec(),
+        vec![u8::from(id.is_some())],
+        id.unwrap_or_default().as_bytes().to_vec(),
+    ]
 }
 
-pub(crate) fn pointer_verifies(
-    ik: &IntegrityKey,
-    pack_key: &str,
-    codes_key: &str,
-    size: u64,
-    pack_generation: u64,
-    code: &[u8],
-) -> bool {
-    ik.verify(
-        &[
-            b"pack-latest",
-            pack_key.as_bytes(),
-            codes_key.as_bytes(),
-            &size.to_be_bytes(),
-            &pack_generation.to_be_bytes(),
-        ],
-        code,
-    )
+/// The code of a pack pointer. The key is the database integrity key, so the code is also tied
+/// to the database.
+pub(crate) fn pointer_code(ik: &IntegrityKey, p: &PackPointer) -> [u8; 32] {
+    let parts = pointer_parts(p);
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    ik.code(&refs)
+}
+
+#[allow(dead_code)] // used from task 5 on
+pub(crate) fn pointer_verifies(ik: &IntegrityKey, p: &PackPointer, code: &[u8]) -> bool {
+    let parts = pointer_parts(p);
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    ik.verify(&refs, code)
 }
 
 /// The length of a head's `key_check`.

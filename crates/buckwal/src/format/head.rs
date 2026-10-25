@@ -76,7 +76,10 @@ impl Head {
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         let manifest = match (self.format, self.manifest) {
-            (FORMAT_V5, _) => String::new(),
+            (FORMAT_V5, m) => {
+                debug_assert!(m.is_none(), "a format 5 head has no manifest");
+                String::new()
+            }
             (_, Some(g)) => format!(",\"manifest\":\"manifest/{g:010}\""),
             (_, None) => ",\"manifest\":null".to_string(),
         };

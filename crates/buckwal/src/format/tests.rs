@@ -1647,6 +1647,154 @@ mod packer_format {
         assert_eq!(other.decode_pointer(&body).unwrap_err(), fail);
     }
 
+    fn coded_with_id() -> (Keys, PackPointer) {
+        let k = coded(1);
+        k.init_database_id().unwrap();
+        let id = k.database_id();
+        let p = pointer(&k, id.as_deref());
+        (k, p)
+    }
+
+    #[test]
+    fn the_pointer_code_covers_every_field() {
+        let (k, p) = coded_with_id();
+        let key = k.pack_pointer();
+        let fail = Error::Corrupt(format!("integrity: {key}"));
+        let body = String::from_utf8(k.encode_pointer(&p)).unwrap();
+        for (from, to) in [
+            ("\"page_size\":4096", "\"page_size\":8192"),
+            ("\"part_size\":16777216", "\"part_size\":16777217"),
+            ("\"block_size\":1048576", "\"block_size\":2097152"),
+        ] {
+            assert!(body.contains(from), "{body}");
+            let edited = body.replace(from, to);
+            assert_eq!(k.decode_pointer(edited.as_bytes()).unwrap_err(), fail);
+        }
+        // The code itself differs when only the database id differs.
+        let code = |id: &str| {
+            let q = PackPointer {
+                database_id: Some(id.into()),
+                ..p.clone()
+            };
+            crate::format::integrity::pointer_code(&ik(1).database_key(&[1; 16]), &q)
+        };
+        assert_ne!(code(ID), code("fedcba9876543210fedcba9876543210"));
+    }
+
+    #[test]
+    fn a_pointer_is_bound_to_its_database_id() {
+        // One base key, two databases: A's pointer does not verify as B's.
+        let a = coded(1);
+        a.init_database_id().unwrap();
+        let b = coded(1);
+        b.init_database_id().unwrap();
+        assert_ne!(a.database_id(), b.database_id());
+        let p = pointer(&a, a.database_id().as_deref());
+        let body = a.encode_pointer(&p);
+        let fail = Error::Corrupt(format!("integrity: {}", b.pack_pointer()));
+        assert_eq!(b.decode_pointer(&body).unwrap_err(), fail);
+        // B's keys with A's id in the pointer: the code is under A's key, so it fails too.
+        let q = PackPointer {
+            database_id: b.database_id(),
+            ..p
+        };
+        assert_eq!(b.decode_pointer(&a.encode_pointer(&q)).unwrap_err(), fail);
+    }
+
+    #[test]
+    fn a_pointer_with_another_database_id_than_the_keys_hold_is_refused() {
+        let (k, p) = coded_with_id();
+        let other = PackPointer {
+            database_id: Some(ID.into()),
+            ..p
+        };
+        assert_ne!(k.database_id().as_deref(), Some(ID));
+        assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&other))));
+    }
+
+    #[test]
+    fn a_coded_pointer_without_a_database_id_is_refused() {
+        let (k, p) = coded_with_id();
+        let none = PackPointer {
+            database_id: None,
+            ..p
+        };
+        assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&none))));
+    }
+
+    #[test]
+    fn a_pointer_whose_codes_key_is_not_its_pack_key_plus_codes_is_refused() {
+        let k = Keys::new("p");
+        let p = PackPointer {
+            codes_key: k.pack_codes(15, "run2"),
+            ..pointer(&k, None)
+        };
+        assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&p))));
+        let (k, p) = coded_with_id();
+        let p = PackPointer {
+            codes_key: k.pack_codes(15, "run2"),
+            ..p
+        };
+        assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&p))));
+    }
+
+    #[test]
+    fn a_pointer_whose_pack_key_does_not_parse_under_the_prefix_is_refused() {
+        let k = Keys::new("p");
+        for pack_key in [
+            "q/pack/0000000015/run1",
+            "p/pack/15/run1",
+            "p/log/0000000015/run1",
+        ] {
+            let p = PackPointer {
+                pack_key: pack_key.into(),
+                codes_key: format!("{pack_key}.codes"),
+                ..pointer(&k, None)
+            };
+            assert!(
+                is_corrupt(k.decode_pointer(&k.encode_pointer(&p))),
+                "{pack_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pointer_whose_generation_is_not_its_pack_keys_is_refused() {
+        let k = Keys::new("p");
+        let p = PackPointer {
+            pack_generation: 16,
+            ..pointer(&k, None)
+        };
+        assert!(is_corrupt(k.decode_pointer(&k.encode_pointer(&p))));
+    }
+
+    #[test]
+    fn a_run_id_with_dashes_and_underscores_round_trips_through_parse_pack() {
+        let k = Keys::new("p");
+        assert_eq!(
+            k.parse_pack(&k.pack(7, "run-1_a")),
+            Some((7, "run-1_a".to_string()))
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    #[cfg(debug_assertions)]
+    fn a_run_id_outside_the_allowed_characters_panics_in_debug() {
+        let _ = Keys::new("p").pack(1, "a/b");
+    }
+
+    #[test]
+    #[should_panic]
+    #[cfg(debug_assertions)]
+    fn a_format_5_head_with_a_manifest_does_not_encode() {
+        let h = Head {
+            manifest: Some(1),
+            ..head5(None)
+        };
+        let _ = h.encode();
+    }
+
     #[test]
     fn a_bad_pointer_is_corrupt() {
         let k = Keys::new("p");

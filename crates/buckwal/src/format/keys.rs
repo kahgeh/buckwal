@@ -77,6 +77,14 @@ fn check<'a>(
     })
 }
 
+/// Whether `run_id` is a pack run id: one or more of `[A-Za-z0-9_-]`.
+fn valid_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Parse exactly `width` ASCII digits.
 fn digits(s: &str, width: usize) -> Option<u64> {
     if s.len() != width || !s.bytes().all(|b| b.is_ascii_digit()) {
@@ -362,12 +370,14 @@ impl Keys {
     /// The pack `pack/<generation>/<run id>`.
     #[allow(dead_code)] // used from task 5 on
     pub(crate) fn pack(&self, gen: u64, run_id: &str) -> String {
+        debug_assert!(valid_run_id(run_id), "bad run id");
         self.join(&format!("pack/{gen:010}/{run_id}"))
     }
 
     /// The codes object of the pack `pack/<generation>/<run id>`.
     #[allow(dead_code)] // used from task 5 on
     pub(crate) fn pack_codes(&self, gen: u64, run_id: &str) -> String {
+        debug_assert!(valid_run_id(run_id), "bad run id");
         self.join(&format!("pack/{gen:010}/{run_id}.codes"))
     }
 
@@ -388,33 +398,30 @@ impl Keys {
     pub(crate) fn parse_pack(&self, key: &str) -> Option<(u64, String)> {
         let rest = self.strip(key)?.strip_prefix("pack/")?;
         let (g, run) = rest.split_once('/')?;
-        let ok = !run.is_empty()
-            && !run.ends_with(".codes")
-            && run
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let ok = valid_run_id(run);
         let generation = digits(g, 10)?;
         ok.then(|| (generation, run.to_string()))
     }
 
     /// The pack pointer's bytes: with an integrity key its fields and their code, made under the
-    /// database integrity key (the code covers the pack key, the codes key, the size and the
-    /// pack generation).
+    /// database integrity key (the code covers every field of the pointer).
     #[allow(dead_code)] // used from task 5 on
     pub(crate) fn encode_pointer(&self, p: &PackPointer) -> Vec<u8> {
         let mut out = p.encode_fields();
         if let Some(ik) = self.object_key() {
-            let code =
-                integrity::pointer_code(&ik, &p.pack_key, &p.codes_key, p.size, p.pack_generation);
+            let code = integrity::pointer_code(&ik, p);
             out.push_str(&format!(",\"integrity\":\"{}\"", hex::encode(code)));
         }
         out.push('}');
         out.into_bytes()
     }
 
-    /// The pack pointer in `body`. In an encrypted bucket its code must verify, else
-    /// `Corrupt("integrity: <pointer key>")`; a pointer without a code is that too. A coded
-    /// pointer read without a key is `Encryption`.
+    /// The pack pointer in `body`. In an encrypted bucket its code must verify and its
+    /// `database_id` must be this database's, else `Corrupt("integrity: <pointer key>")`; a
+    /// pointer without a code or an id is that too. A coded pointer read without a key is
+    /// `Encryption`. In every bucket the pointer must be consistent: `codes_key` is `pack_key`
+    /// plus `.codes`, `pack_key` parses under the prefix and `pack_generation` is its
+    /// generation, else `Corrupt("pack pointer: ...")`.
     #[allow(dead_code)] // used from task 5 on
     pub(crate) fn decode_pointer(&self, body: &[u8]) -> Result<PackPointer> {
         let (p, code) = PackPointer::decode_fields(body)?;
@@ -425,23 +432,47 @@ impl Keys {
                     "{key} is an encrypted database's: set BUCKWAL_ENCRYPTION_KEY_FILE"
                 )));
             }
+            self.check_pointer_fields(&p)?;
             return Ok(p);
         };
-        let ok = code.and_then(|c| hex::decode(c).ok()).is_some_and(|c| {
-            integrity::pointer_verifies(
-                &ik,
-                &p.pack_key,
-                &p.codes_key,
-                p.size,
-                p.pack_generation,
-                &c,
-            )
-        });
-        if ok {
-            Ok(p)
-        } else {
-            Err(integrity_failed(&key, Kind::Pointer, p.pack_generation, 0))
+        let fail = || integrity_failed(&key, Kind::Pointer, p.pack_generation, 0);
+        let known = self.known_database_id();
+        if p.database_id.is_none() || p.database_id != known {
+            return Err(fail());
         }
+        let ok = code
+            .and_then(|c| hex::decode(c).ok())
+            .is_some_and(|c| integrity::pointer_verifies(&ik, &p, &c));
+        if !ok {
+            return Err(fail());
+        }
+        self.check_pointer_fields(&p)?;
+        Ok(p)
+    }
+
+    /// The database id these keys know (a format 4 or 5 head read or made).
+    #[allow(dead_code)] // used from task 5 on
+    fn known_database_id(&self) -> Option<String> {
+        match &*self.identity.lock().unwrap_or_else(|e| e.into_inner()) {
+            Identity::Format4 { id, .. } => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// The checks of a pointer that hold in every bucket.
+    #[allow(dead_code)] // used from task 5 on
+    fn check_pointer_fields(&self, p: &PackPointer) -> Result<()> {
+        let bad = |m: &str| Err(crate::error::Error::Corrupt(format!("pack pointer: {m}")));
+        let Some((generation, _)) = self.parse_pack(&p.pack_key) else {
+            return bad("pack_key is not a pack of this prefix");
+        };
+        if p.codes_key != format!("{}.codes", p.pack_key) {
+            return bad("codes_key is not pack_key plus .codes");
+        }
+        if p.pack_generation != generation {
+            return bad("pack_generation is not the generation of pack_key");
+        }
+        Ok(())
     }
 
     pub(crate) fn parse_log(&self, key: &str) -> Option<(u64, u64)> {
