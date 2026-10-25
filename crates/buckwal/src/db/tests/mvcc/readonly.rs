@@ -41,7 +41,7 @@ fn mid_checkpoint_bucket() -> (Arc<MemStore>, Vec<i64>) {
     let store = Arc::new(FaultStore::new(mem.clone()));
     let t = tempdir();
     let dir = fresh(&t);
-    let (db, c) = seal_fails_then_two_commits(&store, &dir);
+    let (db, c) = switch_fails_then_two_commits(&store, &dir);
     crash(db, vec![c]);
     (mem, (1..=12).collect())
 }
@@ -118,9 +118,11 @@ fn read_only_plain_restore_runs_early_wal_truncate_locally() {
         .filter(|(b, a)| b != a)
         .map(|(b, _)| b.0.as_str())
         .collect();
-    // Observed: the bootstrap writes the database file (a restored plain MVCC directory has
-    // an empty `app.db`) and leaves the log, the empty `-wal` and the state as they were.
-    assert_eq!(changed, ["app.db"]);
+    // Observed: a restored format 5 MVCC directory holds the whole first pack as `app.db`
+    // (one block, local after the restore), so the bootstrap writes no file: the database
+    // file, the log, the empty `-wal` and the state stay as they were. (A format 2 restore
+    // left an empty `app.db`, which the bootstrap wrote.)
+    assert_eq!(changed, Vec::<&str>::new());
     assert!(read(&dir, "app.db-wal").is_empty());
 }
 

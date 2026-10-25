@@ -5,8 +5,9 @@
 //! rewrite of the WAL header with new salts, or a truncate to 0, starts a new generation:
 //! the old one is sealed first (D6), or, in a format 5 bucket, ended with a generation switch.
 //!
-//! In an MVCC database (`in_mvcc`) the `-wal` holds only checkpoint frames, and the seal is
-//! `LogDurableStorage`'s, before the engine cuts the log: this file never seals (not at a new
+//! In an MVCC database (`in_mvcc`) the `-wal` holds only checkpoint frames, and the end of a
+//! generation (the switch, or the seal of formats 2 and 4) is `LogDurableStorage`'s, before
+//! the engine cuts the log: this file never seals or switches (not at a new
 //! epoch, not at `truncate(0)`), its syncs carry no commit and no ack, and the `truncate(0)` of
 //! a generation change is not recorded (that generation's image is empty, as the file then
 //! is).

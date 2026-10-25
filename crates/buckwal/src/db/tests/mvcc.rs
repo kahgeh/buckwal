@@ -1,8 +1,9 @@
 //! Task 5: an MVCC database opened, written and checkpointed through the library
-//! (`LogDurableStorage`, the seal in its `truncate`). Each test checks the bucket by decoding
-//! its objects (kind 1 into a `-wal`, kind 3 into an `app.db-log`, the head's manifest into
-//! `app.db`) and opening that image with plain turso, and, where it says so, a crash copy of
-//! the local directory. A restore of `app.db-log` through the library is Task 6.
+//! (`LogDurableStorage`, the generation switch in its `truncate`; the seal in formats 2 and
+//! 4). Each test checks the bucket by decoding its objects (kind 1 into a `-wal`, kind 3 into an
+//! `app.db-log`, the head's manifest or the first pack into `app.db`) and opening that image
+//! with plain turso, or by a restore through the library (`bucket_rows`), and, where it says
+//! so, a crash copy of the local directory.
 use super::*;
 use crate::encryption::Encryption;
 use crate::format::{apply_ops, Manifest, Op};
@@ -72,15 +73,30 @@ struct BucketImage {
 
 fn bucket_image(store: &dyn ObjectStore) -> BucketImage {
     let head = head(store);
-    let g = head.manifest.expect("an MVCC head names its manifest");
-    let body = store.get(&keys().manifest(g)).unwrap().unwrap().body;
-    let m = Manifest::decode(&as_plain(&body)).unwrap();
-    let ps = m.page_size as usize;
-    let mut db = vec![0u8; ps * m.page_count as usize];
-    for (p, pg) in &m.pages {
-        let page = store.get(&keys().page(*pg, *p)).unwrap().unwrap().body;
-        let at = (*p as usize - 1) * ps;
-        db[at..at + ps].copy_from_slice(page_of(&page, ps));
+    // A format 5 head names no manifest: its `app.db` is the pack, when the pack's generation
+    // is the head's, else the pack and the generations after it (`bucket_rows` restores it;
+    // `db` is then empty).
+    let mut db = Vec::new();
+    if head.manifest.is_none() {
+        if let Some(o) = store.get(&keys().pack_pointer()).unwrap() {
+            let p = crate::pack::pointer::PackPointer::decode_fields(&o.body)
+                .unwrap()
+                .0;
+            if p.pack_generation == head.generation {
+                db = store.get(&p.pack_key).unwrap().unwrap().body;
+            }
+        }
+    }
+    if let Some(g) = head.manifest {
+        let body = store.get(&keys().manifest(g)).unwrap().unwrap().body;
+        let m = Manifest::decode(&as_plain(&body)).unwrap();
+        let ps = m.page_size as usize;
+        db = vec![0u8; ps * m.page_count as usize];
+        for (p, pg) in &m.pages {
+            let page = store.get(&keys().page(*pg, *p)).unwrap().unwrap().body;
+            let at = (*p as usize - 1) * ps;
+            db[at..at + ps].copy_from_slice(page_of(&page, ps));
+        }
     }
     let (mut wal, mut log, mut kinds, mut records) = (Vec::new(), Vec::new(), vec![], vec![]);
     for seq in 1.. {
@@ -158,10 +174,33 @@ fn plain_rows(db: &[u8], wal: &[u8], log: &[u8], enc: Option<&Encryption>) -> Ve
     ids
 }
 
-/// The rows a restore of the bucket's current generation holds (plain turso).
+/// The rows a restore of the bucket's current generation holds (plain turso). A format 5
+/// bucket is restored by the library (the pack, then the chain of generations after it) into
+/// a new directory from a copy of every object, and its files are opened.
 fn bucket_rows(store: &dyn ObjectStore, enc: Option<&Encryption>) -> Vec<i64> {
     let b = bucket_image(store);
-    plain_rows(&b.db, &b.wal, &b.log, enc)
+    if b.head.manifest.is_some() {
+        return plain_rows(&b.db, &b.wal, &b.log, enc);
+    }
+    let copy = Arc::new(MemStore::new());
+    for key in store.list("").unwrap() {
+        copy.put(&key, &store.get(&key).unwrap().unwrap().body)
+            .unwrap();
+    }
+    let mut cfg = crate::engine::tests::cfg();
+    cfg.journal_mode = JournalMode::Mvcc;
+    cfg.encryption = enc.map(|e| Arc::new(Encryption::new(e.cipher, e.key.clone())));
+    let keys = keys().with_integrity(enc.map(Encryption::integrity_key));
+    let t = tempdir();
+    let dir = fresh(&t);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::restore::restore_staged(copy, &keys, &dir, &cfg).unwrap();
+    plain_rows(
+        &read(&dir, "app.db"),
+        &read(&dir, "app.db-wal"),
+        &read(&dir, "app.db-log"),
+        enc,
+    )
 }
 
 /// A process crash: nothing runs on drop. The rows a copy of `dir`'s files holds (plain
@@ -197,7 +236,7 @@ pub(super) fn mvcc_with_rows(
 }
 
 #[test]
-fn mvcc_commit_then_checkpoint_seals_and_log_image_is_empty() {
+fn mvcc_commit_then_checkpoint_switches_and_log_image_is_empty() {
     let store = mem();
     let t = tempdir();
     let dir = fresh(&t);
@@ -217,7 +256,8 @@ fn mvcc_commit_then_checkpoint_seals_and_log_image_is_empty() {
     truncate_checkpoint(&c).unwrap();
     assert_eq!(db.generation(), 3);
     let b = bucket_image(&*store);
-    assert_eq!((b.head.generation, b.head.manifest), (3, Some(2)));
+    // A generation switch: no manifest.
+    assert_eq!((b.head.generation, b.head.manifest), (3, None));
     assert_eq!(
         b.kinds,
         Vec::<u8>::new(),
@@ -238,13 +278,17 @@ fn mvcc_commit_then_checkpoint_seals_and_log_image_is_empty() {
     db.close().unwrap();
 }
 
-/// A seal that fails before its head PUT (the manifest PUT fails): the checkpoint errs before
-/// the engine cuts the log, the generation goes on, later commits ack, and both the bucket
-/// and a crash copy hold all 12 rows (P8f).
-fn seal_fails_then_two_commits(store: &Arc<FaultStore>, dir: &Path) -> (Database, Connection) {
+/// A generation switch that fails at its head PUT (every head PUT fails, nothing stored): the
+/// checkpoint errs before the engine cuts the log, the generation goes on (the next commit
+/// settles the switch with an epoch raise), later commits ack, and both the bucket and a crash
+/// copy hold all 12 rows (P8f). (Formats 2 and 4 failed their manifest PUT here.)
+pub(super) fn switch_fails_then_two_commits(
+    store: &Arc<FaultStore>,
+    dir: &Path,
+) -> (Database, Connection) {
     let (db, c) = mvcc_with_rows(store.clone(), mvcc(dir), 10);
     let log_before = read(dir, "app.db-log");
-    store.only_keys_containing("/manifest/");
+    store.only_keys_containing("/head");
     store.fail_puts_after(0);
     let r = truncate_checkpoint(&c);
     assert!(r.is_err(), "{r:?}");
@@ -264,12 +308,12 @@ fn seal_fails_then_two_commits(store: &Arc<FaultStore>, dir: &Path) -> (Database
 }
 
 #[test]
-fn seal_failure_leaves_log_and_wal_whole_and_later_commits_ack() {
+fn switch_failure_leaves_log_and_wal_whole_and_later_commits_ack() {
     let mem = mem();
     let store = Arc::new(FaultStore::new(mem.clone()));
     let t = tempdir();
     let dir = fresh(&t);
-    let (db, c) = seal_fails_then_two_commits(&store, &dir);
+    let (db, c) = switch_fails_then_two_commits(&store, &dir);
     let acked = db.upload_stats().commits_acked;
     assert_eq!(acked, 13, "the CREATE TABLE and 12 inserts");
     let b = bucket_image(&*mem);
@@ -282,12 +326,12 @@ fn seal_failure_leaves_log_and_wal_whole_and_later_commits_ack() {
 }
 
 #[test]
-fn seal_failure_retry_crash_restore() {
+fn switch_failure_retry_crash_restore() {
     let mem = mem();
     let store = Arc::new(FaultStore::new(mem.clone()));
     let t = tempdir();
     let dir = fresh(&t);
-    let (db, c) = seal_fails_then_two_commits(&store, &dir);
+    let (db, c) = switch_fails_then_two_commits(&store, &dir);
     truncate_checkpoint(&c).unwrap();
     assert_eq!(db.generation(), 3);
     assert_eq!(read(&dir, "app.db-log"), Vec::<u8>::new());
@@ -545,16 +589,19 @@ fn plaintext(dir: &Path, store: &MemStore, needle: &[u8]) -> Vec<String> {
     found
 }
 
-/// Rows with the marker in the local `.db-log` and the bucket, then a checkpoint whose seal
-/// fails (the `-wal` keeps its frames), then one that seals. Returns what held the marker
-/// after each step, and the rows the bucket's image holds.
+/// Rows with the marker in the local `.db-log` and the bucket, then a checkpoint whose
+/// generation switch fails (the `-wal` keeps its frames), then one that switches, then a pack
+/// run. Returns what held the marker after each step, and the rows the bucket holds.
 fn marked_rows(c: Config, enc: Option<&Encryption>) -> (Vec<Vec<String>>, Vec<i64>) {
     let mem = mem();
     let store = Arc::new(FaultStore::new(mem.clone()));
     let dir = c.dir.clone();
+    let packer = c.dir.with_extension("packer");
+    let mut packer_cfg = c.clone();
+    packer_cfg.dir = packer;
     let (db, conn) = mvcc_with_rows(store.clone(), c, 4);
     let mut seen = vec![plaintext(&dir, &mem, MARKER.as_bytes())];
-    store.only_keys_containing("/manifest/");
+    store.only_keys_containing("/head");
     store.fail_puts_after(0);
     assert!(truncate_checkpoint(&conn).is_err());
     assert!(!read(&dir, "app.db-wal").is_empty());
@@ -563,6 +610,8 @@ fn marked_rows(c: Config, enc: Option<&Encryption>) -> (Vec<Vec<String>>, Vec<i6
     store.only_keys_containing("");
     truncate_checkpoint(&conn).unwrap();
     insert_c(&conn, 5).unwrap();
+    let r = crate::pack::run::pack_with_store(&packer_cfg, mem.clone()).unwrap();
+    assert_eq!(r.outcome, crate::pack::run::PackOutcome::Packed, "{r:?}");
     seen.push(plaintext(&dir, &mem, MARKER.as_bytes()));
     let rows = bucket_rows(&*mem, enc);
     conn.close().unwrap();
@@ -601,7 +650,7 @@ fn encrypted_mvcc_needs_context_and_hides_plaintext() {
     assert!(seen[0].iter().any(|k| k.contains("/log/")), "{seen:?}");
     assert!(seen[1].contains(&"app.db-wal".to_string()), "{seen:?}");
     assert!(seen[2].contains(&"app.db".to_string()), "{seen:?}");
-    assert!(seen[2].iter().any(|k| k.contains("/pages/")), "{seen:?}");
+    assert!(seen[2].iter().any(|k| k.contains("/pack/")), "{seen:?}");
     assert_eq!(rows, vec![1, 2, 3, 4, 5]);
 }
 
@@ -808,6 +857,7 @@ fn transaction_with_window_refused_in_mvcc_and_still_works_in_wal() {
 }
 
 mod maintenance;
+mod pack;
 mod readonly;
 mod restore;
 mod run;

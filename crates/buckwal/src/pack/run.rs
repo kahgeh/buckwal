@@ -5,7 +5,8 @@
 //!    generations (`ended_generations`) up to the head's generation.
 //! 3. Download the newest pack in ranges and check each block against its codes.
 //! 4. Apply each ended generation with a local checkpoint, the code a restore uses
-//!    (`restore::apply_generation`), in `<config.dir>/pack-work-<run id>`.
+//!    (`restore::apply_images_over`: a WAL generation's `-wal`, an MVCC one's `-wal` and
+//!    `app.db-log`), in `<config.dir>/pack-work-<run id>`.
 //! 5. Upload the database file as `pack/<G>/<run id>` in 16 MiB parts, 8 at once.
 //! 6. Check the upload: the HEAD size and the SHA-256 of each part. Then upload the codes.
 //! 7. HEAD the pack and its codes, then move the pointer with `If-Match` on its ETag
@@ -22,9 +23,9 @@ use crate::config::{Config, JournalMode};
 use crate::encryption::{self, Encryption};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE};
-use crate::format::{Head, Keys, LogFile, LogRecord};
+use crate::format::{Head, Keys, LogFile, LogRecord, FORMAT_V5};
 use crate::io::block_store::fetch_verified;
-use crate::restore::{apply_generation, db_facts, fetch_generation, replay, Images};
+use crate::restore::{apply_images_over, db_facts, fetch_generation, replay, Images};
 use crate::store::{
     part_size_for, sha256_of, with_retry, CondPut, ObjectStore, PartSource, RetryPolicy,
 };
@@ -418,8 +419,10 @@ impl Run<'_> {
             .req(&head_key, || self.store.get(&head_key))?
             .ok_or_else(|| Error::NotFound(head_key.clone()))?;
         let head = self.keys.decode_head_open(&head_obj.body)?;
-        if head.journal_mode == JournalMode::Mvcc {
-            return Err(Error::Unsupported("a pack run of an MVCC database"));
+        if head.journal_mode == JournalMode::Mvcc && head.format != FORMAT_V5 {
+            return Err(Error::Unsupported(
+                "a pack run of an MVCC bucket of format 2 or 4 (it seals)",
+            ));
         }
         if self.keys.coded() && self.keys.known_database_id().is_none() {
             return Err(Error::Unsupported(
@@ -427,6 +430,13 @@ impl Run<'_> {
             ));
         }
         let base = self.read_pointer()?;
+        if base.is_none() && head.journal_mode == JournalMode::Mvcc {
+            // A new MVCC database is published as its first pack.
+            return Err(Error::Corrupt(format!(
+                "{} is missing: an MVCC bucket of format 5 starts with its first pack",
+                self.keys.pack_pointer()
+            )));
+        }
         let from = base.as_ref().map_or(1, |(p, _)| p.pack_generation);
         self.step("read");
 
@@ -458,8 +468,8 @@ impl Run<'_> {
                     check_page_size(work, enc, p)?;
                 }
             }
-            let wal = replay_ended(records, &head, e.generation)?.wal;
-            apply_generation(work, &wal, &head, enc)?;
+            let images = replay_ended(records, &head, e.generation)?;
+            apply_images_over(work, &images, &head, enc, None)?;
             applied += 1;
             Ok(())
         })?;
@@ -637,7 +647,11 @@ impl Run<'_> {
 }
 
 /// The SHA-256 of each part of `db` (parts of `pointer.part_size`) and its block codes.
-fn digest(keys: &Keys, pointer: &PackPointer, db: &Path) -> Result<(Vec<[u8; 32]>, PackCodes)> {
+pub(crate) fn digest(
+    keys: &Keys,
+    pointer: &PackPointer,
+    db: &Path,
+) -> Result<(Vec<[u8; 32]>, PackCodes)> {
     let mut f = File::open(db).map_err(|e| io_err("open pack file", e))?;
     let mut builder = CodesBuilder::new(
         keys,
@@ -754,13 +768,13 @@ fn fetch_range(
 }
 
 /// A [`PartSource`] over a local file.
-struct FileSource {
+pub(crate) struct FileSource {
     file: Mutex<File>,
     len: u64,
 }
 
 impl FileSource {
-    fn open(path: &Path) -> Result<FileSource> {
+    pub(crate) fn open(path: &Path) -> Result<FileSource> {
         let file = File::open(path).map_err(|e| io_err("open pack file", e))?;
         let len = file
             .metadata()

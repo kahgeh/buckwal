@@ -3974,60 +3974,65 @@ fn mvcc_fast_config(dir: &Path) -> Config {
     c
 }
 
-/// The bucket a creation left: the head (format 2, MVCC, generation 2, manifest 1),
-/// `manifest/1` mapping every page to generation 1, `pages/1/*` of the manifest's page size,
-/// no log object. Returns the head and the `app.db` image the pages make.
-fn created_bucket(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
-    let h = head(store);
-    // Format 2, or 4 for an encrypted database.
-    assert!(
-        h.format == crate::format::FORMAT_V2 || h.format == crate::format::FORMAT_V4,
-        "{h:?}"
-    );
-    assert_eq!(
-        (h.generation, h.manifest, h.journal_mode),
-        (2, Some(1), JournalMode::Mvcc),
-        "{h:?}"
-    );
+/// The first pack the pointer names: the pointer (decoded without its code) and the pack's
+/// bytes, which are its size; its codes object exists.
+fn first_pack(store: &dyn ObjectStore) -> (crate::pack::pointer::PackPointer, Vec<u8>) {
     let body = store
-        .get(&keys().manifest(1))
+        .get(&keys().pack_pointer())
         .unwrap()
-        .expect("manifest/1")
+        .expect("pack-latest")
         .body;
-    let m = crate::format::Manifest::decode(&as_plain(&body)).unwrap();
-    assert_eq!(m.page_size, 4096);
-    assert!(m.page_count >= 1, "{m:?}");
-    assert_eq!(m.pages, (1..=m.page_count).map(|p| (p, 1)).collect());
-    let mut image = Vec::new();
-    for p in 1..=m.page_count {
-        let page = store.get(&keys().page(1, p)).unwrap().expect("page").body;
-        image.extend(page_of(&page, 4096));
-    }
-    assert_eq!(
-        store.list(&keys().log_root()).unwrap(),
-        Vec::<String>::new()
-    );
-    (h, image)
+    let p = crate::pack::pointer::PackPointer::decode_fields(&body)
+        .unwrap()
+        .0;
+    let pack = store.get(&p.pack_key).unwrap().expect("the pack").body;
+    assert_eq!(pack.len() as u64, p.size);
+    assert!(store.get(&p.codes_key).unwrap().is_some(), "its codes");
+    (p, pack)
 }
 
-/// No head without its manifest and every page that manifest maps.
-fn head_has_its_manifest(store: &dyn ObjectStore) {
-    let Some(obj) = store.get(&keys().head()).unwrap() else {
-        return;
-    };
-    let h = Head::decode(&obj.body).unwrap();
-    let Some(g) = h.manifest else {
-        return;
-    };
-    let body = store.get(&keys().manifest(g)).unwrap();
-    let m = crate::format::Manifest::decode(&as_plain(&body.expect("the head's manifest").body))
-        .unwrap();
-    for (p, pg) in m.pages {
-        assert!(
-            store.get(&keys().page(pg, p)).unwrap().is_some(),
-            "page {p}"
-        );
+/// The bucket a creation left (spec "A new MVCC database is the one case that publishes a
+/// pack at once"): the head (format 5, MVCC, generation 2, no manifest), the pointer naming
+/// `pack/2/<run id>` with pack generation 2, its codes, and no page, manifest or log object.
+/// The pack generation is the head's generation, so the chain of generations from the first
+/// pack ends at once at the head's. Returns the head and the pack (the `app.db` image).
+fn created_bucket(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
+    let h = head(store);
+    assert_eq!(
+        (h.format, h.generation, h.manifest, h.journal_mode),
+        (crate::format::FORMAT_V5, 2, None, JournalMode::Mvcc),
+        "{h:?}"
+    );
+    let (p, pack) = first_pack(store);
+    assert_eq!(p.pack_generation, 2);
+    assert_eq!(
+        p.pack_generation, h.generation,
+        "the chain ends at the head"
+    );
+    assert!(
+        p.pack_key
+            .starts_with(&format!("{PREFIX}/pack/0000000002/")),
+        "{}",
+        p.pack_key
+    );
+    assert_eq!(p.page_size, 4096);
+    assert!(p.size >= 4096 && p.size % 4096 == 0, "{p:?}");
+    for root in [
+        keys().page_root(),
+        keys().manifest_root(),
+        keys().log_root(),
+    ] {
+        assert_eq!(store.list(&root).unwrap(), Vec::<String>::new(), "{root}");
     }
+    (h, pack)
+}
+
+/// No head without its pack: a head means the pointer, the pack and its codes are there.
+fn head_has_its_pack(store: &dyn ObjectStore) {
+    if store.get(&keys().head()).unwrap().is_none() {
+        return;
+    }
+    first_pack(store);
 }
 
 /// The engine's log header: `LOG_MAGIC` ("LML2" LE), `hdr_len` 56, 56 bytes.
@@ -4111,7 +4116,7 @@ fn created_locally_with(dir: &Path, image: &[u8], h: &Head, reopened: bool) {
 }
 
 #[test]
-fn create_mvcc_makes_head_manifest_pages_and_local_files() {
+fn create_mvcc_makes_pack_pointer_head_and_local_files() {
     let store = mem();
     let t = tempdir();
     let dir = fresh(&t);
@@ -4120,38 +4125,86 @@ fn create_mvcc_makes_head_manifest_pages_and_local_files() {
     assert_eq!(h.epoch, 1);
     assert_eq!(h.writer_id, st.writer_id);
     assert_eq!(bucket.head(), &h);
-    assert_eq!(bucket.manifest().map(|m| m.page_count), Some(2));
+    assert!(bucket.manifest().is_none());
+    assert_eq!(image.len(), 2 * 4096, "the empty MVCC database is 2 pages");
     assert_eq!(header_bytes(&dir), (255, 255));
     let log = std::fs::read(dir.join("app.db-log")).unwrap();
     assert_eq!(log.len(), 56);
     created_locally(&dir, &image, &h);
     assert!(!dir.join("app.db-wal").exists());
     assert_eq!(state(&dir), st);
-    // The head's If-None-Match is the only conditional PUT: 2 pages, the manifest, the head.
-    assert_eq!(store.stats().puts, 4);
-    // Trim against this head deletes nothing: it is a normal sealed head.
-    let m = bucket.manifest().unwrap();
-    assert_eq!(crate::trim::trim_once(&*store, &keys(), &h, Some(m)), Ok(0));
+    // Trim against this head deletes nothing.
+    assert_eq!(crate::trim::trim_once(&*store, &keys(), &h, None), Ok(0));
     // The local files are an MVCC database turso opens and writes.
     plain_mvcc_open_works(&image, &log, None);
-    // A second machine: the restore reads the head and manifest; the bucket's pages alone
-    // (with the empty log a TRUNCATE checkpoint leaves) are the same database.
+    // A second machine: the restore reads the head, the pointer and the pack; the pack alone
+    // (with the empty log of generation 2) is the same database.
     let t2 = tempdir();
     let rep = restore_with_store(&mvcc_config(&fresh(&t2)), store.clone(), &fresh(&t2)).unwrap();
     assert_eq!(rep.generation, 2);
+    assert_eq!(
+        rep.pack_key,
+        Some(first_pack(&*store).0.pack_key),
+        "the restore read the first pack"
+    );
     assert_eq!(state(&fresh(&t2)).format, crate::format::FORMAT_V2);
     plain_mvcc_open_works(&image, &[], None);
 }
 
+/// The steps of a creation, in order.
+const STEPS: [&str; 4] = ["pack", "codes", "pointer", "head"];
+
+/// The step of a creation a write (a `FaultStore` event) belongs to.
+fn step_of(write: &str) -> &'static str {
+    if write.starts_with("put_multipart ") {
+        "pack"
+    } else if write.ends_with(".codes") {
+        "codes"
+    } else if write.ends_with("/pack-latest") {
+        "pointer"
+    } else if write.ends_with("/head") {
+        "head"
+    } else {
+        "other"
+    }
+}
+
+/// The writes of a creation, in order: the pack (a multipart upload), its codes, the first
+/// pointer with If-None-Match, then the head with If-None-Match (spec "A new MVCC database is
+/// the one case that publishes a pack at once"). A failure after each step leaves no head, and
+/// the next create (an open) succeeds. A write stored whose reply was lost is found as this
+/// creation's own. A crash while the files move in leaves a bucket the next open restores.
 #[test]
-fn create_crash_at_each_step() {
-    // A clean creation's PUTs: the pages, the manifest, the head.
+fn new_mvcc_database_publishes_pack_pointer_head_in_that_order() {
+    let writes = |f: &FaultStore| -> Vec<String> {
+        f.events()
+            .into_iter()
+            .filter(|e| e.starts_with("put"))
+            .collect()
+    };
+    // A clean creation.
     let clean = mem();
+    let fault = Arc::new(FaultStore::new(clean.clone()));
     let t = tempdir();
-    create_mvcc(clean.clone(), &mvcc_config(&fresh(&t))).unwrap();
-    let total = clean.stats().puts;
-    assert_eq!(total, 4);
-    for n in 0..=total {
+    create_mvcc(fault.clone(), &mvcc_config(&fresh(&t))).unwrap();
+    let (p, _) = first_pack(&*clean);
+    let order = [
+        format!("put_multipart {}", p.pack_key),
+        format!("put {}", p.codes_key),
+        format!("put_if_absent {}", keys().pack_pointer()),
+        format!("put_if_absent {}", keys().head()),
+    ];
+    assert_eq!(writes(&fault), order);
+    // The pack's size is checked (HEAD) before its codes go up.
+    let ev = fault.events();
+    let at = |e: &str| ev.iter().position(|x| x == e).unwrap();
+    assert!(
+        at(&format!("stat {}", p.pack_key)) < at(&order[1]),
+        "{ev:?}"
+    );
+    created_bucket(&*clean);
+
+    for n in 0..order.len() as u64 {
         let inner = mem();
         let fault = Arc::new(FaultStore::new(inner.clone()));
         fault.fail_puts_after(n);
@@ -4159,21 +4212,22 @@ fn create_crash_at_each_step() {
         let dir = fresh(&t);
         let c = mvcc_fast_config(&dir);
         let r = create_mvcc(fault.clone(), &c);
-        head_has_its_manifest(&*inner);
-        if n < total {
-            assert!(r.is_err(), "n={n}: {:?}", r.map(|(_, s)| s));
-            assert!(inner.get(&keys().head()).unwrap().is_none(), "n={n}");
-            assert!(LocalState::read(&dir).unwrap().is_none(), "n={n}");
-            assert!(!dir.join("app.db").exists(), "n={n}");
-            // A crash mid-build leaves a staging dir that must never be opened again.
-            let staging = dir.join("app.db-creating");
-            assert!(staging.exists(), "n={n}");
-            std::fs::write(staging.join("app.db"), b"torn switch").unwrap();
-        } else {
-            r.unwrap();
-        }
-        // The next open removes the staging dir, never opening it, and creates again
-        // (overwriting what the crashed attempt left), then opens the engine.
+        assert!(r.is_err(), "n={n}: {:?}", r.map(|(_, s)| s));
+        // The steps up to the failed one (its retries included), in order, and no later one.
+        let mut tried: Vec<&str> = writes(&fault).iter().map(|w| step_of(w)).collect();
+        tried.dedup();
+        assert_eq!(tried, STEPS[..=n as usize], "n={n}");
+        assert!(inner.get(&keys().head()).unwrap().is_none(), "n={n}");
+        head_has_its_pack(&*inner);
+        assert!(LocalState::read(&dir).unwrap().is_none(), "n={n}");
+        assert!(!dir.join("app.db").exists(), "n={n}");
+        // A crash mid-build leaves a staging dir that must never be opened again.
+        let staging = dir.join("app.db-creating");
+        assert!(staging.exists(), "n={n}");
+        std::fs::write(staging.join("app.db"), b"torn switch").unwrap();
+        // The next open removes the staging dir, never opening it, and creates again: a new
+        // pack (an orphan of the crashed attempt may stay, for GC), and the pointer the crashed
+        // attempt left (n = 3) is replaced, as no head names it.
         fault.fail_puts_after(u64::MAX);
         open_with_store(c.clone(), fault.clone())
             .unwrap_or_else(|e| panic!("n={n}: {e}"))
@@ -4181,7 +4235,6 @@ fn create_crash_at_each_step() {
             .unwrap();
         let (h, image) = created_bucket(&*inner);
         created_locally_with(&dir, &image, &h, true);
-        head_has_its_manifest(&*inner);
         // A second machine restores the final state.
         let t2 = tempdir();
         let rep = restore_with_store(&mvcc_config(&fresh(&t2)), inner.clone(), &fresh(&t2));
@@ -4189,8 +4242,8 @@ fn create_crash_at_each_step() {
         plain_mvcc_open_works(&image, &[], None);
     }
 
-    // Stored, then an error: a page or the manifest is PUT again; the head is found as ours.
-    for key in ["pages/", "manifest/", "head"] {
+    // Stored, then an error: each write is found as this creation's own.
+    for key in ["/pack/", ".codes", "pack-latest", "head"] {
         let inner = mem();
         let fault = Arc::new(FaultStore::new(inner.clone()));
         fault.only_keys_containing(key);
@@ -4227,10 +4280,10 @@ fn create_crash_at_each_step() {
             (s.format, s.generation, s.claimed),
             (crate::format::FORMAT_V2, 2, true)
         );
-        let (h, again) = head_and_image(&*store);
-        assert_eq!(again, image, "moved={moved}");
+        let h = head(&*store);
+        assert_eq!(first_pack(&*store).1, image, "moved={moved}");
         assert_eq!(h.writer_id, s.writer_id, "moved={moved}");
-        head_has_its_manifest(&*store);
+        head_has_its_pack(&*store);
         let t2 = tempdir();
         let rep = restore_with_store(&mvcc_config(&fresh(&t2)), store.clone(), &fresh(&t2));
         assert_eq!(rep.unwrap().generation, 2, "moved={moved}");
@@ -4272,17 +4325,42 @@ fn stale_staging_dir_never_deletes_a_foreign_app_db() {
     }
 }
 
-/// The head and the `app.db` image of `manifest/1`, whatever the log holds (a takeover's
-/// fence record, say).
-fn head_and_image(store: &dyn ObjectStore) -> (Head, Vec<u8>) {
-    let h = head(store);
-    assert_eq!((h.generation, h.manifest), (2, Some(1)), "{h:?}");
-    let body = store.get(&keys().manifest(1)).unwrap().unwrap().body;
-    let m = crate::format::Manifest::decode(&body).unwrap();
-    let image = (1..=m.page_count)
-        .flat_map(|p| store.get(&keys().page(1, p)).unwrap().unwrap().body)
+/// A create where a database already exists (its head and pointer are there): the first
+/// pointer write gets a 412, the pointer read is not this creation's, and a head exists, so the
+/// create is `Config` and never writes the pointer with `If-Match`. The database is unchanged.
+#[test]
+fn create_over_an_existing_database_changes_no_pointer() {
+    let inner = mem();
+    let t = tempdir();
+    create_mvcc(inner.clone(), &mvcc_config(&fresh(&t))).unwrap();
+    let pointer = inner.get(&keys().pack_pointer()).unwrap().unwrap();
+    let head_before = inner.get(&keys().head()).unwrap().unwrap();
+    let fault = Arc::new(FaultStore::new(inner.clone()));
+    let t2 = tempdir();
+    let r = create_mvcc(fault.clone(), &mvcc_config(&fresh(&t2))).map(|(_, s)| s);
+    assert_eq!(
+        r,
+        Err(Error::Config(
+            "a database already exists at this prefix".into()
+        ))
+    );
+    let w: Vec<String> = fault
+        .events()
+        .into_iter()
+        .filter(|e| e.starts_with("put_if_match") || e.starts_with("put_if_absent"))
         .collect();
-    (h, image)
+    assert_eq!(
+        w,
+        [format!("put_if_absent {}", keys().pack_pointer())],
+        "no head write, no pointer replaced"
+    );
+    let now = inner.get(&keys().pack_pointer()).unwrap().unwrap();
+    assert_eq!((now.body, now.etag), (pointer.body, pointer.etag));
+    assert_eq!(
+        inner.get(&keys().head()).unwrap().unwrap().body,
+        head_before.body
+    );
+    head_has_its_pack(&*inner);
 }
 
 #[test]
@@ -4314,9 +4392,10 @@ fn racing_creators_one_head_wins() {
     let (dir, st) = won[0];
     let (h, image) = created_bucket(&*store);
     assert_eq!(h.writer_id, st.writer_id);
-    head_has_its_manifest(&*store);
-    // The loser's pages may have replaced the winner's: either way the bucket is a whole
-    // empty MVCC database, and the winner's directory is its own.
+    head_has_its_pack(&*store);
+    // The loser may have replaced the pointer for a while: the winner puts its own back once
+    // its head landed, and the loser puts back the one it replaced. Either way the bucket is a
+    // whole empty MVCC database, and the winner's directory is its own.
     plain_mvcc_open_works(&image, &[], None);
     let local = std::fs::read(dir.join("app.db")).unwrap();
     let log = std::fs::read(dir.join("app.db-log")).unwrap();

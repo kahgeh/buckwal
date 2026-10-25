@@ -221,7 +221,7 @@ fn restore_v2_bucket_writes_wal_and_log_images() {
     let store = Arc::new(FaultStore::new(mem.clone()));
     let t = tempdir();
     let dir = fresh(&t);
-    let (db, c) = seal_fails_then_two_commits(&store, &dir);
+    let (db, c) = switch_fails_then_two_commits(&store, &dir);
     let b = bucket_image(&*mem);
     assert!(
         b.kinds.contains(&1) && b.kinds.contains(&3),
@@ -289,7 +289,7 @@ fn wal_frames_with_empty_log_is_repaired_and_opens() {
     let store = Arc::new(FaultStore::new(mem.clone()));
     let t = tempdir();
     let dir = fresh(&t);
-    let (db, c) = seal_fails_then_two_commits(&store, &dir);
+    let (db, c) = switch_fails_then_two_commits(&store, &dir);
     let b = bucket_image(&*mem);
     crash(db, vec![c]);
     // The bucket's `-wal` image next to an empty log.
@@ -341,7 +341,7 @@ fn restore_with_wal_frames_and_empty_log_image_writes_a_header() {
     let store = Arc::new(FaultStore::new(mem.clone()));
     let t = tempdir();
     let dir = fresh(&t);
-    let (db, c) = seal_fails_then_two_commits(&store, &dir);
+    let (db, c) = switch_fails_then_two_commits(&store, &dir);
     let b = bucket_image(&*mem);
     crash(db, vec![c]);
     for (seq, kind) in b.kinds.iter().enumerate() {
@@ -766,7 +766,8 @@ fn wal_frames_with_empty_log_is_repaired_and_opens_encrypted() {
     let c = mvcc_enc(&dir, &k, &key_hex());
     let enc = encryption::load(&c).unwrap().unwrap();
     let (db, conn) = mvcc_with_rows(store.clone(), c, 4);
-    store.only_keys_containing("/manifest/");
+    // The generation switch fails at its head PUT.
+    store.only_keys_containing("/head");
     store.fail_puts_after(0);
     assert!(truncate_checkpoint(&conn).is_err());
     store.fail_puts_after(u64::MAX);

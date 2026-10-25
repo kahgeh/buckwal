@@ -1,8 +1,8 @@
 //! The seal of bucket formats 1 to 4: the seal-start record, every dirty page of the
 //! generation as its own object (`pages/<G>/<p>`), the manifest (`manifest/<G>`), then the head
 //! move. A format 5 bucket never seals: it switches generations (`Bucket::switch_generation`).
-//! This code stays for the buckets made before format 5 (the upgrade reads what it wrote) and
-//! for the MVCC databases, which still seal (ADR 0002).
+//! This code stays for the buckets made before format 5, WAL and MVCC (formats 2 and 4 keep
+//! sealing in `LogDurableStorage::truncate`, ADR 0002), and the upgrade reads what it wrote.
 
 use super::*;
 
@@ -85,6 +85,10 @@ impl Bucket {
     /// manifest again: the objects the head names are the winner's. (A loser that is slow
     /// enough to land a PUT after that leaves a database that fails its first restore with
     /// `integrity`; it holds no data yet, and a new create at an emptied prefix replaces it.)
+    ///
+    /// Tests only: a new MVCC database is a format 5 one (`create_packed_mvcc_with`). The tests
+    /// of the MVCC buckets of formats 2 and 4, which keep working, make their buckets with it.
+    #[cfg(test)]
     pub(crate) fn create_sealed_with(
         store: Arc<dyn ObjectStore>,
         keys: Keys,

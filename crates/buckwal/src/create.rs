@@ -2,8 +2,9 @@
 //! no open option for MVCC: the header decides (bytes 18/19 = 255). So the library builds the
 //! empty MVCC database itself, in a staging directory `<dir>/app.db-creating`, with plain
 //! local IO and no wrapper: `PRAGMA journal_mode='mvcc'`, then a TRUNCATE checkpoint. Only
-//! then does the bucket see anything (`Bucket::create_sealed`), and only after its head landed
-//! are the files moved into the database directory (`move_created`).
+//! then does the bucket see anything: `app.db` as the first pack, then the head
+//! (`Bucket::create_packed_mvcc_with`). Only after its head landed are the files moved into
+//! the database directory (`move_created`).
 //!
 //! A crash mid-switch can make an open of the staging files panic (P7), so a staging
 //! directory is never opened again: the next open removes it (`clear_interrupted_create`).
@@ -38,6 +39,7 @@ pub(crate) struct Image {
 }
 
 impl Image {
+    #[cfg(test)]
     pub(crate) fn page_count(&self) -> u32 {
         self.pages.len() as u32
     }

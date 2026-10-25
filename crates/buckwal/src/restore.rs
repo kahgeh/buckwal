@@ -453,17 +453,8 @@ pub(crate) fn db_facts(dir: &Path, enc: Option<&Encryption>) -> Result<DbFacts> 
 /// (`page_one_seed`, as a restore of a bucket with no page does). An image with no whole frame
 /// changes nothing. `head` is the head at that generation (its journal mode is checked
 /// against page 1).
-pub(crate) fn apply_generation(
-    dir: &Path,
-    wal: &[u8],
-    head: &Head,
-    enc: Option<&Encryption>,
-) -> Result<()> {
-    apply_generation_over(dir, wal, head, enc, None)
-}
-
-/// [`apply_generation`] over the pack `blocks` serves: each page the checkpoint reads or writes
-/// has its block fetched first, so only the blocks the generation touches come down.
+/// With `blocks`, over the pack it serves: each page the checkpoint reads or writes has its
+/// block fetched first, so only the blocks the generation touches come down.
 pub(crate) fn apply_generation_over(
     dir: &Path,
     wal: &[u8],
@@ -502,6 +493,86 @@ pub(crate) fn apply_generation_over(
         return Err(Error::Engine(format!(
             "the local TRUNCATE checkpoint left a {left}-byte app.db-wal"
         )));
+    }
+    Ok(())
+}
+
+/// Apply one ended generation, its `images`, to `<dir>/app.db` over the pack `blocks` serves
+/// (when given): [`apply_generation_over`] for a WAL database, [`apply_mvcc_generation_over`]
+/// for an MVCC one (`head.journal_mode`).
+pub(crate) fn apply_images_over(
+    dir: &Path,
+    images: &Images,
+    head: &Head,
+    enc: Option<&Encryption>,
+    blocks: Option<&Arc<BlockStore>>,
+) -> Result<()> {
+    match head.journal_mode {
+        JournalMode::Wal => apply_generation_over(dir, &images.wal, head, enc, blocks),
+        JournalMode::Mvcc => apply_mvcc_generation_over(dir, images, head, enc, blocks),
+    }
+}
+
+/// Apply one ended generation of an MVCC database to `<dir>/app.db` (the pack and the
+/// generations before this one) with a local checkpoint of the engine, as a restore of a
+/// format 2 bucket opens its generation: write the `-wal` image (the frames of the
+/// generation's own TRUNCATE checkpoint, which the writer synced before its switch) and the
+/// `app.db-log` image (the generation's commits) next to `app.db`, a fresh log header when the
+/// log image holds none (`repair_wal_without_log`), open the engine over the local files (the
+/// header makes it MVCC; it recovers the log and the WAL as after a crash), run a TRUNCATE
+/// checkpoint and close. Afterwards `app.db` holds every commit of the generation; the `-wal`
+/// is empty and both files are removed. Images with no frame and no commit change nothing.
+/// An MVCC database of format 5 always has a pack (its first one at creation), so an empty
+/// `app.db` is `Corrupt`.
+pub(crate) fn apply_mvcc_generation_over(
+    dir: &Path,
+    images: &Images,
+    head: &Head,
+    enc: Option<&Encryption>,
+    blocks: Option<&Arc<BlockStore>>,
+) -> Result<()> {
+    let wal_path = dir.join(WAL_FILE);
+    let log_path = dir.join(LOG_FILE);
+    if !wal_image_holds_frames(&images.wal) && (images.log.len() as u64) <= LOG_HEADER_LEN {
+        return Ok(());
+    }
+    if file_len(&dir.join(DB_FILE))? == 0 {
+        return Err(Error::Corrupt(format!(
+            "log/{}: an MVCC database of format 5 without its pack",
+            head.generation
+        )));
+    }
+    write_synced(&wal_path, &images.wal)?;
+    write_synced(&log_path, &images.log)?;
+    repair_wal_without_log(dir)?;
+    {
+        let (db, conn) = open_local_over(dir, enc, blocks)?;
+        if !db.mvcc_enabled() {
+            return Err(Error::Corrupt(format!(
+                "log/{}: an MVCC bucket whose database file is not MVCC",
+                head.generation
+            )));
+        }
+        conn.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .map_err(|e| local_engine("local checkpoint", e))?;
+        conn.close()
+            .map_err(|e| local_engine("close the local database", e))?;
+        drop(db);
+    }
+    let left = file_len(&wal_path)?;
+    if left != 0 {
+        return Err(Error::Engine(format!(
+            "the local TRUNCATE checkpoint left a {left}-byte app.db-wal"
+        )));
+    }
+    for path in [&wal_path, &log_path] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("remove an applied generation's file", e)),
+        }
     }
     Ok(())
 }
@@ -646,9 +717,6 @@ fn apply_ended_generations(
     gone: &Arc<AtomicBool>,
     read: &Mutex<Option<String>>,
 ) -> Result<Built> {
-    if head.journal_mode == JournalMode::Mvcc {
-        return Err(Error::Unsupported("restore of a format 5 MVCC bucket"));
-    }
     let enc = cfg.encryption.as_deref();
     let pointer_key = keys.pack_pointer();
     let (blocks, from) = match counted(retries, &cfg.retry, &pointer_key, || {
@@ -686,6 +754,12 @@ fn apply_ended_generations(
             }
             (Some(blocks), from)
         }
+        // A new MVCC database is published as its first pack (`Bucket::create_packed_mvcc_with`).
+        None if head.journal_mode == JournalMode::Mvcc => {
+            return Err(Error::Corrupt(format!(
+                "{pointer_key} is missing: an MVCC bucket of format 5 starts with its first pack"
+            )))
+        }
         None => (None, 1),
     };
     let reader = crate::pack::run::LogReader {
@@ -696,13 +770,13 @@ fn apply_ended_generations(
     };
     let mut applied = false;
     let scanned = crate::pack::run::scan_generations(&reader, from, head, &mut |e, records| {
-        let wal = crate::pack::run::replay_ended(records, head, e.generation)?.wal;
+        let images = crate::pack::run::replay_ended(records, head, e.generation)?;
         if !applied && blocks.is_none() {
             // Page 1 against the encryption setting before the engine opens it, so a wrong key
             // or cipher is the `Encryption` error a restore of a sealed bucket gives.
-            crate::encryption::check_page_one(wal_page_one(&wal), enc)?;
+            crate::encryption::check_page_one(wal_page_one(&images.wal), enc)?;
         }
-        apply_generation_over(dir, &wal, head, enc, blocks.as_ref())?;
+        apply_images_over(dir, &images, head, enc, blocks.as_ref())?;
         applied = true;
         Ok(())
     })?;

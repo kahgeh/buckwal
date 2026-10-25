@@ -2,18 +2,21 @@
 //! the engine with `OpenOptions::durable_storage`, over `app.db-log` wrapped in a
 //! [`LogShippingFile`]. Every `DurableStorage` method delegates to that `Storage`, except:
 //!
-//! - `truncate` (the checkpoint's log cut, step 6 of docs/mvcc-recon.md Q3) seals first:
-//!   pages, manifest and head go up (`BucketDbStorage::seal`, with the page set the WAL seal
-//!   uses), and only then does it delegate. A failed seal returns `Err` before the engine
-//!   touches the log's salt or offset (P8f), so the log and the WAL keep their frames. It
-//!   never returns `Retained` (the TRUNCATE checkpoint asserts `Truncated`).
-//! - `on_checkpoint_start` adopts a seal whose head is published but was never confirmed
-//!   (`Uploader::settle_log`), before any WAL write of the checkpoint: the backstop of the
-//!   adopt every commit's sync makes.
-//! - `on_checkpoint_end` poisons the database when the checkpoint failed after its seal (the
-//!   log truncate, its fsync or the WAL truncate): the engine may already hold the new salt
-//!   while the file keeps the old frames, so every later write is refused, and checkpoints
-//!   and seals too, until the database is reopened (the open repairs and reconciles).
+//! - `truncate` (the checkpoint's log cut, step 6 of docs/mvcc-recon.md Q3) ends the
+//!   generation first, and only then delegates. In a format 5 bucket that is the generation
+//!   switch (`BucketDbStorage::switch_generation`: `app.db` fsynced, the seal-start record
+//!   naming the next generation, then the head move with `If-Match`; no page, no manifest).
+//!   In a bucket of format 2 or 4 it is the seal (`BucketDbStorage::seal`: pages, manifest
+//!   and head, with the page set the WAL seal uses). A failed switch or seal returns `Err`
+//!   before the engine touches the log's salt or offset (P8f), so the log and the WAL keep
+//!   their frames. It never returns `Retained` (the TRUNCATE checkpoint asserts `Truncated`).
+//! - `on_checkpoint_start` adopts a switch or a seal whose head is published but was never
+//!   confirmed (`Uploader::settle_log`), before any WAL write of the checkpoint: the backstop
+//!   of the adopt every commit's sync makes.
+//! - `on_checkpoint_end` poisons the database when the checkpoint failed after its switch or
+//!   seal (the log truncate, its fsync or the WAL truncate): the engine may already hold the
+//!   new salt while the file keeps the old frames, so every later write is refused, and
+//!   checkpoints too, until the database is reopened (the open repairs and reconciles).
 //! - `should_checkpoint` is false: maintenance checkpoints, never the engine on its own (an
 //!   auto-checkpoint's error is swallowed inside a commit, recon Q6).
 //! - `encryption_ctx` is the context built from the same cipher and key as the engine's
@@ -22,7 +25,7 @@
 //! `on_log_write_complete` is the engine's default (a yield): the upload is in the log's
 //! `File::sync`, the commit point.
 //!
-//! No `.db-log` sync can run between the seal's generation change and the delegated log
+//! No `.db-log` sync can run between the switch's (or seal's) generation change and the log
 //! truncate: the checkpoint holds the engine's blocking checkpoint lock, which every
 //! transaction holds for reading from its begin (turso_core-0.8.3
 //! mvcc/database/mod.rs:6610-6612), so no commit runs inside it. If one ever did, the
@@ -68,7 +71,8 @@ pub(crate) struct LogDurableStorage {
     wal_path: PathBuf,
     /// The canonical path of `app.db-log`: `DurableIo` refuses every other open of it.
     log_path: PathBuf,
-    /// The checkpoint now running sealed: a failure after this poisons.
+    /// The checkpoint now running ended its generation (a switch or a seal): a failure after
+    /// this poisons.
     sealed: AtomicBool,
     /// Set once a local step after a seal failed; refuses checkpoints and seals until reopen
     /// (the log file refuses writes with the same error).
@@ -171,10 +175,16 @@ impl LogDurableStorage {
         crate::db::lock(&self.poisoned).get_or_insert(e);
     }
 
-    /// The seal of the generation the local files hold: the same pages a WAL seal uploads
-    /// (written since the last seal, persisted dirty, and every page in a frame of the local
-    /// `-wal`), then manifest and head, behind every record already submitted.
-    fn seal(&self) -> Result<u64> {
+    /// The end of the generation the local files hold, behind every record already
+    /// submitted. Format 5: the generation switch, which uploads no page (the checkpoint wrote
+    /// and synced the `-wal` frames and backfilled `app.db` before this call, so the log of the
+    /// generation and the pack before it hold all of it). Formats 2 and 4: the seal, with the
+    /// same pages a WAL seal uploads (written since the last seal, persisted dirty, and every
+    /// page in a frame of the local `-wal`), then manifest and head.
+    fn end_generation(&self) -> Result<u64> {
+        if self.db.packed() {
+            return self.db.switch_generation();
+        }
         let wal = match std::fs::read(&self.wal_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -227,7 +237,8 @@ impl DurableStorage for LogDurableStorage {
         self.inner.update_header()
     }
 
-    /// Seal, then cut the log. A failed seal returns before the engine changes anything.
+    /// End the generation (a switch, or a seal in formats 2 and 4), then cut the log. A failed
+    /// switch or seal returns before the engine changes anything.
     fn truncate(
         &self,
         checkpointed_through_ts: u64,
@@ -237,7 +248,7 @@ impl DurableStorage for LogDurableStorage {
             return self.inner.truncate(checkpointed_through_ts);
         }
         self.refuse_if_poisoned().map_err(stash)?;
-        self.seal().map_err(stash)?;
+        self.end_generation().map_err(stash)?;
         self.sealed.store(true, SeqCst);
         let (c, outcome) = self.inner.truncate(checkpointed_through_ts)?;
         if outcome == LogicalLogTruncateOutcome::Retained {
@@ -293,8 +304,8 @@ impl DurableStorage for LogDurableStorage {
         self.inner.set_header(header)
     }
 
-    /// Before any WAL write of the checkpoint: refuse it when poisoned, and adopt a seal
-    /// whose head is published (the seal's flush then runs after the adopt).
+    /// Before any WAL write of the checkpoint: refuse it when poisoned, and adopt a switch or a
+    /// seal whose head is published (its flush then runs after the adopt).
     fn on_checkpoint_start(&self) -> turso_core::Result<()> {
         self.sealed.store(false, SeqCst);
         if self.mode != IoMode::Writer {

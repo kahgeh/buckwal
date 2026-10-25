@@ -12,6 +12,7 @@
 
 use crate::clock::Stamp;
 use crate::config::{Event, EventHook, JournalMode};
+#[cfg(test)]
 use crate::create::Image;
 use crate::error::{Error, Result};
 use crate::format::{Head, Keys, LogFile, LogRecord, Manifest, Op, FORMAT_V5};
@@ -1624,6 +1625,7 @@ impl Bucket {
     }
 }
 
+mod first_pack;
 mod legacy;
 
 #[cfg(test)]

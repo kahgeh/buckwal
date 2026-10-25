@@ -6,9 +6,11 @@
 //! are exactly those of a plaintext bucket.
 use super::integrity::{self, Check};
 use super::integrity::{integrity_failed, integrity_failed_as, Kind};
-use super::{
-    Head, JournalMode, LogRecord, Manifest, FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5,
-};
+use super::{Head, LogRecord, Manifest, FORMAT_V3, FORMAT_V4, FORMAT_V5};
+#[cfg(test)]
+use super::{FORMAT, FORMAT_V2};
+#[cfg(test)]
+use crate::config::JournalMode;
 use crate::encryption::IntegrityKey;
 use crate::error::Result;
 use crate::pack::PackPointer;
@@ -46,9 +48,10 @@ thread_local! {
     static LEGACY_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Tests only: while alive, a WAL database created on this thread is a format 1 one (format 4
-/// when encrypted), as every WAL bucket made before format 5 is: it seals, with pages and a
-/// manifest. The tests of the seal code that formats 1 to 4 keep use it.
+/// Tests only: while alive, a database created on this thread is one of the seal formats, as
+/// every bucket made before format 5 is: a WAL one is format 1 (4 when encrypted), an MVCC one
+/// format 2 (4 when encrypted). It seals, with pages and a manifest. The tests of the seal code
+/// that formats 1 to 4 keep use it.
 #[cfg(test)]
 pub(crate) struct LegacySeal;
 
@@ -235,7 +238,9 @@ impl Keys {
         self.integrity.is_some()
     }
 
-    /// The head `format` a new bucket of `mode` is created with.
+    /// The head `format` a new bucket of `mode` is created with in the seal formats 1 to 4
+    /// (tests: `LegacySeal`, `LegacyFormat3`).
+    #[cfg(test)]
     pub(crate) fn new_format(&self, mode: JournalMode) -> u32 {
         match (self.coded(), mode) {
             #[cfg(test)]
@@ -260,6 +265,14 @@ impl Keys {
             return self.new_format(JournalMode::Wal);
         }
         self.new_format_packed()
+    }
+
+    /// Tests: whether a new MVCC database is created as a format 5 one, with its first pack.
+    /// It always is, but in tests of the seal formats: `LegacySeal` and `LegacyFormat3` make it
+    /// a format 2 or 4 one (3 with `LegacyFormat3`), created as a seal of generation 1.
+    #[cfg(test)]
+    pub(crate) fn new_mvcc_packed(&self) -> bool {
+        !(LEGACY_SEAL.with(|f| f.get()) || LEGACY_FORMAT3.with(|f| f.get()))
     }
 
     /// The head's bytes: with an integrity key (a format 3 head) its fields and their code.

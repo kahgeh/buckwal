@@ -906,8 +906,19 @@ fn a_whole_database_copied_with_its_head_still_opens_and_restores() {
         let hex = key_hex();
         for (dst, prefix) in [(&store, "z"), (&other_bucket, "x")] {
             for r in [Reader::ReadOnly, Reader::Restore, Reader::Verify] {
-                let rows = read_at(r, mode, prefix, dst, &k, &hex)
-                    .unwrap_or_else(|e| panic!("{mode:?} {prefix} {r:?}: {e}"));
+                let read = read_at(r, mode, prefix, dst, &k, &hex);
+                if matches!(mode, Mode::Mvcc) && prefix == "z" {
+                    // A new MVCC database has a pack from its start, and the pack pointer
+                    // names its pack by its whole key, prefix included (task 3): a copy at
+                    // another prefix is refused. (A WAL database is the same once it has a
+                    // pack; this one has none yet.)
+                    assert!(
+                        matches!(&read, Err(Error::Corrupt(m)) if m.contains("not a pack of this prefix")),
+                        "{mode:?} {prefix} {r:?}: {read:?}"
+                    );
+                    continue;
+                }
+                let rows = read.unwrap_or_else(|e| panic!("{mode:?} {prefix} {r:?}: {e}"));
                 if matches!(r, Reader::ReadOnly | Reader::Verify) {
                     assert_eq!(rows, 45, "{mode:?} {prefix} {r:?}");
                 }

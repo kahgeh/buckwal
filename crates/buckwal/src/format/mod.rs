@@ -7,8 +7,6 @@ mod keys;
 mod manifest;
 mod record;
 
-use crate::config::JournalMode;
-
 /// The format number of bucket format v1: the head and the local state carry it.
 pub(crate) const FORMAT: u32 = 1;
 /// Bucket format v2: MVCC buckets only (head `"format":2` plus `"journal_mode":"mvcc"`).

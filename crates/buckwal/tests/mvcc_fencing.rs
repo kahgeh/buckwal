@@ -522,15 +522,15 @@ fn sync_ok_only_when_all_ops_confirmed() {
 // Verify of a mid-checkpoint restore; restore through the library
 // ---------------------------------------------------------------------------------------
 
-/// A seal that fails (the manifest PUT) leaves the kind-1 frames next to the whole kind-3
-/// log in the bucket: the image of a restore taken mid-checkpoint. It opens read-only, every
+/// A generation switch that fails (its head PUT) leaves the kind-1 frames next to the whole
+/// kind-3 log in the bucket: the image of a restore taken mid-checkpoint. It opens read-only, every
 /// acked row reads back, `integrity_check` ok, and the bucket is not touched.
 #[test]
 fn verify_of_mid_checkpoint_restore() {
     let mem = Arc::new(MemStore::new());
     let fault = Arc::new(FaultStore::new(mem.clone()));
     let (_a, db, c) = writer(fault.clone(), 10);
-    fault.only_keys_containing("/manifest/");
+    fault.only_keys_containing("/head");
     fault.fail_puts_after(0);
     assert!(c.checkpoint(CheckpointMode::Truncate).is_err());
     fault.fail_puts_after(u64::MAX);
@@ -566,7 +566,7 @@ fn verify_of_mid_checkpoint_restore() {
 }
 
 #[test]
-fn restore_through_library_format_v2() {
+fn restore_through_library_of_an_mvcc_bucket() {
     let mem = Arc::new(MemStore::new());
     let (_a, db, c) = writer(mem.clone(), 6);
     c.checkpoint(CheckpointMode::Truncate).unwrap();
@@ -610,10 +610,11 @@ fn restore_through_library_format_v2() {
 
 /// The same operations on a WAL database: head format 5 with journal_mode, kind-1 records and
 /// the kind-4 seal-start record of its generation switch (no kind 3 anywhere); the MVCC one
-/// has format 2, journal_mode, kind-3 records.
+/// has format 5 too (task 8), journal_mode `mvcc`, kind-3 records and the kind-4 seal-start
+/// record of its switch. Neither head names a manifest.
 #[test]
 fn wal_bucket_is_format_5_under_the_same_operations() {
-    for (mode, format) in [(JournalMode::Wal, 5), (JournalMode::Mvcc, 2)] {
+    for (mode, format) in [(JournalMode::Wal, 5), (JournalMode::Mvcc, 5)] {
         let mem = Arc::new(MemStore::new());
         let t = tempdir();
         let db = open_with_store(config(&fresh(&t), mode), mem.clone()).unwrap();
@@ -650,7 +651,7 @@ fn wal_bucket_is_format_5_under_the_same_operations() {
             "{mode:?}: {body}"
         );
         assert!(body.contains("journal_mode"), "{body}");
-        assert_eq!(body.contains("manifest"), format == 2, "{body}");
+        assert!(!body.contains("manifest"), "{body}");
         let mut seen_kinds = BTreeSet::new();
         for k in mem.list(&format!("{PREFIX}/log/")).unwrap() {
             seen_kinds.insert(mem.get(&k).unwrap().unwrap().body[8]);
@@ -659,7 +660,12 @@ fn wal_bucket_is_format_5_under_the_same_operations() {
             JournalMode::Wal => {
                 assert_eq!(seen_kinds, BTreeSet::from([1, 4]), "{seen_kinds:?}")
             }
-            JournalMode::Mvcc => assert!(seen_kinds.contains(&3), "{seen_kinds:?}"),
+            JournalMode::Mvcc => {
+                assert!(
+                    seen_kinds.contains(&3) && seen_kinds.contains(&4),
+                    "{seen_kinds:?}"
+                )
+            }
         }
         c.close().unwrap();
         db.close().unwrap();

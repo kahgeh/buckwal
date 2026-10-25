@@ -1,8 +1,9 @@
 //! The packer: a pack is one object that holds a whole database's pages as of one generation.
 //! `pointer` is the `pack-latest` object that names the newest pack; `codes` checks a pack's
-//! blocks; `run` is one pack run.
+//! blocks; `run` is one pack run; `first` publishes a new MVCC database's first pack.
 
 pub(crate) mod codes;
+pub(crate) mod first;
 pub(crate) mod pointer;
 pub(crate) mod run;
 #[cfg(test)]

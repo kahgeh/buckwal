@@ -79,11 +79,11 @@ fn maintenance_checkpoints_mvcc_when_log_bytes_exceed_threshold() {
             .iter()
             .any(|e| matches!(e, Event::MaintenanceFinished { generation: 2, .. })));
     }
-    // Sealed: generation +1, the new generation's log image empty, the local log cut, and
-    // the measure back to 0.
+    // Switched: generation +1 (no manifest), the new generation's log image empty, the local
+    // log cut, and the measure back to 0.
     assert_eq!(db.generation(), 3);
     let b = bucket_image(&*mem);
-    assert_eq!((b.head.generation, b.head.manifest), (3, Some(2)));
+    assert_eq!((b.head.generation, b.head.manifest), (3, None));
     assert_eq!(b.kinds, Vec::<u8>::new());
     assert!(b.log.is_empty());
     assert_eq!(read(&dir, "app.db-log"), Vec::<u8>::new());

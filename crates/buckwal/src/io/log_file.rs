@@ -10,12 +10,13 @@
 //! follower makes exactly such a sync, Q6). A fenced writer fails every sync for good.
 //!
 //! Generation changes: when the bucket's generation is not the one this file last shipped
-//! to (a seal adopted by `settle_log`, or a seal elsewhere), the new generation's `.db-log`
+//! to (a switch or seal adopted by `settle_log`, or one elsewhere), the new generation's `.db-log`
 //! image is the local file as it then stands, so the whole file, from offset 0, is what the
 //! next record ships (the generation-change invariant). The same happens at the first sync
 //! after `ship_whole_file_next` (the open), over whatever the image held.
 //!
-//! The truncate of a generation change (`LogDurableStorage::truncate`, after its seal) is not
+//! The truncate of a generation change (`LogDurableStorage::truncate`, after its switch or
+//! seal) is not
 //! recorded: the new generation's image is empty, as the file then is. Only if a sync shipped
 //! into the new generation first is it recorded, so the image follows the file.
 //!
@@ -23,7 +24,7 @@
 //! a header-only write (56 bytes at offset 0). A group commit's lead writes every queued frame
 //! and makes the one sync, so its call carries one ack per frame.
 //!
-//! It never seals (`LogDurableStorage::truncate` does). It keeps the file's high-water mark
+//! It never ends a generation (`LogDurableStorage::truncate` does). It keeps the file's high-water mark
 //! (`high_water`, shared with `Engine::wal_bytes`) for the maintenance trigger, which reads it.
 use super::read_at;
 use super::stash::stash;
@@ -402,7 +403,6 @@ impl File for LogShippingFile {
 mod tests {
     use super::*;
     use crate::bucket::Bucket;
-    use crate::create::Image;
     use crate::format::{apply_ops, decode_record, encode_record, Keys, LogRecord};
     use crate::io::stash;
     use crate::store::fault::HoldStore;
@@ -525,9 +525,9 @@ mod tests {
         }
     }
 
-    /// An MVCC bucket (generation 2, as `create_sealed` leaves it) behind `fault` (over
-    /// `gate`, over `mem`), with `hold` in front of everything; its uploader; a local
-    /// `app.db-log`.
+    /// An MVCC bucket of format 5 (generation 2, as `create_packed_mvcc` leaves it, its first
+    /// pack a one-page file) behind `fault` (over `gate`, over `mem`), with `hold` in front of
+    /// everything; its uploader; a local `app.db-log`.
     struct Rig {
         mem: Arc<MemStore>,
         gate: Arc<GetGate>,
@@ -544,7 +544,7 @@ mod tests {
     }
 
     /// `rig`, after a takeover: writer w2 took the head over from the creating writer w1 and
-    /// appended its fence record, so its first seal skips a generation.
+    /// appended its fence record, so its first generation switch skips a generation.
     fn rig_taken_over() -> Rig {
         rig_build(2_000, None, true)
     }
@@ -559,17 +559,17 @@ mod tests {
         });
         let fault = Arc::new(FaultStore::new(gate.clone()));
         let hold = Arc::new(HoldStore::new(fault.clone()));
-        let image = Image {
-            page_size: 4096,
-            pages: vec![(1, vec![0u8; 4096])],
-        };
-        let mut b = Bucket::create_sealed(
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("first-pack");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let mut b = Bucket::create_packed_mvcc(
             hold.clone(),
             keys(),
             retry(deadline_ms),
             4,
             "w1".into(),
-            image,
+            &image,
+            4096,
         )
         .unwrap();
         if taken_over {
@@ -582,7 +582,6 @@ mod tests {
         }
         let up = Uploader::spawn(b, None, None, Arc::default());
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.db-log");
         let local = io
             .open_file(path.to_str().unwrap(), OpenFlags::Create, false)
@@ -1141,29 +1140,25 @@ mod tests {
         assert!(r.records(2).is_empty(), "a replica sync ships nothing");
     }
 
-    /// A seal's head PUT stored and its reply was lost: generation 3 is published. The next
-    /// sync adopts it before it appends, is acked, and ships the whole local log, from offset
-    /// 0 with its header, as the first kind-3 record of generation 3 (the generation-change
-    /// invariant). Later commits land after it.
+    /// A generation switch's head PUT stored and its reply was lost: generation 3 is
+    /// published. The next sync adopts it before it appends, is acked, and ships the whole
+    /// local log, from offset 0 with its header, as the first kind-3 record of generation 3
+    /// (the generation-change invariant). Later commits land after it.
     #[test]
-    fn sync_adopts_published_pending_seal_before_append() {
+    fn sync_adopts_published_pending_switch_before_append() {
         let r = rig_with(100, None);
         let f = r.file();
         write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
         write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
         assert_eq!(sync(&f, &*r.io), Ok(()));
-        // A commit written, not yet synced, when the seal runs.
+        // A commit written, not yet synced, when the switch runs.
         write(&f, &*r.io, (HEADER + 55) as u64, frame(2, 49)).unwrap();
 
         r.fault.only_keys_containing("/head");
         r.fault.store_then_fail_next_puts(1);
         r.fault.fail_puts_after(0);
-        assert!(r
-            .up
-            .seal_generation(vec![(1, vec![5u8; 4096])], 4096, 1)
-            .is_err());
-        let head =
-            crate::format::Head::decode(&r.mem.get(&keys().head()).unwrap().unwrap().body).unwrap();
+        assert!(r.up.switch_generation().is_err());
+        let head = head_of(&r.mem);
         assert_eq!(head.generation, 3, "the head PUT stored");
         assert_eq!(r.up.generation(), 2, "its reply was lost");
         r.heal();
@@ -1193,9 +1188,31 @@ mod tests {
         assert_eq!(r.image(3), r.local_bytes());
     }
 
-    /// A takeover's seal moves the head to G+2 with its objects under G+1 (`create_sealed`
-    /// leaves G = 2): nothing is written under G, no `log/<G+1>` exists, and the kind-3 records
-    /// of the new generation start in `log/<G+2>`.
+    /// The head, decoded.
+    fn head_of(mem: &MemStore) -> crate::format::Head {
+        crate::format::Head::decode(&mem.get(&keys().head()).unwrap().unwrap().body).unwrap()
+    }
+
+    /// The seal-start record at `log/<gen>/<seq>` names `next`.
+    fn names_next(r: &Rig, gen: u64, seq: u64, next: u64) {
+        match &r.records(gen)[seq as usize - 1] {
+            LogRecord::Extents {
+                file: LogFile::Wal,
+                syncs,
+                next_generation,
+                ..
+            } => {
+                assert!(syncs.is_empty(), "a seal-start record holds no ops");
+                assert_eq!(*next_generation, Some(next));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A takeover's generation switch moves the head to G+2 (`create_packed_mvcc` leaves
+    /// G = 2): the seal-start record in `log/<G>` names G+2, no `log/<G+1>` exists, no page,
+    /// manifest or pack goes up, and the kind-3 records of the new generation start in
+    /// `log/<G+2>`.
     #[test]
     fn mvcc_takeover_seal_lands_on_g_plus_2() {
         let r = rig_taken_over();
@@ -1204,26 +1221,34 @@ mod tests {
         write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
         assert_eq!(sync(&f, &*r.io), Ok(()));
         assert_eq!(kinds(&r.records(2)), [2, 3], "the fence, then the record");
+        let objects = r.mem.list("").unwrap().len();
+        assert_eq!(r.up.switch_generation(), Ok(4));
+        let head = head_of(&r.mem);
         assert_eq!(
-            r.up.seal_generation(vec![(1, vec![5u8; 4096])], 4096, 1),
-            Ok(4)
+            (
+                head.format,
+                head.generation,
+                head.manifest,
+                head.next_generation_floor,
+                head.journal_mode
+            ),
+            (
+                crate::format::FORMAT_V5,
+                4,
+                None,
+                Some(4),
+                crate::config::JournalMode::Mvcc
+            )
         );
-        let head =
-            crate::format::Head::decode(&r.mem.get(&keys().head()).unwrap().unwrap().body).unwrap();
+        assert_eq!(kinds(&r.records(2)), [2, 3, 1]);
+        names_next(&r, 2, 3, 4);
         assert_eq!(
-            (head.generation, head.manifest, head.next_generation_floor),
-            (4, Some(3), Some(4))
+            r.mem.list("").unwrap().len(),
+            objects + 1,
+            "only the seal-start record (and the head, replaced)"
         );
-        assert!(r.mem.get(&keys().page(3, 1)).unwrap().is_some());
-        assert!(r.mem.get(&keys().manifest(3)).unwrap().is_some());
-        assert!(
-            r.mem.get(&keys().page(2, 1)).unwrap().is_none(),
-            "nothing under G"
-        );
-        assert!(
-            r.mem.get(&keys().manifest(2)).unwrap().is_none(),
-            "nothing under G"
-        );
+        assert!(r.mem.list(&keys().page_root()).unwrap().is_empty());
+        assert!(r.mem.list(&keys().manifest_root()).unwrap().is_empty());
         assert!(
             r.records(3).is_empty(),
             "no log under the skipped generation"
@@ -1239,8 +1264,9 @@ mod tests {
         assert_eq!(r.image(4), r.local_bytes());
     }
 
-    /// The same with the seal's head reply lost: G+2 is published, and the next sync adopts it
-    /// (it names this writer) before it appends, shipping the whole local log into `log/<G+2>`.
+    /// The same with the switch's head reply lost: G+2 is published, and the next sync adopts
+    /// it (it names this writer) before it appends, shipping the whole local log into
+    /// `log/<G+2>`. The seal-start record is in `log/<G>` once.
     #[test]
     fn mvcc_seal_with_lost_head_reply_adopts_g_plus_2() {
         let r = rig_taken_over();
@@ -1253,15 +1279,11 @@ mod tests {
         r.fault.only_keys_containing("/head");
         r.fault.store_then_fail_next_puts(1);
         r.fault.fail_puts_after(0);
-        assert!(r
-            .up
-            .seal_generation(vec![(1, vec![5u8; 4096])], 4096, 1)
-            .is_err());
-        let head =
-            crate::format::Head::decode(&r.mem.get(&keys().head()).unwrap().unwrap().body).unwrap();
+        assert!(r.up.switch_generation().is_err());
+        let head = head_of(&r.mem);
         assert_eq!(
             (head.generation, head.manifest),
-            (4, Some(3)),
+            (4, None),
             "the head PUT stored"
         );
         assert_eq!(r.up.generation(), 2, "its reply was lost");
@@ -1269,6 +1291,8 @@ mod tests {
 
         assert_eq!(sync(&f, &*r.io), Ok(()));
         assert_eq!(r.up.generation(), 4, "adopted");
+        assert_eq!(kinds(&r.records(2)), [2, 3, 1], "one seal-start record");
+        names_next(&r, 2, 3, 4);
         assert!(
             r.records(3).is_empty(),
             "no log under the skipped generation"
@@ -1283,22 +1307,21 @@ mod tests {
         io.wait_for_completion(c).unwrap();
     }
 
-    /// A generation change's `truncate(0)`: right after a seal it is not recorded (the new
+    /// A generation change's `truncate(0)`: right after a switch it is not recorded (the new
     /// generation's image is empty, as the file now is), and the next sync ships nothing. If a
     /// sync shipped into the new generation before the truncate (the engine's checkpoint lock
     /// keeps commits out; this is the backstop), the truncate is recorded and shipped, so the
     /// new generation's image is still the local file.
     #[test]
-    fn truncate_after_a_seal_is_recorded_only_if_the_new_generation_holds_bytes() {
+    fn truncate_after_a_switch_is_recorded_only_if_the_new_generation_holds_bytes() {
         let r = rig();
         let f = r.file();
         write(&f, &*r.io, 0, frame(0xAA, HEADER)).unwrap();
         write(&f, &*r.io, HEADER as u64, frame(1, 55)).unwrap();
         assert_eq!(sync(&f, &*r.io), Ok(()));
-        let page = || vec![(1, vec![0u8; 4096])];
 
-        // The normal path: the seal, then the truncate.
-        assert_eq!(r.up.seal_generation(page(), 4096, 1), Ok(3));
+        // The normal path: the switch, then the truncate.
+        assert_eq!(r.up.switch_generation(), Ok(3));
         trunc(&f, &*r.io, 0);
         assert_eq!(sync(&f, &*r.io), Ok(()));
         assert!(r.records(3).is_empty(), "nothing shipped into generation 3");
@@ -1307,9 +1330,9 @@ mod tests {
         assert_eq!(kinds(&r.records(3)), [3]);
         assert_eq!(r.image(3), r.local_bytes());
 
-        // A sync between the seal and the truncate ships the whole file into generation 4;
+        // A sync between the switch and the truncate ships the whole file into generation 4;
         // the truncate after it is shipped too.
-        assert_eq!(r.up.seal_generation(page(), 4096, 1), Ok(4));
+        assert_eq!(r.up.switch_generation(), Ok(4));
         assert_eq!(sync(&f, &*r.io), Ok(()));
         assert_eq!(r.image(4), r.local_bytes());
         assert!(!r.local_bytes().is_empty());

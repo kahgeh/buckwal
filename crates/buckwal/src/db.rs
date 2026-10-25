@@ -637,12 +637,14 @@ fn create_new(
 }
 
 /// A new MVCC database (`create`): the empty image built in `<dir>/app.db-creating`, the
-/// bucket created as a seal of it (`Bucket::create_sealed`, the head last), then the local
-/// state (format 2, at the head's generation, claimed, complete) written into the staging
-/// directory and the files moved in (`create::move_created`). Nothing goes to the bucket
-/// before the image is whole; a failure or crash before the head leaves only the staging
-/// directory (and unreferenced `pages/1/*`, `manifest/1`), which the next open removes and
-/// a retry overwrites. A crash after the head leaves a bucket the next open restores.
+/// bucket created with it as its first pack (`Bucket::create_packed_mvcc_with`: the pack, its
+/// codes, the pointer, then the head, last), then the local state (format 2, at the head's
+/// generation, claimed, complete) written into the staging directory and the files moved in
+/// (`create::move_created`). Nothing goes to the bucket before the image is whole; a failure or
+/// crash before the head leaves only the staging directory (and an orphan pack, and maybe a
+/// pointer no head names), which the next open removes and a retry replaces. A crash after
+/// the head leaves a bucket the next open restores. (Tests of the seal formats create a format
+/// 2 or 4 bucket as a seal instead, `Bucket::create_sealed_with`.)
 fn create_new_mvcc(
     dir: &Path,
     store: &Arc<dyn ObjectStore>,
@@ -652,15 +654,19 @@ fn create_new_mvcc(
     let staging = create::staging_dir(dir);
     let image = create::build_mvcc_image(&staging, cfg.encryption.as_deref())?;
     let writer_id = new_writer_id()?;
-    let mut bucket = Bucket::create_sealed_with(
-        store.clone(),
-        keys.clone(),
-        cfg.retry.clone(),
-        cfg.upload_concurrency,
-        writer_id.clone(),
-        image,
-        timeouts_of(cfg),
-    )?;
+    let mut bucket = match create_sealed_mvcc(store, keys, cfg, &writer_id, &image)? {
+        Some(b) => b,
+        None => Bucket::create_packed_mvcc_with(
+            store.clone(),
+            keys.clone(),
+            cfg.retry.clone(),
+            cfg.upload_concurrency,
+            writer_id.clone(),
+            &staging.join(DB_FILE),
+            image.page_size,
+            timeouts_of(cfg),
+        )?,
+    };
     bucket.set_lease(cfg.lease);
     let state = LocalState {
         format: FORMAT_V2,
@@ -678,6 +684,43 @@ fn create_new_mvcc(
     state.write_atomic(&staging)?;
     create::move_created(&staging, dir)?;
     Ok((bucket, state))
+}
+
+/// Tests of the seal formats (`LegacySeal`, `LegacyFormat3`): the bucket of a new MVCC
+/// database created as a seal of generation 1 (format 2, 4 or 3), as before format 5. `None`
+/// otherwise: a new MVCC database is a format 5 one.
+#[cfg(test)]
+fn create_sealed_mvcc(
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    writer_id: &str,
+    image: &create::Image,
+) -> Result<Option<Bucket>> {
+    if keys.new_mvcc_packed() {
+        return Ok(None);
+    }
+    Bucket::create_sealed_with(
+        store.clone(),
+        keys.clone(),
+        cfg.retry.clone(),
+        cfg.upload_concurrency,
+        writer_id.to_string(),
+        image.clone(),
+        timeouts_of(cfg),
+    )
+    .map(Some)
+}
+
+#[cfg(not(test))]
+fn create_sealed_mvcc(
+    _: &Arc<dyn ObjectStore>,
+    _: &Keys,
+    _: &EngineConfig,
+    _: &str,
+    _: &create::Image,
+) -> Result<Option<Bucket>> {
+    Ok(None)
 }
 
 /// What `attach_existing` hands on.

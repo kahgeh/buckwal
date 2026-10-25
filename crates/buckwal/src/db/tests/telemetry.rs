@@ -118,8 +118,11 @@ fn only_the_first_seal_after_a_takeover_has_a_skipped_generation() {
     assert!(ms > 0 && ms <= 800, "{ms}");
 }
 
+/// The MVCC generation switch (`LogDurableStorage::truncate`) after a takeover: its
+/// `buckwal.generation_switch` span names the generation G and the next one, G + 2 (a skipped
+/// generation, as the WAL switch); the next switch moves by one.
 #[test]
-fn the_mvcc_seal_span_names_the_skipped_generation_too() {
+fn the_mvcc_switch_span_names_the_skipped_generation_too() {
     let store = mem();
     let k = tempdir();
     let a = tempdir();
@@ -142,18 +145,26 @@ fn the_mvcc_seal_span_names_the_skipped_generation_too() {
         c.close().unwrap();
         db.close().unwrap();
     });
-    let seals = spans.named("buckwal.checkpoint_upload");
-    assert!(seals.len() >= 2, "{seals:?}");
-    let skipped = (g + 1).to_string();
+    let switches = spans.named("buckwal.generation_switch");
+    assert!(switches.len() >= 2, "{switches:?}");
+    let field = |i: usize, f: &str| switches[i].field(f).map(str::to_string);
+    assert_eq!(field(0, "buckwal.generation"), Some(g.to_string()));
     assert_eq!(
-        seals[0].field("buckwal.skipped_generation"),
-        Some(skipped.as_str()),
-        "{:?}",
-        seals[0]
+        field(0, "buckwal.next_generation"),
+        Some((g + 2).to_string()),
+        "the first switch after a takeover skips generation {}",
+        g + 1
     );
-    for s in &seals[1..] {
-        assert_eq!(s.field("buckwal.skipped_generation"), None, "{s:?}");
-    }
+    assert_eq!(field(1, "buckwal.generation"), Some((g + 2).to_string()));
+    assert_eq!(
+        field(1, "buckwal.next_generation"),
+        Some((g + 3).to_string())
+    );
+    assert_eq!(field(0, "buckwal.outcome").as_deref(), Some("switched"));
+    assert!(
+        spans.named("buckwal.checkpoint_upload").is_empty(),
+        "no seal"
+    );
     crash(db_a, vec![ca]);
 }
 

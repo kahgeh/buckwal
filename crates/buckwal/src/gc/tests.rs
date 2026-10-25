@@ -346,6 +346,8 @@ fn restored_mvcc_rows(store: &Arc<MemStore>) -> Vec<i64> {
 /// kind-1 and kind-3 objects, and a restore still has every row.
 #[test]
 fn gc_and_trim_across_mvcc_generations_keep_only_sealed_manifest_pages_and_log() {
+    // A seal test of formats 2 and 4 (`bucket::legacy`): MVCC buckets made before format 5.
+    let _legacy = crate::format::LegacySeal::on();
     let store = mem();
     let a = tempdir();
     let k = keys();
