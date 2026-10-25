@@ -1,8 +1,8 @@
 # Packer, stage 1: what was measured
 
-Date: 2026-10-25. Machine: Apple M4 Max Mac, macOS, home internet link. Stores: RustFS 1.0.0 on this Mac, and AWS S3 in ap-southeast-2.
+Date: 2026-10-25. Sizes: "MB" and "GB" mean MiB and GiB in the probes, so a "100 MB" object is 104,857,600 bytes. Machine: Apple M4 Max Mac, macOS, home internet link. Stores: RustFS 1.0.0 on this Mac, and AWS S3 in ap-southeast-2.
 
-**This report is partial.** The user asked to stop the measurements on 2026-10-25 and to start stage 2. The sections "Not measured" lists what stage 1 did not do. The probes were throwaway code and are not in the repository.
+**This report is partial.** The user asked to stop the measurements on 2026-10-25 and to start stage 2. The section "Not measured" lists what stage 1 did not do. The probes were throwaway code and are not in the repository.
 
 ## Result
 
@@ -41,19 +41,19 @@ Multipart upload in 16 MiB parts, 8 parts at once, then a range GET download of 
 
 The upload speed is the speed of this Mac's link. A server in the same AWS region would be faster. Stage 1 did not measure that.
 
-**Today's design on 100 MB (AWS)**, with buckwal's own library: 100 MB filled in 108.7 s (25,120 PUTs). A commit that changed 10% of the pages took 1.60 s. The next commit, which sealed the restarted WAL, waited **8.85 s** (2,571 PUTs, 25.3 MB). Later small commits took 0.05 s. A restore took 0.5 s. The full read of the restored copy (about 26,000 GETs) did not finish and is not measured.
+**Today's design on 100 MB (AWS)**, with buckwal's own library: 100 MB filled in 108.7 s (25,120 PUTs). A commit that changed 10% of the pages took 1.60 s. The next commit, which sealed the restarted WAL, waited **8.85 s** (2,571 PUTs, 25.3 MB). Later small commits took 0.05 to 0.06 s. A restore took 0.5 s. The full read of the restored copy (about 26,000 GETs) did not finish and is not measured.
 
-**buckwal's S3 store tests on AWS.** The 9 non-TLS tests of `crates/buckwal/tests/s3_rustfs.rs` ran against the AWS bucket with `BUCKWAL_PATH_STYLE=false`, and passed (118 s). They need a test-only change first: `S3Store::create_bucket` sends no `LocationConstraint`, so AWS answers `IllegalLocationConstraintException` outside us-east-1. The 4 TLS tests need local certificates and did not run. buckwal ran on AWS S3 for the first time in this stage, over the store and the open, commit, close, restore path.
+**buckwal's S3 store tests on AWS.** The 9 non-TLS tests of `crates/buckwal/tests/s3_rustfs.rs` ran against the AWS bucket with `BUCKWAL_PATH_STYLE=false`, and passed (118 s). They need a test-only change first (the test skips `create_bucket`, because the bucket already exists): `S3Store::create_bucket` sends no `LocationConstraint`, so AWS answers `IllegalLocationConstraintException` outside us-east-1. The 4 TLS tests need local certificates and did not run. buckwal ran on AWS S3 for the first time in this stage, over the store and the open, commit, close, restore path.
 
 ## RustFS checks
 
 - RustFS completes a multipart upload (3 parts of 16 MiB, 40 MB) and answers `Range` with 206 and the right bytes.
 - On RustFS direct (no added delay): 4 KiB GET median 0.6 ms, PUT 1.2 ms, `If-None-Match` 1.1 ms, `If-Match` 1.4 ms. A 100 MB multipart upload took 0.80 s (125 MB/s) and its range download 0.24 s.
-- Today's design on a 20 MB database, no delay: the sealing commit waited 0.15 s (530 PUTs). This matches the mechanism of the discovery.
+- Today's design on a 20 MB database, no delay: the sealing commit waited 0.15 s (530 PUTs). This shows the same mechanism as the 2026-10-25 figures in the spec: the commit after a WAL restart uploads the changed pages.
 
 ## turso 0.8.3 `VACUUM` (turso_core, `DatabaseOpts::with_vacuum(true)`)
 
-A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, then the statement. Each result below is the same for 100 MB and 1 GB; the 1 GB numbers are shown.
+A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, then the statement. The 1 GB numbers are shown. A run at 100 MB gave the same results.
 
 | Database | Statement | Time | Result | Peak WAL |
 |---|---|---|---|---|
@@ -64,7 +64,7 @@ A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, 
 | MVCC | `VACUUM INTO` | 1.21 s | copy opens, integrity ok | none |
 | encrypted | `VACUUM INTO` | 0.97 s | **copy is plaintext and does not open with the key** | none |
 
-The in-place `VACUUM` writes a WAL about as large as the new file. **The `VACUUM INTO` copy of an encrypted database starts with `SQLite format 3` (plaintext), and opening it with the key fails with `Decryption failed for page=1`.** Stage 2 must use the in-place `VACUUM` on the packer's working copy and never `VACUUM INTO` on an encrypted database.
+After the in-place `VACUUM` of the encrypted database, the file still has no plaintext header. The in-place `VACUUM` writes a WAL about as large as the new file. **The `VACUUM INTO` copy of an encrypted database starts with `SQLite format 3` (plaintext), and opening it with the key fails with `Decryption failed for page=1`.** Stage 2 must use the in-place `VACUUM` on the packer's working copy and never `VACUUM INTO` on an encrypted database.
 
 ## Not measured
 
@@ -72,8 +72,13 @@ The in-place `VACUUM` writes a WAL about as large as the new file. **The `VACUUM
 - The pause that stays: the size-limit checkpoint at a 64 MiB and a 256 MiB WAL with readers open.
 - The check that a PASSIVE checkpoint with a reader open never waits for the reader (the probe was stopped before it ran).
 - The full read of a restored 100 MB copy on AWS (about 26,000 GETs).
-- 1 GB on RustFS with added delay (the discovery's figures stand).
+- 1 GB on RustFS with added delay (the spec's figures of 2026-10-25 stand).
 
 ## AWS cost
 
-Counted by a ledger in the probe (PUT, POST and LIST at US$0.0055 per 1,000, GET and HEAD at US$0.00044 per 1,000, transfer out at US$0.12 per GB, always charged). Final count: 34,016 PUT, POST and LIST requests (US$0.19), 58,242 GET and HEAD requests (US$0.03, rounded up: 28,000 of them were reserved for the stopped full read) and 3.69 GB downloaded (US$0.44). The estimate is **US$0.66**, under the limit of US$5. The bucket holds no object and no open multipart upload after the cleanup.
+The probe counted its own requests. The runs of the buckwal library were added as planned amounts, so every figure here is an upper estimate. Prices are the ap-southeast-2 list prices: PUT, POST and LIST at US$0.0055 per 1,000, GET and HEAD at US$0.00044 per 1,000. Transfer out is at US$0.12 per GB and is always charged.
+- 34,016 PUT, POST and LIST requests: US$0.19.
+- 58,242 GET and HEAD requests: US$0.03. About 27,300 of them are DELETE requests from the cleanup, which AWS does not charge. The count also holds 28,000 GETs reserved for the stopped full read.
+- 3.69 GB downloaded: US$0.44.
+
+The total is at most **US$0.66**, under the limit of US$5. After the cleanup the bucket holds no object and no open multipart upload.
