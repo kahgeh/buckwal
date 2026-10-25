@@ -441,9 +441,6 @@ fn last_seq(store: &dyn ObjectStore, g: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// More than the takeover quiet of the test configuration (lease 30 s + request timeout 10 s).
-const PAST_QUIET: Duration = Duration::from_secs(60);
-
 #[test]
 fn pack_applies_one_generation() {
     for encrypted in [false, true] {
@@ -550,65 +547,130 @@ fn generation_without_terminal_record_waits() {
     let r = run(&cfg, mem.clone()).unwrap();
     assert_eq!(r.outcome, PackOutcome::NothingToDo);
     assert_eq!(r.pack_generation, 0);
-    // A generation below the head with no terminal record waits too.
-    w.end_generation();
-    let s = last_seq(&*mem, 1);
-    assert!(
-        matches!(record_at(&*mem, 1, s), LogRecord::Extents { ref syncs, .. } if syncs.is_empty())
-    );
-    mem.delete(&keys().log(1, s)).unwrap();
-    let r = run(&cfg, mem.clone()).unwrap();
-    assert_eq!(r.outcome, PackOutcome::NothingToDo);
     assert!(packs(&*mem).is_empty() && pointer_of(&*mem).is_none());
     w.crash();
 }
 
+/// The ended generations a scan of `store` from `from` finds (`ended_generations`).
+fn ended(cfg: &Config, store: &MemStore, from: u64) -> Vec<EndedGeneration> {
+    let k = keys();
+    let retry = cfg.engine(crate::io::IoMode::Writer).retry;
+    let r = LogReader {
+        store,
+        keys: &k,
+        retry: &retry,
+        concurrency: 4,
+    };
+    ended_generations(&r, from, &head_of(store)).unwrap().ended
+}
+
+/// A seal-start record of `writer`; in format 5 it names the switch's next generation.
+fn seal_start(writer: &str, next: Option<u64>) -> LogRecord {
+    LogRecord::Extents {
+        file: crate::format::LogFile::Wal,
+        writer_id: writer.into(),
+        syncs: Vec::new(),
+        next_generation: next,
+    }
+}
+
+/// `rec`, an Extents record, as writer `writer` wrote it.
+fn as_writer(rec: LogRecord, writer: &str) -> LogRecord {
+    match rec {
+        LogRecord::Extents { file, syncs, .. } => LogRecord::Extents {
+            file,
+            writer_id: writer.into(),
+            syncs,
+            next_generation: None,
+        },
+        r => panic!("not an Extents record: {r:?}"),
+    }
+}
+
+/// Make the last record of generation `g`, a seal-start record the writer of today wrote,
+/// the format 5 one: it names `next`, the generation its switch moved the head to.
+fn link(store: &dyn ObjectStore, g: u64, next: u64) {
+    let s = last_seq(store, g);
+    let LogRecord::Extents {
+        writer_id, syncs, ..
+    } = record_at(store, g, s)
+    else {
+        panic!("log/{g} ends with a fence");
+    };
+    assert!(
+        syncs.is_empty(),
+        "log/{g} does not end with a seal-start record"
+    );
+    put_record(store, g, s, &seal_start(&writer_id, Some(next)));
+}
+
+/// The rows a restore of generation 1 (no pack, no seal) gives, with `writer` the writer the
+/// head named at generation 1.
+fn restore_rows_of_generation_1(store: &dyn ObjectStore, writer: &str) -> Vec<i64> {
+    let head = Head {
+        generation: 1,
+        writer_id: writer.into(),
+        ..head_of(store)
+    };
+    let cfg = config(Path::new("/x")).engine(crate::io::IoMode::Writer);
+    let images = crate::restore::generation_image(store, &keys(), &head, &cfg).unwrap();
+    let seed = crate::restore::page_one_seed(&images.wal, &head, JournalMode::Wal).unwrap();
+    rows_of(&seed, Some(&images.wal), None)
+}
+
+fn no_upload_and_no_pointer_write(hs: &HookStore, mem: &MemStore) {
+    assert!(
+        !hs.calls().iter().any(|c| c.starts_with("put_multipart")
+            || (c.starts_with("put") && c.ends_with("pack-latest"))),
+        "{:?}",
+        hs.calls()
+    );
+    assert!(packs(mem).is_empty() && pointer_of(mem).is_none());
+}
+
+/// A run through a recording store that must end `log_incomplete` at `key`, having uploaded
+/// nothing.
+fn assert_log_incomplete(mem: &Arc<MemStore>, t: &TempDir, key: String) {
+    let hs = HookStore::new(mem.clone());
+    let r = run(&packer(t), hs.clone()).unwrap();
+    assert_eq!(failed_at(&r, "log_incomplete"), Some(key));
+    no_upload_and_no_pointer_write(&hs, mem);
+}
+
 #[test]
-fn fence_generation_applies_only_up_to_the_fence_record() {
+fn head_past_generation_without_seal_start_last_is_log_incomplete() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let s = last_seq(&*mem, 1);
+    assert_eq!(
+        record_at(&*mem, 1, s),
+        seal_start(&head_of(&*mem).writer_id, None)
+    );
+    mem.delete(&keys().log(1, s)).unwrap();
+    let t = tempdir();
+    assert_log_incomplete(&mem, &t, keys().log(1, s - 1));
+    w.crash();
+}
+
+#[test]
+fn fence_last_with_head_at_generation_is_not_ended() {
     let mem = Arc::new(MemStore::new());
     let w = writer(&mem);
     w.insert(1..=2);
-    w.insert(3..=3);
     w.crash();
-    // Row 3's record lands after the fence: a late record of the fenced writer.
-    let s = last_seq(&*mem, 1);
-    let late = record_at(&*mem, 1, s);
-    let epoch = head_of(&*mem).epoch + 1;
-    mem.delete(&keys().log(1, s)).unwrap();
-    put_record(&*mem, 1, s, &fence(epoch));
-    put_record(&*mem, 1, s + 1, &late);
-    move_head(&*mem, 3);
+    let retry = config(Path::new("/x"))
+        .engine(crate::io::IoMode::Writer)
+        .retry;
+    let (taken, _) = crate::bucket::take_over(&*mem, &keys(), &retry, 1, "b").unwrap();
+    put_record(&*mem, 1, last_seq(&*mem, 1) + 1, &fence(taken.epoch));
     let t = tempdir();
     let cfg = packer(&t);
-    // The takeover quiet has not passed yet.
+    assert!(ended(&cfg, &mem, 1).is_empty());
     let r = run(&cfg, mem.clone()).unwrap();
     assert_eq!(r.outcome, PackOutcome::NothingToDo);
-    mem.advance_clock(PAST_QUIET);
-    let reader = LogReader {
-        store: &*mem,
-        keys: &keys(),
-        retry: &cfg.engine(crate::io::IoMode::Writer).retry,
-        concurrency: 4,
-        quiet: Duration::from_secs(40),
-    };
-    let ended = ended_generations(&reader, 1, &head_of(&*mem)).unwrap();
-    assert_eq!(
-        ended,
-        [
-            EndedGeneration {
-                generation: 1,
-                last_seq_to_apply: s
-            },
-            EndedGeneration {
-                generation: 2,
-                last_seq_to_apply: 0
-            }
-        ]
-    );
-    let r = run(&cfg, mem.clone()).unwrap();
-    packed(&r);
-    assert_eq!(r.pack_generation, 3);
-    assert_eq!(pack_rows(&*mem), vec![1, 2]);
+    assert!(packs(&*mem).is_empty() && pointer_of(&*mem).is_none());
 }
 
 #[test]
@@ -621,21 +683,22 @@ fn pack_between_head_write_and_fence_record_does_not_apply_that_generation() {
         .retry;
     // The takeover's head write; its fence record has not landed.
     crate::bucket::take_over(&*mem, &keys(), &retry, 1, "b").unwrap();
+    // Not applied because the head still names generation 1.
+    assert_eq!(head_of(&*mem).generation, 1);
     let t = tempdir();
     let cfg = packer(&t);
-    let r = run(&cfg, mem.clone()).unwrap();
-    assert_eq!(r.outcome, PackOutcome::NothingToDo);
-    // Even with the head past it, a generation with no terminal record waits.
-    move_head(&*mem, 3);
-    mem.advance_clock(PAST_QUIET);
+    assert!(ended(&cfg, &mem, 1).is_empty());
     let r = run(&cfg, mem.clone()).unwrap();
     assert_eq!(r.outcome, PackOutcome::NothingToDo);
     assert!(packs(&*mem).is_empty() && pointer_of(&*mem).is_none());
     w.crash();
 }
 
+/// The old writer acks commits between the takeover's head write and its fence record; the new
+/// writer commits after the fence in the same generation, then switches. The pack holds all of
+/// them, as a restore does.
 #[test]
-fn later_run_holds_acked_commits_before_fence_and_none_after() {
+fn later_run_holds_acked_commits_before_fence_and_new_writers_after() {
     let mem = Arc::new(MemStore::new());
     let w = writer(&mem);
     w.insert(1..=2);
@@ -643,75 +706,224 @@ fn later_run_holds_acked_commits_before_fence_and_none_after() {
         .engine(crate::io::IoMode::Writer)
         .retry;
     let (taken, _) = crate::bucket::take_over(&*mem, &keys(), &retry, 1, "b").unwrap();
-    // The old writer still acks commits between the head write and the fence record.
     w.insert(3..=3);
+    // Row 4's record becomes the new writer's first commit after the fence.
     w.insert(4..=4);
     w.crash();
-    // Row 4 is a late record: its seq comes after the fence's.
     let s = last_seq(&*mem, 1);
-    let late = record_at(&*mem, 1, s);
+    let r4 = record_at(&*mem, 1, s);
     mem.delete(&keys().log(1, s)).unwrap();
     put_record(&*mem, 1, s, &fence(taken.epoch));
-    put_record(&*mem, 1, s + 1, &late);
+    put_record(&*mem, 1, s + 1, &as_writer(r4, "b"));
+    put_record(&*mem, 1, s + 2, &seal_start("b", Some(3)));
     move_head(&*mem, 3);
-    mem.advance_clock(PAST_QUIET);
+    let want = restore_rows_of_generation_1(&*mem, "b");
+    assert_eq!(want, vec![1, 2, 3, 4]);
     let t = tempdir();
     let r = run(&packer(&t), mem.clone()).unwrap();
     packed(&r);
-    assert_eq!(pack_rows(&*mem), vec![1, 2, 3]);
+    assert_eq!(r.pack_generation, 3);
+    assert_eq!(pack_rows(&*mem), want);
 }
 
+/// An older writer's seal-start record before a fence holds no pages and changes nothing.
 #[test]
-fn skipped_generation_is_passed_over() {
+fn earlier_seal_start_before_fence_is_harmless() {
     let mem = Arc::new(MemStore::new());
-    let a = writer(&mem);
-    a.insert(1..=3);
-    a.end_generation();
-    a.insert(4..=5);
-    a.crash();
-    // A real takeover: the head write (floor 4) and the fence record in generation 2.
+    let w = writer(&mem);
+    w.insert(1..=2);
+    w.insert(3..=3);
+    let a = head_of(&*mem).writer_id;
+    w.crash();
+    let s = last_seq(&*mem, 1);
+    let r3 = record_at(&*mem, 1, s);
+    mem.delete(&keys().log(1, s)).unwrap();
+    let epoch = head_of(&*mem).epoch + 1;
+    put_record(&*mem, 1, s, &seal_start(&a, Some(2)));
+    put_record(&*mem, 1, s + 1, &fence(epoch));
+    put_record(&*mem, 1, s + 2, &as_writer(r3, "b"));
+    put_record(&*mem, 1, s + 3, &seal_start("b", Some(3)));
+    move_head(&*mem, 3);
+    let want = restore_rows_of_generation_1(&*mem, "b");
+    assert_eq!(want, vec![1, 2, 3]);
     let t = tempdir();
-    let bdir = t.path().join("b");
-    crate::takeover::takeover_with_store(config(&bdir), mem.clone()).unwrap();
-    let b = open_with_store(config(&bdir), mem.clone()).unwrap();
-    let c = b.connect().unwrap();
-    for id in 6..=7 {
+    let r = run(&packer(&t), mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(r.pack_generation, 3);
+    assert_eq!(pack_rows(&*mem), want);
+}
+
+/// A takeover through the library, in its own directory: the head write and the fence record,
+/// then the new writer's open.
+fn take_over_into(mem: &Arc<MemStore>, dir: &Path) -> (Database, Connection) {
+    crate::takeover::takeover_with_store(config(dir), mem.clone()).unwrap();
+    let db = open_with_store(config(dir), mem.clone()).unwrap();
+    let c = db.connect().unwrap();
+    (db, c)
+}
+
+fn insert_on(c: &Connection, ids: std::ops::RangeInclusive<i64>) {
+    for id in ids {
         c.execute(
-            "INSERT INTO t(id, v) VALUES (?, 'b')",
+            "INSERT INTO t(id, v) VALUES (?, 'n')",
             &[Value::from_i64(id)],
         )
         .unwrap();
     }
-    c.checkpoint(CheckpointMode::Truncate).unwrap();
-    // The first seal after a takeover skips generation 3.
-    assert_eq!(b.generation(), 4);
-    assert!(log_keys(&*mem)
-        .iter()
-        .all(|k| keys().parse_log(k).unwrap().0 != 3));
-    c.execute("INSERT INTO t(id, v) VALUES (8, 'b')", &[])
-        .unwrap();
-    let cfg = packer(&t);
-    let reader = LogReader {
-        store: &*mem,
-        keys: &keys(),
-        retry: &cfg.engine(crate::io::IoMode::Writer).retry,
-        concurrency: 4,
-        quiet: Duration::from_secs(40),
-    };
-    let ended = ended_generations(&reader, 1, &head_of(&*mem)).unwrap();
-    let gens: Vec<_> = ended
-        .iter()
-        .map(|e| (e.generation, e.last_seq_to_apply > 0))
-        .collect();
-    assert_eq!(gens, [(1, true), (2, true), (3, false)]);
-    let r = run(&cfg, mem.clone()).unwrap();
-    packed(&r);
-    assert_eq!(r.pack_generation, 4);
-    assert_eq!(pack_rows(&*mem), (1..=7).collect::<Vec<_>>());
-    std::mem::forget(c);
-    std::mem::forget(b);
 }
 
+/// A generation switch of `db` (a TRUNCATE checkpoint), its seal-start record made the format
+/// 5 one that names the generation the head moved to. Returns that generation.
+fn switch(mem: &MemStore, db: &Database, c: &Connection) -> u64 {
+    let from = db.generation();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    let to = db.generation();
+    assert!(to > from);
+    link(mem, from, to);
+    to
+}
+
+/// The pack, then the head's generation as the WAL: a restore's rows.
+fn restore_rows(mem: &MemStore) -> Vec<i64> {
+    let head = head_of(mem);
+    let cfg = config(Path::new("/x")).engine(crate::io::IoMode::Writer);
+    let images = crate::restore::generation_image(mem, &keys(), &head, &cfg).unwrap();
+    rows_of(&pack_bytes(mem, &keys()).1, Some(&images.wal), None)
+}
+
+/// A takeover, the new writer's commits after the fence in the same generation, its switch
+/// (which skips a generation): the pack equals a restore. With format 5 seal-start records the
+/// chain names the skip; with the old ones the head's floor does.
+#[test]
+fn skipped_generation_is_passed_over() {
+    for format5 in [true, false] {
+        let mem = Arc::new(MemStore::new());
+        let a = writer(&mem);
+        a.insert(1..=3);
+        if format5 {
+            switch(&mem, &a.db, &a.c);
+        } else {
+            a.end_generation();
+        }
+        a.insert(4..=5);
+        a.crash();
+        let t = tempdir();
+        let (b, c) = take_over_into(&mem, &t.path().join("b"));
+        insert_on(&c, 6..=7);
+        if format5 {
+            assert_eq!(switch(&mem, &b, &c), 4);
+        } else {
+            c.checkpoint(CheckpointMode::Truncate).unwrap();
+            assert_eq!(b.generation(), 4);
+        }
+        assert!(log_keys(&*mem)
+            .iter()
+            .all(|k| keys().parse_log(k).unwrap().0 != 3));
+        insert_on(&c, 8..=8);
+        let cfg = packer(&t);
+        let gens: Vec<_> = ended(&cfg, &mem, 1)
+            .iter()
+            .map(|e| (e.generation, e.last_seq_to_apply > 0))
+            .collect();
+        assert_eq!(
+            gens,
+            [(1, true), (2, true), (3, false)],
+            "format 5: {format5}"
+        );
+        let r = run(&cfg, mem.clone()).unwrap();
+        packed(&r);
+        assert_eq!(r.pack_generation, 4);
+        assert_eq!(pack_rows(&*mem), (1..=7).collect::<Vec<_>>());
+        assert_eq!(restore_rows(&mem), query_ids(&c));
+        std::mem::forget(c);
+        std::mem::forget(b);
+    }
+}
+
+/// Two takeovers in one generation, a switch, a third takeover and a switch, no pack between:
+/// the gaps (two generations, then one) follow from the chain, and the pack equals a restore.
+/// The head's floor alone names only the newest gap.
+#[test]
+fn two_takeovers_a_switch_a_third_takeover_and_a_switch_pack_equals_restore() {
+    let mem = Arc::new(MemStore::new());
+    let a = writer(&mem);
+    a.insert(1..=3);
+    switch(&mem, &a.db, &a.c);
+    a.insert(4..=5);
+    a.crash();
+    let t = tempdir();
+    // Two takeovers of generation 2: floors 4, then 5. The second writer commits and switches.
+    crate::takeover::takeover_with_store(config(&t.path().join("b")), mem.clone()).unwrap();
+    let (c, cc) = take_over_into(&mem, &t.path().join("c"));
+    insert_on(&cc, 6..=7);
+    assert_eq!(switch(&mem, &c, &cc), 5);
+    insert_on(&cc, 8..=8);
+    std::mem::forget(cc);
+    std::mem::forget(c);
+    // A third takeover, of generation 5 (floor 7), and its switch.
+    let (d, cd) = take_over_into(&mem, &t.path().join("d"));
+    insert_on(&cd, 9..=10);
+    assert_eq!(switch(&mem, &d, &cd), 7);
+    insert_on(&cd, 11..=11);
+    let r = run(&packer(&t), mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(r.pack_generation, 7);
+    assert_eq!(pack_rows(&*mem), (1..=10).collect::<Vec<_>>());
+    assert_eq!(restore_rows(&mem), query_ids(&cd));
+    std::mem::forget(cd);
+    std::mem::forget(d);
+}
+
+/// The chain breaks when a link names a generation with no log that is not the head's, or a
+/// generation that is not above its own.
+#[test]
+fn broken_chain_is_log_incomplete() {
+    // The next link has no log.
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=2);
+    switch(&mem, &w.db, &w.c);
+    w.insert(3..=4);
+    switch(&mem, &w.db, &w.c);
+    w.insert(5..=5);
+    for k in mem.list(&keys().log_prefix(2)).unwrap() {
+        mem.delete(&k).unwrap();
+    }
+    let t = tempdir();
+    assert_log_incomplete(&mem, &t, keys().log_prefix(2));
+    w.crash();
+    // The next link is not above the one before it.
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=2);
+    switch(&mem, &w.db, &w.c);
+    w.insert(3..=3);
+    link(&*mem, 1, 1);
+    let t = tempdir();
+    assert_log_incomplete(&mem, &t, keys().log(1, last_seq(&*mem, 1)));
+    w.crash();
+}
+
+/// A gap of two generations after a generation with no fence record is fine when the chain
+/// names it.
+#[test]
+fn chain_names_a_gap_longer_than_the_fence_count() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    w.crash();
+    move_head(&*mem, 4);
+    link(&*mem, 1, 4);
+    let t = tempdir();
+    let r = run(&packer(&t), mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(r.pack_generation, 4);
+    assert_eq!(pack_rows(&*mem), vec![1, 2, 3]);
+}
+
+/// Old seal-start records name no next generation: a gap after a generation with no floor
+/// that names it means the log is gone.
 #[test]
 fn missing_log_without_floor_is_an_error() {
     let mem = Arc::new(MemStore::new());
@@ -725,12 +937,7 @@ fn missing_log_without_floor_is_an_error() {
         mem.delete(&k).unwrap();
     }
     let t = tempdir();
-    let r = run(&packer(&t), mem.clone());
-    match r {
-        Err(Error::Corrupt(m)) => assert!(m.contains("t/log/0000000002/"), "{m}"),
-        r => panic!("expected Corrupt, got {r:?}"),
-    }
-    assert!(packs(&*mem).is_empty() && pointer_of(&*mem).is_none());
+    assert_log_incomplete(&mem, &t, keys().log_prefix(2));
     w.crash();
 }
 
@@ -1093,5 +1300,74 @@ fn pointer_page_size_must_match_the_pack() {
         Err(Error::Corrupt(m)) => assert!(m.contains("page_size 8192"), "{m}"),
         r => panic!("expected Corrupt, got {r:?}"),
     }
+    w.crash();
+}
+
+/// A log without a fence record (the rule of logs from before stage 3): another writer's run
+/// of records, then the switcher's. A restore of that generation read it under the head of
+/// then, which named the switcher; the current head names a later writer.
+#[test]
+fn replay_of_an_ended_generation_uses_the_writer_of_its_terminal_record() {
+    let ext = |w: &str| LogRecord::Extents {
+        file: crate::format::LogFile::Wal,
+        writer_id: w.into(),
+        syncs: vec![vec![]],
+        next_generation: None,
+    };
+    let records = [ext("c"), ext("a"), seal_start("a", Some(3))];
+    let now = Head {
+        format: crate::format::FORMAT,
+        generation: 5,
+        manifest: None,
+        writer_id: "c".into(),
+        epoch: 4,
+        journal_mode: JournalMode::Wal,
+        lease_ms: None,
+        request_timeout_ms: None,
+        next_generation_floor: None,
+        database_id: None,
+    };
+    let then = Head {
+        generation: 2,
+        ..now.clone()
+    };
+    assert!(matches!(replay(&records, &then), Err(Error::Fenced(_))));
+    replay_ended(&records, &now, 2).unwrap();
+}
+
+/// `discard` keeps the pack the pointer names, and its codes.
+#[test]
+fn discard_keeps_the_pack_the_pointer_names() {
+    let mem = Arc::new(MemStore::new());
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let t = tempdir();
+    let cfg = packer(&t);
+    packed(&run(&cfg, mem.clone()).unwrap());
+    let p = pointer_of(&*mem).unwrap();
+    let hs = HookStore::new(mem.clone());
+    let (_, clock) = fake_clock();
+    let r = Run {
+        store: &*hs,
+        keys: keys(),
+        retry: cfg.engine(crate::io::IoMode::Writer).retry,
+        enc: None,
+        clock,
+        limit: Duration::from_secs(1),
+        run_id: "x".into(),
+        work: t.path().join("w"),
+        steps: Vec::new(),
+        step_start: Instant::now(),
+    };
+    r.discard(&p.pack_key, &p.codes_key);
+    assert!(mem.get(&p.pack_key).unwrap().is_some() && mem.get(&p.codes_key).unwrap().is_some());
+    assert!(!hs.calls().iter().any(|c| c.starts_with("delete")));
+    // A pack the pointer does not name goes, with its codes.
+    mem.put(&keys().pack(9, "y"), b"p").unwrap();
+    mem.put(&keys().pack_codes(9, "y"), b"c").unwrap();
+    r.discard(&keys().pack(9, "y"), &keys().pack_codes(9, "y"));
+    assert!(mem.get(&keys().pack(9, "y")).unwrap().is_none());
+    assert!(mem.get(&keys().pack_codes(9, "y")).unwrap().is_none());
     w.crash();
 }

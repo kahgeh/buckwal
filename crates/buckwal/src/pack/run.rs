@@ -1,7 +1,8 @@
 //! One pack run ([`pack`]), in the steps of the spec ("Packs and the packer"):
 //!
 //! 1. Read the head (its database id is then known), then the pack pointer.
-//! 2. List the log from the pointer's pack generation and find the ended generations.
+//! 2. List the log from the pointer's pack generation and follow the chain of ended
+//!    generations (`ended_generations`) up to the head's generation.
 //! 3. Download the newest pack in ranges and check each block against its codes.
 //! 4. Apply each ended generation with a local checkpoint, the code a restore uses
 //!    (`restore::apply_generation`), in `<config.dir>/pack-work-<run id>`.
@@ -16,15 +17,13 @@
 //! not move the pointer, but never a pack the pointer names.
 use super::codes::{CodesBuilder, PackCodes, BLOCK_SIZE};
 use super::pointer::{PackPointer, POINTER_FORMAT};
-use crate::bucket::Timeouts;
 use crate::clock::Stamp;
-use crate::config::{defaults, Config, JournalMode};
+use crate::config::{Config, JournalMode};
 use crate::encryption::{self, Encryption};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE};
-use crate::format::{Head, Keys, LogRecord};
-use crate::replica::fence::FenceRule;
-use crate::restore::{apply_generation, db_facts, fetch_generation_upto, replay};
+use crate::format::{Head, Keys, LogFile, LogRecord};
+use crate::restore::{apply_generation, db_facts, fetch_generation, replay, Images};
 use crate::store::{
     part_size_for, sha256_of, with_retry, CondPut, ObjectStore, PartSource, RetryPolicy,
 };
@@ -41,7 +40,8 @@ use std::time::{Duration, Instant};
 pub(crate) const PART_SIZE: usize = 16 << 20;
 /// How many parts go up at once, and how many ranges come down at once.
 pub(crate) const PART_CONCURRENCY: usize = 8;
-/// The most pointer writes one run sends before it gives up.
+/// The most pointer writes one run sends before it gives up (`Failed` at `pointer`), when each
+/// one gets a 412 or an unknown result and the pointer read after it still allows a retry.
 const MAX_POINTER_WRITES: u32 = 10;
 
 /// How a pack run ended.
@@ -55,9 +55,14 @@ pub enum PackOutcome {
     /// deleted its own pack and codes.
     Superseded,
     /// The run stopped at `step`; `key` is the object it concerns, when there is one. The
-    /// pointer does not name the run's pack, and the run deleted its pack and codes, except
-    /// when it could not read the pointer to make sure (`pointer read`): GC then deletes them
-    /// as an orphan.
+    /// steps: `log_incomplete` (a generation below the head's does not end with a seal-start
+    /// record, or the chain of generations breaks; nothing is uploaded), `download`, `upload`,
+    /// `verify size`, `verify checksum`, `upload codes`, `head`, `time limit`, `pointer` (more
+    /// than `MAX_POINTER_WRITES` writes, 10) and `pointer read`. The run moved no pointer, and
+    /// it deleted its pack and codes when the pointer did not name them. A pack can still stay
+    /// behind as an orphan, which GC deletes after the orphan grace: after `pointer read`, when
+    /// the run could not make sure that the pointer does not name it, and after `upload`, when
+    /// the store completed the upload but the reply was lost.
     Failed { step: String, key: Option<String> },
 }
 
@@ -85,8 +90,8 @@ pub struct PackReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EndedGeneration {
     pub generation: u64,
-    /// The seq of its terminal record: the run applies seqs 1 to it. 0 for a skipped
-    /// generation (a takeover left it with no log).
+    /// The seq of its terminal record, the last one: the run applies seqs 1 to it. 0 for a
+    /// skipped generation (a takeover left it with no log).
     pub last_seq_to_apply: u64,
 }
 
@@ -97,34 +102,50 @@ pub(crate) struct LogReader<'a> {
     pub retry: &'a RetryPolicy,
     /// Parallel log GETs.
     pub concurrency: usize,
-    /// The takeover quiet: how old a terminal fence record must be, by the bucket's clock.
-    pub quiet: Duration,
 }
 
-/// The ended generations from `from` on, in order: a prefix of `from..head.generation`.
+/// What a scan of the log found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Scanned {
+    /// The ended and skipped generations, in order.
+    pub ended: Vec<EndedGeneration>,
+    /// The pack generation of a pack that holds `ended`: the next generation the last
+    /// terminal record names. `None` when no generation ended.
+    pub pack_generation: Option<u64>,
+    /// The key where the log is not as buckwal writes it (`log_incomplete`). The run then
+    /// makes no pack.
+    pub incomplete: Option<String>,
+}
+
+/// The ended generations from `from` (the pack generation), following the chain of terminal
+/// records (spec "Packs and the packer", rev 6).
 ///
-/// A generation `g` has ended when the head names a later generation and its log holds a
-/// terminal record (`terminal_seq`). After a terminal fence record the run also waits out the
-/// takeover quiet. A generation with no log is a skipped generation when a takeover left it
-/// (`skipped`), else the log the pack needs is gone: `Corrupt`. The scan stops at the first
-/// generation that has not ended: a later run takes it.
+/// Only a generation switch ends a generation: the writer uploads its seal-start record, then
+/// moves the head. So a generation `g` below the head's has ended, and its last record must be
+/// a seal-start record: the terminal record. A takeover does not end a generation, and a fence
+/// record is never a terminal record. The run applies all of `g`, the records after a fence
+/// included, as a restore does.
+///
+/// In format 5 the terminal record names the next link of the chain: the generation its switch
+/// moved the head to. Every number between two links is a skipped generation, and the chain ends
+/// at the head's generation. A terminal record of formats 1 to 4 names none: the next link is
+/// then the next generation with a log, and each number before it must be one the head's
+/// `next_generation_floor` names. The log is incomplete when a generation below the head's
+/// does not end with a seal-start record, when a link is not above the one before it, or when
+/// the next link has no log and is not the head's generation.
 #[cfg_attr(not(test), allow(dead_code))] // the packer loop asks it before a run
-pub(crate) fn ended_generations(
-    r: &LogReader,
-    from: u64,
-    head: &Head,
-) -> Result<Vec<EndedGeneration>> {
+pub(crate) fn ended_generations(r: &LogReader, from: u64, head: &Head) -> Result<Scanned> {
     scan_generations(r, from, head, &mut |_, _| Ok(()))
 }
 
-/// [`ended_generations`], calling `visit` with each ended generation that has a log and its
-/// records up to the terminal record, in order, as it finds them.
+/// [`ended_generations`], calling `visit` with each ended generation and all its records, in
+/// order, as it finds them.
 fn scan_generations(
     r: &LogReader,
     from: u64,
     head: &Head,
     visit: &mut dyn FnMut(EndedGeneration, &[LogRecord]) -> Result<()>,
-) -> Result<Vec<EndedGeneration>> {
+) -> Result<Scanned> {
     let root = r.keys.log_root();
     // Every key of the generations below `from` sorts before this one.
     let after = format!("{}~", r.keys.log_prefix(from.saturating_sub(1)));
@@ -135,116 +156,119 @@ fn scan_generations(
         .map(|(g, _)| g)
         .filter(|g| *g >= from)
         .collect();
-    let mut out = Vec::new();
-    // Whether the nearest lower generation this scan read holds a fence record.
-    let mut fence_below = false;
-    for g in from..head.generation {
-        if !with_log.contains(&g) {
-            if !skipped(g, head, &with_log, fence_below) {
-                return Err(Error::Corrupt(format!(
-                    "{} holds no record and no takeover skipped generation {g}: the log a \
-                     pack needs is gone",
-                    r.keys.log_prefix(g)
-                )));
-            }
-            out.push(EndedGeneration {
-                generation: g,
-                last_seq_to_apply: 0,
-            });
-            continue;
+    let mut out = Scanned::default();
+    let mut link = from;
+    while link < head.generation {
+        if !with_log.contains(&link) {
+            out.incomplete = Some(r.keys.log_prefix(link));
+            break;
         }
-        let records = fetch_generation_upto(
+        let records = fetch_generation(
             r.store,
             r.keys,
-            g,
-            None,
+            link,
             r.concurrency,
             r.retry,
             &AtomicU64::new(0),
         )?;
-        let Some(t) = terminal_seq(&records) else {
-            break;
+        let last = records.len() as u64;
+        let terminal = r.keys.log(link, last);
+        let named = match records.last() {
+            Some(LogRecord::Extents {
+                file: LogFile::Wal,
+                syncs,
+                next_generation,
+                ..
+            }) if syncs.is_empty() => *next_generation,
+            _ => {
+                out.incomplete = Some(terminal);
+                break;
+            }
         };
-        if matches!(records[t as usize - 1], LogRecord::Fence { .. }) && !quiet_passed(r, g, t)? {
+        let next = match named {
+            Some(n) if n > link && n <= head.generation => n,
+            Some(_) => {
+                out.incomplete = Some(terminal);
+                break;
+            }
+            None => match next_by_floor(link, head, &with_log) {
+                Ok(n) => n,
+                Err(missing) => {
+                    out.incomplete = Some(r.keys.log_prefix(missing));
+                    break;
+                }
+            },
+        };
+        if next != head.generation && !with_log.contains(&next) {
+            out.incomplete = Some(r.keys.log_prefix(next));
             break;
         }
-        fence_below = records.iter().any(|x| matches!(x, LogRecord::Fence { .. }));
         let e = EndedGeneration {
-            generation: g,
-            last_seq_to_apply: t,
+            generation: link,
+            last_seq_to_apply: last,
         };
-        visit(e, &records[..t as usize])?;
-        out.push(e);
+        visit(e, &records)?;
+        out.ended.push(e);
+        out.ended
+            .extend((link + 1..next).map(|generation| EndedGeneration {
+                generation,
+                last_seq_to_apply: 0,
+            }));
+        out.pack_generation = Some(next);
+        link = next;
     }
     Ok(out)
 }
 
-/// The seq of the terminal record of a generation's log (`records`, from seq 1), when the
-/// generation has ended. The terminal record is the last seal-start record (an Extents record
-/// with no syncs) or fence record after which the log holds no Extents record the fence rule
-/// admits: only late records of a writer a fence shut out may follow it. A writer that goes
-/// on writing after it (the fencer, after its fence) means the generation has not ended.
-fn terminal_seq(records: &[LogRecord]) -> Option<u64> {
-    let mut rule = FenceRule::default();
-    let mut terminal = None;
-    for (i, rec) in records.iter().enumerate() {
-        match rec {
-            LogRecord::Fence { writer_id, epoch } => {
-                if rule.on_fence(writer_id, *epoch) {
-                    terminal = Some(i as u64 + 1);
-                }
-            }
-            LogRecord::Extents {
-                writer_id, syncs, ..
-            } => {
-                if !rule.admits(writer_id) {
-                    continue;
-                }
-                terminal = syncs.is_empty().then_some(i as u64 + 1);
-            }
+/// The next link after `link` when its terminal record names none (formats 1 to 4): the next
+/// generation with a log, or the head's. Each number before it must be a skipped generation
+/// that the head's `next_generation_floor` names (ADR 0005): below the floor, with no log from
+/// it up to the floor. Else the first number that is not: its log is gone.
+fn next_by_floor(
+    link: u64,
+    head: &Head,
+    with_log: &BTreeSet<u64>,
+) -> std::result::Result<u64, u64> {
+    let mut n = link + 1;
+    while n < head.generation && !with_log.contains(&n) {
+        let named = head
+            .next_generation_floor
+            .is_some_and(|f| n < f && with_log.range(n..f).next().is_none());
+        if !named {
+            return Err(n);
         }
+        n += 1;
     }
-    terminal
+    Ok(n)
 }
 
-/// Whether the terminal fence record `log/<g>/<t>` is older than the takeover quiet by the
-/// bucket's clock (1 s more for the resolution of the age, `ObjectStore::stat`).
-fn quiet_passed(r: &LogReader, g: u64, t: u64) -> Result<bool> {
-    let key = r.keys.log(g, t);
-    let st = with_retry(r.retry, &key, |_| r.store.stat(&key))?;
-    Ok(st.is_some_and(|s| s.age >= r.quiet.saturating_add(Duration::from_secs(1))))
-}
-
-/// Whether generation `g` (no log, below the head's generation) is one a takeover skipped
-/// (ADR 0005). A takeover of generation G writes the floor `max(G + 1, old floor) + 1`, and the
-/// generations from G + 1 up to the floor never get a log. So `g` is skipped when the head's
-/// `next_generation_floor` is above it and no generation from `g` up to the floor has a log,
-/// or when the nearest lower generation this run read holds a fence record (the generations
-/// between are skipped too). Any other missing log is not a skip.
-fn skipped(g: u64, head: &Head, with_log: &BTreeSet<u64>, fence_below: bool) -> bool {
-    let under_floor = head
-        .next_generation_floor
-        .is_some_and(|f| g < f && with_log.range(g..f).next().is_none());
-    under_floor || fence_below
-}
-
-/// The takeover quiet a terminal fence record waits out: the larger of this configuration's
-/// `lease + request_timeout` and the head's, at most `MAX_SEAL_QUIET`.
-fn takeover_quiet(config: &Config, head: &Head) -> Duration {
-    let own = Timeouts {
-        lease: config.lease,
-        request_timeout: config.request_timeout,
+/// Replay an ended generation's `records` as a restore of it would have: under the head it
+/// had then. That head named the writer of the terminal record, because only the head's own
+/// writer can move the head with `If-Match`. The current head can name a later writer, and
+/// `replay`'s rule for logs without a fence record reads the head's writer id.
+fn replay_ended(records: &[LogRecord], head: &Head, generation: u64) -> Result<Images> {
+    let writer_id = match records.last() {
+        Some(LogRecord::Extents { writer_id, .. }) => writer_id.clone(),
+        _ => head.writer_id.clone(),
     };
-    own.quiet_for(Some(head)).min(defaults::MAX_SEAL_QUIET)
+    replay(
+        records,
+        &Head {
+            generation,
+            writer_id,
+            ..head.clone()
+        },
+    )
 }
 
 /// How long ago the run's clock started; tests move it by hand.
 pub(crate) type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 /// Run one pack run against the bucket `config` names. A run that finds no ended generation
-/// returns `NothingToDo`. Errors before the upload (the log the pack needs is gone, a record
-/// fails its check, the store fails) are `Err`; once the upload started, the run cleans up and
-/// returns a `Failed` outcome instead.
+/// returns `NothingToDo`, and a log that is not as buckwal writes it `Failed` at
+/// `log_incomplete`, with nothing uploaded. Other errors before the upload (a record fails its
+/// check, the store fails) are `Err`; once the upload started, the run cleans up and returns a
+/// `Failed` outcome instead.
 pub fn pack(config: &Config) -> Result<PackReport> {
     let store = config.s3_store()?;
     pack_with_store(config, store)
@@ -406,13 +430,11 @@ impl Run<'_> {
 
         // Steps 2 to 4: each ended generation, applied as the scan finds it. The newest pack
         // is downloaded before the first one.
-        let quiet = takeover_quiet(config, &head);
         let reader = LogReader {
             store: self.store,
             keys: &self.keys,
             retry: &self.retry,
             concurrency: config.upload_concurrency,
-            quiet,
         };
         let db = self.work.join(DB_FILE);
         let mut base_ready = false;
@@ -420,7 +442,7 @@ impl Run<'_> {
         let mut applied = 0u64;
         let (work, enc, store, keys, retry) =
             (&self.work, self.enc, self.store, &self.keys, &self.retry);
-        let ended = scan_generations(&reader, from, &head, &mut |e, records| {
+        let scanned = scan_generations(&reader, from, &head, &mut |e, records| {
             if gone.is_some() {
                 return Ok(());
             }
@@ -434,16 +456,17 @@ impl Run<'_> {
                     check_page_size(work, enc, p)?;
                 }
             }
-            let g = Head {
-                generation: e.generation,
-                ..head.clone()
-            };
-            apply_generation(work, &replay(records, &g)?.wal, &g, enc)?;
+            let wal = replay_ended(records, &head, e.generation)?.wal;
+            apply_generation(work, &wal, &head, enc)?;
             applied += 1;
             Ok(())
         })?;
         self.step("apply");
         let current = base.as_ref().map_or(0, |(p, _)| p.pack_generation);
+        if let Some(key) = scanned.incomplete {
+            tracing::warn!(target: "buckwal", key = %key, "pack run: the log is incomplete");
+            return Ok((failed("log_incomplete", Some(&key)), current, None, 0.0));
+        }
         if let Some(key) = gone {
             // A newer pack replaced it and GC deleted it: the next run reads the new pointer.
             return Ok((failed("download", Some(&key)), current, None, 0.0));
@@ -452,7 +475,7 @@ impl Run<'_> {
         if applied == 0 || size == 0 {
             return Ok((PackOutcome::NothingToDo, current, None, 0.0));
         }
-        let pack_generation = ended.last().expect("a generation was applied").generation + 1;
+        let pack_generation = scanned.pack_generation.expect("a generation was applied");
         let facts = db_facts(&self.work, self.enc)?;
         let free = if facts.page_count == 0 {
             0.0

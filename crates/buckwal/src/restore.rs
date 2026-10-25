@@ -73,21 +73,6 @@ pub(crate) fn fetch_generation(
     retry: &RetryPolicy,
     retries: &AtomicU64,
 ) -> Result<Vec<LogRecord>> {
-    fetch_generation_upto(store, keys, gen, None, concurrency, retry, retries)
-}
-
-/// [`fetch_generation`], but with `upto` only the records of seqs 1 to `upto` (a pack run
-/// applies a generation up to its terminal record). The listing must still run 1, 2, 3, …
-/// with no gap, and reach `upto`.
-pub(crate) fn fetch_generation_upto(
-    store: &dyn ObjectStore,
-    keys: &Keys,
-    gen: u64,
-    upto: Option<u64>,
-    concurrency: usize,
-    retry: &RetryPolicy,
-    retries: &AtomicU64,
-) -> Result<Vec<LogRecord>> {
     let prefix = keys.log_prefix(gen);
     let mut seqs: Vec<u64> = counted(retries, retry, &prefix, || store.list(&prefix))?
         .iter()
@@ -103,15 +88,6 @@ pub(crate) fn fetch_generation_upto(
                 "gap in log/{gen}: expected seq {want}, found {s}"
             )));
         }
-    }
-    if let Some(upto) = upto {
-        if upto > seqs.len() as u64 {
-            return Err(Error::Corrupt(format!(
-                "log/{gen} ends at seq {}, before seq {upto}",
-                seqs.len()
-            )));
-        }
-        seqs.truncate(upto as usize);
     }
     let slots: Vec<Mutex<Option<LogRecord>>> = seqs.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
