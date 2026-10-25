@@ -355,3 +355,90 @@ fn mvcc_bucket_of_format_2_keeps_sealing() {
     c.close().unwrap();
     db.close().unwrap();
 }
+
+/// A text of about 3.5 KB: one row fills most of a 4 KiB page.
+fn big(id: i64) -> String {
+    format!("{id:06}{}", "x".repeat(3500))
+}
+
+/// `BEGIN CONCURRENT` inserts of rows `ids` with `big` texts.
+fn insert_big(c: &Connection, ids: std::ops::RangeInclusive<i64>) {
+    for id in ids {
+        c.execute("BEGIN CONCURRENT", &[]).unwrap();
+        c.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[Value::from_i64(id), Value::build_text(big(id))],
+        )
+        .unwrap();
+        c.execute("COMMIT", &[]).unwrap();
+    }
+}
+
+/// Every row of `t`: its id, the first 12 bytes of its text and its length.
+fn big_rows(c: &Connection) -> Vec<(i64, String, i64)> {
+    c.query(
+        "SELECT id, substr(v, 1, 12), length(v) FROM t ORDER BY id",
+        &[],
+    )
+    .unwrap()
+    .iter()
+    .map(|r| (r[0].as_int().unwrap(), text(&r[1]), r[2].as_int().unwrap()))
+    .collect()
+}
+
+/// An MVCC pack of several 1 MiB blocks, with the background fetch off: a restore reads the
+/// pack's blocks as the engine needs them and applies the generation that ended after the
+/// pack over them. The copy opens read-only with every row, then as a writer (a takeover)
+/// that commits and switches.
+#[test]
+fn mvcc_restore_of_a_pack_of_several_blocks_equals_writer_db() {
+    let _off = crate::io::block_store::NoBackgroundFetch::on();
+    let mem = mem();
+    let t = tempdir();
+    let dir = fresh(&t);
+    let (db, c) = mvcc_with_rows(mem.clone(), mvcc(&dir), 0);
+    insert_big(&c, 1..=450);
+    truncate_checkpoint(&c).unwrap();
+    let r = pack_run(mem.clone(), &mvcc);
+    assert_eq!((r.outcome, r.pack_generation), (PackOutcome::Packed, 3));
+    let p = pointer(&*mem).unwrap();
+    assert!(p.size > 1 << 20, "a pack of several blocks: {p:?}");
+    // A generation after the pack that changes a few rows, then rows in the head's.
+    c.execute("BEGIN CONCURRENT", &[]).unwrap();
+    c.execute("UPDATE t SET v = 'changed' WHERE id IN (5, 400)", &[])
+        .unwrap();
+    c.execute("COMMIT", &[]).unwrap();
+    truncate_checkpoint(&c).unwrap();
+    insert_big(&c, 451..=455);
+    let want = big_rows(&c);
+    c.close().unwrap();
+    db.close().unwrap();
+
+    let t2 = tempdir();
+    let d2 = fresh(&t2);
+    let rep = restore_with_store(&mvcc(&d2), mem.clone(), &d2).unwrap();
+    assert_eq!(rep.pack_key, Some(p.pack_key.clone()));
+    assert_eq!(rep.generation, 4);
+    // Observed (turso 0.8.3): the MVCC engine reads every page when it opens, so the local
+    // checkpoint of generation 3 brings the whole pack down (1855488 of 1855488 bytes). A WAL
+    // restore fetches only the blocks its generations touch.
+    assert!(
+        rep.bytes_fetched > 0 && rep.bytes_fetched <= p.size,
+        "{rep:?}"
+    );
+    let ro = open_read_only_with_store(mvcc(&d2), mem.clone()).unwrap();
+    let rc = ro.connect().unwrap();
+    assert_eq!(big_rows(&rc), want);
+    rc.close().unwrap();
+    ro.close().unwrap();
+    let db = open_with_store(mvcc(&d2), mem.clone()).unwrap();
+    let c = db.connect().unwrap();
+    assert_eq!(big_rows(&c), want);
+    insert_big(&c, 456..=456);
+    truncate_checkpoint(&c).unwrap();
+    let want = big_rows(&c);
+    c.close().unwrap();
+    db.close().unwrap();
+    let (_, ids) = restored_ids(mem.clone(), &mvcc);
+    assert_eq!(ids, want.iter().map(|r| r.0).collect::<Vec<_>>());
+}
