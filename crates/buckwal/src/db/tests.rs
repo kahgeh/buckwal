@@ -815,7 +815,14 @@ fn record(store: &Arc<MemStore>, gen: u64, seq: u64) -> LogRecord {
 /// A copy of a (crashed) directory's database files, in a new directory.
 fn copy_db_files(from: &Path) -> TempDir {
     let to = tempdir();
-    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-dirty"] {
+    for f in [
+        "app.db",
+        "app.db-wal",
+        "app.db-durable",
+        "app.db-dirty",
+        "app.db-pack",
+        "app.db-blocks",
+    ] {
         if from.join(f).exists() {
             std::fs::copy(from.join(f), to.path().join(f)).unwrap();
         }
@@ -3543,7 +3550,14 @@ fn torn_page_one_image(store: &Arc<MemStore>, cfg: impl Fn(&Path) -> Config) -> 
         insert(&c, id).unwrap();
     }
     let img = tempdir();
-    for f in ["app.db", "app.db-wal", "app.db-durable", "app.db-dirty"] {
+    for f in [
+        "app.db",
+        "app.db-wal",
+        "app.db-durable",
+        "app.db-dirty",
+        "app.db-pack",
+        "app.db-blocks",
+    ] {
         if a.path().join(f).exists() {
             std::fs::copy(a.path().join(f), img.path().join(f)).unwrap();
         }
@@ -4377,6 +4391,7 @@ fn create_mvcc_encrypted_has_no_plaintext() {
 mod checkpoint_race;
 mod integrity;
 mod mvcc;
+mod pack_restore;
 mod switch;
 mod telemetry;
 

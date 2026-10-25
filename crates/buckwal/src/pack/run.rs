@@ -23,6 +23,7 @@ use crate::encryption::{self, Encryption};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE};
 use crate::format::{Head, Keys, LogFile, LogRecord};
+use crate::io::block_store::fetch_verified;
 use crate::restore::{apply_generation, db_facts, fetch_generation, replay, Images};
 use crate::store::{
     part_size_for, sha256_of, with_retry, CondPut, ObjectStore, PartSource, RetryPolicy,
@@ -729,8 +730,8 @@ fn download_pack(
     Ok(true)
 }
 
-/// One range of the pack at `offset`, checked block by block, written to `file`. False when
-/// the pack is gone.
+/// One range of the pack at `offset`, checked block by block
+/// (`io::block_store::fetch_verified`), written to `file`. False when the pack is gone.
 #[allow(clippy::too_many_arguments)]
 fn fetch_range(
     store: &dyn ObjectStore,
@@ -742,31 +743,9 @@ fn fetch_range(
     len: u64,
     file: &Mutex<File>,
 ) -> Result<bool> {
-    let Some(bytes) = with_retry(retry, &p.pack_key, |_| {
-        store.get_range(&p.pack_key, offset, len)
-    })?
-    else {
+    let Some(bytes) = fetch_verified(store, keys, retry, p, codes, offset, len)? else {
         return Ok(false);
     };
-    let want = p.size.saturating_sub(offset).min(len) as usize;
-    if bytes.len() != want {
-        return Err(Error::Corrupt(format!(
-            "{}: a range at {offset} came back {} bytes, not {want}",
-            p.pack_key,
-            bytes.len()
-        )));
-    }
-    let first = offset / BLOCK_SIZE;
-    for (i, block) in bytes.chunks(BLOCK_SIZE as usize).enumerate() {
-        codes.verify_block(
-            keys,
-            &p.pack_key,
-            p.pack_generation,
-            p.size,
-            first + i as u64,
-            block,
-        )?;
-    }
     let mut f = file.lock().unwrap();
     f.seek(SeekFrom::Start(offset))
         .and_then(|_| f.write_all(&bytes))

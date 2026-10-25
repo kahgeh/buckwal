@@ -9,6 +9,7 @@ use crate::encryption::{check_page_one, local_page_one};
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOG_FILE};
 use crate::format::{LocalState, FORMAT_V5};
+use crate::io::block_store::{background_fetch, BlockStore};
 use crate::io::db_storage::StorageParts;
 use crate::io::log_storage::LogDurableStorage;
 use crate::io::{stash, BucketDbStorage, DurableIo};
@@ -135,6 +136,20 @@ pub(crate) fn open_engine(
     }
     let uploader = Uploader::spawn(bucket, trim_tx, cfg.events.clone(), Arc::default());
 
+    // A copy restored from a pack reads the blocks that are not local yet from it.
+    let blocks = if packed {
+        BlockStore::open(
+            dir,
+            store.clone(),
+            &keys,
+            &cfg.retry,
+            state.complete,
+            state.generation,
+        )?
+        .map(Arc::new)
+    } else {
+        None
+    };
     stash::clear();
     let file = platform
         .open_file(&db_path, OpenFlags::Create, false)
@@ -152,6 +167,7 @@ pub(crate) fn open_engine(
         mode: cfg.io_mode,
         mvcc: cfg.journal_mode == JournalMode::Mvcc,
         packed,
+        blocks,
     }));
     storage.adopt_persisted_dirty()?;
     // D16: page 1, as the engine will read it, against the encryption setting.
@@ -220,7 +236,9 @@ pub(crate) fn open_engine(
         (false, true) => return Err(Error::Unsupported("MVCC: switching back to WAL")),
         _ => {}
     }
-    let prefetch = if cfg.prefetch {
+    // Formats 1 to 4 fetch in the background only with `prefetch`. A copy restored from a pack
+    // always does (Choice C(a)): its blocks come in 16 MiB ranges, 8 at once.
+    let prefetch = if cfg.prefetch || (storage.has_blocks() && background_fetch()) {
         let s = storage.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));

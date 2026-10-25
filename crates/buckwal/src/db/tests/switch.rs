@@ -1,5 +1,5 @@
 //! A format 5 writer: the generation switch at each WAL restart, and a restore that reads the
-//! log only (no pack yet).
+//! log only (no pack yet; `pack_restore` restores from a pack).
 use super::*;
 use crate::format::FORMAT_V5;
 
@@ -41,7 +41,7 @@ fn switch_record_names(store: &MemStore, g: u64) -> Option<u64> {
 /// the switch), so the bucket sees four PUTs in all. The trimmer is off: its GC pass after the
 /// switch reads the head on its own thread, not on the commit's path.
 #[test]
-fn commit_that_restarts_wal_makes_three_small_puts() {
+fn commit_that_restarts_wal_makes_four_small_puts() {
     let store = mem();
     let t = tempdir();
     let mut cfg = config(t.path());
@@ -160,24 +160,6 @@ fn log_only_restore_after_switches_and_a_takeover_equals_the_writer() {
     assert_eq!((g.deleted, g.outcome), (0, crate::gc::GcOutcome::Nothing));
     assert!(!log_seqs(&*store, 1).is_empty());
     crash(db_b, vec![cb]);
-}
-
-/// Until a pack can be read (task 7), a restore of a format 5 bucket that holds a pack pointer
-/// is refused with a clear error, and it writes nothing into the directory.
-#[test]
-fn restore_of_a_bucket_with_a_pack_pointer_is_refused_for_now() {
-    let store = mem();
-    let a = tempdir();
-    let db = open_mem(&store, a.path());
-    let c = db.connect().unwrap();
-    create(&c);
-    insert(&c, 1).unwrap();
-    store.put(&keys().pack_pointer(), b"{}").unwrap();
-    let r = tempdir();
-    let got = restore_with_store(&config(&fresh(&r)), store.clone(), &fresh(&r));
-    assert!(matches!(got, Err(Error::Unsupported(_))), "{got:?}");
-    assert!(!fresh(&r).join("app.db").exists());
-    crash(db, vec![c]);
 }
 
 /// An encrypted format 5 bucket: its head carries a database id and a key check, its log holds

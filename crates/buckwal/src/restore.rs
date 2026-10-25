@@ -1,21 +1,28 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
-//! Restore onto an empty directory: rebuild the current generation's `-wal` from its log and
-//! leave every database page in the bucket, to be fetched on first read.
+//! Restore onto an empty directory: rebuild the current generation's `-wal` from its log. Formats
+//! 1 to 4 leave every database page in the bucket, to be fetched on first read. Format 5 builds
+//! `app.db` from the pack (its blocks fetched on first read or by the background fetch) and the
+//! log of every generation since it, or from the log alone when there is no pack yet.
 
 use crate::config::{Config, EngineConfig, JournalMode};
 use crate::db::{refuse_mode_mismatch, DirGuard};
 use crate::encryption::Encryption;
 use crate::error::{Error, Result};
-use crate::files::{io_err, DB_FILE, DIRTY_FILE, LOG_FILE, RESTORING_FILE, STATE_FILE, WAL_FILE};
+use crate::files::{
+    io_err, BLOCKS_FILE, DB_FILE, DIRTY_FILE, LOG_FILE, PACK_FILE, RESTORING_FILE, STATE_FILE,
+    WAL_FILE,
+};
 use crate::format::{
     apply_ops, Head, Keys, LocalState, LogFile, LogRecord, FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4,
     FORMAT_V5,
 };
+use crate::io::block_store::{BlockDbStorage, BlockStore};
+use crate::pack::codes::PackCodes;
 use crate::store::{with_retry, ObjectStore, RetryPolicy, StoreError};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
@@ -35,6 +42,11 @@ pub struct RestoreReport {
     pub lists: u64,
     /// Bytes downloaded.
     pub bytes: u64,
+    /// The pack the restore read (`pack/<G>/<run id>`); `None` for a bucket with no pack.
+    pub pack_key: Option<String>,
+    /// Bytes of the pack the restore fetched before it returned (blocks fetched later, by
+    /// the background fetch or a page read, are not counted).
+    pub bytes_fetched: u64,
     pub elapsed: Duration,
 }
 
@@ -349,8 +361,10 @@ pub(crate) struct DbFacts {
     pub free_pages: u64,
 }
 
+/// The typed error a block fetch under the engine stashed (a block that fails its code, a
+/// pack that is gone), else the engine's error.
 fn local_engine(what: &str, e: turso_core::LimboError) -> Error {
-    Error::Engine(format!("{what}: {e}"))
+    crate::io::stash::take().unwrap_or_else(|| Error::Engine(format!("{what}: {e}")))
 }
 
 /// Open `<dir>/app.db` (and its `-wal`) with the engine over plain local files, as
@@ -360,12 +374,29 @@ fn open_local(
     dir: &Path,
     enc: Option<&Encryption>,
 ) -> Result<(Arc<turso_core::Database>, Arc<turso_core::Connection>)> {
+    open_local_over(dir, enc, None)
+}
+
+/// [`open_local`]; with `blocks`, the database file is `app.db` as its block store serves it
+/// (`BlockDbStorage`: a block is fetched from the pack before a page in it is read or written).
+fn open_local_over(
+    dir: &Path,
+    enc: Option<&Encryption>,
+    blocks: Option<&Arc<BlockStore>>,
+) -> Result<(Arc<turso_core::Database>, Arc<turso_core::Connection>)> {
     let db_path = dir.join(DB_FILE);
     let path = db_path
         .to_str()
         .ok_or_else(|| Error::Config(format!("{} is not UTF-8", db_path.display())))?;
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| io_err("platform IO", e))?);
     let mut opts = OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::Create);
+    if let Some(blocks) = blocks {
+        let file = io
+            .open_file(path, OpenFlags::Create, false)
+            .map_err(|e| local_engine("open the local database", e))?;
+        opts = opts.storage(Arc::new(BlockDbStorage::new(file, blocks.clone())));
+    }
+    crate::io::stash::clear();
     if let Some(enc) = enc {
         opts = opts
             .db_opts(DatabaseOpts::new().with_encryption(true))
@@ -428,6 +459,18 @@ pub(crate) fn apply_generation(
     head: &Head,
     enc: Option<&Encryption>,
 ) -> Result<()> {
+    apply_generation_over(dir, wal, head, enc, None)
+}
+
+/// [`apply_generation`] over the pack `blocks` serves: each page the checkpoint reads or writes
+/// has its block fetched first, so only the blocks the generation touches come down.
+pub(crate) fn apply_generation_over(
+    dir: &Path,
+    wal: &[u8],
+    head: &Head,
+    enc: Option<&Encryption>,
+    blocks: Option<&Arc<BlockStore>>,
+) -> Result<()> {
     let wal_path = dir.join(WAL_FILE);
     let db_path = dir.join(DB_FILE);
     if !wal_image_holds_frames(wal) {
@@ -445,7 +488,7 @@ pub(crate) fn apply_generation(
     }
     write_synced(&wal_path, wal)?;
     {
-        let (db, conn) = open_local(dir, enc)?;
+        let (db, conn) = open_local_over(dir, enc, blocks)?;
         conn.checkpoint(turso_core::CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         })
@@ -568,48 +611,95 @@ pub(crate) fn local_format(head: &Head) -> u32 {
     }
 }
 
-/// A format 5 bucket with no pack yet, restored from its log only: every generation the chain
-/// of terminal records ends before the head's (`pack::run::scan_generations`, from generation
-/// 1), each applied to `<dir>/app.db` with a local checkpoint (`apply_generation`), as a pack
-/// run applies them. The head's generation is left for the caller, as the `-wal`. A log that is
-/// not as buckwal writes it is `Corrupt`. Returns whether `app.db` was written.
+/// What [`apply_ended_generations`] built in the directory.
+struct Built {
+    /// `app.db` was written: from the pack, or from the log of an ended generation.
+    db: bool,
+    /// The pack read, and the bytes of it fetched.
+    pack_key: Option<String>,
+    bytes_fetched: u64,
+    /// Every block of the pack is local (true without a pack).
+    complete: bool,
+}
+
+/// The database file of a format 5 bucket before the head's generation (spec "Restore"):
 ///
-/// A bucket that holds a pack pointer is refused for now: reading a pack comes with the restore
-/// from packs.
+/// - With a pack pointer: the pointer (decoded once the head is adopted), then the pack codes,
+///   then the pack's first block (page 1: the encryption setting, the journal mode and the
+///   pointer's page size against the header). Every other block stays in the bucket until a
+///   page in it is read or written (`BlockStore`).
+/// - Without one: an empty file, from generation 1.
+///
+/// Then every generation the chain of terminal records ends before the head's, from the pack
+/// generation (`pack::run::scan_generations`, the pack run's own rule), each applied to
+/// `<dir>/app.db` with a local checkpoint (`apply_generation_over`). The head's generation is
+/// left for the caller, as the `-wal`. A log that is not as buckwal writes it is `Corrupt`. A
+/// pack (or its codes) that is gone sets `gone` and fails: the caller starts again.
 fn apply_ended_generations(
-    store: &dyn ObjectStore,
+    store: &Arc<dyn ObjectStore>,
     keys: &Keys,
     dir: &Path,
     cfg: &EngineConfig,
     head: &Head,
     retries: &AtomicU64,
-) -> Result<bool> {
+    gone: &Arc<AtomicBool>,
+) -> Result<Built> {
     if head.journal_mode == JournalMode::Mvcc {
         return Err(Error::Unsupported("restore of a format 5 MVCC bucket"));
     }
-    let pointer = keys.pack_pointer();
-    if counted(retries, &cfg.retry, &pointer, || store.stat(&pointer))?.is_some() {
-        return Err(Error::Unsupported(
-            "restore of a bucket that holds a pack (pack-latest): reading a pack is not \
-             supported yet",
-        ));
-    }
+    let enc = cfg.encryption.as_deref();
+    let pointer_key = keys.pack_pointer();
+    let (blocks, from) = match counted(retries, &cfg.retry, &pointer_key, || {
+        store.get(&pointer_key)
+    })? {
+        Some(obj) => {
+            let p = keys.decode_pointer(&obj.body)?;
+            let from = p.pack_generation;
+            let Some(codes) = counted(retries, &cfg.retry, &p.codes_key, || {
+                store.get(&p.codes_key)
+            })?
+            else {
+                gone.store(true, Relaxed);
+                return Err(Error::NotFound(p.codes_key));
+            };
+            let decoded =
+                PackCodes::decode(keys, &codes.body, &p.pack_key, p.pack_generation, p.size)?;
+            let blocks = Arc::new(BlockStore::create(
+                dir,
+                store.clone(),
+                keys,
+                &cfg.retry,
+                p,
+                &obj.body,
+                decoded,
+                &codes.body,
+                gone.clone(),
+            )?);
+            blocks.ensure_block(0)?;
+            let page1 = crate::encryption::file_page_one(dir)?;
+            crate::encryption::check_page_one(page1.as_deref(), enc)?;
+            if let Some(p1) = &page1 {
+                refuse_mvcc(p1, head, cfg.journal_mode)?;
+            }
+            (Some(blocks), from)
+        }
+        None => (None, 1),
+    };
     let reader = crate::pack::run::LogReader {
-        store,
+        store: &**store,
         keys,
         retry: &cfg.retry,
         concurrency: cfg.upload_concurrency,
     };
-    let enc = cfg.encryption.as_deref();
     let mut applied = false;
-    let scanned = crate::pack::run::scan_generations(&reader, 1, head, &mut |e, records| {
+    let scanned = crate::pack::run::scan_generations(&reader, from, head, &mut |e, records| {
         let wal = crate::pack::run::replay_ended(records, head, e.generation)?.wal;
-        if !applied {
+        if !applied && blocks.is_none() {
             // Page 1 against the encryption setting before the engine opens it, so a wrong key
             // or cipher is the `Encryption` error a restore of a sealed bucket gives.
             crate::encryption::check_page_one(wal_page_one(&wal), enc)?;
         }
-        apply_generation(dir, &wal, head, enc)?;
+        apply_generation_over(dir, &wal, head, enc, blocks.as_ref())?;
         applied = true;
         Ok(())
     })?;
@@ -619,7 +709,20 @@ fn apply_ended_generations(
              end with a seal-start record, or the chain of generations breaks)"
         )));
     }
-    Ok(applied && file_len(&dir.join(DB_FILE))? > 0)
+    Ok(match blocks {
+        Some(b) => Built {
+            db: true,
+            pack_key: Some(b.pack_key()),
+            bytes_fetched: b.fetched(),
+            complete: b.is_complete(),
+        },
+        None => Built {
+            db: applied && file_len(&dir.join(DB_FILE))? > 0,
+            pack_key: None,
+            bytes_fetched: 0,
+            complete: true,
+        },
+    })
 }
 
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
@@ -671,11 +774,16 @@ fn restore_into_seen(
         log_objects = r.log_objects,
         gets = r.gets,
         bytes = r.bytes,
+        pack_key = r.pack_key.as_deref().unwrap_or(""),
+        bytes_fetched = r.bytes_fetched,
         ms = r.elapsed.as_millis() as u64,
         "restore finished"
     );
     Ok((r, page1))
 }
+
+/// How many times a restore starts again from a newer pack, when the pack it read is gone.
+const PACK_RESTARTS: u32 = 3;
 
 fn restore_files(
     store: Arc<dyn ObjectStore>,
@@ -694,6 +802,37 @@ fn restore_files(
             )));
         }
     }
+    let mut restarts = 0;
+    let (mut report, page1) = loop {
+        let gone = Arc::new(AtomicBool::new(false));
+        match restore_attempt(&store, keys, dir, cfg, retries, &gone) {
+            Err(e) if gone.load(Relaxed) && restarts < PACK_RESTARTS => {
+                // A newer pack replaced the one this restore read, and GC deleted it (spec
+                // "Restore"): read the pointer again and start again from the newer pack.
+                tracing::warn!(target: "buckwal", error = %e, "restore: the pack is gone; starting again");
+                restarts += 1;
+                fs::remove_dir_all(dir).map_err(|e| io_err("clear the restore dir", e))?;
+            }
+            r => break r?,
+        }
+    };
+    let delta = store.stats().since(&before);
+    report.gets = delta.gets;
+    report.lists = delta.lists;
+    report.bytes = delta.bytes_down;
+    report.elapsed = start.elapsed();
+    Ok((report, page1))
+}
+
+/// One attempt of [`restore_files`]. `gone` is set when the pack it read is gone.
+fn restore_attempt(
+    store: &Arc<dyn ObjectStore>,
+    keys: &Keys,
+    dir: &Path,
+    cfg: &EngineConfig,
+    retries: &AtomicU64,
+    gone: &Arc<AtomicBool>,
+) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let retry = &cfg.retry;
     let head_key = keys.head();
     let head_obj = counted(retries, retry, &head_key, || store.get(&head_key))?
@@ -702,12 +841,20 @@ fn restore_files(
     // The mode is checked on the head alone first: nothing is fetched for a mismatch.
     refuse_mode_mismatch(&head, None, cfg.journal_mode)?;
     fs::create_dir_all(dir).map_err(|e| io_err("create dir", e))?;
-    // A format 5 bucket holds no page: the generations before the head's come from the log.
-    let built = head.format == FORMAT_V5
-        && apply_ended_generations(&*store, keys, dir, cfg, &head, retries)?;
+    // A format 5 bucket holds no page: the generations before the head's come from the pack
+    // and the log since it.
+    let built = match head.format {
+        FORMAT_V5 => apply_ended_generations(store, keys, dir, cfg, &head, retries, gone)?,
+        _ => Built {
+            db: false,
+            pack_key: None,
+            bytes_fetched: 0,
+            complete: true,
+        },
+    };
     let sealed_page1 = match head.manifest {
         Some(g) => {
-            let p = manifest_page_one(&*store, keys, g, retry, retries)?;
+            let p = manifest_page_one(&**store, keys, g, retry, retries)?;
             refuse_mvcc(&p, &head, cfg.journal_mode)?;
             Some(p)
         }
@@ -717,12 +864,12 @@ fn restore_files(
         wal,
         log,
         records: log_objects,
-    } = generation_image_counted(&*store, keys, &head, cfg, retries)?;
+    } = generation_image_counted(&**store, keys, &head, cfg, retries)?;
     // Never sealed: the bucket holds no page, so the database file is seeded (`page_one_seed`),
     // unless the ended generations of a format 5 bucket built it.
     let db = match head.manifest {
         Some(_) => Vec::new(),
-        None if built => Vec::new(),
+        None if built.db => Vec::new(),
         None => page_one_seed(&wal, &head, cfg.journal_mode)?,
     };
     write_synced(&dir.join(WAL_FILE), &wal)?;
@@ -731,8 +878,12 @@ fn restore_files(
         write_synced(&dir.join(LOG_FILE), &log)?;
         repair_wal_without_log(dir)?;
     }
-    if !built {
+    if !built.db {
         write_synced(&dir.join(DB_FILE), &db)?;
+    }
+    if built.complete {
+        // Every block of the pack is local (or there is no pack): nothing is left to fetch.
+        crate::io::block_store::remove_files(dir)?;
     }
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
@@ -741,8 +892,9 @@ fn restore_files(
         format: local_format(&head),
         writer_id: head.writer_id.clone(),
         generation: head.generation,
-        // A format 5 bucket holds no page to fetch: the local file is the whole database.
-        complete: head.format == FORMAT_V5,
+        // A format 5 bucket holds no page to fetch: the local file is the whole database once
+        // every block of the pack is local.
+        complete: head.format == FORMAT_V5 && built.complete,
         // Nothing is written to the bucket: the first writer open claims the head (with
         // this ETag) under a new writer id.
         claimed: false,
@@ -754,16 +906,22 @@ fn restore_files(
         next_generation_floor: 0,
     }
     .write_atomic(dir)?;
-    let delta = store.stats().since(&before);
+    // The counters and the time are the caller's (`restore_files`), over every attempt.
     let report = RestoreReport {
         generation: head.generation,
         log_objects,
-        gets: delta.gets,
-        lists: delta.lists,
-        bytes: delta.bytes_down,
-        elapsed: start.elapsed(),
+        gets: 0,
+        lists: 0,
+        bytes: 0,
+        pack_key: built.pack_key,
+        bytes_fetched: built.bytes_fetched,
+        elapsed: Duration::ZERO,
     };
-    let page1 = sealed_page1.or_else(|| (!db.is_empty()).then_some(db));
+    // Page 1 of a restore from a pack is its local first block.
+    let page1 = match &report.pack_key {
+        Some(_) => crate::encryption::file_page_one(dir)?,
+        None => sealed_page1.or_else(|| (!db.is_empty()).then_some(db)),
+    };
     Ok((report, page1))
 }
 
@@ -805,7 +963,14 @@ pub(crate) struct Staged {
 }
 
 /// Moved in this order: the local state last, so a directory with a state file is whole.
-const RESTORED: [&str; 4] = [WAL_FILE, LOG_FILE, DB_FILE, STATE_FILE];
+const RESTORED: [&str; 6] = [
+    WAL_FILE,
+    LOG_FILE,
+    PACK_FILE,
+    BLOCKS_FILE,
+    DB_FILE,
+    STATE_FILE,
+];
 
 /// Restore into `dir` (held by the caller: `DirGuard`) without ever leaving it half
 /// restored: the files are built in a staging directory next to it (same filesystem), then
@@ -819,7 +984,14 @@ pub(crate) fn restore_staged(
     cfg: &EngineConfig,
 ) -> Result<Staged> {
     clear_interrupted_restore(dir)?;
-    for f in [DB_FILE, WAL_FILE, LOG_FILE, STATE_FILE] {
+    for f in [
+        DB_FILE,
+        WAL_FILE,
+        LOG_FILE,
+        STATE_FILE,
+        PACK_FILE,
+        BLOCKS_FILE,
+    ] {
         if dir.join(f).exists() {
             return Err(Error::Config(format!(
                 "{} already holds a database ({f})",

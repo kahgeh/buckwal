@@ -993,10 +993,13 @@ struct Figures {
     /// one by one, included).
     seals: usize,
     maintenance_runs: usize,
-    /// GETs of a restore taken right after the run, with the writer still open (so the
-    /// close-time checkpoint does not seal first).
+    /// GETs of a restore taken right after the run and a pack run, with the writer still open
+    /// (so the close-time checkpoint does not seal first).
     restore_gets: u64,
     restore_log_objects: u64,
+    /// The restore's generation, and the pack generation of the pack it read.
+    restore_generation: u64,
+    pack_generation: u64,
     /// Inserts the engine refused as busy (retried); Off with 8 writers only.
     busy_retries: usize,
     /// The longest `gate_wait` and the longest whole run among the finished runs.
@@ -1116,6 +1119,17 @@ fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Du
     wait_maintenance_quiet(&rec);
     let ev = rec.events();
     let under_load = &ev[..load_end.lock().unwrap().expect("a connection ran out")];
+    // A pack run, as the packer would make one: the restore then reads the pack and the log
+    // since it, not every generation's log.
+    let packer = tempfile::tempdir().unwrap();
+    let packed = buckwal::pack_with_store(&config(&packer.path().join("p")), mem.clone()).unwrap();
+    assert!(
+        matches!(
+            packed.outcome,
+            buckwal::PackOutcome::Packed | buckwal::PackOutcome::NothingToDo
+        ),
+        "{packed:?}"
+    );
     let restored = tempfile::tempdir().unwrap();
     let report =
         restore_with_store(&config(restored.path()), mem.clone(), restored.path()).unwrap();
@@ -1147,6 +1161,8 @@ fn sustained(batching: Batching, log_objects: u64, commits: usize, put_delay: Du
             .count(),
         restore_gets: report.gets,
         restore_log_objects: report.log_objects,
+        restore_generation: report.generation,
+        pack_generation: packed.pack_generation,
         busy_retries,
         max_gate_wait: finished(&ev).map(|(g, _)| g).max().unwrap_or_default(),
         max_run: finished(&ev).map(|(_, r)| r).max().unwrap_or_default(),
@@ -1177,10 +1193,15 @@ fn sustained_window_load_seals_and_bounds_restore_gets() {
         after.max_log_objects_under_load <= THRESHOLD + SLACK,
         "{after:?}"
     );
-    // The head's generation's log objects (+ 1 in flight). A format 5 bucket with no pack is
-    // restored from every generation's log, so the restore's GETs are bounded only once a pack
-    // exists (`restore_gets` is not checked here until a restore reads packs).
+    // The head's generation's log objects (+ 1 in flight).
     assert!(after.restore_log_objects <= THRESHOLD + 1, "{after:?}");
+    // With a pack of every ended generation, a restore GETs the head, the pointer, the codes,
+    // the pack's one block (the database is under 1 MiB) and the head's generation's log.
+    assert_eq!(after.pack_generation, after.restore_generation, "{after:?}");
+    assert!(
+        after.restore_gets <= after.restore_log_objects + 4,
+        "{after:?}"
+    );
 }
 
 /// Off seals by itself (the engine restarts the WAL between commits); the figures with

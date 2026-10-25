@@ -44,7 +44,7 @@ pub mod defaults {
     /// A writer runs GC itself (`BUCKWAL_GC_AFTER_SEAL`): at open, after each seal and when
     /// the next manifest comes of age.
     pub const GC_AFTER_SEAL: bool = true;
-    /// Fetch every sealed page in the background after open.
+    /// Formats 1 to 4: fetch every sealed page in the background after open.
     pub const PREFETCH: bool = false;
     /// Every commit is uploaded on its own.
     pub const BATCHING: super::Batching = super::Batching::Off;
@@ -173,6 +173,9 @@ pub struct Config {
     /// PUT attempt of a seal, GETs the head first; another writer's head fences this one.
     /// 0 checks before every append and page PUT (tests).
     pub lease: Duration,
+    /// Formats 1 to 4: fetch every sealed page in the background after open
+    /// (`BUCKWAL_PREFETCH`). A format 5 copy restored from a pack always fetches the rest of the
+    /// pack in the background, in 16 MiB ranges, 8 at once (Choice C(a)), whatever this says.
     pub prefetch: bool,
     /// How commits are gathered into one upload (`BUCKWAL_BATCHING`).
     pub batching: Batching,
@@ -699,7 +702,8 @@ pub(crate) struct EngineConfig {
     /// Parallel log GETs in a restore; the caller builds its `Bucket` with it too (parallel
     /// page uploads in a seal).
     pub upload_concurrency: usize,
-    /// Fetch every sealed page in the background after open.
+    /// Formats 1 to 4: fetch every sealed page in the background after open (a copy restored
+    /// from a pack always fetches its blocks in the background).
     pub prefetch: bool,
     /// The writer's lease (`Bucket::set_lease`, `Bucket::check_lease`).
     pub lease: Duration,

@@ -13,6 +13,12 @@ pub(crate) const LOG_FILE: &str = "app.db-log";
 pub(crate) const STATE_FILE: &str = "app.db-durable";
 /// Page numbers checkpointed since the last seal (u32 LE each).
 pub(crate) const DIRTY_FILE: &str = "app.db-dirty";
+/// The pack a restored copy reads its blocks from, while some are not local yet: the pack
+/// pointer's bytes (a u32 LE length, then the bytes), then the pack codes object's bytes.
+pub(crate) const PACK_FILE: &str = "app.db-pack";
+/// Which blocks of the pack are local: the limit (u64 LE: bytes at or above it are never
+/// fetched), then one byte per block (1 = local).
+pub(crate) const BLOCKS_FILE: &str = "app.db-blocks";
 /// Present while a restore moves its files into the directory (`restore_staged`).
 pub(crate) const RESTORING_FILE: &str = "app.db-restoring";
 /// A read replica's position file (generation, stage, offset, replica id).

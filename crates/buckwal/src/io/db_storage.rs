@@ -3,9 +3,11 @@
 //! local are fetched on first read; pages the engine writes are recorded dirty (in memory and
 //! in `<dir>/app.db-dirty`) and uploaded only when the generation is sealed (D6).
 //!
-//! A format 5 bucket (`packed`) holds no page: the local file is the whole database, nothing is
-//! fetched, no dirty page is recorded and no dirty file is written. Its WAL restart is a
-//! generation switch (`switch_generation`), which uploads no page.
+//! A format 5 bucket (`packed`) holds no page: no dirty page is recorded and no dirty file is
+//! written, and its WAL restart is a generation switch (`switch_generation`), which uploads no
+//! page. A copy restored from a pack reads the blocks that are not local yet from the pack
+//! (`blocks`, the `BlockStore`) until every block is local; then nothing is fetched.
+use super::block_store::{page_bytes, BlockStore};
 use super::stash::stash;
 use super::IoMode;
 use super::{read_at, sync_file, write_at};
@@ -106,6 +108,8 @@ pub(crate) struct BucketDbStorage {
     /// A format 5 bucket: no dirty page set, no dirty file, a generation switch at a WAL
     /// restart (the module doc).
     packed: bool,
+    /// A format 5 copy restored from a pack whose blocks are not all local yet.
+    blocks: Option<Arc<BlockStore>>,
 }
 
 pub(crate) struct StorageParts {
@@ -124,6 +128,8 @@ pub(crate) struct StorageParts {
     pub mvcc: bool,
     /// The bucket is format 5 (`BucketDbStorage::packed`).
     pub packed: bool,
+    /// The pack's blocks (`BucketDbStorage::blocks`).
+    pub blocks: Option<Arc<BlockStore>>,
 }
 
 impl BucketDbStorage {
@@ -155,7 +161,13 @@ impl BucketDbStorage {
             mode: p.mode,
             mvcc: p.mvcc,
             packed: p.packed,
+            blocks: p.blocks,
         }
+    }
+
+    /// The copy reads blocks from a pack: the background fetch completes it.
+    pub(crate) fn has_blocks(&self) -> bool {
+        self.blocks.is_some()
     }
 
     /// The bucket is format 5: a WAL restart is a generation switch (`switch_generation`).
@@ -193,10 +205,15 @@ impl BucketDbStorage {
         }
     }
 
-    /// Make page `p` present in the local file, fetching it from the bucket once.
+    /// Make page `p` present in the local file, fetching it from the bucket once (from a
+    /// pack: its whole block).
     pub(crate) fn ensure_local(&self, p: u32) -> Result<()> {
         if p == 0 || self.complete.load(SeqCst) {
             return Ok(());
+        }
+        if let Some(b) = &self.blocks {
+            let (off, len) = page_bytes(p as usize, b.page_size() as usize);
+            return b.ensure(off, len);
         }
         let mut local = self.local.lock().unwrap();
         if local.contains(&p) {
@@ -250,14 +267,75 @@ impl BucketDbStorage {
         Ok(())
     }
 
+    /// The bytes of `count` pages of `page_size` from page `first` on are local: from a pack,
+    /// each block they touch is fetched first (also before the engine writes them, so a fetch
+    /// never overwrites a page the engine wrote). Without a pack, as `ensure_local`.
+    fn ensure_pages(&self, first: usize, count: usize, page_size: usize) -> Result<()> {
+        if self.complete.load(SeqCst) {
+            return Ok(());
+        }
+        match &self.blocks {
+            Some(b) => {
+                let (off, _) = page_bytes(first, page_size);
+                b.ensure(off, (count * page_size) as u64)
+            }
+            None => (0..count).try_for_each(|i| match u32::try_from(first + i) {
+                Ok(p) => self.ensure_local(p),
+                Err(_) => Ok(()),
+            }),
+        }
+    }
+
+    /// A copy restored from a pack: fetch every block that is not local, in 16 MiB ranges, 8
+    /// at once (`BlockStore::fetch_all`); once all are local, record the copy complete, and a
+    /// writer removes the pack files. The `buckwal.prefetch` span as `prefetch` makes it, its
+    /// `buckwal.pages` the pages of the bytes fetched.
+    fn fetch_pack(&self, blocks: &BlockStore, stop: &AtomicBool) {
+        let span = tracing::info_span!(
+            target: "buckwal",
+            "buckwal.prefetch",
+            buckwal.pages = tracing::field::Empty,
+            buckwal.outcome = tracing::field::Empty,
+        );
+        let _run = span.enter();
+        let before = blocks.fetched();
+        let outcome = match blocks.fetch_all(stop) {
+            Ok(true) => {
+                let r = self.mark_complete().and_then(|_| match self.mode {
+                    IoMode::Writer => super::block_store::remove_files(&self.dir),
+                    _ => Ok(()),
+                });
+                match r {
+                    Ok(()) => "complete",
+                    Err(e) => e.outcome(),
+                }
+            }
+            Ok(false) => "stopped",
+            Err(e) => {
+                tracing::warn!(target: "buckwal", error = %e, "background fetch of the pack failed");
+                e.outcome()
+            }
+        };
+        let page_size = u64::from(blocks.page_size().max(1));
+        span.record("buckwal.pages", (blocks.fetched() - before) / page_size);
+        span.record("buckwal.outcome", outcome);
+    }
+
     /// Fetch every page the manifest names; once all are local, nothing is fetched again, in
     /// this process or a later one (`mark_complete`). Returns early, leaving the rest to be
-    /// fetched on read, once `stop` is set.
+    /// fetched on read, once `stop` is set. A copy restored from a pack fetches its blocks
+    /// instead (`fetch_pack`).
     ///
     /// One `buckwal.prefetch` span covers the run, from its first page to its return, with
     /// `buckwal.pages` (pages fetched during the run) and `buckwal.outcome`: `complete`,
     /// `stopped`, `integrity` or `error`. It records once, never per page.
     pub(crate) fn prefetch(&self, stop: &AtomicBool) {
+        if let Some(b) = &self.blocks {
+            if !self.complete.load(SeqCst) {
+                self.fetch_pack(b, stop);
+            }
+            return;
+        }
         let Some(m) = &self.manifest else {
             return;
         };
@@ -379,6 +457,9 @@ impl BucketDbStorage {
         let mut dirty = self.dirty.lock().unwrap();
         sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
         let generation = self.uploader.switch_generation()?;
+        if let Some(b) = &self.blocks {
+            b.set_generation(generation);
+        }
         // As in `seal`: the head's ETag changed, and a takeover quiet of the generation that
         // ended is cleared. Writer id, epoch and claim id carry over.
         let state = LocalState {
@@ -488,9 +569,8 @@ impl DatabaseStorage for BucketDbStorage {
         io_ctx: &IOContext,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        if let Ok(p) = u32::try_from(page_idx) {
-            self.ensure_local(p).map_err(stash)?;
-        }
+        self.ensure_pages(page_idx, 1, c.as_read().buf().len())
+            .map_err(stash)?;
         self.inner.read_page(page_idx, io_ctx, c)
     }
     fn write_page(
@@ -501,6 +581,10 @@ impl DatabaseStorage for BucketDbStorage {
         c: Completion,
     ) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        if self.blocks.is_some() {
+            self.ensure_pages(page_idx, 1, buffer.len())
+                .map_err(stash)?;
+        }
         self.record_written(page_idx as u32, 1, buffer.len());
         self.inner.write_page(page_idx, buffer, io_ctx, c)
     }
@@ -513,6 +597,10 @@ impl DatabaseStorage for BucketDbStorage {
         c: Completion,
     ) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        if self.blocks.is_some() {
+            self.ensure_pages(first_page_idx, buffers.len(), page_size)
+                .map_err(stash)?;
+        }
         self.record_written(first_page_idx as u32, buffers.len(), page_size);
         self.inner
             .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
@@ -529,6 +617,9 @@ impl DatabaseStorage for BucketDbStorage {
     }
     fn truncate(&self, len: usize, c: Completion) -> turso_core::Result<Completion> {
         self.refuse_if_read_only()?;
+        if let Some(b) = &self.blocks {
+            b.truncate(len as u64).map_err(stash)?;
+        }
         if let Some(ps) = std::num::NonZeroU32::new(self.page_size.load(SeqCst)) {
             let pages = (len as u64 / ps.get() as u64).min(u32::MAX as u64) as u32;
             self.bucket_pages.store(pages, SeqCst);
