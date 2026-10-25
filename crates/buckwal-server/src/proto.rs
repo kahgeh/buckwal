@@ -396,7 +396,8 @@ pub fn error_code(e: &buckwal::Error) -> &'static str {
         E::Config(_) => "SQL_INPUT_ERROR",
         E::Bucket(_) => "BUCKET_ERROR",
         E::Io(_) => "IO_ERROR",
-        E::Corrupt(_) => "CORRUPT",
+        // A stale restored copy was `Corrupt` before it had its own variant: same code.
+        E::Corrupt(_) | E::Stale(_) => "CORRUPT",
         E::Encryption(_) => "ENCRYPTION_ERROR",
         E::NotFound(_) | E::Locked(_) | E::AlreadyOpen(_) => "INTERNAL_ERROR",
     }

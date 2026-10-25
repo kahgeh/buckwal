@@ -817,8 +817,10 @@ mod fence_image {
 /// change nothing.
 #[test]
 fn format_5_generation_jump_or_stale_restore_is_corrupt() {
+    // A generation jump of a claimed copy is `Corrupt`; an unclaimed copy behind a switch is
+    // `Stale` (a read-only open restores it again).
     let stale = |r: &Result<Reconciled>| {
-        matches!(r, Err(Error::Corrupt(m))
+        matches!(r, Err(Error::Corrupt(m) | Error::Stale(m))
             if m.contains("generation") && m.contains("stale") && m.contains("restore again"))
     };
     let mem = Arc::new(MemStore::new());
@@ -853,6 +855,7 @@ fn format_5_generation_jump_or_stale_restore_is_corrupt() {
     assert!(!s.claimed);
     let wal = local_wal(r.path());
     let got = reconcile(r.path(), &mut b, &mut s, &cfg());
+    assert!(matches!(got, Err(Error::Stale(_))), "{got:?}");
     assert!(stale(&got), "{got:?}");
     let two = Head {
         generation: 2,

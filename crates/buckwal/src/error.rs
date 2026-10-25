@@ -17,6 +17,9 @@ pub enum Error {
     Io(String),
     Config(String),
     Encryption(String),
+    /// A copy that was restored and never claimed is behind the head (the writer switched the
+    /// generation since the restore): restore again into a new directory.
+    Stale(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -37,6 +40,7 @@ impl fmt::Display for Error {
             Error::Io(m) => write!(f, "io error: {m}"),
             Error::Config(m) => write!(f, "config error: {m}"),
             Error::Encryption(m) => write!(f, "encryption error: {m}"),
+            Error::Stale(m) => write!(f, "stale copy: {m}"),
         }
     }
 }

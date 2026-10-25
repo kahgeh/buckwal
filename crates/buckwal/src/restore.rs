@@ -635,6 +635,7 @@ struct Built {
 /// `<dir>/app.db` with a local checkpoint (`apply_generation_over`). The head's generation is
 /// left for the caller, as the `-wal`. A log that is not as buckwal writes it is `Corrupt`. A
 /// pack (or its codes) that is gone sets `gone` and fails: the caller starts again.
+#[allow(clippy::too_many_arguments)]
 fn apply_ended_generations(
     store: &Arc<dyn ObjectStore>,
     keys: &Keys,
@@ -643,6 +644,7 @@ fn apply_ended_generations(
     head: &Head,
     retries: &AtomicU64,
     gone: &Arc<AtomicBool>,
+    read: &Mutex<Option<String>>,
 ) -> Result<Built> {
     if head.journal_mode == JournalMode::Mvcc {
         return Err(Error::Unsupported("restore of a format 5 MVCC bucket"));
@@ -654,6 +656,7 @@ fn apply_ended_generations(
     })? {
         Some(obj) => {
             let p = keys.decode_pointer(&obj.body)?;
+            *read.lock().unwrap() = Some(p.pack_key.clone());
             let from = p.pack_generation;
             let Some(codes) = counted(retries, &cfg.retry, &p.codes_key, || {
                 store.get(&p.codes_key)
@@ -805,11 +808,16 @@ fn restore_files(
     let mut restarts = 0;
     let (mut report, page1) = loop {
         let gone = Arc::new(AtomicBool::new(false));
-        match restore_attempt(&store, keys, dir, cfg, retries, &gone) {
-            Err(e) if gone.load(Relaxed) && restarts < PACK_RESTARTS => {
-                // A newer pack replaced the one this restore read, and GC deleted it (spec
-                // "Restore"): read the pointer again and start again from the newer pack.
-                tracing::warn!(target: "buckwal", error = %e, "restore: the pack is gone; starting again");
+        let read = Mutex::new(None);
+        match restore_attempt(&store, keys, dir, cfg, retries, &gone, &read) {
+            Err(e)
+                if restarts < PACK_RESTARTS
+                    && (gone.load(Relaxed)
+                        || pointer_moved(&*store, keys, cfg, read.into_inner().unwrap())) =>
+            {
+                // A newer pack replaced the one this restore read, and GC deleted it, or the
+                // log below the newer pack (spec "Restore"): start again from the newer pack.
+                tracing::warn!(target: "buckwal", error = %e, "restore: the pack is gone or replaced; starting again");
                 restarts += 1;
                 fs::remove_dir_all(dir).map_err(|e| io_err("clear the restore dir", e))?;
             }
@@ -824,7 +832,28 @@ fn restore_files(
     Ok((report, page1))
 }
 
-/// One attempt of [`restore_files`]. `gone` is set when the pack it read is gone.
+/// Whether the pointer now names another pack than `read`, the pack an attempt read (false
+/// when it read none, or when the pointer cannot be read).
+fn pointer_moved(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    read: Option<String>,
+) -> bool {
+    let Some(read) = read else {
+        return false;
+    };
+    let key = keys.pack_pointer();
+    match with_retry(&cfg.retry, &key, |_| store.get(&key)) {
+        Ok(Some(obj)) => keys
+            .decode_pointer(&obj.body)
+            .is_ok_and(|p| p.pack_key != read),
+        _ => false,
+    }
+}
+
+/// One attempt of [`restore_files`]. `gone` is set when the pack it read is gone, and `read`
+/// names the pack it read.
 fn restore_attempt(
     store: &Arc<dyn ObjectStore>,
     keys: &Keys,
@@ -832,6 +861,7 @@ fn restore_attempt(
     cfg: &EngineConfig,
     retries: &AtomicU64,
     gone: &Arc<AtomicBool>,
+    read: &Mutex<Option<String>>,
 ) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let retry = &cfg.retry;
     let head_key = keys.head();
@@ -844,7 +874,7 @@ fn restore_attempt(
     // A format 5 bucket holds no page: the generations before the head's come from the pack
     // and the log since it.
     let built = match head.format {
-        FORMAT_V5 => apply_ended_generations(store, keys, dir, cfg, &head, retries, gone)?,
+        FORMAT_V5 => apply_ended_generations(store, keys, dir, cfg, &head, retries, gone, read)?,
         _ => Built {
             db: false,
             pack_key: None,

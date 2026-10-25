@@ -98,7 +98,14 @@ struct Recording {
     first_pointer: Mutex<Option<Vec<u8>>>,
     /// While set, a range GET past the first block waits.
     hold: std::sync::atomic::AtomicBool,
+    /// Runs once, after the first range GET returns.
+    after_range: Mutex<Option<Hook>>,
+    /// Runs once, after the first GET of a key that holds the text.
+    after_get: Mutex<Option<(String, Hook)>>,
 }
+
+/// What a test runs between two requests of a restore.
+type Hook = Box<dyn FnOnce() + Send>;
 
 impl Recording {
     fn new(inner: Arc<MemStore>) -> Arc<Recording> {
@@ -108,6 +115,8 @@ impl Recording {
             pointer_key: keys().pack_pointer(),
             first_pointer: Mutex::new(None),
             hold: Default::default(),
+            after_range: Mutex::new(None),
+            after_get: Mutex::new(None),
         })
     }
     fn take_ranges(&self) -> Vec<(String, u64, u64)> {
@@ -134,7 +143,18 @@ impl ObjectStore for Recording {
                 }));
             }
         }
-        self.inner.get(k)
+        let got = self.inner.get(k);
+        let hook = {
+            let mut armed = self.after_get.lock().unwrap();
+            match &*armed {
+                Some((text, _)) if k.contains(text.as_str()) => armed.take().map(|(_, h)| h),
+                _ => None,
+            }
+        };
+        if let Some(h) = hook {
+            h();
+        }
+        got
     }
     fn stat(&self, k: &str) -> std::result::Result<Option<ObjectStat>, StoreError> {
         self.inner.stat(k)
@@ -170,7 +190,12 @@ impl ObjectStore for Recording {
         while offset >= BLOCK_SIZE && self.hold.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        self.inner.get_range(k, offset, len)
+        let got = self.inner.get_range(k, offset, len);
+        let hook = self.after_range.lock().unwrap().take();
+        if let Some(h) = hook {
+            h();
+        }
+        got
     }
     fn abort_incomplete(&self, p: &str, d: Duration) -> std::result::Result<u64, StoreError> {
         self.inner.abort_incomplete(p, d)
@@ -786,4 +811,163 @@ fn block_read_after_its_pack_was_deleted_takes_the_newer_pack() {
     restore_with_store(&config(&fresh(&r)), store.clone(), &fresh(&r)).unwrap();
     let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
     assert_eq!(rows(&v.connect().unwrap()), want);
+}
+
+/// The pack grows across a 1 MiB block boundary after the open, and the old pack is gone: a read
+/// takes the newer pack. The database is closed before the fetch completes; the directory
+/// reopens, reads, and the background fetch completes it.
+#[test]
+fn pack_switch_across_a_block_boundary_then_reopen_reads_and_completes() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    insert_big(&c, 451..=700);
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    pack_now(store.clone(), &config(a.path()));
+    let old = pointer(&*store, &keys());
+    crash(db, vec![c]);
+    let b = tempdir();
+    let off = NoBackgroundFetch::on();
+    let db = open_mem(&store, &fresh(&b));
+    let cb = db.connect().unwrap();
+    insert_big(&cb, 701..=1000);
+    cb.checkpoint(CheckpointMode::Truncate).unwrap();
+    pack_now(store.clone(), &config(a.path()));
+    let new = pointer(&*store, &keys());
+    assert!(
+        new.size.div_ceil(BLOCK_SIZE) > old.size.div_ceil(BLOCK_SIZE),
+        "{old:?} {new:?}"
+    );
+    store.delete(&old.pack_key).unwrap();
+    store.delete(&old.codes_key).unwrap();
+    assert_eq!(block_flags(&fresh(&b))[1], 0, "block 1 is local already");
+    let one = cb
+        .query("SELECT substr(v, 1, 6) FROM t WHERE id = 300", &[])
+        .unwrap();
+    assert_eq!(text(&one[0][0]), "000300");
+    assert_eq!(block_flags(&fresh(&b))[1], 1);
+    cb.close().unwrap();
+    db.close().unwrap();
+    assert!(!state(&fresh(&b)).complete);
+    let db = open_mem(&store, &fresh(&b));
+    let cb = db.connect().unwrap();
+    let one = cb
+        .query("SELECT substr(v, 1, 6) FROM t WHERE id = 200", &[])
+        .unwrap();
+    assert_eq!(text(&one[0][0]), "000200");
+    cb.close().unwrap();
+    db.close().unwrap();
+    drop(off);
+    let db = open_mem(&store, &fresh(&b));
+    wait_complete(&fresh(&b));
+    let cb = db.connect().unwrap();
+    integrity_ok(&cb);
+    let want: Vec<(i64, String, i64)> = (1..=1000)
+        .map(|id| (id, big(id)[..12].to_string(), big(id).len() as i64))
+        .collect();
+    assert_eq!(rows(&cb), want);
+    cb.close().unwrap();
+    db.close().unwrap();
+}
+
+/// GC runs between the restore's first block and its log listing: it deletes the pack the
+/// restore read (a newer pack won) and the log below the newer pack's generation. The restore
+/// reads the pointer again and starts again from the newer pack.
+#[test]
+fn restore_restarts_when_gc_deletes_its_pack_and_log_between_steps() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    let old = pointer(&*store, &keys());
+    let old_body = store.get(&keys().pack_pointer()).unwrap().unwrap().body;
+    c.execute("UPDATE t SET v = 'g' WHERE id > 420", &[])
+        .unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    insert_big(&c, 451..=452);
+    pack_now(store.clone(), &config(a.path()));
+    let new = pointer(&*store, &keys());
+    let want = rows(&c);
+    let rec = Recording::new(store.clone());
+    *rec.first_pointer.lock().unwrap() = Some(old_body);
+    let gc = store.clone();
+    let (old_key, old_codes, below) = (
+        old.pack_key.clone(),
+        old.codes_key.clone(),
+        new.pack_generation,
+    );
+    *rec.after_range.lock().unwrap() = Some(Box::new(move || {
+        gc.delete(&old_key).unwrap();
+        gc.delete(&old_codes).unwrap();
+        for g in 1..below {
+            for seq in log_seqs(&*gc, g) {
+                gc.delete(&keys().log(g, seq)).unwrap();
+            }
+        }
+    }));
+    let r = tempdir();
+    let rep = restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap();
+    assert_eq!(rep.pack_key.as_deref(), Some(new.pack_key.as_str()));
+    let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
+    let vc = v.connect().unwrap();
+    integrity_ok(&vc);
+    assert_eq!(rows(&vc), want);
+    drop(vc);
+    drop(v);
+    crash(db, vec![c]);
+}
+
+/// A pointer that keeps naming a pack that is gone: the restore starts again at most 3 times,
+/// then fails with the pack's `NotFound`, and leaves no database.
+#[test]
+fn restore_of_a_pack_that_stays_gone_stops_after_its_restarts() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    let p = pointer(&*store, &keys());
+    store.delete(&p.pack_key).unwrap();
+    let rec = Recording::new(store.clone());
+    let r = tempdir();
+    let e = restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap_err();
+    assert_eq!(e, Error::NotFound(p.pack_key.clone()));
+    let tries = rec
+        .take_ranges()
+        .iter()
+        .filter(|(k, _, _)| k == &p.pack_key)
+        .count();
+    assert_eq!(tries, 4, "one attempt and 3 restarts");
+    assert!(!fresh(&r).join("app.db").exists());
+    crash(db, vec![c]);
+}
+
+/// A read-only open of an empty directory restores, and the writer switches generation during
+/// the restore: the copy is behind the head before it ever opened. The open removes it and
+/// restores again, and answers with the writer's rows.
+#[test]
+fn read_only_open_restores_again_when_the_head_moves_during_its_restore() {
+    let store = mem();
+    let a = tempdir();
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    insert_big(&c, 1..=10);
+    let writer = db.clone();
+    let rec = Recording::new(store.clone());
+    *rec.after_get.lock().unwrap() = Some((
+        "/log/".to_string(),
+        Box::new(move || {
+            let w = writer.connect().unwrap();
+            insert_big(&w, 11..=12);
+            w.checkpoint(CheckpointMode::Truncate).unwrap();
+            w.close().unwrap();
+        }),
+    ));
+    let g = db.generation();
+    let r = tempdir();
+    let v = open_read_only_with_store(config(&fresh(&r)), rec.clone()).unwrap();
+    assert!(db.generation() > g, "the hook never ran");
+    let vc = v.connect().unwrap();
+    assert_eq!(rows(&vc), rows(&c));
+    drop(vc);
+    drop(v);
+    crash(db, vec![c]);
 }

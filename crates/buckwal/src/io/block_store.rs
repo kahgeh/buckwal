@@ -90,7 +90,8 @@ fn check_page_size(p: &PackPointer, block0: &[u8]) -> Result<()> {
 /// `len` bytes of the pack `p` names from `offset` (a block boundary), in one range GET, each
 /// block checked against `codes`. Fewer bytes at the end of the pack. `None` when the pack is
 /// gone. A range of the wrong length, or a block that fails its code, is `Corrupt` (the
-/// integrity error and record in an encrypted bucket).
+/// integrity error and record in an encrypted bucket), and so is an `offset` at or after the end
+/// of the pack: no block of it is there.
 pub(crate) fn fetch_verified(
     store: &dyn ObjectStore,
     keys: &Keys,
@@ -101,10 +102,15 @@ pub(crate) fn fetch_verified(
     len: u64,
 ) -> Result<Option<Vec<u8>>> {
     debug_assert_eq!(offset % BLOCK_SIZE, 0);
-    let want = p.size.saturating_sub(offset).min(len);
-    if want == 0 {
-        return Ok(Some(Vec::new()));
+    if offset >= p.size {
+        return Err(Error::Corrupt(format!(
+            "{}: block {} is past the end of the pack ({} bytes)",
+            p.pack_key,
+            offset / BLOCK_SIZE,
+            p.size
+        )));
     }
+    let want = (p.size - offset).min(len);
     let Some(bytes) = with_retry(retry, &p.pack_key, |_| {
         store.get_range(&p.pack_key, offset, want)
     })?
@@ -138,7 +144,8 @@ pub(crate) struct BlockStore {
     /// `app.db`, for the fetched blocks (the engine writes through its own handle).
     db: File,
     source: Mutex<Arc<Source>>,
-    /// One flag per block of the first pack. Blocks beyond it were written locally.
+    /// One flag per block of the first pack, whatever pack the blocks come from now. Blocks
+    /// beyond it were written locally.
     local: Vec<AtomicBool>,
     /// `BLOCKS_FILE`. Its mutex is the write lock: held to write fetched blocks into `app.db`,
     /// so a fetch writes a block only while it is not local, and by `truncate`.
@@ -254,15 +261,21 @@ impl BlockStore {
         restore: bool,
         gone: Arc<AtomicBool>,
     ) -> Result<BlockStore> {
-        let blocks = source.pointer.size.div_ceil(BLOCK_SIZE);
-        if flags.len() as u64 != LIMIT_LEN + blocks {
+        // The flags are of the first pack's blocks (a newer pack that replaced it can have more
+        // or fewer): the limit, then one flag per block, and the limit is within them.
+        let Some(limit) = flags.get(..8) else {
             return Err(Error::Corrupt(format!(
-                "{BLOCKS_FILE} holds {} bytes, not {} for {blocks} blocks",
-                flags.len(),
-                LIMIT_LEN + blocks
+                "{BLOCKS_FILE} holds {} bytes, fewer than its limit",
+                flags.len()
+            )));
+        };
+        let limit = u64::from_le_bytes(limit.try_into().unwrap());
+        let blocks = flags.len() as u64 - LIMIT_LEN;
+        if limit > blocks * BLOCK_SIZE {
+            return Err(Error::Corrupt(format!(
+                "{BLOCKS_FILE}: its limit {limit} is beyond its {blocks} blocks"
             )));
         }
-        let limit = u64::from_le_bytes(flags[..8].try_into().unwrap());
         let db = OpenOptions::new()
             .read(true)
             .write(true)
@@ -389,6 +402,7 @@ impl BlockStore {
         if p.pack_key == old.pack_key || p.pack_generation > self.generation.load(SeqCst) {
             return Ok(false);
         }
+        self.check_local_page_size(&p, old)?;
         let Some(codes) = with_retry(&self.retry, &p.codes_key, |_| self.store.get(&p.codes_key))?
         else {
             return Ok(false);
@@ -416,6 +430,27 @@ impl BlockStore {
             codes: decoded,
         });
         Ok(true)
+    }
+
+    /// The newer pointer `p` against the local file: its page size must be the one the local
+    /// header gives (the header of `old`'s first block while block 0 is not local).
+    fn check_local_page_size(&self, p: &PackPointer, old: &PackPointer) -> Result<()> {
+        let local = if self.done(0) {
+            let mut header = [0u8; 18];
+            self.db
+                .read_exact_at(&mut header, 0)
+                .map_err(|e| io_err("read the app.db header", e))?;
+            header_page_size(&header)
+        } else {
+            Some(old.page_size)
+        };
+        if local != Some(p.page_size) {
+            return Err(Error::Corrupt(format!(
+                "pack pointer: page_size {} of {}, but the local database has {:?}-byte pages",
+                p.page_size, p.pack_key, local
+            )));
+        }
+        Ok(())
     }
 
     /// Write the fetched `bytes` (blocks from block `first` on) into `app.db`, each block only
@@ -658,3 +693,6 @@ impl Drop for NoBackgroundFetch {
         NO_BACKGROUND_FETCH.with(|f| f.set(false));
     }
 }
+
+#[cfg(test)]
+mod tests;

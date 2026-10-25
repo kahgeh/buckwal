@@ -109,7 +109,7 @@ pub(crate) fn reconcile_files(
     let packed = head.format == FORMAT_V5;
     let expected = (state.generation + 1).max(state.next_generation_floor);
     if state.generation < head.generation && packed && !state.claimed {
-        return Err(Error::Corrupt(format!(
+        return Err(Error::Stale(format!(
             "{} is stale: it was restored at generation {}, and the head moved on to generation \
              {}; restore again into a new directory",
             dir.display(),

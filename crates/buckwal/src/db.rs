@@ -11,7 +11,7 @@ use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
 use crate::format::{Head, Keys, LocalState, LogRecord, FORMAT, FORMAT_V2};
 use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
 use crate::reconcile::{reconcile, Reconciled};
-use crate::restore::{clear_interrupted_restore, restore_staged, sealed_page_one};
+use crate::restore::{clear_interrupted_restore, remove_restored, restore_staged, sealed_page_one};
 use crate::stats::{StatsCell, UploadStats};
 use crate::store::{with_retry, ObjectStore, StatsSnap};
 use crate::trim::spawn_trimmer;
@@ -286,6 +286,10 @@ pub fn open_read_only_with_store(config: Config, store: Arc<dyn ObjectStore>) ->
     open_impl(config, store, true)
 }
 
+/// How many times a read-only open of an empty directory restores when the head moves during
+/// its restore (`Error::Stale`).
+const READ_ONLY_RESTORES: u32 = 3;
+
 fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Result<Database> {
     config.validate()?;
     let encryption = encryption::load(&config)?;
@@ -320,11 +324,24 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             )))
         }
         None if head_exists(&*store, &keys, &cfg)? => {
-            let staged = restore_staged(store.clone(), &keys, &dir, &cfg)?;
-            let state = LocalState::read(&dir)?
-                .ok_or_else(|| Error::Corrupt("the restore wrote no local state".into()))?;
-            refuse_encryption_mismatch(&dir, &store, &keys, &cfg, staged.page1)?;
-            attached(attach_existing(&dir, &store, &keys, &cfg, state)?)
+            let mut attempt = 1;
+            loop {
+                let staged = restore_staged(store.clone(), &keys, &dir, &cfg)?;
+                let state = LocalState::read(&dir)?
+                    .ok_or_else(|| Error::Corrupt("the restore wrote no local state".into()))?;
+                refuse_encryption_mismatch(&dir, &store, &keys, &cfg, staged.page1)?;
+                match attach_existing(&dir, &store, &keys, &cfg, state) {
+                    // A read-only open writes nothing to the bucket: when the writer switched
+                    // the generation during this open's own restore, the copy is removed and
+                    // restored again.
+                    Err(Error::Stale(m)) if read_only && attempt < READ_ONLY_RESTORES => {
+                        tracing::info!(target: "buckwal", reason = %m, "read-only open: the head moved during the restore; restoring again");
+                        remove_restored(&dir)?;
+                        attempt += 1;
+                    }
+                    r => break attached(r?),
+                }
+            }
         }
         None if read_only => {
             return Err(Error::NotFound(format!(
