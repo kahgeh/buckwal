@@ -1,6 +1,6 @@
 # Packer, stage 1: what was measured
 
-Date: 2026-10-25. Sizes: "MB" and "GB" mean MiB and GiB in the probes, so a "100 MB" object is 104,857,600 bytes. Machine: Apple M4 Max Mac, macOS, home internet link. Stores: RustFS 1.0.0 on this Mac, and AWS S3 in ap-southeast-2.
+Date: 2026-10-25. Sizes: in the multipart tables, "MB" and "GB" mean MiB and GiB, so a "100 MB" object is 104,857,600 bytes. Every other size is in decimal MB. Machine: Apple M4 Max Mac, macOS, home internet link. Stores: RustFS 1.0.0 on this Mac, and AWS S3 in ap-southeast-2.
 
 **This report is partial.** The user asked to stop the measurements on 2026-10-25 and to start stage 2. The section "Not measured" lists what stage 1 did not do. The probes were throwaway code and are not in the repository.
 
@@ -47,13 +47,13 @@ The upload speed is the speed of this Mac's link. A server in the same AWS regio
 
 ## RustFS checks
 
-- RustFS completes a multipart upload (3 parts of 16 MiB, 40 MB) and answers `Range` with 206 and the right bytes.
+- RustFS completes a multipart upload (3 parts of 16 MiB, 16 MiB and 6.4 MB; 40 MB in all) and answers `Range` with 206 and the right bytes.
 - On RustFS direct (no added delay): 4 KiB GET median 0.6 ms, PUT 1.2 ms, `If-None-Match` 1.1 ms, `If-Match` 1.4 ms. A 100 MB multipart upload took 0.80 s (125 MB/s) and its range download 0.24 s.
 - Today's design on a 20 MB database, no delay: the sealing commit waited 0.15 s (530 PUTs). This shows the same mechanism as the 2026-10-25 figures in the spec: the commit after a WAL restart uploads the changed pages.
 
 ## turso 0.8.3 `VACUUM` (turso_core, `DatabaseOpts::with_vacuum(true)`)
 
-A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, then the statement. The 1 GB numbers are shown. A run at 100 MB gave the same results.
+A table of 4,000-byte blobs, half the rows deleted, then a TRUNCATE checkpoint, then the statement. The 1 GB numbers are shown (1,000 MB of rows). The times come from the first 1 GB run. The reopen and header checks come from a second run. A run at 100 MB gave the same results.
 
 | Database | Statement | Time | Result | Peak WAL |
 |---|---|---|---|---|
