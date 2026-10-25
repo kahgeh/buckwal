@@ -20,19 +20,42 @@ pub(crate) struct PackCodes {
 /// What every code covers, besides its own kind and data.
 struct Binding<'a> {
     keys: &'a Keys,
+    /// The database id ("" in a plaintext bucket, which has none).
+    id: String,
     pack_key: &'a str,
     pack_generation: u64,
     total: u64,
 }
 
-impl Binding<'_> {
+impl<'a> Binding<'a> {
+    /// The binding of a pack. In an encrypted bucket the keys must know the database id (a
+    /// format 5 head was read or made), else `Corrupt`: a code without it would not bind the
+    /// pack to its database.
+    fn new(keys: &'a Keys, pack_key: &'a str, pack_generation: u64, total: u64) -> Result<Self> {
+        let id = match keys.known_database_id() {
+            Some(id) => id,
+            None if keys.coded() => {
+                return Err(Error::Corrupt(format!(
+                    "pack codes of {pack_key}: the database id is not known"
+                )))
+            }
+            None => String::new(),
+        };
+        Ok(Binding {
+            keys,
+            id,
+            pack_key,
+            pack_generation,
+            total,
+        })
+    }
+
     /// The code of `kind` over the binding, `extra` and `data`. Each part is fed as its length
     /// and then its bytes, as `IntegrityKey::code` does, in both kinds of bucket.
     fn code(&self, kind: &[u8], extra: &[u8], data: &[u8]) -> [u8; CODE_LEN] {
-        let id = self.keys.known_database_id().unwrap_or_default();
         let parts: [&[u8]; 7] = [
             kind,
-            id.as_bytes(),
+            self.id.as_bytes(),
             self.pack_key.as_bytes(),
             &self.pack_generation.to_be_bytes(),
             &self.total.to_be_bytes(),
@@ -82,31 +105,19 @@ impl PackCodes {
     }
 
     /// The codes of `blocks`, in order. They must be the whole pack: all of `BLOCK_SIZE` bytes
-    /// but the last, and `total` bytes together.
-    pub(crate) fn build<'a>(
+    /// but the last, and `total` bytes together (`Corrupt` otherwise).
+    pub(crate) fn build<'a, B: AsRef<[u8]> + 'a>(
         keys: &Keys,
         pack_key: &str,
         pack_generation: u64,
         total: u64,
-        blocks: impl Iterator<Item = &'a [u8]>,
-    ) -> PackCodes {
-        let b = Binding {
-            keys,
-            pack_key,
-            pack_generation,
-            total,
-        };
-        let mut seen = 0u64;
-        let codes: Vec<_> = blocks
-            .enumerate()
-            .map(|(n, bytes)| {
-                seen += bytes.len() as u64;
-                b.block_code(n as u64, bytes)
-            })
-            .collect();
-        debug_assert_eq!(seen, total, "the blocks are not the whole pack");
-        debug_assert_eq!(codes.len() as u64, block_count(total));
-        PackCodes { codes }
+        blocks: impl Iterator<Item = B>,
+    ) -> Result<PackCodes> {
+        let mut b = CodesBuilder::new(keys, pack_key, pack_generation, total)?;
+        for block in blocks {
+            b.block(block.as_ref())?;
+        }
+        b.finish()
     }
 
     /// The block codes, then the code over all of them.
@@ -116,20 +127,15 @@ impl PackCodes {
         pack_key: &str,
         pack_generation: u64,
         total: u64,
-    ) -> Vec<u8> {
-        let b = Binding {
-            keys,
-            pack_key,
-            pack_generation,
-            total,
-        };
+    ) -> Result<Vec<u8>> {
+        let b = Binding::new(keys, pack_key, pack_generation, total)?;
         let mut out = Vec::with_capacity((self.codes.len() + 1) * CODE_LEN);
         for c in &self.codes {
             out.extend_from_slice(c);
         }
         let own = b.codes_code(&out);
         out.extend_from_slice(&own);
-        out
+        Ok(out)
     }
 
     /// The codes in `body`, when its own code is right for this pack and it holds one code per
@@ -142,12 +148,7 @@ impl PackCodes {
         pack_generation: u64,
         total: u64,
     ) -> Result<PackCodes> {
-        let b = Binding {
-            keys,
-            pack_key,
-            pack_generation,
-            total,
-        };
+        let b = Binding::new(keys, pack_key, pack_generation, total)?;
         let codes_key = format!("{pack_key}.codes");
         let fail = || b.fail(&codes_key, Kind::PackCodes, 0);
         let split = body.len().checked_sub(CODE_LEN).ok_or_else(fail)?;
@@ -176,12 +177,7 @@ impl PackCodes {
         n: u64,
         bytes: &[u8],
     ) -> Result<()> {
-        let b = Binding {
-            keys,
-            pack_key,
-            pack_generation,
-            total,
-        };
+        let b = Binding::new(keys, pack_key, pack_generation, total)?;
         let fail = || b.fail(pack_key, Kind::Pack, n);
         let want = total
             .saturating_sub(n.saturating_mul(BLOCK_SIZE))
@@ -195,6 +191,61 @@ impl PackCodes {
         } else {
             Err(fail())
         }
+    }
+}
+
+/// The codes of a pack, made one block at a time, in order, as the pack is read.
+pub(crate) struct CodesBuilder<'a> {
+    binding: Binding<'a>,
+    codes: Vec<[u8; CODE_LEN]>,
+    /// The bytes of the blocks so far.
+    seen: u64,
+}
+
+impl<'a> CodesBuilder<'a> {
+    pub(crate) fn new(
+        keys: &'a Keys,
+        pack_key: &'a str,
+        pack_generation: u64,
+        total: u64,
+    ) -> Result<Self> {
+        Ok(CodesBuilder {
+            binding: Binding::new(keys, pack_key, pack_generation, total)?,
+            codes: Vec::with_capacity(block_count(total) as usize),
+            seen: 0,
+        })
+    }
+
+    fn layout(&self, m: &str) -> Error {
+        Error::Corrupt(format!("pack codes of {}: {m}", self.binding.pack_key))
+    }
+
+    /// The next block. It must be `BLOCK_SIZE` bytes, or what is left of the pack for the
+    /// last block (`Corrupt` otherwise).
+    pub(crate) fn block(&mut self, bytes: &[u8]) -> Result<()> {
+        let want = (self.binding.total - self.seen).min(BLOCK_SIZE);
+        if want == 0 || bytes.len() as u64 != want {
+            return Err(self.layout(&format!(
+                "block {} is {} bytes, not {want}",
+                self.codes.len(),
+                bytes.len()
+            )));
+        }
+        let n = self.codes.len() as u64;
+        self.codes.push(self.binding.block_code(n, bytes));
+        self.seen += want;
+        Ok(())
+    }
+
+    /// The codes, once the blocks were the whole pack.
+    pub(crate) fn finish(self) -> Result<PackCodes> {
+        if self.seen != self.binding.total {
+            return Err(self.layout(&format!(
+                "the blocks hold {} of {} bytes",
+                self.seen, self.binding.total
+            )));
+        }
+        Ok(PackCodes { codes: self.codes })
     }
 }
 

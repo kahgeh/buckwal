@@ -35,6 +35,7 @@ fn built(k: &Keys, d: &[u8]) -> PackCodes {
         d.len() as u64,
         blocks(d).into_iter(),
     )
+    .unwrap()
 }
 
 fn each(f: impl Fn(&Keys)) {
@@ -132,7 +133,7 @@ fn the_codes_object_round_trips_and_a_changed_byte_fails_its_own_code() {
         let c = built(k, &d);
         let t = d.len() as u64;
         let key = "p/pack/0000000015/r1";
-        let body = c.encode(k, key, 15, t);
+        let body = c.encode(k, key, 15, t).unwrap();
         assert_eq!(PackCodes::decode(k, &body, key, 15, t).unwrap(), c);
         for at in [0, 40, body.len() - 1] {
             let mut bad = body.clone();
@@ -154,7 +155,7 @@ fn a_coded_codes_object_fails_with_the_integrity_record_and_a_wrong_key() {
     let d = data();
     let t = d.len() as u64;
     let key = "p/pack/0000000015/r1";
-    let body = built(&k, &d).encode(&k, key, 15, t);
+    let body = built(&k, &d).encode(&k, key, 15, t).unwrap();
     let mut bad = body.clone();
     bad[3] ^= 1;
     let r = PackCodes::decode(&k, &bad, key, 15, t);
@@ -176,9 +177,12 @@ fn one_gigabyte_gives_32_kb_of_codes() {
         1,
         3 * MIB as u64,
         std::iter::repeat_n(&one[..], 3),
-    );
+    )
+    .unwrap();
     assert_eq!(
-        c.encode(&k, "p/pack/0000000001/r", 1, 3 * MIB as u64).len(),
+        c.encode(&k, "p/pack/0000000001/r", 1, 3 * MIB as u64)
+            .unwrap()
+            .len(),
         PackCodes::encoded_len(3 << 20)
     );
 }
@@ -186,12 +190,53 @@ fn one_gigabyte_gives_32_kb_of_codes() {
 #[test]
 fn an_empty_pack_has_no_blocks() {
     each(|k| {
-        let c = PackCodes::build(k, "p/pack/0000000001/r", 1, 0, std::iter::empty());
-        let body = c.encode(k, "p/pack/0000000001/r", 1, 0);
+        let c =
+            PackCodes::build(k, "p/pack/0000000001/r", 1, 0, std::iter::empty::<&[u8]>()).unwrap();
+        let body = c.encode(k, "p/pack/0000000001/r", 1, 0).unwrap();
         assert_eq!(body.len(), 32);
         assert_eq!(
             PackCodes::decode(k, &body, "p/pack/0000000001/r", 1, 0).unwrap(),
             c
         );
+    });
+}
+
+/// In an encrypted bucket every code covers the database id: without a known id (no format 5
+/// head read yet) the codes are neither made nor checked.
+#[test]
+fn codes_need_the_database_id_in_a_coded_bucket() {
+    let ik = Encryption::new(CipherMode::Aegis256, EncryptionKey::new_256([1; 32])).integrity_key();
+    let k = Keys::new("p").with_integrity(Some(ik));
+    let d = data();
+    let t = d.len() as u64;
+    let key = "p/pack/0000000015/r1";
+    let r = PackCodes::build(&k, key, 15, t, blocks(&d).into_iter());
+    assert!(
+        matches!(&r, Err(Error::Corrupt(m)) if m.contains("database id")),
+        "{r:?}"
+    );
+    let body = built(&coded(1), &d).encode(&coded(1), key, 15, t).unwrap();
+    let r = PackCodes::decode(&k, &body, key, 15, t);
+    assert!(
+        matches!(&r, Err(Error::Corrupt(m)) if m.contains("database id")),
+        "{r:?}"
+    );
+}
+
+/// Blocks that are not the whole pack in 1 MiB blocks are an error, not a debug assertion.
+#[test]
+fn blocks_that_are_not_the_whole_pack_are_an_error() {
+    each(|k| {
+        let d = data();
+        let t = d.len() as u64;
+        let key = "p/pack/0000000015/r1";
+        let short = PackCodes::build(k, key, 15, t + 1, blocks(&d).into_iter());
+        assert!(matches!(short, Err(Error::Corrupt(_))), "{short:?}");
+        let long = PackCodes::build(k, key, 15, t - 1, blocks(&d).into_iter());
+        assert!(matches!(long, Err(Error::Corrupt(_))), "{long:?}");
+        // A small block that is not the last.
+        let odd = [&d[..10], &d[10..]];
+        let r = PackCodes::build(k, key, 15, t, odd.into_iter());
+        assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
     });
 }
