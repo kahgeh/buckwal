@@ -761,11 +761,13 @@ fn apply_ended_generations(
         }
         // A new MVCC database is published as its first pack (`Bucket::create_packed_mvcc_with`).
         None if head.journal_mode == JournalMode::Mvcc => {
-            return Err(Error::Corrupt(format!(
-                "{pointer_key} is missing or another database's: an MVCC bucket of format 5 \
-                 starts with its first pack; the create of this database did not finish; \
-                 delete the object 'head' under the prefix and create the database again"
-            )))
+            return Err(crate::pack::first::pointer_gap_error(
+                &**store,
+                keys,
+                &cfg.retry,
+                head,
+                &pointer_key,
+            ));
         }
         None => (None, 1),
     };

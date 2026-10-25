@@ -455,12 +455,13 @@ impl Run<'_> {
         let base = pointer_now.own().cloned();
         if base.is_none() && head.journal_mode == JournalMode::Mvcc {
             // A new MVCC database is published as its first pack.
-            return Err(Error::Corrupt(format!(
-                "{} is missing or another database's: an MVCC bucket of format 5 starts with its \
-                 first pack; the create of this database did not finish; delete the object \
-                 'head' under the prefix and create the database again",
-                self.keys.pack_pointer()
-            )));
+            return Err(super::first::pointer_gap_error(
+                self.store,
+                &self.keys,
+                &self.retry,
+                &head,
+                &self.keys.pack_pointer(),
+            ));
         }
         let from = base.as_ref().map_or(1, |p| p.pack_generation);
         self.step("read");

@@ -558,45 +558,114 @@ fn a_pointer_naming_another_databases_pack_fails() {
     crash(dbb, vec![cb]);
 }
 
-/// The create gap (task 9b): an MVCC create that stopped after its head landed leaves a head of
-/// format 5 with no pointer, or with another database's. Restore and the pack run refuse it,
-/// and the text of both says how to get out: delete the head and create again. The text names
-/// keys only.
-#[test]
-fn mvcc_create_gap_refusal_names_the_way_out() {
-    let way_out = "the create of this database did not finish; delete the object 'head' under the \
-                   prefix and create the database again";
+const WAY_OUT: &str = "Delete the object 'head' under the prefix and create the database again.";
+
+/// How a bucket of format 5 loses its pointer: it is deleted, or another database's takes its
+/// place.
+#[derive(Clone, Copy, Debug)]
+enum Gap {
+    Absent,
+    Foreign,
+}
+
+/// What a database was doing when its pointer went: `Created` is the create state (no commit),
+/// `Committed` has commits in the first generation, `Later` has switched generations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Past {
+    Created,
+    Committed,
+    Later,
+}
+
+/// A database in `past`, its pointer lost as `gap`; the head and the log are checked, then the
+/// texts of the restore and the pack run errors are returned.
+fn gap_errors(past: Past, gap: Gap) -> (String, String) {
     let k = tempdir();
-    // Case 1: the pointer is absent. Case 2: the pointer is another database's.
-    for foreign in [false, true] {
-        let a = mem();
-        let cfg_a = |d: &Path| mvcc_enc(d, &k, &key_hex());
-        let ta = tempdir();
-        let (dba, ca) = mvcc_with_rows(a.clone(), cfg_a(&fresh(&ta)), 2);
-        let ka = keys_of(&a, &cfg_a(&fresh(&ta)));
-        if foreign {
+    let cfg_a = |d: &Path| mvcc_enc(d, &k, &key_hex());
+    let made = |store: Arc<dyn ObjectStore>, d: &Path, past: Past| match past {
+        Past::Created => (open_mvcc(store, cfg_a(d)), vec![]),
+        Past::Committed => {
+            let (db, c) = mvcc_with_rows(store, cfg_a(d), 2);
+            (db, vec![c])
+        }
+        Past::Later => {
+            let (db, c) = mvcc_with_rows(store, cfg_a(d), 2);
+            truncate_checkpoint(&c).unwrap();
+            insert_c(&c, 3).unwrap();
+            (db, vec![c])
+        }
+    };
+    let a = mem();
+    let ta = tempdir();
+    let (dba, ca) = made(a.clone(), &fresh(&ta), past);
+    let ka = keys_of(&a, &cfg_a(&fresh(&ta)));
+    let head = ka
+        .decode_head(&a.get(&ka.head()).unwrap().unwrap().body)
+        .unwrap();
+    let logged = a.list(&ka.log_prefix(head.generation)).unwrap().len();
+    match past {
+        Past::Created => assert_eq!((head.generation, head.epoch, logged), (2, 1, 0)),
+        Past::Committed => assert_eq!((head.generation, head.epoch), (2, 1)),
+        Past::Later => assert!(head.generation > 2, "{}", head.generation),
+    }
+    assert_eq!(logged > 0, past != Past::Created, "{past:?}");
+    match gap {
+        Gap::Absent => a.delete(&ka.pack_pointer()).unwrap(),
+        Gap::Foreign => {
             let b = mem();
             let tb = tempdir();
-            let (dbb, cb) = mvcc_with_rows(b.clone(), cfg_a(&fresh(&tb)), 2);
+            let (dbb, cb) = made(b.clone(), &fresh(&tb), Past::Created);
             let kb = keys_of(&b, &cfg_a(&fresh(&tb)));
             let body = b.get(&kb.pack_pointer()).unwrap().unwrap().body;
             a.put(&ka.pack_pointer(), &body).unwrap();
-            crash(dbb, vec![cb]);
-        } else {
-            a.delete(&ka.pack_pointer()).unwrap();
+            crash(dbb, cb);
         }
-        let t = tempdir();
-        let r = restore_with_store(&cfg_a(&fresh(&t)), a.clone(), &fresh(&t));
-        assert!(
-            matches!(&r, Err(Error::Corrupt(m)) if m.contains(way_out)),
-            "foreign={foreign} restore: {r:?}"
-        );
-        let t = tempdir();
-        let r = crate::pack::run::pack_with_store(&cfg_a(&t.path().join("packer")), a.clone());
-        assert!(
-            matches!(&r, Err(Error::Corrupt(m)) if m.contains(way_out)),
-            "foreign={foreign} pack run: {r:?}"
-        );
-        crash(dba, vec![ca]);
+    }
+    let text = |r: Result<()>| match r {
+        Err(Error::Corrupt(m)) => m,
+        other => panic!("{past:?} {gap:?}: {other:?}"),
+    };
+    let t = tempdir();
+    let restore = text(restore_with_store(&cfg_a(&fresh(&t)), a.clone(), &fresh(&t)).map(|_| ()));
+    let t = tempdir();
+    let run = text(
+        crate::pack::run::pack_with_store(&cfg_a(&t.path().join("packer")), a.clone()).map(|_| ()),
+    );
+    crash(dba, ca);
+    (restore, run)
+}
+
+/// The create gap (task 9b): an MVCC create that stopped after its head landed leaves a head of
+/// format 5 (generation 2, epoch 1, no commit) with no pointer, or with another database's.
+/// Restore and the pack run refuse it, and the text of both says how to get out: delete the head
+/// and create again.
+#[test]
+fn mvcc_create_gap_refusal_names_the_way_out() {
+    for gap in [Gap::Absent, Gap::Foreign] {
+        let (restore, run) = gap_errors(Past::Created, gap);
+        for m in [restore, run] {
+            assert!(m.contains(WAY_OUT), "{gap:?}: {m}");
+            assert!(m.contains("did not finish"), "{gap:?}: {m}");
+        }
+    }
+}
+
+/// A database that has committed data never gets the advice to delete its head: the head still
+/// at generation 2 and epoch 1 but with a commit in the log, and a head past the create
+/// generation.
+#[test]
+fn mvcc_pointer_gap_with_committed_data_gives_no_destructive_advice() {
+    for past in [Past::Committed, Past::Later] {
+        for gap in [Gap::Absent, Gap::Foreign] {
+            let (restore, run) = gap_errors(past, gap);
+            for m in [restore, run] {
+                assert!(
+                    !m.contains("Delete") && !m.contains("delete"),
+                    "{past:?} {gap:?}: {m}"
+                );
+                assert!(m.contains("committed data"), "{past:?} {gap:?}: {m}");
+                assert!(m.contains("is missing or another database's"), "{m}");
+            }
+        }
     }
 }

@@ -24,7 +24,7 @@ use super::pointer::{PackPointer, POINTER_FORMAT};
 use super::run::{upload_verified, PART_SIZE};
 use crate::error::{Error, Result};
 use crate::files::io_err;
-use crate::format::Keys;
+use crate::format::{Head, Keys};
 use crate::store::{part_size_for, with_retry, CondPut, ObjectStore, RetryPolicy};
 use std::path::Path;
 
@@ -186,4 +186,34 @@ pub(crate) fn rewrite_after_head(
         }
     }
     Err(too_many(&key))
+}
+
+/// The error for an MVCC bucket of format 5 whose pack pointer (`pointer_key`) is missing or
+/// another database's. Only a head that is still the create state gets the way out: the first
+/// pack generation, epoch 1, and no object under the log of that generation (no commit was ever
+/// acked). Any other bucket may hold committed data, so its text gives no destructive advice.
+pub(crate) fn pointer_gap_error(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    head: &Head,
+    pointer_key: &str,
+) -> Error {
+    let prefix = keys.log_prefix(head.generation);
+    let create_state = head.generation == crate::bucket::first_pack::FIRST_GENERATION
+        && head.epoch == 1
+        && match with_retry(retry, &prefix, |_| store.list(&prefix)) {
+            Ok(objects) => objects.is_empty(),
+            Err(e) => return e,
+        };
+    let advice = if create_state {
+        "The create of this database did not finish. Delete the object 'head' under the prefix \
+         and create the database again."
+    } else {
+        "The bucket may hold committed data. Keep every object."
+    };
+    Error::Corrupt(format!(
+        "{pointer_key} is missing or another database's. An MVCC bucket of format 5 starts with \
+         its first pack. {advice}"
+    ))
 }

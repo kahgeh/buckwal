@@ -1647,7 +1647,7 @@ impl Bucket {
     }
 }
 
-mod first_pack;
+pub(crate) mod first_pack;
 mod legacy;
 
 #[cfg(test)]
