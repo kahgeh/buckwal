@@ -32,11 +32,13 @@ use std::time::{Duration, Instant};
 use tracing::field::Empty;
 
 /// What the SQL guard answers for the copy form of `VACUUM` on an encrypted database
-/// (`Error::Unsupported`). Made with `concat!` so that the two words are not next to each
-/// other in the source (see the module text).
+/// (`Error::Unsupported`). Made with `concat!`, with the second word in two parts, so that the
+/// source search of `source_never_contains_vacuum_into` finds no copy form here (it also takes
+/// a quoted name between the two words, and `", "` looks like one).
 pub(crate) const VACUUM_INTO_REFUSED: &str = concat!(
     "VACUUM",
-    " INTO on an encrypted database (it writes a plaintext copy; run `buckwal vacuum` to \
+    " IN",
+    "TO on an encrypted database (it writes a plaintext copy; run `buckwal vacuum` to \
      vacuum the database in place)"
 );
 

@@ -34,7 +34,7 @@
 //!   `nothing_to_do`, `superseded` or `failed`, with `buckwal.pack.failed_step`,
 //!   `buckwal.pack.failed_key` and `buckwal.error`) (`pack/run.rs`), and
 //!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes (`buckwal.pack.behind_bytes`,
-//!   `buckwal.pack.age_seconds`, `buckwal.pack.generation`, `buckwal.pack.size`,
+//!   `buckwal.pack.age_seconds`, `buckwal.pack.generation`, `buckwal.pack.size_bytes`,
 //!   `buckwal.outcome`) (`pack/thread.rs`);
 //! - `buckwal.vacuum`, one per `buckwal vacuum` (`buckwal.vacuum.page_size`,
 //!   `buckwal.vacuum.pages_before`, `buckwal.vacuum.free_pages_before`,

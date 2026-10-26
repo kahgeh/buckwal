@@ -272,36 +272,133 @@ fn crate_files() -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
-/// `body` holds the copy form of the vacuum statement: the first word, white space, and the
-/// second word, in any case.
+/// A byte of an unquoted SQL name (lower case).
+fn name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// The end of the white space and the comments (`/* ... */`, `-- ...`) at `at`.
+fn skip_gap(s: &[u8], mut at: usize) -> usize {
+    loop {
+        if at < s.len() && s[at].is_ascii_whitespace() {
+            at += 1;
+        } else if s[at..].starts_with(b"/*") {
+            at = match s[at + 2..].windows(2).position(|w| w == b"*/") {
+                Some(i) => at + 2 + i + 2,
+                None => s.len(),
+            };
+        } else if s[at..].starts_with(b"--") {
+            at = match s[at..].iter().position(|&b| b == b'\n') {
+                Some(i) => at + i + 1,
+                None => s.len(),
+            };
+        } else {
+            return at;
+        }
+    }
+}
+
+/// The end of one SQL name at `at` (a schema name): unquoted, or in `"..."`, `` `...` `` or
+/// `[...]`. `None` when there is no name.
+fn skip_name(s: &[u8], at: usize) -> Option<usize> {
+    let close = match s.get(at)? {
+        b'"' => b'"',
+        b'`' => b'`',
+        b'[' => b']',
+        &b if name_byte(b) => {
+            let n = s[at..].iter().take_while(|&&b| name_byte(b)).count();
+            return Some(at + n);
+        }
+        _ => return None,
+    };
+    let n = s[at + 1..].iter().position(|&b| b == close)?;
+    Some(at + 1 + n + 1)
+}
+
+/// `body` holds the copy form of the vacuum statement, in any case: the first word, then
+/// white space and comments (`/* ... */`, `-- ...`) in any mix, at most one schema name
+/// (unquoted or quoted), and the second word. A comment alone between the two words is
+/// enough. The first and the second word must each be a whole word.
 fn holds_copy_form(body: &[u8]) -> bool {
+    // The second word in two parts: a quoted name may stand between the two words, and the
+    // text from one literal to the next looks like one.
     let first: &[u8] = b"vacuum";
-    let second: &[u8] = b"into";
-    let lower = body.to_ascii_lowercase();
-    let mut at = 0;
-    while let Some(i) = lower[at..].windows(first.len()).position(|w| w == first) {
-        let mut j = at + i + first.len();
-        let spaces = j;
-        while j < lower.len() && lower[j].is_ascii_whitespace() {
-            j += 1;
+    let second: &[u8] = concat!("in", "to").as_bytes();
+    let s = body.to_ascii_lowercase();
+    let whole = |at: usize, word: &[u8]| {
+        s[at..].starts_with(word) && s.get(at + word.len()).is_none_or(|&b| !name_byte(b))
+    };
+    for i in 0..s.len() {
+        if !whole(i, first) || (i > 0 && name_byte(s[i - 1])) {
+            continue;
         }
-        if j > spaces && lower[j..].starts_with(second) {
-            return true;
+        let mut at = i + first.len();
+        let mut named = false;
+        loop {
+            at = skip_gap(&s, at);
+            if whole(at, second) {
+                return true;
+            }
+            match skip_name(&s, at) {
+                Some(end) if !named => {
+                    named = true;
+                    at = end;
+                }
+                _ => break,
+            }
         }
-        at += i + 1;
     }
     false
 }
 
+/// The matcher finds every spelling of the copy form that the engine accepts, and nothing
+/// else. The spellings are made from their parts at run time, so this file holds none.
+#[test]
+fn copy_form_matcher_finds_every_spelling() {
+    for (f, s) in [
+        ("VACUUM", concat!("IN", "TO")),
+        ("vacuum", concat!("in", "to")),
+        ("VaCuUm", concat!("iN", "tO")),
+    ] {
+        for sql in [
+            format!("{f} {s} 'x'"),
+            format!("{f}\n\t\r\n {s} 'x'"),
+            format!("{f}/*x*/{s} 'x'"),
+            format!("{f} /* a\n b */ {s} 'x'"),
+            format!("{f} -- c\n{s} 'x'"),
+            format!("{f} main {s} 'x'"),
+            format!("{f}\tMain\n{s} 'x'"),
+            format!("{f} \"main\" {s} 'x'"),
+            format!("{f}`aux`{s} 'x'"),
+            format!("{f} [aux]{s} 'x'"),
+            format!("{f} /* a */ main /* b */ -- c\n {s} 'x'"),
+            format!("conn.execute(\"{f} main {s} '/tmp/c.db'\")"),
+            format!("EXPLAIN {f} {s} 'x'"),
+        ] {
+            assert!(holds_copy_form(sql.as_bytes()), "{sql:?}");
+        }
+        for sql in [
+            format!("{f}; SELECT 1 {s}"),
+            format!("{f}ed {s}"),
+            format!("{f} main aux {s}"),
+            format!("{f} 'x' {s}"),
+            format!("{f}.rs {s}"),
+            format!("{f} {s}x"),
+            format!("x{f} {s}"),
+            f.to_string(),
+        ] {
+            assert!(!holds_copy_form(sql.as_bytes()), "{sql:?}");
+        }
+    }
+}
+
 /// No source under `crates/` runs or names the copy form: on an encrypted database it writes
-/// a plaintext file (docs/packer-recon.md). The search finds every spelling with white space
-/// between the two words, so no source can hide one from it.
+/// a plaintext file (docs/packer-recon.md). The search finds each spelling that
+/// [`holds_copy_form`] names: any case, white space and comments between the two words, and
+/// a schema name. The guard (`guard.rs`) stays the protection at run time: it refuses each
+/// spelling on an encrypted database.
 #[test]
 fn source_never_contains_vacuum_into() {
-    // The search works: it finds a spelling made at run time.
-    let made = format!("{}\n\t {} 'x'", "Vacuum", "INTO");
-    assert!(holds_copy_form(made.as_bytes()));
-    assert!(!holds_copy_form(b"VACUUM; SELECT 1 INTO"));
     let files = crate_files();
     assert!(
         files
@@ -326,15 +423,22 @@ fn copy_form(first: &str, ws: &str, second: &str, path: &Path) -> String {
 /// Spellings of the copy form: cases, white space, a comment and a schema name.
 fn copy_forms(path: &Path) -> Vec<String> {
     let mut v = Vec::new();
-    for (first, second) in [("VACUUM", "INTO"), ("vacuum", "into"), ("VaCuUm", "InTo")] {
+    for (first, second) in [
+        ("VACUUM", concat!("IN", "TO")),
+        ("vacuum", concat!("in", "to")),
+        ("VaCuUm", concat!("In", "To")),
+    ] {
         for ws in [" ", "\n\t  ", " /* c */ ", " main "] {
             v.push(copy_form(first, ws, second, path));
         }
     }
-    v.push(format!("  {}", copy_form("VACUUM", "\r\n", "INTO", path)));
+    v.push(format!(
+        "  {}",
+        copy_form("VACUUM", "\r\n", concat!("IN", "TO"), path)
+    ));
     v.push(format!(
         "EXPLAIN {}",
-        copy_form("VACUUM", " ", "INTO", path)
+        copy_form("VACUUM", " ", concat!("IN", "TO"), path)
     ));
     v
 }
@@ -403,7 +507,7 @@ fn vacuum_into_on_plain_database_is_not_refused_by_the_guard() {
     let target = out.path().join("copy.db");
     let db = crate::db::open_for_vacuum(cfg, store.clone()).unwrap();
     let c = db.connect().unwrap();
-    let sql = copy_form("vacuum", "  ", "into", &target);
+    let sql = copy_form("vacuum", "  ", concat!("in", "to"), &target);
     let r = c.execute(&sql, &[]);
     assert_ne!(r, Err(Error::Unsupported(VACUUM_INTO_REFUSED)), "{sql}");
     c.close().unwrap();

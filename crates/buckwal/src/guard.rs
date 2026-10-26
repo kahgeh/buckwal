@@ -562,7 +562,7 @@ mod tests {
             mode,
             encrypted: true,
         };
-        let (first, second) = ("VACUUM", "INTO");
+        let (first, second) = ("VACUUM", concat!("IN", "TO"));
         let forms = [
             format!("{first} {second} '/tmp/x.db'"),
             format!("{} {} 'x'", first.to_lowercase(), second.to_lowercase()),

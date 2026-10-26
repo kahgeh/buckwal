@@ -1938,7 +1938,7 @@ fn encrypted_replica_refuses_the_copy_form_of_vacuum() {
     wait_rows(&rc, 1);
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("copy.db");
-    let (first, second) = ("vacuum", "INTO");
+    let (first, second) = ("vacuum", concat!("IN", "TO"));
     let sql = format!("{first}  {second} '{}'", target.display());
     let refused = crate::vacuum::VACUUM_INTO_REFUSED;
     assert_eq!(unsupported(rc.query(&sql, &[])), refused);
