@@ -806,7 +806,8 @@ fn maintenance_span_carries_its_fields_and_parents_the_seal() {
             >= 16 << 10
     );
     assert!(m.field("buckwal.gate_wait_ms").is_some());
-    assert_eq!(m.field("buckwal.outcome"), Some("sealed"));
+    // A format 5 run ends the generation with a switch, not a seal.
+    assert_eq!(m.field("buckwal.outcome"), Some("switched"));
     // Through the engine's own spans (`pager_checkpoint`), which are never exported.
     let under_m = |s: &SpanRec| {
         let mut parent = s.parent;
@@ -1476,6 +1477,7 @@ fn every_other_outcome_ends_the_span_with_status_unset() {
         "closed",
         "takeover_quiet",
         "sealed",
+        "switched",
         "applied",
         "nothing",
         "checkpoint_busy",

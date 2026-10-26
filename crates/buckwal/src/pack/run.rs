@@ -358,7 +358,8 @@ pub(crate) fn pack_run(
 /// The run counts its own bytes (`CountingStore`): other traffic on the same store (the
 /// writer's commits) is not in `bytes_down` and `bytes_up`.
 ///
-/// The span (spec "Observability"): `buckwal.pack.generation`, `buckwal.pack.key`,
+/// The span (spec "Observability"): `buckwal.prefix` (the database's bucket prefix),
+/// `buckwal.pack.generation`, `buckwal.pack.key`,
 /// `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
 /// `buckwal.free_page_share`, `buckwal.pack.source` and `buckwal.pack.reason` (where the
 /// run got its file: [`PackSource`]; recorded as soon as the run knows it, so a run that ends
@@ -384,6 +385,7 @@ pub(crate) fn pack_run_in(
     let span = tracing::info_span!(
         target: "buckwal",
         "buckwal.pack",
+        buckwal.prefix = config.prefix.trim_matches('/'),
         buckwal.pack.generation = Empty,
         buckwal.pack.key = Empty,
         buckwal.pack.bytes_down = Empty,

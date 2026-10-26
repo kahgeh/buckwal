@@ -15,8 +15,9 @@
 //!   (`buckwal.generation`, `buckwal.seq`, `buckwal.pages`, `buckwal.retries`, `s3.status`,
 //!   and `buckwal.skipped_generation`, on the first seal after a takeover only),
 //!   on the uploader thread (`uploader.rs`, fields recorded by `bucket.rs` and the stores);
-//! - `buckwal.restore` (`buckwal.generation`, `buckwal.log_objects`, `buckwal.gets`,
-//!   `buckwal.bytes`, `buckwal.seq`, `buckwal.retries`, `s3.status`, `buckwal.outcome`)
+//! - `buckwal.restore` (`buckwal.prefix`, `buckwal.generation`, `buckwal.log_objects`,
+//!   `buckwal.gets`, `buckwal.bytes`, `buckwal.seq`, `buckwal.retries`,
+//!   `buckwal.restore.restarts`, `buckwal.restore.outcome`, `s3.status`, `buckwal.outcome`)
 //!   (`restore.rs`);
 //! - `buckwal.takeover` (`buckwal.generation`, `buckwal.epoch`, `buckwal.seq` (the fence's),
 //!   `buckwal.retries`, `s3.status`, `buckwal.outcome`, `buckwal.quiet_ms`,
@@ -25,7 +26,7 @@
 //!   fence, or around the fence of a takeover an `open` resumes (`db.rs`), and
 //!   `buckwal.fence` (`buckwal.generation`, `buckwal.seq`, `buckwal.epoch`,
 //!   `buckwal.retries`, `s3.status`) around each fence record (`bucket.rs`);
-//! - `buckwal.pack`, one per pack run (`buckwal.pack.generation`, `buckwal.pack.key`,
+//! - `buckwal.pack`, one per pack run (`buckwal.prefix`, `buckwal.pack.generation`, `buckwal.pack.key`,
 //!   `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
 //!   `buckwal.free_page_share` (free pages over all pages of the new pack: the data of the warn
 //!   alert past 0.2 that tells you to run `buckwal vacuum`, spec Choice A (a)),
@@ -33,7 +34,8 @@
 //!   `buckwal.elapsed_ms`, `buckwal.pack.failures`, `buckwal.outcome`: `packed`,
 //!   `nothing_to_do`, `superseded` or `failed`, with `buckwal.pack.failed_step`,
 //!   `buckwal.pack.failed_key` and `buckwal.error`) (`pack/run.rs`), and
-//!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes (`buckwal.pack.behind_bytes`,
+//!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes (`buckwal.prefix`,
+//!   `buckwal.pack.behind_bytes`,
 //!   `buckwal.pack.age_seconds`, `buckwal.pack.generation`, `buckwal.pack.size_bytes`,
 //!   `buckwal.outcome`) (`pack/thread.rs`);
 //! - `buckwal.vacuum`, one per `buckwal vacuum` (`buckwal.vacuum.page_size`,

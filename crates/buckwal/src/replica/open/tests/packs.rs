@@ -196,6 +196,13 @@ fn replica_behind_gc_re_restores_from_newest_pack() {
     assert_eq!(rr.len(), 1, "{rr:?}");
     let restore = spans.with_parent(rr[0].id, "buckwal.restore");
     assert_eq!(restore.field("buckwal.restore.outcome"), Some("restored"));
+    // The span names the database's prefix (the alert "restore gave up" groups by it).
+    let prefix = restore.field("buckwal.prefix").expect("buckwal.prefix");
+    assert!(
+        new.pack_key.starts_with(prefix),
+        "{prefix} {}",
+        new.pack_key
+    );
     assert!(new.pack_generation > 1);
 }
 

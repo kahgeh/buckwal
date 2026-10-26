@@ -2375,6 +2375,11 @@ fn a_run_that_errs_carries_its_source_and_reason() {
     assert_eq!(s.field("buckwal.outcome"), Some("failed"));
     assert_eq!(s.field("buckwal.pack.source"), Some("kept"));
     assert_eq!(s.field("buckwal.pack.reason"), Some("none"));
+    // The span names the database (the alerts group by it).
+    assert_eq!(
+        s.field("buckwal.prefix"),
+        Some(cfg.prefix.trim_matches('/'))
+    );
 
     // A good copy again, then a changed block, and a pack in the bucket with a changed byte.
     let t = tempdir();

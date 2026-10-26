@@ -844,6 +844,9 @@ fn gauges_use_pointer_last_modified_and_listing_sizes() {
     let spans = cap.spans();
     let s = spans.last_named("buckwal.pack.gauges");
     assert_eq!(s.field("buckwal.outcome"), Some("ok"));
+    // The alert groups the gauges by database: the span names the bucket prefix.
+    let prefix = config(&t.path().join("any")).prefix;
+    assert_eq!(s.field("buckwal.prefix"), Some(&*prefix));
     assert_eq!(
         s.field("buckwal.pack.behind_bytes"),
         Some(&*log_bytes_from(&*mem, p.pack_generation).to_string())

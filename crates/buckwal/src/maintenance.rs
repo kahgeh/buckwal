@@ -67,6 +67,9 @@ pub(crate) struct MaintenanceConfig {
     pub retry: Duration,
     /// The longest backoff (repeated gate timeouts and busy refusals double `retry`).
     pub retry_max: Duration,
+    /// A bucket of format 5: a run ends the generation with a generation switch (span outcome
+    /// `switched`), not a seal (`sealed`, formats 1 to 4).
+    pub packed: bool,
 }
 
 impl MaintenanceConfig {
@@ -91,6 +94,7 @@ impl MaintenanceConfig {
             gate_wait: c.maintenance_gate_wait,
             retry: defaults::MAINTENANCE_RETRY,
             retry_max: defaults::MAINTENANCE_RETRY_MAX,
+            packed,
         }
     }
 
@@ -297,7 +301,10 @@ pub(crate) struct Maintenance {
 /// How a run ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    /// Formats 1 to 4: the run's checkpoint sealed the generation.
     Sealed,
+    /// Format 5: the run's checkpoint ended the generation with a generation switch.
+    Switched,
     /// Not started: the bucket looked unable to take a seal.
     BucketFailing,
     /// Not started: a seal now would wait out this much of a takeover quiet.
@@ -313,6 +320,7 @@ impl Outcome {
     fn as_str(&self) -> &'static str {
         match self {
             Outcome::Sealed => "sealed",
+            Outcome::Switched => "switched",
             Outcome::BucketFailing => "bucket_failing",
             Outcome::TakeoverQuiet(_) => "takeover_quiet",
             Outcome::Busy => "busy",
@@ -511,7 +519,7 @@ fn run(shared: &Weak<Shared>, cfg: &MaintenanceConfig, signal: &Signal) {
         signal.passive_ran(cfg.passive_interval);
         let (mut bypass_log, mut bypass_wal) = (u64::MAX, u64::MAX);
         let delay = match outcome {
-            Outcome::Sealed => None,
+            Outcome::Sealed | Outcome::Switched => None,
             Outcome::GateTimeout | Outcome::Busy => {
                 held_off = held_off.saturating_add(1);
                 Some(backoff(cfg.retry, held_off, cfg.retry_max))
@@ -610,6 +618,7 @@ fn run_once(
     };
     let sealed = shared.uploader.generation() != generation;
     let (outcome, reason) = match r {
+        Ok(()) if sealed && cfg.packed => (Outcome::Switched, None),
         Ok(()) if sealed => (Outcome::Sealed, None),
         // TRUNCATE returned without ending the generation: not expected; retried later.
         Ok(()) => (

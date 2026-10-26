@@ -428,6 +428,12 @@ impl Keys {
         }
     }
 
+    /// The bucket prefix of every key (`Config::prefix`), as the spans name the database
+    /// (`buckwal.prefix`).
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     fn join(&self, rest: &str) -> String {
         if self.prefix.is_empty() {
             rest.to_string()

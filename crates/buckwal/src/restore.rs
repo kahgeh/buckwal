@@ -812,8 +812,9 @@ fn apply_ended_generations(
 }
 
 /// Restore the bucket's current state into `dir`, which must hold no database yet. It
-/// writes nothing to the bucket. Runs in a `buckwal.restore` span, and logs the finished
-/// restore. The span's `buckwal.seq` is the highest log seq replayed (0 for an empty log), and
+/// writes nothing to the bucket. Runs in a `buckwal.restore` span (`buckwal.prefix` names the
+/// database's bucket prefix, which the alert "restore gave up" groups by), and logs the
+/// finished restore. The span's `buckwal.seq` is the highest log seq replayed (0 for an empty log), and
 /// `buckwal.retries` the extra attempts of the restore's requests, and `buckwal.outcome`
 /// `ok`, `integrity` (a failed integrity check) or `error`. Also returns page 1 as the
 /// restore saw it: the sealed page 1 it fetched for the MVCC check, or the WAL's page-1 frame
@@ -827,6 +828,7 @@ fn restore_into_seen(
     let span = tracing::info_span!(
         target: "buckwal",
         "buckwal.restore",
+        buckwal.prefix = keys.prefix(),
         buckwal.generation = Empty,
         buckwal.log_objects = Empty,
         buckwal.gets = Empty,

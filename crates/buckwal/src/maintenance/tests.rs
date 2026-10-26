@@ -102,6 +102,7 @@ fn due_follows_the_thresholds() {
         gate_wait: Duration::from_millis(500),
         retry: Duration::from_secs(1),
         retry_max: Duration::from_secs(30),
+        packed: log_objects == 0,
     };
     let c = cfg(1 << 20, 0, 0);
     assert!(c.enabled());

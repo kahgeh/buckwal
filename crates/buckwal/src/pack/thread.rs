@@ -545,7 +545,9 @@ impl Gauges {
         })
     }
 
-    /// One gauge in its `buckwal.pack.gauges` span: `buckwal.pack.behind_bytes`, and with a
+    /// One gauge in its `buckwal.pack.gauges` span: `buckwal.prefix` (the database's bucket
+    /// prefix, which the alert "packer not keeping up" groups by), `buckwal.pack.behind_bytes`,
+    /// and with a
     /// pack `buckwal.pack.age_seconds`, `buckwal.pack.size_bytes` (the newest pack's size,
     /// from the pointer) and `buckwal.pack.generation`, then `buckwal.outcome` (`ok`, or
     /// `error` and `integrity` as other spans).
@@ -553,6 +555,7 @@ impl Gauges {
         let span = tracing::info_span!(
             target: "buckwal",
             "buckwal.pack.gauges",
+            buckwal.prefix = self.keys.prefix(),
             buckwal.pack.behind_bytes = Empty,
             buckwal.pack.age_seconds = Empty,
             buckwal.pack.size_bytes = Empty,
