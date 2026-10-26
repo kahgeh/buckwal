@@ -2,9 +2,9 @@
 //! section). The writer is `buckwal soak` or an in-process `Writer`; the replica is either
 //! `buckwal follow` as a child (status lines, kill -9, SIGTERM) or `open_replica` in the test
 //! process over a counting store (`stats()`, row counts, the S3 store's PUT and DELETE counts).
-//! The notification listener is the same code `follow` runs; the test posts the S3-format
-//! `ObjectCreated` events itself (RustFS cannot deliver to the listener, docs/read-replicas-recon.md,
-//! question 8).
+//! The notification listener is the same code `follow` runs; the tests post the S3-format
+//! `ObjectCreated` events themselves, except `tls_rustfs_delivers_events_to_a_replica_listener`,
+//! where RustFS sends them (docs/read-replicas-recon.md, "Question 8, again").
 //!
 //! In the second pass of `scripts/test.sh` (`BUCKWAL_TLS_DIR` set) every listener serves HTTPS
 //! with a token and the database is encrypted (`BUCKWAL_ENCRYPTION_KEY_FILE` reaches the
@@ -1762,5 +1762,343 @@ fn replica_sync_spans_reach_clickhouse() {
         std::env::var("BUCKWAL_OTEL").ok(),
         std::env::var("BUCKWAL_TEST_RUN_ID").ok()
     );
+    w.close().expect("close writer");
+}
+
+// ---------------------------------------------------------------------------------------
+// tls_rustfs_delivers_events_to_a_replica_listener
+// ---------------------------------------------------------------------------------------
+
+/// The prefixes `buckwal notify-setup` prints for its RustFS rules, in order, without
+/// duplicates (the test keeps no copy, so it stays right when the command changes them).
+fn notify_setup_prefixes(ctx: &Ctx, bucket: &str) -> Vec<String> {
+    let out = ctx
+        .ok(&["notify-setup", "--bucket", bucket, "--replicas", "1"])
+        .stdout;
+    let rustfs = out
+        .split("notification-rustfs.json")
+        .nth(1)
+        .expect("a RustFS block in the notify-setup output");
+    let mut prefixes: Vec<String> = Vec::new();
+    for l in rustfs.lines() {
+        let Some(rest) = l.split("\"Name\": \"prefix\", \"Value\": \"").nth(1) else {
+            continue;
+        };
+        let p = rest.split('"').next().unwrap().to_string();
+        if !prefixes.contains(&p) {
+            prefixes.push(p);
+        }
+    }
+    assert!(
+        prefixes.iter().any(|p| p == "log/") && prefixes.iter().any(|p| p == "head"),
+        "prefixes of notify-setup: {prefixes:?}"
+    );
+    prefixes
+}
+
+/// One call to the RustFS admin or S3 API with `curl` (the keys go in through stdin, not in
+/// the argument list): the status and the body.
+fn rustfs_call(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    use std::io::Write;
+    let ca = ctx
+        .opt_var("BUCKWAL_CA_BUNDLE")
+        .expect("BUCKWAL_CA_BUNDLE (the HTTPS pass)");
+    let url = format!("{}{path}", ctx.var("BUCKWAL_ENDPOINT"));
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sS", "--max-time", "20", "--cacert", &ca, "-X", method])
+        .args(["--aws-sigv4", "aws:amz:us-east-1:s3", "--config", "-"])
+        .args(["-H", "x-amz-content-sha256: UNSIGNED-PAYLOAD"])
+        .args(["-w", "\n%{http_code}"]);
+    if let Some(b) = body {
+        cmd.args(["--data-binary", b]);
+    }
+    let mut child = cmd
+        .arg(&url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn curl");
+    let user = format!(
+        "user = \"{}:{}\"\n",
+        ctx.var("BUCKWAL_ACCESS_KEY"),
+        ctx.var("BUCKWAL_SECRET_KEY")
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(user.as_bytes())
+        .expect("write the curl config");
+    let o = child.wait_with_output().expect("curl");
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    let (body, code) = text.rsplit_once('\n').unwrap_or(("", "0"));
+    (code.trim().parse().unwrap_or(0), body.to_string())
+}
+
+/// A RustFS webhook target and the bucket notification that names it. Dropping it removes
+/// both, so a failed test leaves no rule for the next one.
+struct RustfsTarget<'a> {
+    ctx: &'a Ctx,
+    name: String,
+}
+
+impl<'a> RustfsTarget<'a> {
+    /// The admin calls of docs/read-replicas-recon.md ("Question 8, again"): the target
+    /// checks its endpoint when it starts, so the listener must already run. RustFS takes
+    /// the bucket notification as XML, not the JSON that `notify-setup` prints.
+    fn create(
+        ctx: &'a Ctx,
+        name: &str,
+        endpoint: &str,
+        token: &str,
+        prefixes: &[String],
+    ) -> RustfsTarget<'a> {
+        let t = RustfsTarget {
+            ctx,
+            name: name.to_string(),
+        };
+        let expect_ok = |what: &str, (code, body): (u16, String)| {
+            assert_eq!(code, 200, "{what}: HTTP {code}: {body}");
+        };
+        expect_ok(
+            "module-switches",
+            rustfs_call(
+                ctx,
+                "PUT",
+                "/rustfs/admin/v3/module-switches",
+                Some(r#"{"notify_enabled":true,"audit_enabled":false}"#),
+            ),
+        );
+        let target = format!(
+            r#"{{"key_values":[{{"key":"enable","value":"on"}},{{"key":"endpoint","value":"{endpoint}"}},{{"key":"auth_token","value":"{token}"}},{{"key":"queue_dir","value":"/tmp"}}]}}"#
+        );
+        expect_ok(
+            "target",
+            rustfs_call(
+                ctx,
+                "PUT",
+                &format!("/rustfs/admin/v3/target/notify_webhook/{name}"),
+                Some(&target),
+            ),
+        );
+        let rules: String = prefixes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                format!(
+                    "<QueueConfiguration><Id>buckwal-{i}</Id><Queue>arn:rustfs:sqs:us-east-1:{name}:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>{}/{p}</Value></FilterRule></S3Key></Filter></QueueConfiguration>",
+                    ctx.prefix()
+                )
+            })
+            .collect();
+        expect_ok(
+            "bucket notification",
+            rustfs_call(
+                ctx,
+                "PUT",
+                &format!("/{}?notification", ctx.var("BUCKWAL_BUCKET")),
+                Some(&format!(
+                    "<NotificationConfiguration>{rules}</NotificationConfiguration>"
+                )),
+            ),
+        );
+        t
+    }
+}
+
+impl Drop for RustfsTarget<'_> {
+    fn drop(&mut self) {
+        let bucket = self.ctx.var("BUCKWAL_BUCKET");
+        rustfs_call(
+            self.ctx,
+            "PUT",
+            &format!("/{bucket}?notification"),
+            Some("<NotificationConfiguration></NotificationConfiguration>"),
+        );
+        rustfs_call(
+            self.ctx,
+            "DELETE",
+            &format!("/rustfs/admin/v3/target/notify_webhook/{}", self.name),
+            None,
+        );
+    }
+}
+
+/// A `buckwal follow` child whose listener binds `0.0.0.0:<port>` (RustFS reaches the host
+/// only through `host.containers.internal`) with the pass's server certificate and a token.
+/// Its stdout lines are read on a thread.
+struct PublicFollower {
+    child: std::process::Child,
+    rx: std::sync::mpsc::Receiver<String>,
+    lines: Vec<String>,
+}
+
+impl PublicFollower {
+    fn spawn(ctx: &Ctx, dir: &std::path::Path, port: u16, tls: &str, token_file: &str) -> Self {
+        let listen = format!("0.0.0.0:{port}");
+        let cert = format!("{tls}/server/rustfs_cert.pem");
+        let key = format!("{tls}/server/rustfs_key.pem");
+        let mut child = ctx
+            .command(&[
+                "follow",
+                "--dir",
+                dir.to_str().unwrap(),
+                "--poll-ms",
+                "60000",
+            ])
+            .envs([
+                ("BUCKWAL_REPLICA_NOTIFY_LISTEN", listen.as_str()),
+                ("BUCKWAL_REPLICA_NOTIFY_TLS_CERT", cert.as_str()),
+                ("BUCKWAL_REPLICA_NOTIFY_TLS_KEY", key.as_str()),
+                ("BUCKWAL_REPLICA_NOTIFY_TOKEN_FILE", token_file),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn follow");
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        PublicFollower {
+            child,
+            rx,
+            lines: Vec::new(),
+        }
+    }
+
+    /// The first line at or after `from` that `p` accepts, waiting up to `limit`.
+    fn wait_line(&mut self, from: usize, what: &str, limit: Duration, p: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + limit;
+        loop {
+            while let Ok(l) = self.rx.try_recv() {
+                self.lines.push(l);
+            }
+            if self.lines[from.min(self.lines.len())..]
+                .iter()
+                .any(|l| p(l))
+            {
+                return;
+            }
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                panic!("follow exited ({s}) before {what}: {:?}", self.lines);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "follow: no {what} within {limit:?}: {:?}",
+                self.lines
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn applied(&mut self, from: usize, generation: u64, seq: u64, limit: Duration) {
+        let want = format!("applied generation={generation} seq={seq}");
+        self.wait_line(from, &want, limit, |l| l == want);
+    }
+
+    fn stop(&mut self) {
+        let pid = self.child.id().to_string();
+        let st = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("kill");
+        assert!(st.success(), "kill -TERM {pid}");
+        assert!(
+            self.child.wait().expect("wait").success(),
+            "{:?}",
+            self.lines
+        );
+    }
+}
+
+impl Drop for PublicFollower {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// RustFS, not the test, sends the events. A webhook target on `https://host.containers.internal:
+/// <port>/notify` and a bucket notification for the prefixes of `notify-setup` (under the test's
+/// own key prefix) wake a `follow` whose slow poll is 60 s. A lone commit after a quiet period
+/// shows on the replica within 5 s; the last commit of a burst of ten within 15 s (RustFS
+/// batches the later events of a burst: the recon saw about 5 s). The test posts nothing.
+/// Runs only in the HTTPS pass: `scripts/test.sh` gives that pass's RustFS container the
+/// listener port (`BUCKWAL_NOTIFY_PORT`), the pass's CA and the origin.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn tls_rustfs_delivers_events_to_a_replica_listener() {
+    let ctx = Ctx::new("tls_rustfs_delivers_events_to_a_replica_listener");
+    let tls = std::env::var("BUCKWAL_TLS_DIR").expect("the HTTPS pass (BUCKWAL_TLS_DIR)");
+    let port: u16 = std::env::var("BUCKWAL_NOTIFY_PORT")
+        .expect("BUCKWAL_NOTIFY_PORT: run through ./scripts/test.sh, which sets BUCKWAL_RUSTFS_NOTIFY_PORT")
+        .parse()
+        .expect("a port in BUCKWAL_NOTIFY_PORT");
+    let token = format!("rtok-{:032x}-{}", nanos(), std::process::id());
+    let token_file = ctx.tmp.path().join("rustfs-token");
+    std::fs::write(&token_file, format!("{token}\n")).unwrap();
+
+    let mut w = Writer::open(ctx.config(&ctx.dir("a")));
+    w.insert_range(1..=20);
+    let mut f = PublicFollower::spawn(
+        &ctx,
+        &ctx.dir("r"),
+        port,
+        &tls,
+        token_file.to_str().unwrap(),
+    );
+    let g = ctx.head().generation;
+    let n = ctx.assert_log_contiguous(g);
+    f.applied(0, g, n, Duration::from_secs(60));
+
+    // The listener runs, so the target can start.
+    let prefixes = notify_setup_prefixes(&ctx, &ctx.var("BUCKWAL_BUCKET"));
+    let _target = RustfsTarget::create(
+        &ctx,
+        &format!("e{:x}", nanos()),
+        &format!("https://host.containers.internal:{port}/notify"),
+        &token,
+        &prefixes,
+    );
+
+    // A quiet period longer than RustFS's batching window, so the next event is a lone one.
+    std::thread::sleep(Duration::from_secs(7));
+    let from = f.lines.len();
+    w.insert(21);
+    let g = ctx.head().generation;
+    let n = ctx.assert_log_contiguous(g);
+    let t0 = Instant::now();
+    f.applied(from, g, n, Duration::from_secs(5));
+    let lone = t0.elapsed();
+    f.wait_line(from, "notified", Duration::from_secs(1), |l| {
+        l.starts_with("notified ")
+    });
+
+    // A burst: the replica applies the last commit within 15 s.
+    let from = f.lines.len();
+    for id in 22..=31 {
+        w.insert(id);
+    }
+    let g = ctx.head().generation;
+    let n = ctx.assert_log_contiguous(g);
+    let t0 = Instant::now();
+    f.applied(from, g, n, Duration::from_secs(15));
+    eprintln!(
+        "tls_rustfs_delivers_events_to_a_replica_listener: lone commit {lone:?}; last of a burst {:?}",
+        t0.elapsed()
+    );
+    f.wait_line(from, "notified", Duration::from_secs(1), |l| {
+        l.starts_with("notified ")
+    });
+
+    f.stop();
     w.close().expect("close writer");
 }
