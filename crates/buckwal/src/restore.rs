@@ -847,10 +847,8 @@ fn restore_into_seen(
     let (r, page1) = match r {
         Ok(r) => r,
         Err(e) => {
-            if let Error::Timeout(m) = &e {
-                if m == GAVE_UP {
-                    span.record("buckwal.restore.outcome", "gave_up");
-                }
+            if is_gave_up(&e) {
+                span.record("buckwal.restore.outcome", "gave_up");
             }
             span.record("buckwal.outcome", e.outcome());
             return Err(e);
@@ -885,6 +883,11 @@ const PACK_RESTARTS: u32 = 3;
 /// The error of a restore that met "not found" once more after `PACK_RESTARTS` restarts.
 const GAVE_UP: &str =
     "restore: the pack changed 3 times while it was read; raise BUCKWAL_PACK_KEEP_SECS";
+
+/// Whether `e` is the error of a restore that gave up after its restarts (`GAVE_UP`).
+pub(crate) fn is_gave_up(e: &Error) -> bool {
+    matches!(e, Error::Timeout(m) if m == GAVE_UP)
+}
 
 /// Why a failed attempt may start again: what it found gone.
 fn restart_reason(

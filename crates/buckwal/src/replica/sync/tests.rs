@@ -1318,3 +1318,70 @@ fn long_generation_is_followed_in_order_and_idle_pass_lists_after_last() {
         )
     );
 }
+
+impl Fx {
+    /// A format 5 generation switch: the seal-start record names `to` (the terminal record),
+    /// a WAL restart, the head moves to `to`.
+    fn switch_to(&mut self, to: u64) {
+        self.put_next(&LogRecord::Extents {
+            file: LogFile::Wal,
+            writer_id: "w1".into(),
+            syncs: vec![],
+            next_generation: Some(to),
+        });
+        self.writer
+            .checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        self.shipped = 0;
+        self.set_head(to);
+        self.gen = to;
+        self.next_seq = 1;
+    }
+}
+
+/// A format 5 terminal record names the next generation: the follower moves to it at once,
+/// passes over the skipped generations between without a LIST of them, and needs no recent
+/// sighting of the head (the time rule is for formats 1 to 4, whose terminal record names
+/// none).
+#[test]
+fn terminal_record_that_names_the_next_generation_is_followed_without_the_time_rule() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship(2);
+    f.switch_to(3);
+    f.ship(4);
+    f.follower.advance_wall_clock(Duration::from_secs(601));
+    let start = f.fault.events().len();
+    let r = f.pass();
+    assert!(!matches!(r.outcome, Outcome::ReRestore(_)), "{r:?}");
+    f.pass();
+    assert_eq!(f.follower.generation(), 3);
+    assert_eq!(f.rows(), 3);
+    let ev = f.fault.events()[start..].to_vec();
+    let p2 = f.keys.log_prefix(2);
+    assert!(ev.iter().all(|e| !e.contains(&p2)), "{}", names(&ev));
+    assert_eq!(f.position().generation, 3);
+}
+
+/// A terminal record names generation 3, the head is at 4 and GC deleted the log of 3: the
+/// follower re-restores and never moves to a generation it cannot follow.
+#[test]
+fn named_next_generation_without_its_log_below_the_head_re_restores() {
+    let mut f = Fx::new().positioned(BUDGET);
+    f.ship_big(2);
+    f.switch_to(3);
+    f.ship_big(3);
+    f.switch_to(4);
+    f.ship_big(4);
+    f.mem.delete(&f.keys.log(3, 1)).unwrap();
+    f.mem.delete(&f.keys.log(3, 2)).unwrap();
+    let r = f.pass();
+    assert_eq!(r.outcome, Outcome::ReRestore(Reason::Trimmed), "{r:?}");
+    assert_eq!(f.follower.generation(), 1);
+    assert_eq!(f.position().generation, 1);
+    assert!(
+        r.detail.as_deref().is_some_and(|d| d.contains("log/3")),
+        "{r:?}"
+    );
+}

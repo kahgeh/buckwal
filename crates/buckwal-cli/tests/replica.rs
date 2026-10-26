@@ -705,14 +705,13 @@ fn replica_rolled_back_large_transaction() {
 // replica_follows_before_prefetch_finishes
 // ---------------------------------------------------------------------------------------
 
-/// The writer commits 4,000 rows of 1 KiB (about 4.5 MB) and seals, so the pages are in
-/// `pages/`; then 20 more rows reach the log. A replica opens with prefetch on over a store
-/// that delays every page GET by 100 ms, so its prefetch is still running while the test
-/// reads and the follower applies: the first reading right after open already equals the
-/// writer's rows (read through the lazy page storage), a full scan of the payload sizes
-/// is correct, a commit made meanwhile is followed, and after the prefetch has had time to
-/// finish `integrity_check` is ok. The prefetch was still running at open: the page GETs
-/// counted right after open are fewer than the total once GETs stop (asserted).
+/// The writer commits 4,000 rows of 1 KiB (about 4.5 MB, five 1 MiB blocks), switches
+/// generation, and a pack run packs it; then 20 more rows reach the log. A replica opens over a
+/// store that delays every GET under `pack/` by 1 s, so the background fetch of the pack is
+/// still running while the test reads and the follower applies: right after open the blocks
+/// file names a block that is not local yet (asserted), the first reading already equals the
+/// writer's rows (each block read on demand), a full scan of the payload sizes is correct, a
+/// commit made meanwhile is followed, and once every block is local `integrity_check` is ok.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn replica_follows_before_prefetch_finishes() {
@@ -722,28 +721,32 @@ fn replica_follows_before_prefetch_finishes() {
         w.insert_bulk(chunk * 1000 + 1..=chunk * 1000 + 1000, 1024);
     }
     w.seal();
+    let packed = buckwal::pack(&ctx.config(&ctx.dir("p"))).expect("pack run");
+    assert_eq!(packed.outcome, buckwal::PackOutcome::Packed, "{packed:?}");
     w.insert_range(5001..=5020);
     let fault = std::sync::Arc::new(buckwal::store::FaultStore::new(std::sync::Arc::new(
         ctx.store(),
     )));
-    fault.only_keys_containing("pages/");
-    fault.delay_gets(Duration::from_millis(100));
-    let mut cfg = ctx.config(&ctx.dir("r"));
+    fault.only_keys_containing("pack/");
+    fault.delay_gets(Duration::from_secs(1));
+    let rdir = ctx.dir("r");
+    let mut cfg = ctx.config(&rdir);
     cfg.prefetch = true;
     cfg.replica_poll_interval = Duration::from_millis(300);
     let store: std::sync::Arc<dyn buckwal::store::ObjectStore> = fault.clone();
     let t0 = Instant::now();
     let rep = Rep::open_store(cfg, store);
     let opened = t0.elapsed();
-    let page_gets = |f: &buckwal::store::FaultStore| {
-        f.events()
-            .iter()
-            .filter(|e| e.starts_with("get ") && e.contains("pages/"))
-            .count()
-    };
-    let gets_open = page_gets(&fault);
+    // The blocks file: the limit (u64 LE), then one byte per block (1 = local).
+    let blocks = || std::fs::read(rdir.join("app.db-blocks")).unwrap_or_default();
+    let missing = |b: &[u8]| b.get(8..).is_some_and(|f| f.contains(&0));
+    let at_open = blocks();
+    assert!(
+        missing(&at_open),
+        "the background fetch was already finished at open ({at_open:?}): the test proves \
+         nothing"
+    );
     let first = rep.count();
-    let gets_first = page_gets(&fault);
     let want = w.acked.len() as i64;
     assert_eq!(first, want, "the first reading right after open");
     assert_eq!(
@@ -752,29 +755,18 @@ fn replica_follows_before_prefetch_finishes() {
     );
     w.insert_range(5021..=5030);
     rep.wait_equal(&w, Duration::from_secs(60));
-    let gets_scan = page_gets(&fault);
-    // The prefetch ends when the page GETs stop: no new one for 2 s.
-    let mut stable = (gets_scan, Instant::now());
-    let final_gets = wait_until("the prefetch to finish", Duration::from_secs(180), || {
-        let n = page_gets(&fault);
-        if n != stable.0 {
-            stable = (n, Instant::now());
-        }
-        (stable.1.elapsed() >= Duration::from_secs(2)).then_some(n)
+    wait_until("every block local", Duration::from_secs(180), || {
+        (!missing(&blocks())).then_some(())
     });
-    assert!(
-        gets_open < final_gets,
-        "the prefetch was already finished at open ({gets_open} page GETs of {final_gets}): \
-         the test proves nothing"
-    );
     assert_eq!(rep.integrity(), "ok");
     assert_eq!(rep.sum(), w.sum());
     assert_no_writes(&rep, "prefetch");
-    eprintln!(
-        "prefetch: open took {opened:?}; page GETs {gets_first} at the first reading, \
-         {gets_scan} after the follow, {} at the end",
-        page_gets(&fault)
-    );
+    let range_gets = fault
+        .events()
+        .iter()
+        .filter(|e| e.starts_with("get_range ") && e.contains("pack/"))
+        .count();
+    eprintln!("prefetch: open took {opened:?}; {range_gets} range GETs of the pack");
     w.close().expect("close writer");
     rep.close();
 }
@@ -846,9 +838,10 @@ fn wake_and_settle(rep: &Rep) {
 // replica_paused_past_trim_grace_re_restores
 // ---------------------------------------------------------------------------------------
 
-/// A `follow` child (poll 1 s) is stopped with SIGSTOP at generation G. The writer seals twice
-/// (G, G+1) and the `gc` command runs every second until `log/<G>/` is empty (a 6 s grace:
-/// the G+1 manifest is old enough after about 11 s). SIGCONT: the child prints
+/// A `follow` child (poll 1 s) is stopped with SIGSTOP at generation G. The writer switches
+/// generation twice (G, G+1), a `pack` run packs both, and the `gc` command runs every second
+/// until `log/<G>/` is empty (a 6 s grace and a 6 s pack keep time: the new pack's codes are
+/// old enough after about 6 s). SIGCONT: the child re-restores from the newest pack, prints
 /// `re-restored count=1 reason=trimmed` and catches up (`applied` at the head's generation and
 /// the log's object count); it re-restores once, not again. After SIGTERM (exit 0) a reopen of
 /// its directory holds the writer's rows (count and id sum). The `replica fell behind` WARN
@@ -857,7 +850,8 @@ fn wake_and_settle(rep: &Rep) {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn replica_paused_past_trim_grace_re_restores() {
-    let ctx = short_lease_ctx("replica_paused_past_trim_grace_re_restores");
+    let ctx = short_lease_ctx("replica_paused_past_trim_grace_re_restores")
+        .set("BUCKWAL_PACK_KEEP_SECS", "6");
     let mut a = Writer::open(short_lease(ctx.config(&ctx.dir("a"))));
     a.insert_range(1..=20);
     let c = ctx.dir("c");
@@ -871,6 +865,9 @@ fn replica_paused_past_trim_grace_re_restores() {
     a.insert_range(31..=35);
     let head = ctx.head();
     assert!(head.generation >= g0 + 2, "two seals: {g0} then {head:?}");
+    let p = ctx.dir("p");
+    let pack = ctx.ok(&["pack", "--dir", p.to_str().unwrap()]).stdout;
+    eprintln!("paused: {}", pack.trim());
     wait_until(
         "GC to delete the paused replica's log",
         Duration::from_secs(60),

@@ -166,41 +166,13 @@ fn int(v: i64) -> Value {
 }
 
 /// `open_with_store` that creates a WAL database of format 1 (format 4 when encrypted), which
-/// seals: a replica follows formats 1 to 4 only, for now (a format 5 head is refused,
-/// `a_replica_refuses_a_format_5_bucket`).
+/// seals. The tests of a format 5 bucket (packs) are in `packs`.
 fn legacy_open_with_store(
     config: Config,
     store: Arc<dyn crate::store::ObjectStore>,
 ) -> crate::Result<crate::Database> {
     let _legacy = crate::format::LegacySeal::on();
     crate::open_with_store(config, store)
-}
-
-/// A format 5 bucket (a WAL database made now, which switches generations) is refused with a
-/// clear `Unsupported` error before anything is written to the replica's directory.
-#[test]
-fn a_replica_refuses_a_format_5_bucket() {
-    let store = Arc::new(MemStore::new());
-    let t = tempfile::tempdir().unwrap();
-    let db = crate::open_with_store(wconfig(&t.path().join("w")), store.clone()).unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
-        .unwrap();
-    add(&conn, 1);
-    let r = tempfile::tempdir().unwrap();
-    let got = open_replica_with_store(rconfig(&r.path().join("r")), store.clone());
-    match got {
-        Err(Error::Unsupported(m)) => assert!(m.contains("format 5"), "{m}"),
-        Err(e) => panic!("expected Unsupported, got {e:?}"),
-        Ok(_) => panic!("a replica opened a format 5 bucket"),
-    }
-    let left: Vec<_> = std::fs::read_dir(r.path().join("r"))
-        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
-        .unwrap_or_default();
-    assert!(
-        left.iter().all(|n| n == crate::files::LOCK_FILE),
-        "{left:?}"
-    );
 }
 
 /// A writer on `store` in a new temp dir with table `t` and `n` rows.
@@ -1935,3 +1907,5 @@ fn stopped_reasons_integrity_and_corrupt_carry_the_object_key() {
         assert_eq!(all.last().unwrap().field("buckwal.outcome"), Some("error"));
     }
 }
+
+mod packs;

@@ -22,7 +22,7 @@ use crate::files::{
     STATE_FILE, WAL_FILE,
 };
 use crate::format::Head;
-use crate::format::{Keys, LocalState, Manifest};
+use crate::format::{Keys, LocalState, Manifest, FORMAT_V5};
 use crate::io::IoMode;
 use crate::reconcile::replace_file;
 use crate::replica::{
@@ -34,7 +34,7 @@ use crate::replica::{
     waker::{ReplicaWaker, WakeState},
 };
 use crate::restore::fsync_dir;
-use crate::restore::{clear_interrupted_restore, remove_restored, restore_staged};
+use crate::restore::{clear_interrupted_restore, is_gave_up, remove_restored, restore_staged};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
 
 /// Open the read replica `config` names. See [`Replica`].
@@ -172,8 +172,12 @@ impl Env {
         head_read_at: SystemTime,
     ) -> Result<(Database, Follower)> {
         let head_generation = head.generation;
-        let manifest =
-            manifest_before(&*self.store, &self.keys, &self.cfg.retry, state.generation)?;
+        // A format 5 bucket has no manifest and no page object: the copy is the pack (its
+        // blocks fetched by the restore's background fetch) and the log applied over it.
+        let manifest = match head.format {
+            FORMAT_V5 => None,
+            _ => manifest_before(&*self.store, &self.keys, &self.cfg.retry, state.generation)?,
+        };
         let page_size = manifest
             .as_ref()
             .map(|m| m.page_size as usize)
@@ -217,7 +221,8 @@ impl Env {
         Ok((db, follower))
     }
 
-    /// The head, read afresh; an MVCC head and a format 5 head are refused.
+    /// The head, read afresh; an MVCC head is refused. A format 5 head (packs) is followed: a
+    /// restore reads the pack and the log since it, and the follower reads the log only.
     fn read_head(&self) -> Result<(Head, String, SystemTime)> {
         let read_at = SystemTime::now();
         let key = self.keys.head();
@@ -226,11 +231,6 @@ impl Env {
         let head = self.keys.decode_head_open(&obj.body)?;
         if head.journal_mode == JournalMode::Mvcc {
             return Err(Error::Unsupported("replica: MVCC"));
-        }
-        if head.format == crate::format::FORMAT_V5 {
-            return Err(Error::Unsupported(
-                "replica: a format 5 bucket (packs); a replica follows formats 1 to 4 only, for now",
-            ));
         }
         Ok((head, obj.etag, read_at))
     }
@@ -252,7 +252,8 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
     // A replica follows WAL databases only; an MVCC head is refused below.
     cfg.journal_mode = JournalMode::Wal;
     // The replica fetches every sealed page in the background once restored (the spec's
-    // "today's prefetch"), whatever BUCKWAL_PREFETCH says for the other opens.
+    // "today's prefetch"), whatever BUCKWAL_PREFETCH says for the other opens. In a format 5
+    // bucket the restore's background fetch of the pack does this work.
     cfg.prefetch = true;
     let env = Env {
         store: store.clone(),
@@ -897,7 +898,14 @@ impl Runner {
             });
             ep.failures += 1;
             let shift = (ep.failures - 1).min(16);
-            ep.next_attempt = Instant::now() + (wait * (1u32 << shift)).min(self.interval);
+            ep.next_attempt = if is_gave_up(&e) {
+                // The restore met "not found" past its restart limit and logged `restore gave
+                // up`: the current copy stays, and the next try is at the next slow poll
+                // (spec "Restore").
+                Instant::now() + self.interval
+            } else {
+                Instant::now() + (wait * (1u32 << shift)).min(self.interval)
+            };
             if !ep.failure_logged {
                 ep.failure_logged = true;
                 tracing::warn!(target: "buckwal", error = %e, "replica: restoring again failed, trying again later");

@@ -208,6 +208,9 @@ pub(crate) struct Follower {
     fence: FenceRule,
     /// The last admitted record of the generation was a seal-start (an empty Extents record).
     sealed: bool,
+    /// The generation that last seal-start record names (format 5, spec "Packs and the
+    /// packer"); `None` when it names none (formats 1 to 4) or the generation is not sealed.
+    named_next: Option<u64>,
     /// Where the position file lives; `None` writes none (the pure-pass tests).
     dir: Option<PathBuf>,
     replica_id: String,
@@ -310,6 +313,7 @@ impl Follower {
             head_view: None,
             fence: FenceRule::default(),
             sealed: false,
+            named_next: None,
             dir: None,
             replica_id: String::new(),
             busy_budget: Duration::ZERO,
@@ -458,6 +462,7 @@ impl Follower {
         self.applied = 0;
         self.fence = FenceRule::default();
         self.sealed = false;
+        self.named_next = None;
     }
 
     pub(crate) fn pass(&mut self, trigger: Trigger) -> PassResult {
@@ -621,11 +626,19 @@ impl Follower {
     /// only after the seal that moved the head past a generation is `trim_grace` old, so an
     /// empty listing is a skip only when the head was last seen no further than G+1 less than
     /// `trim_grace` ago (wall clock). Otherwise the replica re-restores.
+    ///
+    /// A format 5 terminal record names the next generation itself: every number between is a
+    /// skipped generation, and no time rule is needed. The named generation must be above ours
+    /// and at most the head's, and below the head's it must have a log (one LIST); otherwise
+    /// GC deleted it and the replica re-restores.
     fn next_generation(
         &mut self,
         head_generation: u64,
         t: &mut Tally,
     ) -> std::result::Result<u64, Outcome> {
+        if let Some(named) = self.named_next {
+            return self.named_generation(named, head_generation, t);
+        }
         for next in self.generation + 1..head_generation {
             let prefix = self.keys.log_prefix(next);
             t.lists += 1;
@@ -663,6 +676,51 @@ impl Follower {
             }
         }
         Ok(head_generation)
+    }
+
+    /// [`Follower::next_generation`] when the terminal record names `named`.
+    fn named_generation(
+        &mut self,
+        named: u64,
+        head_generation: u64,
+        t: &mut Tally,
+    ) -> std::result::Result<u64, Outcome> {
+        if named <= self.generation || named > head_generation {
+            t.detail = Some(format!(
+                "log/{}: its terminal record names generation {named}, and the head is at \
+                 generation {head_generation}",
+                self.generation
+            ));
+            return Err(Outcome::ReRestore(Reason::Trimmed));
+        }
+        if named < head_generation {
+            let prefix = self.keys.log_prefix(named);
+            t.lists += 1;
+            let listed = with_retry(&self.retry, &prefix, |_| {
+                self.store.list_after(&prefix, &prefix)
+            })
+            .map_err(|e| failed(t, e))?;
+            let has_log = listed
+                .iter()
+                .any(|k| matches!(self.keys.parse_log(k), Some((g, _)) if g == named));
+            if !has_log {
+                t.detail = Some(format!(
+                    "log/{named} is empty, its generation is named by the terminal record of \
+                     log/{} and the head is at generation {head_generation}: trimmed",
+                    self.generation
+                ));
+                return Err(Outcome::ReRestore(Reason::Trimmed));
+            }
+        }
+        for skipped in self.generation + 1..named {
+            tracing::info!(
+                target: "buckwal",
+                generation = skipped,
+                reason = "takeover",
+                "replica skipped a generation"
+            );
+        }
+        Ok(named)
     }
 
     /// Run the pending checkpoint. `Some` ends the pass (Busy within the budget, or an error).
@@ -915,6 +973,7 @@ impl Follower {
                 // A stale fence changes nothing and is not counted.
                 if self.fence.on_fence(&writer_id, epoch) {
                     self.sealed = false;
+                    self.named_next = None;
                 }
                 None
             }
@@ -926,7 +985,10 @@ impl Follower {
                 Some(Outcome::Stopped(StopReason::Mvcc))
             }
             LogRecord::Extents {
-                writer_id, syncs, ..
+                writer_id,
+                syncs,
+                next_generation,
+                ..
             } => {
                 if !self.fence.admits(&writer_id) {
                     // Empty records (seal-start) carry nothing to skip.
@@ -944,6 +1006,7 @@ impl Follower {
                 }
                 // An empty record is the writer's seal-start: the log's end once a head moves.
                 self.sealed = syncs.iter().all(|ops| ops.is_empty());
+                self.named_next = next_generation.filter(|_| self.sealed);
                 for ops in &syncs {
                     if let Err(e) = self.image.apply_sync(ops) {
                         t.detail = Some(e.to_string());
