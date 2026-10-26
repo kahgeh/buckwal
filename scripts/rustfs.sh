@@ -9,6 +9,11 @@
 #   serves HTTPS only on the same port, with that directory's server/ certificate; curl trusts
 #   its ca.pem, and `env` also prints BUCKWAL_CA_BUNDLE. A container is plain or TLS for its
 #   whole life: switch modes with `reset`.
+# Notification delivery: in TLS mode, set BUCKWAL_RUSTFS_NOTIFY_PORT to a number. RustFS then
+#   may send bucket events to https://host.containers.internal:<port> (RUSTFS_OUTBOUND_ALLOW_ORIGINS),
+#   and trusts the ca.pem of BUCKWAL_TLS_DIR for that call (mounted read only, SSL_CERT_FILE).
+#   `env` also prints BUCKWAL_NOTIFY_PORT. Plain mode ignores the port. The listener's certificate
+#   must name host.containers.internal (scripts/tls-material.sh makes one that does).
 set -euo pipefail
 
 IMAGE="docker.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
@@ -20,6 +25,7 @@ REGION="us-east-1"
 AK="buckwal-admin"
 SK="buckwal-local-secret-not-real"
 TLS_DIR="${BUCKWAL_TLS_DIR:-}"
+NOTIFY_PORT="${BUCKWAL_RUSTFS_NOTIFY_PORT:-}"
 CURL_TLS=()
 if [ -n "$TLS_DIR" ]; then
   ENDPOINT="https://localhost:$PORT"
@@ -35,10 +41,12 @@ die() { echo "rustfs.sh: $*" >&2; exit 1; }
 case "$NAME" in buckwal-?*) ;; *) die "BUCKWAL_RUSTFS_NAME must start with buckwal-: $NAME" ;; esac
 case "$VOLUME" in buckwal-?*) ;; *) die "BUCKWAL_RUSTFS_VOLUME must start with buckwal-: $VOLUME" ;; esac
 case "$PORT" in ''|*[!0-9]*) die "BUCKWAL_RUSTFS_PORT must be a number: $PORT" ;; esac
+case "$NOTIFY_PORT" in *[!0-9]*) die "BUCKWAL_RUSTFS_NOTIFY_PORT must be a number: $NOTIFY_PORT" ;; esac
 
 print_env() {
   echo "export BUCKWAL_ENDPOINT=$ENDPOINT BUCKWAL_REGION=$REGION BUCKWAL_PATH_STYLE=true BUCKWAL_BUCKET=$BUCKET BUCKWAL_ACCESS_KEY=$AK BUCKWAL_SECRET_KEY=$SK"
   if [ -n "$TLS_DIR" ]; then echo "export BUCKWAL_CA_BUNDLE=$TLS_DIR/ca.pem"; fi
+  if [ -n "$TLS_DIR" ] && [ -n "$NOTIFY_PORT" ]; then echo "export BUCKWAL_NOTIFY_PORT=$NOTIFY_PORT"; fi
 }
 
 ensure_machine() {
@@ -115,6 +123,10 @@ cmd_up() {
       local tls_args=()
       if [ -n "$TLS_DIR" ]; then
         tls_args=(-v "$TLS_DIR/server":/certs:ro -e RUSTFS_TLS_PATH=/certs)
+        if [ -n "$NOTIFY_PORT" ]; then
+          tls_args+=(-v "$TLS_DIR/ca.pem":/notify-ca/ca.pem:ro -e SSL_CERT_FILE=/notify-ca/ca.pem
+            -e "RUSTFS_OUTBOUND_ALLOW_ORIGINS=https://host.containers.internal:$NOTIFY_PORT")
+        fi
       fi
       podman run -d --name "$NAME" \
         -v "$VOLUME":/data:U ${tls_args[@]+"${tls_args[@]}"} \
