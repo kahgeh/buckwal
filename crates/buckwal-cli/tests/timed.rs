@@ -6,9 +6,13 @@
 //!    head move and the WAL header record). The size-limit checkpoint pause is measured on
 //!    its own (the spec: the README states its value).
 //!    Two short phases at 50 ms add the commit that restarts the WAL itself (a PASSIVE
-//!    checkpoint, then one commit): with batching Off, its own log record and three small
-//!    requests; as a background commit (`background 5ms 64 1MiB 1000`), the records queued
-//!    before it, then three small requests (spec rev 31).
+//!    checkpoint, then one commit). Its goal is its request count plus at most
+//!    `RESTART_MARGIN` (1.5) small requests (spec rev 33). One small request is the median
+//!    small PUT of the same run. With batching Off, the count is 4 (its own log record and
+//!    three small requests), so the goal is at most 5.5. As a background commit
+//!    (`background 5ms 64 1MiB 1000`, a full queue), the count is `BACKGROUND_UPLOADS` + 3
+//!    = 21 (the records queued before it, then three small requests), so the goal is at
+//!    most 22.5.
 //! 2. 20 ms added: a restore of a 1 GB pack with no log after it is fully local within 10 s,
 //!    and its open returns before the blocks are all local (Choice C).
 //! 3. 20 ms added: a pack run on 1 GB, 10% changed, finishes within 30 s.
@@ -64,6 +68,12 @@ const SMALL_CAP: usize = 1500;
 const GOAL_REQUESTS: f64 = 4.0;
 /// "About" four: the measured commit passes at up to half a request more.
 const ABOUT: f64 = 0.5;
+/// The request count of the commit that restarts the WAL with batching Off: its own log
+/// record, the seal-start record, the head move and the WAL header record.
+const OFF_RESTART_COUNT: f64 = 4.0;
+/// The margin of a commit that restarts the WAL, in small requests, above its request count
+/// (spec rev 33). It covers the fsync, the WAL header write and the checkpoint.
+const RESTART_MARGIN: f64 = 1.5;
 /// Tries of the in-commit switch phases.
 const IN_COMMIT_TRIES: usize = 3;
 /// The background setting of the spec's timed test, its `max_behind`, and the record uploads
@@ -326,6 +336,23 @@ fn about_four(n: f64) -> &'static str {
     } else {
         "miss"
     }
+}
+
+/// The verdict of a commit that restarts the WAL: it waited `n` small requests, and its
+/// request count is `count`. It passes at most `count` + `RESTART_MARGIN` small requests.
+fn restart_wait(count: f64, n: f64) -> &'static str {
+    verdict(n <= count + RESTART_MARGIN)
+}
+
+#[test]
+fn restart_wait_bounds() {
+    assert_eq!(restart_wait(OFF_RESTART_COUNT, 4.0), "pass");
+    assert_eq!(restart_wait(OFF_RESTART_COUNT, 5.5), "pass");
+    assert_eq!(restart_wait(OFF_RESTART_COUNT, 5.51), "miss");
+    let bg = f64::from(BACKGROUND_UPLOADS + 3);
+    assert_eq!(bg, 21.0);
+    assert_eq!(restart_wait(bg, 22.5), "pass");
+    assert_eq!(restart_wait(bg, 22.51), "miss");
 }
 
 fn env_u64(k: &str, default: u64) -> u64 {
@@ -782,12 +809,19 @@ fn timed_goal_packer_stage2() {
         "1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small \
          requests"
             .into(),
-        format!("about 4 small requests (one = {})", ms(r50)),
+        format!(
+            "count {OFF_RESTART_COUNT:.0} + at most {RESTART_MARGIN} = at most {:.1} small \
+             requests (one = {})",
+            OFF_RESTART_COUNT + RESTART_MARGIN,
+            ms(r50)
+        ),
         match worst {
             Some(w) => format!("{} = {:.2} small requests", ms(w), in_requests(w)),
             None => "not measured: no commit did the switch".into(),
         },
-        worst.map_or("not measured", |w| about_four(in_requests(w))),
+        worst.map_or("not measured", |w| {
+            restart_wait(OFF_RESTART_COUNT, in_requests(w))
+        }),
     ));
 
     // ---- The background case: `background 5ms 64 1MiB 1000`, at 50 ms. ----
@@ -818,16 +852,18 @@ fn timed_goal_packer_stage2() {
             ms(s.fill_time)
         ));
     }
-    // The spec's bound: the records queued before it (at most max_behind commits; about 18
-    // uploads, about 1 s at this setting and 50 ms), then three small requests.
-    let bound = r50 * (BACKGROUND_UPLOADS + 3);
+    // The spec's count: the records queued before it (at most max_behind commits; about 18
+    // uploads at this setting), then three small requests. The goal adds `RESTART_MARGIN`.
+    let bg_count = f64::from(BACKGROUND_UPLOADS + 3);
+    let bound = r50.mul_f64(bg_count + RESTART_MARGIN);
     let worst_bg = bg.iter().max_by_key(|s| s.wait);
     goals.push((
         format!("1c. background commit that restarts the WAL at 50 ms, `{BACKGROUND}`"),
         format!(
-            "records queued before it (at most {MAX_BEHIND} commits, about \
-             {BACKGROUND_UPLOADS} uploads, about 1 s), then three small requests: about {} \
-             ({BACKGROUND_UPLOADS} + 3 small requests)",
+            "records queued before it (at most {MAX_BEHIND} commits, {BACKGROUND_UPLOADS} \
+             uploads), then three small requests: count {bg_count:.0} + at most \
+             {RESTART_MARGIN} = at most {:.1} small requests ({})",
+            bg_count + RESTART_MARGIN,
             ms(bound)
         ),
         match worst_bg {
@@ -844,9 +880,8 @@ fn timed_goal_packer_stage2() {
             ),
         },
         worst_bg.map_or("not measured", |s| {
-            verdict(
-                bg.len() == IN_COMMIT_TRIES && s.wait <= bound && s.behind <= u64::from(MAX_BEHIND),
-            )
+            let within = restart_wait(bg_count, in_requests(s.wait)) == "pass";
+            verdict(bg.len() == IN_COMMIT_TRIES && within && s.behind <= u64::from(MAX_BEHIND))
         }),
     ));
 
