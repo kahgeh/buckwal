@@ -811,7 +811,7 @@ fn writer_packer_waits_a_whole_interval_before_its_first_check() {
 // ---- The gauges ----
 
 #[test]
-fn gauges_use_pointer_last_modified_and_listing_sizes() {
+fn gauges_use_pointer_size_and_listing_sizes() {
     let _gc = crate::trim::NoWriterGc::on();
     let mem = Arc::new(MemStore::new());
     let ts = TestStore::new(mem.clone());
@@ -879,6 +879,37 @@ fn gauges_use_pointer_last_modified_and_listing_sizes() {
     assert_eq!(ts.calls_of("get", "pack-latest"), 0);
     assert_eq!(ts.calls_of("stat", "pack-latest"), 0);
     drop(w);
+}
+
+/// Before the first generation ends, no generation waits for the packer: `age_seconds` is 0
+/// however old the log of generation 1 is (review 1, note 2.4).
+#[test]
+fn gauges_send_age_0_before_the_first_generation_ends() {
+    let _gc = crate::trim::NoWriterGc::on();
+    let mem = Arc::new(MemStore::new());
+    let cap = Capture::new();
+    let w = tracing::subscriber::with_default(cap.subscriber(), || {
+        writer_on(mem.clone(), |d| {
+            let mut c = config(d);
+            c.pack = false;
+            c.pack_gauge_interval = Duration::from_millis(50);
+            c
+        })
+    });
+    w.insert(1..=5);
+    mem.advance_clock(Duration::from_secs(3 * 7200));
+    let gauges = || cap.spans().named("buckwal.pack.gauges").len();
+    assert!(eventually(10, || gauges() >= 3));
+    assert_eq!(w.db.generation(), 1, "no generation ended");
+    let spans = cap.spans();
+    let s = spans.last_named("buckwal.pack.gauges");
+    assert_eq!(s.field("buckwal.outcome"), Some("ok"));
+    assert_eq!(s.field("buckwal.pack.age_seconds"), Some("0"));
+    assert_eq!(s.field("buckwal.pack.size_bytes"), Some("0"));
+    assert_eq!(
+        s.field("buckwal.pack.behind_bytes"),
+        Some(&*log_bytes_from(&*mem, 1).to_string())
+    );
 }
 
 #[test]

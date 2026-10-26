@@ -275,6 +275,21 @@ pub(crate) fn parse_list(xml: &str) -> ListPage {
     }
 }
 
+/// The keys of one ListObjectsV2 page, for the keys-only listing (`list`, `list_after`). It
+/// needs one `<Size>` per key, as before, but no time: restore, GC, takeover and the replica
+/// do not use the Last-Modified time or the `Date` header, so a server that sends them in
+/// another form still serves those paths.
+pub(crate) fn keys_page(what: &str, page: ListPage) -> Result<Vec<String>, StoreError> {
+    if page.sizes.len() != page.keys.len() {
+        return Err(StoreError::Permanent(format!(
+            "{what}: {} keys but {} sizes in a reply",
+            page.keys.len(),
+            page.sizes.len()
+        )));
+    }
+    Ok(page.keys)
+}
+
 /// The objects of one ListObjectsV2 page whose reply has the `Date` header `date`: each key
 /// with its `<Size>` and `<LastModified>`, and its age as `Date - LastModified` (both from
 /// the bucket, so the caller's clock does not enter; 0 when a skew puts Last-Modified after
@@ -288,7 +303,7 @@ pub(crate) fn listed_page(
     let n = page.keys.len();
     if page.sizes.len() != n || page.modified.len() != n {
         return Err(StoreError::Permanent(format!(
-            "{what}: {n} keys but {} sizes and {} Last-Modified times in a reply",
+            "{what}: {n} keys but {} sizes and {} LastModified values in a reply",
             page.sizes.len(),
             page.modified.len()
         )));
@@ -1012,25 +1027,46 @@ impl S3Store {
 }
 
 impl S3Store {
+    /// The keys only: no Last-Modified time and no `Date` header is read ([`keys_page`]).
     fn list_from(
         &self,
         prefix: &str,
         start_after: Option<&str>,
     ) -> Result<Vec<String>, StoreError> {
-        Ok(self
-            .list_sized_from(prefix, start_after)?
-            .into_iter()
-            .map(|l| l.key)
-            .collect())
+        let mut keys =
+            self.list_pages(prefix, start_after, |what, page, _| keys_page(what, page))?;
+        if let Some(a) = start_after {
+            keys.retain(|k| k.as_str() > a);
+        }
+        keys.sort();
+        Ok(keys)
     }
 
+    /// Each object with its size, Last-Modified time and age ([`listed_page`]): a missing or
+    /// bad time is a permanent error here only.
     fn list_sized_from(
         &self,
         prefix: &str,
         start_after: Option<&str>,
     ) -> Result<Vec<Listed>, StoreError> {
+        let mut keys = self.list_pages(prefix, start_after, listed_page)?;
+        if let Some(a) = start_after {
+            keys.retain(|l| l.key.as_str() > a);
+        }
+        keys.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(keys)
+    }
+
+    /// Every page of a ListObjectsV2 listing, each read by `take` (with the text for errors
+    /// and the reply's `Date` header).
+    fn list_pages<T>(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        mut take: impl FnMut(&str, ListPage, Option<&str>) -> Result<Vec<T>, StoreError>,
+    ) -> Result<Vec<T>, StoreError> {
         let what = format!("LIST {prefix}");
-        let mut keys = Vec::new();
+        let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let q = list_query(prefix, start_after, token.as_deref());
@@ -1041,17 +1077,13 @@ impl S3Store {
             }
             let mut page = parse_list(&String::from_utf8_lossy(&r.body));
             let next = page.next.take();
-            keys.extend(listed_page(&what, page, r.date.as_deref())?);
+            out.extend(take(&what, page, r.date.as_deref())?);
             match next {
                 Some(t) => token = Some(t),
                 None => break,
             }
         }
-        if let Some(a) = start_after {
-            keys.retain(|l| l.key.as_str() > a);
-        }
-        keys.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(keys)
+        Ok(out)
     }
 }
 
@@ -2040,6 +2072,41 @@ mod tests {
         let no_size = "<ListBucketResult><Contents><Key>a/1</Key>\
             <LastModified>2026-10-25T01:00:00Z</LastModified></Contents></ListBucketResult>";
         assert!(listed_page("LIST a/", parse_list(no_size), Some(date)).is_err());
+    }
+
+    /// The keys-only listing (`list`, `list_after`: restore, GC, takeover, the replica) needs
+    /// no time: a page whose Last-Modified is missing or not in the `Z` form still gives its
+    /// keys. Only the sized listing (the gauges) needs the times, and it fails with a clear
+    /// error (review 1, finding 1.1).
+    #[test]
+    fn keys_only_page_needs_no_last_modified() {
+        let offset = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+            <Contents><Key>a/1</Key><LastModified>2026-10-25T01:00:00+00:00</LastModified>\
+            <Size>12</Size></Contents>\
+            <Contents><Key>a/2</Key><Size>3</Size></Contents></ListBucketResult>";
+        let date = Some("Sun, 25 Oct 2026 02:00:00 GMT");
+        assert_eq!(
+            keys_page("LIST a/", parse_list(offset)).unwrap(),
+            ["a/1", "a/2"]
+        );
+        let e = listed_page("LIST a/", parse_list(offset), date).unwrap_err();
+        assert!(e.to_string().contains("LastModified"), "{e}");
+        let bad_form = "<ListBucketResult><Contents><Key>a/1</Key>\
+            <LastModified>2026-10-25T01:00:00+00:00</LastModified><Size>1</Size></Contents>\
+            </ListBucketResult>";
+        assert_eq!(keys_page("LIST a/", parse_list(bad_form)).unwrap(), ["a/1"]);
+        let e = listed_page("LIST a/", parse_list(bad_form), date).unwrap_err();
+        assert!(e.to_string().contains("bad LastModified of \"a/1\""), "{e}");
+        // No Date header: the keys still come; the sized listing fails.
+        assert_eq!(keys_page("LIST a/", parse_list(bad_form)).unwrap(), ["a/1"]);
+        let good = "<ListBucketResult><Contents><Key>a/1</Key>\
+            <LastModified>2026-10-25T01:00:00Z</LastModified><Size>1</Size></Contents>\
+            </ListBucketResult>";
+        let e = listed_page("LIST a/", parse_list(good), None).unwrap_err();
+        assert!(e.to_string().contains("no usable Date header"), "{e}");
+        // The keys-only listing keeps its old check: one size per key.
+        let no_size = "<ListBucketResult><Contents><Key>a/1</Key></Contents></ListBucketResult>";
+        assert!(keys_page("LIST a/", parse_list(no_size)).is_err());
     }
 
     #[test]
