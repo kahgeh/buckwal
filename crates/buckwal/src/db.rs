@@ -125,6 +125,8 @@ pub(crate) struct Shared {
     batching: Mutex<Batching>,
     /// The database's journal mode (its head's, which `open` made equal to the config's).
     pub(crate) journal_mode: JournalMode,
+    /// The engine opened with a key (`guard::check_sql` refuses the copy form of `VACUUM`).
+    encrypted: bool,
     /// The uploader's counters; connections record their acks in them.
     pub(crate) stats: Arc<StatsCell>,
     events: Option<EventHook>,
@@ -144,6 +146,14 @@ impl Shared {
 
     pub(crate) fn batching(&self) -> Batching {
         *lock(&self.batching)
+    }
+
+    /// What the SQL guard checks each statement against.
+    pub(crate) fn guard_target(&self) -> crate::guard::Target {
+        crate::guard::Target {
+            mode: self.journal_mode,
+            encrypted: self.encrypted,
+        }
     }
 
     pub(crate) fn emit(&self, e: Event) {
@@ -291,7 +301,13 @@ pub fn is_claimed(dir: &Path) -> Result<bool> {
 
 #[doc(hidden)]
 pub fn open_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Result<Database> {
-    open_impl(config, store, false)
+    open_impl(config, store, false, false)
+}
+
+/// A writer [`open`] with turso's in-place `VACUUM` on (`EngineConfig::vacuum`), for
+/// [`crate::vacuum`] only.
+pub(crate) fn open_for_vacuum(config: Config, store: Arc<dyn ObjectStore>) -> Result<Database> {
+    open_impl(config, store, false, true)
 }
 
 /// Open for reading only (verification): nothing is ever written to the bucket. The
@@ -310,14 +326,19 @@ pub fn open_read_only(config: Config) -> Result<Database> {
 
 #[doc(hidden)]
 pub fn open_read_only_with_store(config: Config, store: Arc<dyn ObjectStore>) -> Result<Database> {
-    open_impl(config, store, true)
+    open_impl(config, store, true, false)
 }
 
 /// How many times a read-only open of an empty directory restores when the head moves during
 /// its restore (`Error::Stale`).
 const READ_ONLY_RESTORES: u32 = 3;
 
-fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Result<Database> {
+fn open_impl(
+    config: Config,
+    store: Arc<dyn ObjectStore>,
+    read_only: bool,
+    vacuum: bool,
+) -> Result<Database> {
     config.validate()?;
     let encryption = encryption::load(&config)?;
     let guard = DirGuard::acquire(&config.dir)?;
@@ -329,6 +350,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
     });
     let keys = config.keys_for(encryption.as_deref());
     cfg.encryption = encryption;
+    cfg.vacuum = vacuum;
     clear_interrupted_restore(&dir)?;
     clear_interrupted_create(&dir)?;
     if !read_only {
@@ -465,6 +487,7 @@ fn open_impl(config: Config, store: Arc<dyn ObjectStore>, read_only: bool) -> Re
             connections: AtomicUsize::new(0),
             batching: Mutex::new(config.batching),
             journal_mode: config.journal_mode,
+            encrypted: cfg.encryption.is_some(),
             events: cfg.events.clone(),
             reconciled,
             dir_guard: None,
@@ -504,6 +527,7 @@ pub(crate) fn replica_database(
             connections: AtomicUsize::new(0),
             batching: Mutex::new(Batching::Off),
             journal_mode: JournalMode::Wal,
+            encrypted: cfg.encryption.is_some(),
             events: cfg.events.clone(),
             reconciled: None,
             dir_guard: Some(guard),

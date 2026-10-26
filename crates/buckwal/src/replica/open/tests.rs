@@ -1909,3 +1909,44 @@ fn stopped_reasons_integrity_and_corrupt_carry_the_object_key() {
 }
 
 mod packs;
+
+/// A replica of an encrypted database refuses the copy form of `VACUUM` on every call of a
+/// `ReadConnection` (it would write a plaintext file), and writes no file. The SQL is made from
+/// its parts (`source_never_contains_vacuum_into` searches this file too).
+#[test]
+fn encrypted_replica_refuses_the_copy_form_of_vacuum() {
+    let store = Arc::new(MemStore::new());
+    let k = tempfile::tempdir().unwrap();
+    let t = tempfile::tempdir().unwrap();
+    let key = "11".repeat(32);
+    let db = crate::open_with_store(
+        key_config(&t.path().join("w"), k.path(), &key, wconfig),
+        store.clone(),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    add(&conn, 1);
+    let r = tempfile::tempdir().unwrap();
+    let replica = open_replica_with_store(
+        key_config(&r.path().join("r"), k.path(), &key, rconfig),
+        store.clone(),
+    )
+    .unwrap();
+    let rc = replica.connect().unwrap();
+    wait_rows(&rc, 1);
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("copy.db");
+    let (first, second) = ("vacuum", "INTO");
+    let sql = format!("{first}  {second} '{}'", target.display());
+    let refused = crate::vacuum::VACUUM_INTO_REFUSED;
+    assert_eq!(unsupported(rc.query(&sql, &[])), refused);
+    assert_eq!(unsupported(rc.run(&sql, &[], &[])), refused);
+    assert_eq!(unsupported(rc.describe(&sql)), refused);
+    assert!(!target.exists());
+    rc.close().unwrap();
+    replica.close().unwrap();
+    conn.close().unwrap();
+    db.close().unwrap();
+}

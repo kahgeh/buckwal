@@ -692,6 +692,7 @@ impl Config {
             io_mode: mode,
             encryption: None,
             journal_mode: self.journal_mode,
+            vacuum: false,
         }
     }
 
@@ -832,6 +833,9 @@ pub(crate) struct EngineConfig {
     /// The mode the caller opens the database in: a head or local state of the other mode is
     /// refused (`db::refuse_mode_mismatch`).
     pub journal_mode: JournalMode,
+    /// turso's experimental in-place `VACUUM` is on (`DatabaseOpts::with_vacuum`): only the
+    /// open of `buckwal vacuum` ([`crate::vacuum`]) sets it.
+    pub(crate) vacuum: bool,
 }
 
 impl EngineConfig {

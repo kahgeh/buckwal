@@ -490,11 +490,7 @@ fn pack_span_has_outcome_and_step_times() {
         Some(&*r.bytes_down.to_string())
     );
     assert_eq!(s.field("buckwal.pack.failures"), Some("0"));
-    let share: f64 = s
-        .field("buckwal.pack.free_page_share")
-        .unwrap()
-        .parse()
-        .unwrap();
+    let share: f64 = s.field("buckwal.free_page_share").unwrap().parse().unwrap();
     assert!((0.0..1.0).contains(&share), "{share}");
     for step in ["read", "apply", "upload", "verify", "publish"] {
         let ms = s.field(&format!("buckwal.pack.{step}_ms"));

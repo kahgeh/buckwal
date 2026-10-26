@@ -27,6 +27,7 @@ pub mod telemetry;
 pub(crate) mod trim;
 pub(crate) mod upgrade;
 pub(crate) mod uploader;
+pub(crate) mod vacuum;
 
 pub use batching::Batching;
 pub use config::{Config, JournalMode};
@@ -62,6 +63,9 @@ pub use turso_core::Value;
 #[doc(hidden)]
 pub use upgrade::upgrade_with_store;
 pub use upgrade::{upgrade, UpgradeReport};
+#[doc(hidden)]
+pub use vacuum::vacuum_with_store;
+pub use vacuum::{vacuum, VacuumReport};
 
 #[cfg(test)]
 mod tests {

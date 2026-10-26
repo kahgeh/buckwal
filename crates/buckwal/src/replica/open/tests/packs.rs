@@ -326,3 +326,56 @@ fn a_copy_without_a_pack_under_a_format_5_head_restores_again_at_open() {
     assert_eq!(warns[0].level, tracing::Level::WARN);
     assert_eq!(spans.named("buckwal.restore").len(), 1);
 }
+
+/// The writer vacuums (`buckwal vacuum`, with the writer closed for it) while a replica
+/// follows. The replica applies the vacuum's commit like any other: after the writer's next
+/// commits, its rows equal the writer's and its copy passes `PRAGMA integrity_check`.
+#[test]
+fn replica_follows_a_vacuum() {
+    let Packed {
+        store,
+        _w: _wdir,
+        wcfg,
+        wdb,
+        wc,
+        _r: _rdir,
+        replica,
+        ..
+    } = packed(POLL);
+    let big = |id: i64| format!("{id:06}{}", "y".repeat(3500));
+    for id in 6..=200 {
+        wc.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[int(id), Value::build_text(big(id))],
+        )
+        .unwrap();
+    }
+    wc.execute("DELETE FROM t WHERE id > 100", &[]).unwrap();
+    wc.checkpoint(CheckpointMode::Truncate).unwrap();
+    wc.close().unwrap();
+    wdb.close().unwrap();
+    let v = crate::vacuum_with_store(&wcfg, store.clone()).unwrap();
+    assert!(v.pages_after * 10 < v.pages_before * 7, "{v:?}");
+    let wdb = crate::open_with_store(wcfg.clone(), store.clone()).unwrap();
+    let wc = wdb.connect().unwrap();
+    for id in 201..=210 {
+        wc.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[int(id), Value::build_text(big(id))],
+        )
+        .unwrap();
+    }
+    let all = "SELECT id, length(v), substr(v, 1, 6) FROM t ORDER BY id";
+    let want = wc.query(all, &[]).unwrap();
+    assert_eq!(want.len(), 110);
+    let rc = replica.connect().unwrap();
+    until("the replica has the writer's rows", || {
+        rc.query(all, &[]).unwrap() == want
+    });
+    let ok = rc.query("PRAGMA integrity_check", &[]).unwrap();
+    assert_eq!(ok[0][0].to_text(), Some("ok"));
+    rc.close().unwrap();
+    replica.close().unwrap();
+    wc.close().unwrap();
+    wdb.close().unwrap();
+}

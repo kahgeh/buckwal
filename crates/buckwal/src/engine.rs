@@ -218,13 +218,18 @@ pub(crate) fn open_engine(
     }
     // All three of turso's switches (D16): the database option, the cipher and key at open
     // (a new database gets its reserved bytes from them), and the key on every connection.
+    // The vacuum option only for `buckwal vacuum` (turso marks the in-place `VACUUM`
+    // experimental).
+    opts = opts.db_opts(
+        DatabaseOpts::new()
+            .with_encryption(cfg.encryption.is_some())
+            .with_vacuum(cfg.vacuum),
+    );
     if let Some(enc) = &cfg.encryption {
-        opts = opts
-            .db_opts(DatabaseOpts::new().with_encryption(true))
-            .encryption(EncryptionOpts {
-                cipher: enc.cipher.to_string(),
-                hexkey: hex::encode(enc.key.as_slice()),
-            });
+        opts = opts.encryption(EncryptionOpts {
+            cipher: enc.cipher.to_string(),
+            hexkey: hex::encode(enc.key.as_slice()),
+        });
     }
     let db = EngineDb {
         db: Database::open(io.clone(), &db_path, opts).map_err(engine_error)?,

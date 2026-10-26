@@ -7,6 +7,10 @@
 //! - `PRAGMA journal_mode` set to anything else: only the WAL and the MVCC log are shipped.
 //! - `PRAGMA synchronous` below FULL: a commit that does not fsync is not uploaded either.
 //! - `ATTACH`: writes to an attached database are not shipped.
+//! - The copy form of `VACUUM` (with a target file) on an encrypted database: turso 0.8.3
+//!   writes the copy as a plaintext file (docs/packer-recon.md). `buckwal vacuum` runs the
+//!   in-place `VACUUM` only. The parser finds every spelling (case, white space, comments,
+//!   a schema name, `EXPLAIN`); a plain database's copy form is left to the engine.
 //! - `PRAGMA hexkey` or `PRAGMA cipher` set to a value: the engine would swap the
 //!   connection's key or cipher (translate/pragma.rs:644-655); the key comes from
 //!   `BUCKWAL_ENCRYPTION_KEY_FILE` only (D16).
@@ -25,21 +29,31 @@ use crate::error::{Error, Result};
 use turso_parser::ast::{Cmd, Expr, Literal, PragmaBody, QualifiedName, Stmt, UnaryOperator};
 use turso_parser::parser::Parser;
 
-/// Refuse a statement that would leave WAL mode, lower `synchronous` or attach a database,
-/// and a `PRAGMA buckwal_batching` that is not the only statement in `sql`.
-pub(crate) fn check_sql(sql: &str, mode: JournalMode) -> Result<()> {
-    check(sql, false, mode)
+/// The database a statement runs on, as the guard needs to know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Target {
+    pub(crate) mode: JournalMode,
+    pub(crate) encrypted: bool,
+}
+
+/// Refuse a statement that would leave WAL mode, lower `synchronous`, attach a database or
+/// copy an encrypted database to a plaintext file, and a `PRAGMA buckwal_batching` that is
+/// not the only statement in `sql`.
+pub(crate) fn check_sql(sql: &str, target: Target) -> Result<()> {
+    check(sql, false, target)
 }
 
 /// [`check_sql`] for a caller that runs `sql` one statement at a time, catching each
 /// `PRAGMA buckwal_batching` in place ([`first_batching_pragma`]): it may be one of several.
-pub(crate) fn check_sql_split(sql: &str, mode: JournalMode) -> Result<()> {
-    check(sql, true, mode)
+pub(crate) fn check_sql_split(sql: &str, target: Target) -> Result<()> {
+    check(sql, true, target)
 }
 
-fn check(sql: &str, split: bool, mode: JournalMode) -> Result<()> {
+fn check(sql: &str, split: bool, target: Target) -> Result<()> {
+    let mode = target.mode;
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("pragma") && !lower.contains("attach") {
+    let vacuum = target.encrypted && lower.contains("vacuum");
+    if !lower.contains("pragma") && !lower.contains("attach") && !vacuum {
         return Ok(());
     }
     // Statements parsed; a buckwal_batching PRAGMA among them; text after them that does
@@ -65,6 +79,9 @@ fn check(sql: &str, split: bool, mode: JournalMode) -> Result<()> {
         }
         match stmt {
             Stmt::Attach { .. } => return Err(Error::Unsupported("ATTACH")),
+            Stmt::Vacuum { into: Some(_), .. } if target.encrypted => {
+                return Err(Error::Unsupported(crate::vacuum::VACUUM_INTO_REFUSED))
+            }
             Stmt::Pragma {
                 name,
                 body: Some(PragmaBody::Equals(value) | PragmaBody::Call(value)),
@@ -243,11 +260,19 @@ mod tests {
 
     // The WAL-mode checks below keep their call shape.
     fn check_sql(sql: &str) -> Result<()> {
-        super::check_sql(sql, JournalMode::Wal)
+        super::check_sql(sql, plain(JournalMode::Wal))
     }
 
     fn check_sql_split(sql: &str) -> Result<()> {
-        super::check_sql_split(sql, JournalMode::Wal)
+        super::check_sql_split(sql, plain(JournalMode::Wal))
+    }
+
+    /// An unencrypted database of `mode`.
+    fn plain(mode: JournalMode) -> Target {
+        Target {
+            mode,
+            encrypted: false,
+        }
     }
 
     fn refused(sql: &str) -> &'static str {
@@ -258,7 +283,7 @@ mod tests {
     }
 
     fn refused_in_mvcc(sql: &str) -> &'static str {
-        match super::check_sql(sql, JournalMode::Mvcc) {
+        match super::check_sql(sql, plain(JournalMode::Mvcc)) {
             Err(Error::Unsupported(what)) => what,
             r => panic!("{sql}: {r:?}"),
         }
@@ -278,7 +303,7 @@ mod tests {
             "SELECT 1; PRAGMA journal_mode=wal;",
         ] {
             assert_eq!(refused_in_mvcc(sql), SWITCH_BACK, "{sql}");
-            let r = super::check_sql_split(sql, JournalMode::Mvcc);
+            let r = super::check_sql_split(sql, plain(JournalMode::Mvcc));
             assert_eq!(r, Err(Error::Unsupported(SWITCH_BACK)), "split: {sql}");
         }
         // Reading the mode, setting it to what it is, and other modes' own refusal.
@@ -288,7 +313,11 @@ mod tests {
             "PRAGMA journal_mode='experimental_mvcc'",
             "SELECT 'pragma journal_mode=wal'",
         ] {
-            assert_eq!(super::check_sql(sql, JournalMode::Mvcc), Ok(()), "{sql}");
+            assert_eq!(
+                super::check_sql(sql, plain(JournalMode::Mvcc)),
+                Ok(()),
+                "{sql}"
+            );
         }
         assert_eq!(
             refused_in_mvcc("PRAGMA journal_mode=delete"),
@@ -317,8 +346,12 @@ mod tests {
             "PRAGMA main.buckwal_batching('window 1s 2 3')",
         ] {
             assert_eq!(refused_in_mvcc(sql), "MVCC: Window batching", "{sql}");
-            assert_eq!(super::check_sql(sql, JournalMode::Wal), Ok(()), "{sql}");
-            let r = super::check_sql_split(sql, JournalMode::Mvcc);
+            assert_eq!(
+                super::check_sql(sql, plain(JournalMode::Wal)),
+                Ok(()),
+                "{sql}"
+            );
+            let r = super::check_sql_split(sql, plain(JournalMode::Mvcc));
             assert_eq!(r, Err(Error::Unsupported("MVCC: Window batching")), "{sql}");
         }
         for sql in [
@@ -326,7 +359,11 @@ mod tests {
             "PRAGMA buckwal_batching",
             "PRAGMA buckwal_batching = 'off'",
         ] {
-            assert_eq!(super::check_sql(sql, JournalMode::Mvcc), Ok(()), "{sql}");
+            assert_eq!(
+                super::check_sql(sql, plain(JournalMode::Mvcc)),
+                Ok(()),
+                "{sql}"
+            );
         }
     }
 
@@ -513,6 +550,51 @@ mod tests {
             "PRAGMA journal_mode = (",
         ] {
             assert_eq!(check_sql(sql), Ok(()), "{sql}");
+        }
+    }
+
+    /// The copy form of `VACUUM` on an encrypted database, in every spelling, is refused; the
+    /// in-place form and a plain database's copy form are not. The SQL is made from its parts
+    /// (`source_never_contains_vacuum_into` searches this file too).
+    #[test]
+    fn copy_form_of_vacuum_is_refused_on_an_encrypted_database() {
+        let encrypted = |mode| Target {
+            mode,
+            encrypted: true,
+        };
+        let (first, second) = ("VACUUM", "INTO");
+        let forms = [
+            format!("{first} {second} '/tmp/x.db'"),
+            format!("{} {} 'x'", first.to_lowercase(), second.to_lowercase()),
+            format!("VaCuUm\n\t {second}\r\n'x'"),
+            format!("{first} /* c */ {second} 'x'"),
+            format!("{first} main {second} 'x'"),
+            format!("EXPLAIN {first} {second} 'x'"),
+            format!("SELECT 1; {first} {second} 'x'"),
+            format!("{first} {second} ('x' || 'y')"),
+        ];
+        for mode in [JournalMode::Wal, JournalMode::Mvcc] {
+            for sql in &forms {
+                for r in [
+                    super::check_sql(sql, encrypted(mode)),
+                    super::check_sql_split(sql, encrypted(mode)),
+                ] {
+                    assert_eq!(
+                        r,
+                        Err(Error::Unsupported(crate::vacuum::VACUUM_INTO_REFUSED)),
+                        "{sql}"
+                    );
+                }
+                assert_eq!(super::check_sql(sql, plain(mode)), Ok(()), "{sql}");
+            }
+            for sql in [
+                "VACUUM",
+                "vacuum main",
+                "SELECT 'vacuum' AS v",
+                "VACUUM; SELECT 1",
+            ] {
+                assert_eq!(super::check_sql(sql, encrypted(mode)), Ok(()), "{sql}");
+            }
         }
     }
 }

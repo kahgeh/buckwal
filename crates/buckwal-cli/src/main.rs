@@ -271,6 +271,30 @@ fn upgrade(dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// Vacuum the writer's own database in `dir` in place (`buckwal::vacuum`), and print what it did.
+fn vacuum(dir: &Path) -> CliResult<()> {
+    let r = buckwal::vacuum(&writer_config(dir)?).map_err(err)?;
+    say(&vacuum_line(&r));
+    Ok(())
+}
+
+/// The line `vacuum` prints for its report.
+fn vacuum_line(r: &buckwal::VacuumReport) -> String {
+    format!(
+        "vacuumed page_size={} pages_before={} free_pages_before={} free_page_share={:.3} \
+         pages_after={} free_pages_after={} bytes_before={} bytes_after={} ms={}",
+        r.page_size,
+        r.pages_before,
+        r.free_pages_before,
+        r.free_page_share_before(),
+        r.pages_after,
+        r.free_pages_after,
+        r.file_bytes_before,
+        r.file_bytes_after,
+        r.elapsed.as_millis()
+    )
+}
+
 /// GC: delete what the database no longer needs (old enough heads, packs, log and uploads). It
 /// needs no directory.
 fn gc() -> CliResult<()> {
@@ -597,6 +621,7 @@ fn main() -> ExitCode {
         Command::Restore { dir } => restore(dir),
         Command::Takeover { dir } => takeover(dir),
         Command::Upgrade { dir } => upgrade(dir),
+        Command::Vacuum { dir } => vacuum(dir),
         Command::Gc => gc(),
         Command::Verify { dir, acked } => verify(dir, acked.as_deref()),
         Command::Sql {

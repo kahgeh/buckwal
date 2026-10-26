@@ -27,13 +27,21 @@
 //!   `buckwal.retries`, `s3.status`) around each fence record (`bucket.rs`);
 //! - `buckwal.pack`, one per pack run (`buckwal.pack.generation`, `buckwal.pack.key`,
 //!   `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
-//!   `buckwal.pack.free_page_share`, `buckwal.pack.<step>_ms` for each step it made,
+//!   `buckwal.free_page_share` (free pages over all pages of the new pack: the data of the warn
+//!   alert past 0.2 that tells you to run `buckwal vacuum`, spec Choice A (a)),
+//!   `buckwal.pack.<step>_ms` for each step it made,
 //!   `buckwal.elapsed_ms`, `buckwal.pack.failures`, `buckwal.outcome`: `packed`,
 //!   `nothing_to_do`, `superseded` or `failed`, with `buckwal.pack.failed_step`,
 //!   `buckwal.pack.failed_key` and `buckwal.error`) (`pack/run.rs`), and
 //!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes (`buckwal.pack.behind_bytes`,
 //!   `buckwal.pack.age_seconds`, `buckwal.pack.generation`, `buckwal.pack.size`,
-//!   `buckwal.outcome`) (`pack/thread.rs`).
+//!   `buckwal.outcome`) (`pack/thread.rs`);
+//! - `buckwal.vacuum`, one per `buckwal vacuum` (`buckwal.vacuum.page_size`,
+//!   `buckwal.vacuum.pages_before`, `buckwal.vacuum.free_pages_before`,
+//!   `buckwal.vacuum.pages_after`, `buckwal.vacuum.free_pages_after`,
+//!   `buckwal.vacuum.bytes_before`, `buckwal.vacuum.bytes_after`,
+//!   `buckwal.free_page_share` before the vacuum, `buckwal.elapsed_ms`, `buckwal.outcome`:
+//!   `vacuumed` or the error's, and `buckwal.error`) (`vacuum.rs`).
 //!
 //! `buckwal.outcome = integrity` marks a span whose read failed an integrity check, next to
 //! the ERROR record `integrity check failed` (`format/integrity.rs`).

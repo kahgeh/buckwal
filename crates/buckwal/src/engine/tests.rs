@@ -38,6 +38,7 @@ pub(crate) fn cfg_deadline(deadline: Duration) -> EngineConfig {
         io_mode: crate::io::IoMode::Writer,
         encryption: None,
         journal_mode: crate::config::JournalMode::Wal,
+        vacuum: false,
     }
 }
 

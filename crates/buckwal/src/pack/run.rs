@@ -360,7 +360,7 @@ pub(crate) fn pack_run(
 ///
 /// The span (spec "Observability"): `buckwal.pack.generation`, `buckwal.pack.key`,
 /// `buckwal.pack.bytes_down`, `buckwal.pack.bytes_up`, `buckwal.pack.size`,
-/// `buckwal.pack.free_page_share`, `buckwal.pack.source` and `buckwal.pack.reason` (where the
+/// `buckwal.free_page_share`, `buckwal.pack.source` and `buckwal.pack.reason` (where the
 /// run got its file: [`PackSource`]; recorded as soon as the run knows it, so a run that ends
 /// with an error after that has them too; a run without the lock knows it at its start, a
 /// run with the lock once it read the pointer and checked the copy, before the free disk
@@ -389,7 +389,7 @@ pub(crate) fn pack_run_in(
         buckwal.pack.bytes_down = Empty,
         buckwal.pack.bytes_up = Empty,
         buckwal.pack.size = Empty,
-        buckwal.pack.free_page_share = Empty,
+        buckwal.free_page_share = Empty,
         buckwal.pack.source = Empty,
         buckwal.pack.reason = Empty,
         buckwal.pack.read_ms = Empty,
@@ -440,7 +440,7 @@ fn record_report(span: &tracing::Span, r: &PackReport) {
     span.record("buckwal.pack.bytes_down", r.bytes_down);
     span.record("buckwal.pack.bytes_up", r.bytes_up);
     span.record("buckwal.pack.size", r.pack_size);
-    span.record("buckwal.pack.free_page_share", r.free_page_share);
+    span.record("buckwal.free_page_share", r.free_page_share);
     if let Some(src) = r.source {
         record_source(span, src);
     }

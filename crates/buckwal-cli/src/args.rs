@@ -111,6 +111,10 @@ pub enum Command {
     Upgrade {
         dir: PathBuf,
     },
+    /// Run turso's in-place `VACUUM` on the writer's own database in `dir` (closed).
+    Vacuum {
+        dir: PathBuf,
+    },
     /// Delete what an old enough head no longer reaches; no directory.
     Gc,
     /// Serve the database over tursodb's SQL over HTTP v3 until SIGTERM or SIGINT.
@@ -164,6 +168,7 @@ pub const USAGE: &str = "usage: buckwal <command> [options]
           [--pack on|off]
   takeover --dir DIR [--journal-mode wal|mvcc]
   upgrade DIR  (or upgrade --dir DIR)
+  vacuum  DIR  (or vacuum --dir DIR)
   follow  --dir DIR [--poll-ms N]
   notify-setup --bucket B --replicas N [--region R] [--topic NAME]
   pack    --dir DIR
@@ -190,6 +195,10 @@ upgrade converts a bucket of format 1 to 4 to format 5 (packs) in place. It take
 over first, so a writer still running elsewhere is fenced. Run it on the machine that will be
 the writer: DIR must be missing or empty, and afterwards holds the restored copy. Builds before
 format 5 refuse the bucket afterwards. A failed upgrade leaves the old format working; run it again.
+vacuum runs the in-place VACUUM on the writer's own database in DIR, with no other open of DIR
+(stop serve first). The file gets smaller; the vacuum's commit goes to the bucket like any other.
+The database is not available during the vacuum and its upload, so run it at a quiet time, when
+the free_page_share of the pack runs is high. An encrypted database stays encrypted.
 S3 settings come from the BUCKWAL_* environment variables; serve also reads BUCKWAL_SERVE_*.";
 
 fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
@@ -431,8 +440,9 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             topic,
         });
     }
-    // `upgrade DIR`: the spec's form, and `--dir DIR` as every other command takes it.
-    if cmd == "upgrade" && dir.is_none() && positional.len() == 1 {
+    // `upgrade DIR` and `vacuum DIR`: the spec's form, and `--dir DIR` as every other command
+    // takes it.
+    if matches!(cmd.as_str(), "upgrade" | "vacuum") && dir.is_none() && positional.len() == 1 {
         dir = positional.pop().map(PathBuf::from);
     }
     let dir = dir.ok_or("--dir is required")?;
@@ -443,6 +453,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
         "restore" => Command::Restore { dir },
         "takeover" => Command::Takeover { dir },
         "upgrade" => Command::Upgrade { dir },
+        "vacuum" => Command::Vacuum { dir },
         "verify" => Command::Verify { dir, acked },
         "sql" | "stats" if positional.is_empty() => {
             return Err(format!("{cmd} needs at least one SQL argument"));
@@ -755,6 +766,22 @@ mod tests {
         assert!(p(&["upgrade", "d", "--claim"]).is_err());
         assert!(p(&["upgrade", "d", "--journal-mode", "wal"]).is_err());
         assert!(USAGE.contains("upgrade DIR"));
+    }
+
+    /// `vacuum DIR` or `vacuum --dir DIR`.
+    #[test]
+    fn parses_vacuum() {
+        let want = Ok(Command::Vacuum {
+            dir: PathBuf::from("d"),
+        });
+        assert_eq!(p(&["vacuum", "d"]), want);
+        assert_eq!(p(&["vacuum", "--dir", "d"]), want);
+        assert!(p(&["vacuum"]).is_err(), "a directory is required");
+        assert!(p(&["vacuum", "d", "e"]).is_err());
+        assert!(p(&["vacuum", "--dir", "d", "e"]).is_err());
+        assert!(p(&["vacuum", "d", "--claim"]).is_err());
+        assert!(p(&["vacuum", "d", "--journal-mode", "wal"]).is_err());
+        assert!(USAGE.contains("vacuum  DIR"));
     }
 
     /// `pack --dir DIR`: one pack run, with `DIR` as the pack directory.
