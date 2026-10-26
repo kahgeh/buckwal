@@ -705,13 +705,104 @@ fn replica_rolled_back_large_transaction() {
 // replica_follows_before_prefetch_finishes
 // ---------------------------------------------------------------------------------------
 
+/// One block of a pack (`BLOCK_SIZE` of the library): a page read fetches one block, and the
+/// background fetch asks for up to 16 of them in one range GET.
+const PACK_BLOCK: u64 = 1 << 20;
+
+/// A store that holds every range GET under `pack/` of more than one block (the background
+/// fetch) until `release`, at most 120 s. A one-block GET (a page read or a local checkpoint
+/// over a block that is not local yet) goes through at once.
+struct HoldFetch {
+    inner: std::sync::Arc<dyn ObjectStore>,
+    released: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl HoldFetch {
+    fn new(inner: std::sync::Arc<dyn ObjectStore>) -> HoldFetch {
+        HoldFetch {
+            inner,
+            released: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
+impl ObjectStore for HoldFetch {
+    fn put(&self, key: &str, body: &[u8]) -> Result<String, buckwal::store::StoreError> {
+        self.inner.put(key, body)
+    }
+    fn put_if_absent(
+        &self,
+        key: &str,
+        body: &[u8],
+    ) -> Result<buckwal::store::CondPut, buckwal::store::StoreError> {
+        self.inner.put_if_absent(key, body)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> Result<buckwal::store::CondPut, buckwal::store::StoreError> {
+        self.inner.put_if_match(key, body, etag)
+    }
+    fn get(&self, key: &str) -> Result<Option<buckwal::store::Object>, buckwal::store::StoreError> {
+        self.inner.get(key)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, buckwal::store::StoreError> {
+        if key.contains("/pack/") && len > PACK_BLOCK {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut g = self.released.lock().unwrap();
+            while !*g && Instant::now() < deadline {
+                g = self.cv.wait_timeout(g, Duration::from_secs(1)).unwrap().0;
+            }
+        }
+        self.inner.get_range(key, offset, len)
+    }
+    fn stat(
+        &self,
+        key: &str,
+    ) -> Result<Option<buckwal::store::ObjectStat>, buckwal::store::StoreError> {
+        self.inner.stat(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, buckwal::store::StoreError> {
+        self.inner.list(prefix)
+    }
+    fn list_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> Result<Vec<String>, buckwal::store::StoreError> {
+        self.inner.list_after(prefix, start_after)
+    }
+    fn delete(&self, key: &str) -> Result<(), buckwal::store::StoreError> {
+        self.inner.delete(key)
+    }
+    fn stats(&self) -> buckwal::store::StatsSnap {
+        self.inner.stats()
+    }
+}
+
 /// The writer commits 4,000 rows of 1 KiB (about 4.5 MB, five 1 MiB blocks), switches
 /// generation, and a pack run packs it; then 20 more rows reach the log. A replica opens over a
-/// store that delays every GET under `pack/` by 1 s, so the background fetch of the pack is
-/// still running while the test reads and the follower applies: right after open the blocks
-/// file names a block that is not local yet (asserted), the first reading already equals the
-/// writer's rows (each block read on demand), a full scan of the payload sizes is correct, a
-/// commit made meanwhile is followed, and once every block is local `integrity_check` is ok.
+/// store that holds the background fetch of the pack ([`HoldFetch`]). While it is held, with
+/// no read on the replica, the writer commits, switches generation and commits again. The
+/// follower applies all of it, its local checkpoint of the switch included, and moves to the
+/// head's generation and its last seq, while the blocks file still names blocks that are not
+/// local (asserted before and after). Then the reads equal the writer's rows (each missing
+/// block read on demand), the fetch is let go, every block becomes local, and
+/// `integrity_check` is ok.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn replica_follows_before_prefetch_finishes() {
@@ -724,49 +815,45 @@ fn replica_follows_before_prefetch_finishes() {
     let packed = buckwal::pack(&ctx.config(&ctx.dir("p"))).expect("pack run");
     assert_eq!(packed.outcome, buckwal::PackOutcome::Packed, "{packed:?}");
     w.insert_range(5001..=5020);
-    let fault = std::sync::Arc::new(buckwal::store::FaultStore::new(std::sync::Arc::new(
-        ctx.store(),
-    )));
-    fault.only_keys_containing("pack/");
-    fault.delay_gets(Duration::from_secs(1));
+    let hold = std::sync::Arc::new(HoldFetch::new(std::sync::Arc::new(ctx.store())));
     let rdir = ctx.dir("r");
     let mut cfg = ctx.config(&rdir);
     cfg.prefetch = true;
     cfg.replica_poll_interval = Duration::from_millis(300);
-    let store: std::sync::Arc<dyn buckwal::store::ObjectStore> = fault.clone();
-    let t0 = Instant::now();
+    let store: std::sync::Arc<dyn ObjectStore> = hold.clone();
     let rep = Rep::open_store(cfg, store);
-    let opened = t0.elapsed();
     // The blocks file: the limit (u64 LE), then one byte per block (1 = local).
     let blocks = || std::fs::read(rdir.join("app.db-blocks")).unwrap_or_default();
     let missing = |b: &[u8]| b.get(8..).is_some_and(|f| f.contains(&0));
     let at_open = blocks();
-    assert!(
-        missing(&at_open),
-        "the background fetch was already finished at open ({at_open:?}): the test proves \
-         nothing"
-    );
-    let first = rep.count();
-    let want = w.acked.len() as i64;
-    assert_eq!(first, want, "the first reading right after open");
-    assert_eq!(
-        rep.query_int("SELECT coalesce(sum(length(payload)), 0) FROM soak"),
-        1024 * want
-    );
+    assert!(missing(&at_open), "every block local at open: {at_open:?}");
+
     w.insert_range(5021..=5030);
+    w.seal();
+    w.insert_range(5031..=5040);
+    let head = ctx.head();
+    let seq = ctx.assert_log_contiguous(head.generation);
+    wait_until("the follower at the head", Duration::from_secs(60), || {
+        let s = rep.stats();
+        (s.generation == head.generation && s.seq == seq).then_some(())
+    });
+    let applied = blocks();
+    assert!(
+        missing(&applied),
+        "the follower applied only after the background fetch: {applied:?}"
+    );
+
     rep.wait_equal(&w, Duration::from_secs(60));
+    let payload = "SELECT coalesce(sum(length(payload)), 0) FROM soak";
+    let want = w.conn().query(payload, &[]).expect("writer query")[0][0].as_int();
+    assert_eq!(Some(rep.query_int(payload)), want);
+    hold.release();
     wait_until("every block local", Duration::from_secs(180), || {
         (!missing(&blocks())).then_some(())
     });
     assert_eq!(rep.integrity(), "ok");
     assert_eq!(rep.sum(), w.sum());
     assert_no_writes(&rep, "prefetch");
-    let range_gets = fault
-        .events()
-        .iter()
-        .filter(|e| e.starts_with("get_range ") && e.contains("pack/"))
-        .count();
-    eprintln!("prefetch: open took {opened:?}; {range_gets} range GETs of the pack");
     w.close().expect("close writer");
     rep.close();
 }

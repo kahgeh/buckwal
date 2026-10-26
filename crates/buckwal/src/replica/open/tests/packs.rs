@@ -265,3 +265,64 @@ fn replica_whose_re_restore_gives_up_keeps_its_copy_and_retries_at_next_slow_pol
     assert!(outcomes.contains(&"gave_up"), "{outcomes:?}");
     assert_eq!(outcomes.last(), Some(&"restored"), "{outcomes:?}");
 }
+
+/// A replica copy of a format 1 to 4 bucket (no `app.db-pack`, not complete: some pages are
+/// still in `pages/`) opens under a format 5 head, as after `buckwal upgrade`. The copy has no
+/// page source then, so the open restores again from the format 5 bucket (its pack and log)
+/// with a WARN, and the replica reads the format 5 database.
+#[test]
+fn a_copy_without_a_pack_under_a_format_5_head_restores_again_at_open() {
+    let legacy = Arc::new(MemStore::new());
+    let (_lw, _ldb, _lc) = writer(&legacy, 3);
+    let r = tempfile::tempdir().unwrap();
+    let dir = r.path().join("r");
+    let old = open_replica_with_store(rconfig(&dir), legacy.clone()).unwrap();
+    let rc = old.connect().unwrap();
+    wait_rows(&rc, 3);
+    rc.close().unwrap();
+    old.close().unwrap();
+    // Some pages are still in the bucket, as in a large copy whose fetch did not end.
+    let mut state = LocalState::read(&dir).unwrap().unwrap();
+    state.complete = false;
+    state.write_atomic(&dir).unwrap();
+    assert!(!dir.join(crate::files::PACK_FILE).exists());
+
+    // The bucket is now format 5, with a pack: the same prefix, another store.
+    let store = Arc::new(MemStore::new());
+    let w = tempfile::tempdir().unwrap();
+    let wcfg = packed_wconfig(&w.path().join("w"));
+    let wdb = crate::open_with_store(wcfg.clone(), store.clone()).unwrap();
+    let wc = wdb.connect().unwrap();
+    wc.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .unwrap();
+    for i in 1..=7 {
+        add(&wc, i);
+    }
+    wc.checkpoint(CheckpointMode::Truncate).unwrap();
+    add(&wc, 8);
+    pack_now(&store, &wcfg);
+
+    let cap = Capture::new();
+    let spans = tracing::subscriber::with_default(cap.subscriber(), || {
+        let replica = open_replica_with_store(rconfig(&dir), store.clone()).unwrap();
+        let rc = replica.connect().unwrap();
+        wait_rows(&rc, 8);
+        add(&wc, 9);
+        wait_rows(&rc, 9);
+        assert_eq!(replica.stats().stopped, None);
+        rc.close().unwrap();
+        replica.close().unwrap();
+        cap.spans()
+    });
+    let warns: Vec<_> = spans
+        .events
+        .iter()
+        .filter(|e| {
+            e.field("message")
+                == Some("replica copy has no pack under a format 5 head, restoring again")
+        })
+        .collect();
+    assert_eq!(warns.len(), 1, "one WARN for the restore at open");
+    assert_eq!(warns[0].level, tracing::Level::WARN);
+    assert_eq!(spans.named("buckwal.restore").len(), 1);
+}

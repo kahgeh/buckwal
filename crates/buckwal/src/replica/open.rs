@@ -18,8 +18,8 @@ use crate::encryption::{self, check_page_one, file_page_one};
 use crate::engine::{engine_error, open_engine};
 use crate::error::{Error, Result};
 use crate::files::{
-    io_err, DB_FILE, LOCK_FILE, LOG_FILE, REPLICA_AT_FILE, REPLICA_FILE, REPLICA_SEEN_FILE,
-    STATE_FILE, WAL_FILE,
+    io_err, DB_FILE, LOCK_FILE, LOG_FILE, PACK_FILE, REPLICA_AT_FILE, REPLICA_FILE,
+    REPLICA_SEEN_FILE, STATE_FILE, WAL_FILE,
 };
 use crate::format::Head;
 use crate::format::{Keys, LocalState, Manifest, FORMAT_V5};
@@ -270,7 +270,18 @@ pub fn open_replica_with_store(config: Config, store: Arc<dyn ObjectStore>) -> R
 
     clear_interrupted_restore(&dir)?;
     let mut data = settle_layout(&dir)?;
-    let state = match resumable_state(&data)? {
+    let resumable = resumable_state(&data)?.filter(|state| {
+        let usable = has_page_source(&head, &data, state);
+        if !usable {
+            tracing::warn!(
+                target: "buckwal",
+                generation = state.generation,
+                "replica copy has no pack under a format 5 head, restoring again"
+            );
+        }
+        usable
+    });
+    let state = match resumable {
         Some(state) => state,
         None => {
             // No usable position file or database: restore afresh into the directory itself.
@@ -331,6 +342,14 @@ fn resumable_state(dir: &Path) -> Result<Option<LocalState>> {
         (Ok(Some(_)), Ok(Some(s))) if dir.join(DB_FILE).exists() => Ok(Some(s)),
         _ => Ok(None),
     }
+}
+
+/// Whether the copy in `dir` can read every page it does not hold under `head`. A format 5
+/// bucket has no `pages/`: a copy reads its missing blocks from the pack it was restored from
+/// (`PACK_FILE`), or holds the whole file (`complete`). A copy of a format 1 to 4 bucket that is
+/// not complete (for example after `buckwal upgrade`) has neither, and must restore again.
+fn has_page_source(head: &Head, dir: &Path, state: &LocalState) -> bool {
+    head.format != FORMAT_V5 || state.complete || dir.join(PACK_FILE).exists()
 }
 
 fn refuse_writer_dir(dir: &Path, s: &LocalState) -> Result<()> {
