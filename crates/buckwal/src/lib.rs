@@ -40,12 +40,11 @@ pub use error::{Error, Result};
 #[doc(hidden)]
 pub use gc::gc_with_store;
 pub use gc::{gc, GcOutcome, GcReport};
-pub use pack::{
-    check_bucket, pack, run_packer, BucketCheck, DownloadReason, PackOutcome, PackReport,
-    PackSource,
-};
 #[doc(hidden)]
-pub use pack::{check_bucket_with_store, pack_with_store, run_packer_with_store};
+pub use pack::{
+    check_bucket, check_bucket_with_store, pack_with_store, run_packer_with_store, BucketCheck,
+};
+pub use pack::{pack, run_packer, DownloadReason, PackOutcome, PackReport, PackSource};
 #[doc(hidden)]
 pub use replica::open_replica_with_store;
 pub use replica::{
