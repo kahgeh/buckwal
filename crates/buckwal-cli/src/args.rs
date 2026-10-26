@@ -106,6 +106,11 @@ pub enum Command {
     Takeover {
         dir: PathBuf,
     },
+    /// Convert a bucket of format 1 to 4 to format 5 in place (packs), taking the database
+    /// over; `dir` must be missing or empty and gets the restored copy.
+    Upgrade {
+        dir: PathBuf,
+    },
     /// Delete what an old enough head no longer reaches; no directory.
     Gc,
     /// Serve the database over tursodb's SQL over HTTP v3 until SIGTERM or SIGINT.
@@ -158,6 +163,7 @@ pub const USAGE: &str = "usage: buckwal <command> [options]
   serve   --dir DIR [--listen IP:PORT] [--claim] [--batching SPEC] [--journal-mode wal|mvcc]
           [--pack on|off]
   takeover --dir DIR [--journal-mode wal|mvcc]
+  upgrade DIR  (or upgrade --dir DIR)
   follow  --dir DIR [--poll-ms N]
   notify-setup --bucket B --replicas N [--region R] [--topic NAME]
   pack    --dir DIR
@@ -180,6 +186,10 @@ files); BUCKWAL_PACK_DIR replaces it. When a packer runs on another machine, set
 on the writer to stop its packer thread; serve --pack on|off replaces BUCKWAL_PACK for serve.
 The packer settings: BUCKWAL_PACK, BUCKWAL_PACK_DIR, BUCKWAL_PACK_LOG_PERCENT,
 BUCKWAL_PACK_MAX_AGE_SECS, BUCKWAL_PACK_ORPHAN_GRACE_SECS and BUCKWAL_PACK_KEEP_SECS.
+upgrade converts a bucket of format 1 to 4 to format 5 (packs) in place. It takes the database
+over first, so a writer still running elsewhere is fenced. Run it on the machine that will be
+the writer: DIR must be missing or empty, and afterwards holds the restored copy. Builds before
+format 5 refuse the bucket afterwards. A failed upgrade leaves the old format working; run it again.
 S3 settings come from the BUCKWAL_* environment variables; serve also reads BUCKWAL_SERVE_*.";
 
 fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
@@ -421,6 +431,10 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             topic,
         });
     }
+    // `upgrade DIR`: the spec's form, and `--dir DIR` as every other command takes it.
+    if cmd == "upgrade" && dir.is_none() && positional.len() == 1 {
+        dir = positional.pop().map(PathBuf::from);
+    }
     let dir = dir.ok_or("--dir is required")?;
     if !matches!(cmd.as_str(), "sql" | "stats") && !positional.is_empty() {
         return Err(format!("unexpected argument {:?}", positional[0]));
@@ -428,6 +442,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
     let command = match cmd.as_str() {
         "restore" => Command::Restore { dir },
         "takeover" => Command::Takeover { dir },
+        "upgrade" => Command::Upgrade { dir },
         "verify" => Command::Verify { dir, acked },
         "sql" | "stats" if positional.is_empty() => {
             return Err(format!("{cmd} needs at least one SQL argument"));
@@ -724,6 +739,22 @@ mod tests {
         assert!(p(&["takeover"]).is_err(), "--dir is required");
         assert!(p(&["takeover", "--dir", "d", "--claim"]).is_err());
         assert!(p(&["takeover", "--dir", "d", "extra"]).is_err());
+    }
+
+    /// `upgrade DIR` (the spec's form) or `upgrade --dir DIR`.
+    #[test]
+    fn parses_upgrade() {
+        let want = Ok(Command::Upgrade {
+            dir: PathBuf::from("d"),
+        });
+        assert_eq!(p(&["upgrade", "d"]), want);
+        assert_eq!(p(&["upgrade", "--dir", "d"]), want);
+        assert!(p(&["upgrade"]).is_err(), "a directory is required");
+        assert!(p(&["upgrade", "d", "e"]).is_err());
+        assert!(p(&["upgrade", "--dir", "d", "e"]).is_err());
+        assert!(p(&["upgrade", "d", "--claim"]).is_err());
+        assert!(p(&["upgrade", "d", "--journal-mode", "wal"]).is_err());
+        assert!(USAGE.contains("upgrade DIR"));
     }
 
     /// `pack --dir DIR`: one pack run, with `DIR` as the pack directory.

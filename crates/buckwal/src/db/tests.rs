@@ -4636,6 +4636,7 @@ mod mvcc;
 mod pack_restore;
 mod switch;
 mod telemetry;
+mod upgrade;
 
 /// `quiet_config` with the lease and request timeout (ms) given.
 fn timeouts_config(dir: &Path, lease_ms: u64, request_timeout_ms: u64) -> Config {

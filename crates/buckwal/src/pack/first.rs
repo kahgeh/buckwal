@@ -106,6 +106,37 @@ pub(crate) fn publish(
     page_size: u32,
     generation: u64,
 ) -> Result<FirstPack> {
+    let pointer = upload_first(store, keys, retry, db, page_size, generation)?;
+    // Step 3. A 412: another creator's pointer appeared since rule 1 (an earlier attempt of
+    // this one that landed has these bytes); rule 1 again, then the write again.
+    let key = keys.pack_pointer();
+    let body = keys.encode_pointer(&pointer);
+    for _ in 0..MAX_ROUNDS {
+        if let CondPut::Created { .. } =
+            with_retry(retry, &key, |_| store.put_if_absent(&key, &body))?
+        {
+            return Ok(FirstPack { pointer });
+        }
+        if with_retry(retry, &key, |_| store.get(&key))?.is_some_and(|o| o.body == body) {
+            return Ok(FirstPack { pointer });
+        }
+        clear_leftover_pointer(store, keys, retry)?;
+    }
+    Err(too_many(&key))
+}
+
+/// Steps 1 and 2 (module doc): upload the database file `db` of `page_size`-byte pages as a new
+/// pack `pack/<generation>/<run id>` and its codes, checked as a pack run checks them. Returns
+/// the pointer that names it (not written). A failed check leaves the pack and its codes for
+/// GC. The keys must know the database id. `buckwal upgrade` makes its first pack with it too.
+pub(crate) fn upload_first(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    retry: &RetryPolicy,
+    db: &Path,
+    page_size: u32,
+    generation: u64,
+) -> Result<PackPointer> {
     let run_id = crate::db::new_writer_id()?;
     let size = std::fs::metadata(db)
         .map_err(|e| io_err("stat the first pack", e))?
@@ -123,7 +154,7 @@ pub(crate) fn publish(
         block_size: BLOCK_SIZE,
         database_id: keys.known_database_id(),
     };
-    // Steps 1 and 2. A failed check leaves the pack and its codes for GC.
+    // A failed check leaves the pack and its codes for GC.
     if let Err(f) = upload_verified(
         store,
         keys,
@@ -142,22 +173,7 @@ pub(crate) fn publish(
         }
         return Err(f.error);
     }
-    // Step 3. A 412: another creator's pointer appeared since rule 1 (an earlier attempt of
-    // this one that landed has these bytes); rule 1 again, then the write again.
-    let key = keys.pack_pointer();
-    let body = keys.encode_pointer(&pointer);
-    for _ in 0..MAX_ROUNDS {
-        if let CondPut::Created { .. } =
-            with_retry(retry, &key, |_| store.put_if_absent(&key, &body))?
-        {
-            return Ok(FirstPack { pointer });
-        }
-        if with_retry(retry, &key, |_| store.get(&key))?.is_some_and(|o| o.body == body) {
-            return Ok(FirstPack { pointer });
-        }
-        clear_leftover_pointer(store, keys, retry)?;
-    }
-    Err(too_many(&key))
+    Ok(pointer)
 }
 
 /// Rule 2 of an MVCC create, after its head landed: write the pointer again with a new

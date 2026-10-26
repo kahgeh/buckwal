@@ -162,6 +162,16 @@ impl Keys {
         self
     }
 
+    /// These keys with the same prefix and integrity key, but with no head read yet: they share
+    /// no database id with `self`. `buckwal upgrade` reads a format 1 to 3 bucket with `self`
+    /// and writes its format 5 objects, under a new database id, with these.
+    pub(crate) fn with_new_identity(&self) -> Keys {
+        Keys {
+            identity: Arc::new(Mutex::new(Identity::Unknown)),
+            ..self.clone()
+        }
+    }
+
     /// The key page, log record and manifest codes are made under: the database integrity key
     /// once a format 4 head has been read or made, else the integrity key; `None` for a
     /// plaintext database.

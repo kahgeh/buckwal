@@ -1227,7 +1227,7 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
         .map_err(|e| io_err("fsync dir", e))
 }
 
-fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
+pub(crate) fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
     write_synced(&dir.join(RESTORING_FILE), b"")?;
     fsync_dir(dir)?;
     for f in RESTORED {

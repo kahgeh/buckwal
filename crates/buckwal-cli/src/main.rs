@@ -250,6 +250,27 @@ fn takeover(dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// Convert the bucket's database of format 1 to 4 to format 5 in place; `dir` gets the restored
+/// copy, which `sql --dir` then continues as the writer.
+fn upgrade(dir: &Path) -> CliResult<()> {
+    let r = buckwal::upgrade(&reader_config(dir)?, dir).map_err(err)?;
+    say(&format!(
+        "upgraded from_format={} from_generation={} generation={} epoch={} fence_seq={} \
+         database_id={} pack_key={} bytes={} replaced_pointer={} ms={}",
+        r.from_format,
+        r.from_generation,
+        r.generation,
+        r.epoch,
+        r.fence_seq,
+        r.database_id,
+        r.pack_key,
+        r.bytes,
+        r.replaced_pointer,
+        r.elapsed.as_millis()
+    ));
+    Ok(())
+}
+
 /// GC: delete what the database no longer needs (old enough heads, packs, log and uploads). It
 /// needs no directory.
 fn gc() -> CliResult<()> {
@@ -575,6 +596,7 @@ fn main() -> ExitCode {
     let result = match &cmd {
         Command::Restore { dir } => restore(dir),
         Command::Takeover { dir } => takeover(dir),
+        Command::Upgrade { dir } => upgrade(dir),
         Command::Gc => gc(),
         Command::Verify { dir, acked } => verify(dir, acked.as_deref()),
         Command::Sql {

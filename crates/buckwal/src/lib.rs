@@ -25,6 +25,7 @@ pub mod store;
 pub(crate) mod takeover;
 pub mod telemetry;
 pub(crate) mod trim;
+pub(crate) mod upgrade;
 pub(crate) mod uploader;
 
 pub use batching::Batching;
@@ -58,6 +59,9 @@ pub use stats::UploadStats;
 pub use takeover::takeover_with_store;
 pub use takeover::{takeover, TakeoverReport};
 pub use turso_core::Value;
+#[doc(hidden)]
+pub use upgrade::upgrade_with_store;
+pub use upgrade::{upgrade, UpgradeReport};
 
 #[cfg(test)]
 mod tests {
