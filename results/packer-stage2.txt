@@ -5,8 +5,9 @@ Test:     crates/buckwal-cli/tests/timed.rs, timed_goal_packer_stage2 (ignored; 
 Command:  BUCKWAL_RUSTFS_NAME=buckwal-rustfs-w BUCKWAL_RUSTFS_VOLUME=buckwal-objects-w BUCKWAL_RUSTFS_PORT=9298
           scripts/rustfs.sh reset; eval "$(scripts/rustfs.sh env)"
           cargo test --locked --release -p buckwal-cli --test timed -- --ignored --nocapture
-Commit:   7da944c (branch packer): the test code as run. The earlier runs at bd36108 are
-          replaced by these: that proxy could let a request skip its delay.
+Commit:   4b271e5 (branch packer): the test code as run. These runs replace the runs at
+          bd36108 (that proxy could let a request skip its delay) and at 7da944c (that test
+          counted a background try with any queue size).
 Spec:     .superpowers/specs/packer.md rev 31 (sha256 313b6589c4a9)
 Date:     2026-10-26
 Machine:  Apple M4 Max, 128 GB, macOS 27.0.1; RustFS 1.0.0 in podman (applehv VM, 4 CPUs)
@@ -14,30 +15,31 @@ Store:    RustFS over plain HTTP, no encryption, through a TCP delay proxy in th
           request waits the delay once, before its first byte goes to RustFS. Each new
           connection also waits the delay once for its TCP connect.
 Size:     1024 MiB as the spec asks (262,144 rows of 4,000 bytes, app.db 1,076,441,088 bytes).
-          Each run took about 150 s. No limit of disk or time made a smaller size necessary.
+          Each run took about 160 s. No limit of disk or time made a smaller size necessary.
 Runs:     2, from an empty volume each time. The table shows run 1; run 2 is in brackets.
-          "One small request" is the median of 20 small PUTs through the proxy at 50 ms:
-          62 ms [62 ms] (50 ms added plus the local store time).
+          "One small request" is the median of 20 small PUTs through the proxy at 50 ms,
+          measured at the start of phase 1: 58 ms [62 ms] (50 ms added plus the local store
+          time). Both runs exit 101: the test fails, because goals 1b and 1c miss.
 
 Goal                                                  Goal value                      Measured                            Result
 ----------------------------------------------------  ------------------------------  ----------------------------------  ----------
-1. Longest small commit, 50 ms, 1 GB, 10% changed,    own log record (one small       130 ms = 2.08 small requests        pass
-   batching Off, outside the size-limit pause         request), plus three small      [131 ms = 2.11]
+1. Longest small commit, 50 ms, 1 GB, 10% changed,    own log record (one small       129 ms = 2.22 small requests        pass
+   batching Off, outside the size-limit pause         request), plus three small      [119 ms = 1.91]
                                                       requests at a WAL restart
-1b. Commit that restarts the WAL, batching Off,       own log record + three small    273 ms = 4.37 small requests        about four
-    50 ms (a PASSIVE checkpoint, then one commit)     requests: about 4 small         (3 of 3 commits did the switch:
-                                                      requests                        4.29 to 4.37) [272 ms = 4.39;
-                                                                                      4.25 to 4.39]
-1c. Background commit that restarts the WAL, 50 ms,   records queued before it (at    1134 ms [1264 ms]; 1000 commits     pass
-    `background 5ms 64 1MiB 1000`, a full queue       most max_behind = 1000          behind, 16 records landed before
-                                                      commits, about 18 uploads,      the switch [16]; about 62 commits
-                                                      about 1 s), then three small    per record
-                                                      requests: about 21 x 62 ms
-                                                      = 1310 ms [1300 ms]
-2. Restore, 20 ms, 1 GB pack, no log after it,        within 10 s; open returns       3.4 s [3.4 s]; open returned at     pass
-   fully local                                        before all blocks are local     0.6 s [0.7 s], blocks remote
-3a. Pack run, 20 ms, 1 GB, 10% changed, kept copy     within 30 s                     11.4 s [11.1 s]                     pass
-3b. Pack run, 20 ms, 1 GB, 10% changed, new pack      within 30 s                     13.7 s [13.1 s]                     pass
+1b. Commit that restarts the WAL, batching Off,       own log record + three small    273 ms = 4.71 small requests        miss
+    50 ms (a PASSIVE checkpoint, then one commit)     requests: about 4 small         (3 of 3 commits did the switch:     [miss]
+                                                      requests (the test: at most     4.60 to 4.71) [282 ms = 4.55;
+                                                      4.5)                            4.04 to 4.55]
+1c. Background commit that restarts the WAL, 50 ms,   records queued before it (at    1273 ms with 978 commits behind     miss
+    `background 5ms 64 1MiB 1000`, a full queue       most max_behind = 1000          and 16 records [1325 ms with 1000   [miss]
+    (a try counts only with at least 900 commits      commits, about 18 uploads,      behind and 17 records]
+    behind)                                           about 1 s), then three small
+                                                      requests: 21 x 58 ms = 1217 ms
+                                                      [21 x 62 ms = 1304 ms]
+2. Restore, 20 ms, 1 GB pack, no log after it,        within 10 s; open returns       3.3 s [3.5 s]; open returned at     pass
+   fully local                                        before all blocks are local     0.7 s [0.7 s], blocks remote
+3a. Pack run, 20 ms, 1 GB, 10% changed, kept copy     within 30 s                     11.0 s [11.0 s]                     pass
+3b. Pack run, 20 ms, 1 GB, 10% changed, new pack      within 30 s                     13.0 s [13.6 s]                     pass
     directory (downloads the pack)
 4. Two packers at once, 20 ms, then GC                one newest pack and no extra    packed + superseded; pack/ holds    pass
                                                       objects after GC                only the newest pack and codes
@@ -45,130 +47,140 @@ Goal                                                  Goal value                
 "about four": above 4.0 and at most 4.5 small requests. The test does not fail on it, but it
 is not a clean pass. The 0.5 margin is the test's reading of "about"; the spec gives no margin.
 
+The two misses
+--------------
+- 1b. All six commits that restarted the WAL waited 251 to 282 ms. Measured against one small
+  request, that is 4.60 to 4.71 [4.04 to 4.55] small requests. The round 1 runs (7da944c)
+  measured 263 to 273 ms, 4.25 to 4.39 small requests ("about four"), with one small request
+  at 62 ms. The waits in ms are nearly the same in all runs; the unit (58 to 62 ms at the
+  start of phase 1, 64 to 65 ms when phase 1b starts) moves the verdict. The time above
+  four small requests is not measured: the test does not break the commit into its parts.
+- 1c. The six counted tries waited 1222, 1228 and 1273 ms [1325, 1268 and 1161 ms]. The
+  worst try of run 1 is 4.6% above its bound; the worst of run 2 is 1.6% above its bound.
+  The queue just before the commit was 1000, 1000 and 978 [1000, 944 and 936] commits behind:
+  1000 in three of six tries, 936 to 978 in the other three. 15 to 17 records of about 59 to
+  63 commits landed before the switch (the spec counts about 57 commits per record and about
+  18 uploads). No try had fewer than 900 commits behind, so every try counted. The round 1
+  runs measured 1033 to 1264 ms, all within that bound.
+
 Measured with the goal, as spec rev 29 words them (no goal changed)
 --------------------------------------------------------------------
 - The size-limit pause. A commit that arrives while the maintenance checkpoint at the WAL size
-  limit (64 MiB) switches the generation waits for that switch. Measured: 339 ms [330 ms] at
-  50 ms added, that is 5.5 [5.3] small requests. This is the longest wait of all small
-  commits. No reader was open; with readers that stay open the pause can be longer. Task 18
-  puts the measured value in the README; the README does not state it yet.
-- The 10% change commit waits for the upload of its own log record, about 102 MiB: 2.63 s
-  [3.09 s]. The spec (rev 29) words this as about 2.7 s. That is one large request.
+  limit (64 MiB) switches the generation waits for that switch. Measured: 336 ms [343 ms] at
+  50 ms added, that is 5.8 [5.5] small requests. This is the longest wait of all small
+  commits in phase 1. No reader was open; with readers that stay open the pause can be
+  longer. Task 18 puts the measured value in the README; the README does not state it yet.
+- The 10% change commit waits for the upload of its own log record, about 102 MiB: 2.67 s
+  [3.03 s]. The spec (rev 29) words this as about 2.7 s. That is one large request.
 - In phase 1 every generation switch came in a maintenance run: each 10% change (about
   102 MiB of WAL) passes the 64 MiB limit. No small commit of phase 1 did a switch. Phase 1b
-  measures the switch inside an app commit on its own.
-- Phase 1b: 4.25 to 4.39 small requests over 6 commits in 2 runs. The four requests are the
-  seal-start record, the head move, the WAL header record and the commit's own log record;
-  the rest is the local fsync and the engine work. The longest generation switch extra wait
-  in phase 1 was 126 ms [131 ms].
-- Phase 1c: each try filled the queue to 1000 commits behind (1000 small commits in about
-  60 ms, as each returns after the local fsync), then a PASSIVE checkpoint, then one commit.
-  That commit waited for 16 records of about 62 commits (the spec counts about 57 commits per
-  record and about 18 uploads), then the three requests. The 6 tries in 2 runs waited 1033 to
-  1264 ms. The worst is within 3% of the bound of about 1.3 s.
+  measures the switch inside an app commit on its own. The longest generation switch extra
+  wait in phase 1 was 131 ms [139 ms].
 
 Restore detail (goal 2), run 1
 ------------------------------
 - buckwal::restore returned at 300 ms: 7 GETs, 3 log objects, a 1 MiB block fetched.
-- The writer open of the restored directory returned at 640 ms, with blocks not yet local
+- The writer open of the restored directory returned at 656 ms, with blocks not yet local
   (Choice C). The background fetch made the file fully local (app.db-blocks removed) at
-  3.4 s from the restore start. All 262,144 rows were there.
+  3.3 s from the restore start. All 262,144 rows were there.
 
 Pack run detail (goal 3), step times of run 1
 ---------------------------------------------
-- 3a, kept copy: read 634 ms, apply 1,431 ms, upload 9,145 ms, verify 56 ms, publish 83 ms;
+- 3a, kept copy: read 577 ms, apply 1,377 ms, upload 8,870 ms, verify 53 ms, publish 87 ms;
   210 MB down, 1,076 MB up.
-- 3b, new pack directory: read 110 ms, apply 4,206 ms, upload 9,256 ms, verify 58 ms,
-  publish 80 ms; 1,286 MB down, 1,076 MB up.
-- The upload of the 1 GB pack takes about 9 s at this store's speed (about 118 MB/s).
+- 3b, new pack directory: read 107 ms, apply 3,948 ms, upload 8,806 ms, verify 54 ms,
+  publish 89 ms; 1,286 MB down, 1,076 MB up.
+- The upload of the 1 GB pack takes about 9 s at this store's speed (about 121 MB/s).
 
 Two packers (goal 4)
 --------------------
-- Both runs started together from two new pack directories. One run moved the pointer (22.7
-  to 24.3 s); the other ended as superseded and deleted its own pack and codes.
-- GC with a 5 s trim grace and pack keep time: 2 passes in 15 s. After it, pack/ held only the
-  newest pack and its codes; the bucket held 7 objects: head, pack-latest, the pack, its codes
-  and 3 log objects of the head's generation. No pages/ or manifest/ object, no orphan pack,
-  no open multipart upload aborted.
+- Both runs started together from two new pack directories. One run moved the pointer (24.3
+  to 25.0 s); the other ended as superseded and deleted its own pack and codes.
+- GC with a 5 s trim grace and pack keep time: 2 passes in 15 s [17 s]. After it, pack/ held
+  only the newest pack and its codes; the bucket held 7 objects: head, pack-latest, the pack,
+  its codes and 3 log objects of the head's generation. No pages/ or manifest/ object, no
+  orphan pack, no open multipart upload aborted.
 
 Limits of this measurement
 --------------------------
 - Local RustFS, not a cloud store: the delay is per request, the bandwidth is local (about
-  118 MB/s up). On AWS S3 from this Mac the upload speed was 12.4 MB/s (docs/packer-recon.md),
+  121 MB/s up). On AWS S3 from this Mac the upload speed was 12.4 MB/s (docs/packer-recon.md),
   so a 1 GB pack upload there takes about 80 s, and goal 3 on such a link misses 30 s. Real
   AWS runs belong to the coordinator and were not made.
 - The size-limit pause was measured with no reader open.
 
 Full output, run 1
 ------------------
-size=1024 MiB rows=262144 row_bytes=4000 cycles=2 prefix=sys/timed_goal_packer_stage2-1792990607212792000
-fill: 262144 rows, app.db 1076441088 bytes, 19.2 s (no delay)
-first pack (no delay): outcome=packed pack_generation=33 size=1076441088 bytes_down=2034962811 bytes_up=1076474320 source=downloaded ms=16260 steps=[read=6ms,apply=7630ms,upload=8608ms,verify=2ms,publish=2ms]
-small PUT median at 50 ms added: 62 ms (one small request)
-writer open at 50 ms (local copy, packer thread on): 516 ms
-cycle 0: 10% change 2629 ms ; switch after 1 small commits (came by itself)
-cycle 1: 10% change 2610 ms ; switch after 2 small commits (came by itself)
-commits at 50 ms: 103 small (median 63 ms), 2 10% changes, 0 explicit checkpoints; 4 generation switches (longest extra wait 126 ms), 2 maintenance runs, 0 skipped
-longest small commit outside a maintenance run: 130 ms (2.08 small requests)
+size=1024 MiB rows=262144 row_bytes=4000 cycles=2 prefix=sys/timed_goal_packer_stage2-1792991312526222000
+fill: 262144 rows, app.db 1076441088 bytes, 19.9 s (no delay)
+first pack (no delay): outcome=packed pack_generation=33 size=1076441088 bytes_down=2034962811 bytes_up=1076474320 source=downloaded ms=17421 steps=[read=5ms,apply=8389ms,upload=9011ms,verify=2ms,publish=2ms]
+small PUT median at 50 ms added: 58 ms (one small request)
+writer open at 50 ms (local copy, packer thread on): 498 ms
+cycle 0: 10% change 2669 ms ; switch after 2 small commits (came by itself)
+cycle 1: 10% change 2662 ms ; switch after 2 small commits (came by itself)
+commits at 50 ms: 104 small (median 64 ms), 2 10% changes, 0 explicit checkpoints; 5 generation switches (longest extra wait 131 ms), 2 maintenance runs, 0 skipped
+longest small commit outside a maintenance run: 129 ms (2.22 small requests)
 longest small commit that switched the generation: 0 ms (0.00 small requests)
-longest small commit held by the size-limit checkpoint: 339 ms ; longest small commit of all: 339 ms ; longest 10% change commit (its own log upload of about 102 MiB): 2629 ms ; longest explicit TRUNCATE checkpoint: 0 ms
+longest small commit held by the size-limit checkpoint: 336 ms ; longest small commit of all: 336 ms ; longest 10% change commit (its own log upload of about 102 MiB): 2669 ms ; longest explicit TRUNCATE checkpoint: 0 ms
 packer thread pack runs during the 50 ms commits: 0
-in-commit switch, Off, 50 ms: 3 tries, 3 commits did the switch, 0 switches came in the checkpoint call; their waits: [271 ms = 4.35 small requests, 267 ms = 4.29 small requests, 273 ms = 4.37 small requests] (one small PUT now 61 ms)
-background switch commit 0: wait 1134 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 999 commits in 43 ms
-background switch commit 1: wait 1105 ms ; 967 commits behind before it ; 16 log records landed during its wait before the switch ; 60.4 commits per record (mean of the records before it) ; filled the queue with 1999 commits in 1211 ms
-background switch commit 2: wait 1033 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 1000 commits in 64 ms
-pack of the 50 ms commits (no delay): outcome=packed pack_generation=46 size=1076441088 bytes_down=436938399 bytes_up=1076474320 source=kept ms=12262 steps=[read=531ms,apply=2984ms,upload=8727ms,verify=2ms,publish=2ms]
-small PUT median at 20 ms added: 28 ms
-pack run at 20 ms, kept copy: outcome=packed pack_generation=47 size=1076441088 bytes_down=209948887 bytes_up=1076474320 source=kept ms=11361 steps=[read=634ms,apply=1431ms,upload=9145ms,verify=56ms,publish=83ms]
-pack run at 20 ms, new pack directory (downloads the pack): outcome=packed pack_generation=48 size=1076441088 bytes_down=1286390157 bytes_up=1076474320 source=downloaded ms=13724 steps=[read=110ms,apply=4206ms,upload=9256ms,verify=58ms,publish=80ms]
-head generation 48 ; newest pack generation 48 (the log after the pack: generation 48 only)
-restore at 20 ms: restore returned 300 ms (generation=48 log_objects=3 gets=7 bytes=1082280 bytes_fetched=1048576), writer open returned 640 ms (blocks still remote at open: true), fully local 3435 ms ; 262144 rows
-two packers, A: outcome=packed pack_generation=50 size=1076441088 bytes_down=1286390361 bytes_up=1076474320 source=downloaded ms=22661 steps=[read=147ms,apply=7176ms,upload=15156ms,verify=59ms,publish=69ms]
-two packers, B: outcome=superseded pack_generation=50 size=1076441088 bytes_down=1286391033 bytes_up=1076474320 source=downloaded ms=24268 steps=[read=115ms,apply=7117ms,upload=16715ms,verify=57ms,publish=199ms]
-GC after the two packers: 2 passes in 15 s, last: deleted=10 packs_deleted=1 orphan_packs_deleted=0 uploads_aborted=0 outcome=trimmed ; pack/ holds ["pack/0000000050/49059f2ec15afff5a2c48a38d2faf4fb", "pack/0000000050/49059f2ec15afff5a2c48a38d2faf4fb.codes"]
+in-commit switch, Off, 50 ms: 3 tries, 3 commits did the switch, 0 switches came in the checkpoint call; their waits: [267 ms = 4.60 small requests, 273 ms = 4.71 small requests, 272 ms = 4.69 small requests] (one small PUT now 65 ms)
+background tries that did not count (fewer than 900 commits behind): 0 
+background switch commit 0: wait 1222 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 999 commits in 57 ms
+background switch commit 1: wait 1228 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 1000 commits in 62 ms
+background switch commit 2: wait 1273 ms ; 978 commits behind before it ; 16 log records landed during its wait before the switch ; 61.1 commits per record (mean of the records before it) ; filled the queue with 1999 commits in 1449 ms
+pack of the 50 ms commits (no delay): outcome=packed pack_generation=47 size=1076441088 bytes_down=436942836 bytes_up=1076474320 source=kept ms=12179 steps=[read=456ms,apply=3000ms,upload=8704ms,verify=2ms,publish=2ms]
+small PUT median at 20 ms added: 30 ms
+pack run at 20 ms, kept copy: outcome=packed pack_generation=48 size=1076441088 bytes_down=209948887 bytes_up=1076474320 source=kept ms=10980 steps=[read=577ms,apply=1377ms,upload=8870ms,verify=53ms,publish=87ms]
+pack run at 20 ms, new pack directory (downloads the pack): outcome=packed pack_generation=49 size=1076441088 bytes_down=1286390157 bytes_up=1076474320 source=downloaded ms=13021 steps=[read=107ms,apply=3948ms,upload=8806ms,verify=54ms,publish=89ms]
+head generation 49 ; newest pack generation 49 (the log after the pack: generation 49 only)
+restore at 20 ms: restore returned 300 ms (generation=49 log_objects=3 gets=7 bytes=1082280 bytes_fetched=1048576), writer open returned 656 ms (blocks still remote at open: true), fully local 3336 ms ; 262144 rows
+two packers, A: outcome=packed pack_generation=51 size=1076441088 bytes_down=1286390361 bytes_up=1076474320 source=downloaded ms=24332 steps=[read=156ms,apply=7585ms,upload=16155ms,verify=185ms,publish=236ms]
+two packers, B: outcome=superseded pack_generation=51 size=1076441088 bytes_down=1286391033 bytes_up=1076474320 source=downloaded ms=24999 steps=[read=116ms,apply=7366ms,upload=17241ms,verify=55ms,publish=174ms]
+GC after the two packers: 2 passes in 15 s, last: deleted=10 packs_deleted=1 orphan_packs_deleted=0 uploads_aborted=0 outcome=trimmed ; pack/ holds ["pack/0000000051/0409e729ecb72e23c70792f36ce80e0a", "pack/0000000051/0409e729ecb72e23c70792f36ce80e0a.codes"]
 bucket after GC: 7 objects: log 3, pack 2, pages 0, manifest 0, other 2 (head, pack-latest)
-proxy requests: 2320
-goal | 1. longest commit at 50 ms, 1024 MiB, 10% changed (size-limit checkpoint and the 10% change commit itself apart) | about 4 small requests (at most 4.5 x 62 ms) | 130 ms = 2.08 small requests | pass
-goal | 1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small requests | about 4 small requests (one = 62 ms) | 273 ms = 4.37 small requests | about four
-goal | 1c. background commit that restarts the WAL at 50 ms, `background 5ms 64 1MiB 1000` | records queued before it (at most 1000 commits, about 18 uploads, about 1 s), then three small requests: about 1310 ms (18 + 3 small requests) | 1134 ms = 18.18 small requests; 1000 commits behind, 16 records before the switch | pass
-goal | 3a. pack run at 20 ms, 1024 MiB, 10% changed, kept copy (the packer thread's usual run) | within 30 s | 11.4 s | pass
-goal | 3b. pack run at 20 ms, 1024 MiB, 10% changed, new pack directory | within 30 s | 13.7 s | pass
-goal | 2. restore at 20 ms of a 1024 MiB pack with no log after it, fully local | within 10 s, open returns before all blocks are local | 3.4 s to fully local, open returned at 0.6 s with blocks remote: true | pass
+proxy requests: 2343
+goal | 1. longest commit at 50 ms, 1024 MiB, 10% changed (size-limit checkpoint and the 10% change commit itself apart) | about 4 small requests (at most 4.5 x 58 ms) | 129 ms = 2.22 small requests | pass
+goal | 1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small requests | about 4 small requests (one = 58 ms) | 273 ms = 4.71 small requests | miss
+goal | 1c. background commit that restarts the WAL at 50 ms, `background 5ms 64 1MiB 1000` | records queued before it (at most 1000 commits, about 18 uploads, about 1 s), then three small requests: about 1217 ms (18 + 3 small requests) | 1273 ms = 21.96 small requests; 978 commits behind, 16 records before the switch | miss
+goal | 3a. pack run at 20 ms, 1024 MiB, 10% changed, kept copy (the packer thread's usual run) | within 30 s | 11.0 s | pass
+goal | 3b. pack run at 20 ms, 1024 MiB, 10% changed, new pack directory | within 30 s | 13.0 s | pass
+goal | 2. restore at 20 ms of a 1024 MiB pack with no log after it, fully local | within 10 s, open returns before all blocks are local | 3.3 s to fully local, open returned at 0.7 s with blocks remote: true | pass
 goal | 4. two packers at once at 20 ms, then GC | one newest pack and no extra objects after GC | outcomes packed and superseded; pack/ after GC holds 2 objects (the newest pack and its codes) | pass
 
 Full output, run 2
 ------------------
-size=1024 MiB rows=262144 row_bytes=4000 cycles=2 prefix=sys/timed_goal_packer_stage2-1792990760979842000
-fill: 262144 rows, app.db 1076441088 bytes, 19.5 s (no delay)
-first pack (no delay): outcome=packed pack_generation=33 size=1076441088 bytes_down=2034962811 bytes_up=1076474320 source=downloaded ms=17369 steps=[read=5ms,apply=8007ms,upload=9340ms,verify=2ms,publish=2ms]
+size=1024 MiB rows=262144 row_bytes=4000 cycles=2 prefix=sys/timed_goal_packer_stage2-1792991469037530000
+fill: 262144 rows, app.db 1076441088 bytes, 19.6 s (no delay)
+first pack (no delay): outcome=packed pack_generation=33 size=1076441088 bytes_down=2034962811 bytes_up=1076474320 source=downloaded ms=17073 steps=[read=5ms,apply=7893ms,upload=9161ms,verify=2ms,publish=2ms]
 small PUT median at 50 ms added: 62 ms (one small request)
-writer open at 50 ms (local copy, packer thread on): 500 ms
-cycle 0: 10% change 3094 ms ; switch after 2 small commits (came by itself)
-cycle 1: 10% change 2697 ms ; switch after 2 small commits (came by itself)
-commits at 50 ms: 104 small (median 64 ms), 2 10% changes, 0 explicit checkpoints; 5 generation switches (longest extra wait 131 ms), 2 maintenance runs, 0 skipped
-longest small commit outside a maintenance run: 131 ms (2.11 small requests)
+writer open at 50 ms (local copy, packer thread on): 496 ms
+cycle 0: 10% change 3034 ms ; switch after 2 small commits (came by itself)
+cycle 1: 10% change 2912 ms ; switch after 2 small commits (came by itself)
+commits at 50 ms: 104 small (median 66 ms), 2 10% changes, 0 explicit checkpoints; 5 generation switches (longest extra wait 139 ms), 2 maintenance runs, 0 skipped
+longest small commit outside a maintenance run: 119 ms (1.91 small requests)
 longest small commit that switched the generation: 0 ms (0.00 small requests)
-longest small commit held by the size-limit checkpoint: 330 ms ; longest small commit of all: 330 ms ; longest 10% change commit (its own log upload of about 102 MiB): 3094 ms ; longest explicit TRUNCATE checkpoint: 0 ms
+longest small commit held by the size-limit checkpoint: 343 ms ; longest small commit of all: 343 ms ; longest 10% change commit (its own log upload of about 102 MiB): 3034 ms ; longest explicit TRUNCATE checkpoint: 0 ms
 packer thread pack runs during the 50 ms commits: 0
-in-commit switch, Off, 50 ms: 3 tries, 3 commits did the switch, 0 switches came in the checkpoint call; their waits: [267 ms = 4.31 small requests, 263 ms = 4.25 small requests, 272 ms = 4.39 small requests] (one small PUT now 64 ms)
-background switch commit 0: wait 1264 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 999 commits in 42 ms
-background switch commit 1: wait 1216 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 1000 commits in 61 ms
-background switch commit 2: wait 1219 ms ; 1000 commits behind before it ; 16 log records landed during its wait before the switch ; 62.5 commits per record (mean of the records before it) ; filled the queue with 1000 commits in 68 ms
-pack of the 50 ms commits (no delay): outcome=packed pack_generation=46 size=1076441088 bytes_down=432808425 bytes_up=1076474320 source=kept ms=12432 steps=[read=471ms,apply=2970ms,upload=8956ms,verify=2ms,publish=2ms]
-small PUT median at 20 ms added: 31 ms
-pack run at 20 ms, kept copy: outcome=packed pack_generation=47 size=1076441088 bytes_down=209948887 bytes_up=1076474320 source=kept ms=11118 steps=[read=580ms,apply=1551ms,upload=8829ms,verify=53ms,publish=90ms]
-pack run at 20 ms, new pack directory (downloads the pack): outcome=packed pack_generation=48 size=1076441088 bytes_down=1286390157 bytes_up=1076474320 source=downloaded ms=13120 steps=[read=116ms,apply=4211ms,upload=8633ms,verify=60ms,publish=84ms]
-head generation 48 ; newest pack generation 48 (the log after the pack: generation 48 only)
-restore at 20 ms: restore returned 329 ms (generation=48 log_objects=3 gets=7 bytes=1082280 bytes_fetched=1048576), writer open returned 707 ms (blocks still remote at open: true), fully local 3387 ms ; 262144 rows
-two packers, A: outcome=superseded pack_generation=50 size=1076441088 bytes_down=1286391033 bytes_up=1076474320 source=downloaded ms=24421 steps=[read=140ms,apply=7295ms,upload=16659ms,verify=62ms,publish=216ms]
-two packers, B: outcome=packed pack_generation=50 size=1076441088 bytes_down=1286390361 bytes_up=1076474320 source=downloaded ms=24259 steps=[read=115ms,apply=7259ms,upload=16720ms,verify=62ms,publish=84ms]
-GC after the two packers: 2 passes in 15 s, last: deleted=10 packs_deleted=1 orphan_packs_deleted=0 uploads_aborted=0 outcome=trimmed ; pack/ holds ["pack/0000000050/6b6cf8cf7fd3371e35495e64489fe864", "pack/0000000050/6b6cf8cf7fd3371e35495e64489fe864.codes"]
+in-commit switch, Off, 50 ms: 3 tries, 3 commits did the switch, 0 switches came in the checkpoint call; their waits: [282 ms = 4.55 small requests, 251 ms = 4.04 small requests, 275 ms = 4.43 small requests] (one small PUT now 64 ms)
+background tries that did not count (fewer than 900 commits behind): 0 
+background switch commit 0: wait 1325 ms ; 1000 commits behind before it ; 17 log records landed during its wait before the switch ; 58.8 commits per record (mean of the records before it) ; filled the queue with 999 commits in 64 ms
+background switch commit 1: wait 1268 ms ; 944 commits behind before it ; 15 log records landed during its wait before the switch ; 62.9 commits per record (mean of the records before it) ; filled the queue with 4000 commits in 4088 ms
+background switch commit 2: wait 1161 ms ; 936 commits behind before it ; 15 log records landed during its wait before the switch ; 62.4 commits per record (mean of the records before it) ; filled the queue with 1999 commits in 1429 ms
+pack of the 50 ms commits (no delay): outcome=packed pack_generation=50 size=1076441088 bytes_down=449358246 bytes_up=1076474320 source=kept ms=12878 steps=[read=457ms,apply=3241ms,upload=9135ms,verify=2ms,publish=2ms]
+small PUT median at 20 ms added: 30 ms
+pack run at 20 ms, kept copy: outcome=packed pack_generation=51 size=1076441088 bytes_down=209948887 bytes_up=1076474320 source=kept ms=11011 steps=[read=589ms,apply=1468ms,upload=8799ms,verify=51ms,publish=80ms]
+pack run at 20 ms, new pack directory (downloads the pack): outcome=packed pack_generation=52 size=1076441088 bytes_down=1286390157 bytes_up=1076474320 source=downloaded ms=13598 steps=[read=111ms,apply=4254ms,upload=9075ms,verify=54ms,publish=89ms]
+head generation 52 ; newest pack generation 52 (the log after the pack: generation 52 only)
+restore at 20 ms: restore returned 315 ms (generation=52 log_objects=3 gets=7 bytes=1082280 bytes_fetched=1048576), writer open returned 691 ms (blocks still remote at open: true), fully local 3515 ms ; 262144 rows
+two packers, A: outcome=packed pack_generation=54 size=1076441088 bytes_down=1286390361 bytes_up=1076474320 source=downloaded ms=24621 steps=[read=152ms,apply=7523ms,upload=16795ms,verify=54ms,publish=80ms]
+two packers, B: outcome=superseded pack_generation=54 size=1076441088 bytes_down=1286391033 bytes_up=1076474320 source=downloaded ms=24835 steps=[read=117ms,apply=7391ms,upload=17054ms,verify=52ms,publish=190ms]
+GC after the two packers: 2 passes in 17 s, last: deleted=10 packs_deleted=1 orphan_packs_deleted=0 uploads_aborted=0 outcome=trimmed ; pack/ holds ["pack/0000000054/b4b4702080e75fc8c0184dd1481cef45", "pack/0000000054/b4b4702080e75fc8c0184dd1481cef45.codes"]
 bucket after GC: 7 objects: log 3, pack 2, pages 0, manifest 0, other 2 (head, pack-latest)
-proxy requests: 2272
-goal | 1. longest commit at 50 ms, 1024 MiB, 10% changed (size-limit checkpoint and the 10% change commit itself apart) | about 4 small requests (at most 4.5 x 62 ms) | 131 ms = 2.11 small requests | pass
-goal | 1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small requests | about 4 small requests (one = 62 ms) | 272 ms = 4.39 small requests | about four
-goal | 1c. background commit that restarts the WAL at 50 ms, `background 5ms 64 1MiB 1000` | records queued before it (at most 1000 commits, about 18 uploads, about 1 s), then three small requests: about 1300 ms (18 + 3 small requests) | 1264 ms = 20.42 small requests; 1000 commits behind, 16 records before the switch | pass
-goal | 3a. pack run at 20 ms, 1024 MiB, 10% changed, kept copy (the packer thread's usual run) | within 30 s | 11.1 s | pass
-goal | 3b. pack run at 20 ms, 1024 MiB, 10% changed, new pack directory | within 30 s | 13.1 s | pass
-goal | 2. restore at 20 ms of a 1024 MiB pack with no log after it, fully local | within 10 s, open returns before all blocks are local | 3.4 s to fully local, open returned at 0.7 s with blocks remote: true | pass
-goal | 4. two packers at once at 20 ms, then GC | one newest pack and no extra objects after GC | outcomes superseded and packed; pack/ after GC holds 2 objects (the newest pack and its codes) | pass
+proxy requests: 2523
+goal | 1. longest commit at 50 ms, 1024 MiB, 10% changed (size-limit checkpoint and the 10% change commit itself apart) | about 4 small requests (at most 4.5 x 62 ms) | 119 ms = 1.91 small requests | pass
+goal | 1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small requests | about 4 small requests (one = 62 ms) | 282 ms = 4.55 small requests | miss
+goal | 1c. background commit that restarts the WAL at 50 ms, `background 5ms 64 1MiB 1000` | records queued before it (at most 1000 commits, about 18 uploads, about 1 s), then three small requests: about 1304 ms (18 + 3 small requests) | 1325 ms = 21.33 small requests; 1000 commits behind, 17 records before the switch | miss
+goal | 3a. pack run at 20 ms, 1024 MiB, 10% changed, kept copy (the packer thread's usual run) | within 30 s | 11.0 s | pass
+goal | 3b. pack run at 20 ms, 1024 MiB, 10% changed, new pack directory | within 30 s | 13.6 s | pass
+goal | 2. restore at 20 ms of a 1024 MiB pack with no log after it, fully local | within 10 s, open returns before all blocks are local | 3.5 s to fully local, open returned at 0.7 s with blocks remote: true | pass
+goal | 4. two packers at once at 20 ms, then GC | one newest pack and no extra objects after GC | outcomes packed and superseded; pack/ after GC holds 2 objects (the newest pack and its codes) | pass
