@@ -215,9 +215,12 @@ pub fn scan_in(
     range: u64,
 ) -> Result<ScanReport, buckwal::Error> {
     let policy = RetryPolicy::default();
-    let keys = with_retry(&policy, &format!("list {prefix}"), |_| {
+    let keys: Vec<(String, u64)> = with_retry(&policy, &format!("list {prefix}"), |_| {
         store.list_sized(prefix)
-    })?;
+    })?
+    .into_iter()
+    .map(|l| (l.key, l.size))
+    .collect();
     let labels = labels(needles);
     let size = keys.len().div_ceil(THREADS).max(1);
     let parts: Vec<_> = std::thread::scope(|sc| {

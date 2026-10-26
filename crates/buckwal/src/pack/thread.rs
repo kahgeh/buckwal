@@ -160,29 +160,43 @@ fn list_log_from(
     let after = format!("{}~", keys.log_prefix(from.saturating_sub(1)));
     let listed = with_retry(retry, &root, |_| store.list_sized_after(&root, &after))?;
     let mut per_generation = BTreeMap::new();
-    for (k, n) in listed {
-        if let Some((g, _)) = keys.parse_log(&k).filter(|(g, _)| *g >= from) {
-            *per_generation.entry(g).or_default() += n;
+    for l in listed {
+        if let Some((g, _)) = keys.parse_log(&l.key).filter(|(g, _)| *g >= from) {
+            *per_generation.entry(g).or_default() += l.size;
         }
     }
     Ok(per_generation)
 }
 
-/// The keys of one listing of the log from `from` on, with their sizes (the gauge's first
-/// merge needs the keys).
+/// One log object of the gauge's listing: its position, size, and age by the bucket's clock.
+struct LoggedObject {
+    pos: (u64, u64),
+    size: u64,
+    age: Duration,
+}
+
+/// The objects of one listing of the log from `from` on, with their sizes and ages (the
+/// gauge's first merge needs the keys, and `age_seconds` the age of each generation's last
+/// record).
 fn list_log_keys_from(
     store: &dyn ObjectStore,
     keys: &Keys,
     retry: &RetryPolicy,
     from: u64,
-) -> Result<Vec<((u64, u64), u64)>> {
+) -> Result<Vec<LoggedObject>> {
     let root = keys.log_root();
     let after = format!("{}~", keys.log_prefix(from.saturating_sub(1)));
     let listed = with_retry(retry, &root, |_| store.list_sized_after(&root, &after))?;
     Ok(listed
         .into_iter()
-        .filter_map(|(k, n)| keys.parse_log(&k).map(|pos| (pos, n)))
-        .filter(|((g, _), _)| *g >= from)
+        .filter_map(|l| {
+            keys.parse_log(&l.key).map(|pos| LoggedObject {
+                pos,
+                size: l.size,
+                age: l.age,
+            })
+        })
+        .filter(|o| o.pos.0 >= from)
         .collect())
 }
 
@@ -477,29 +491,55 @@ fn check_and_run(
     Ok(Some(report))
 }
 
-/// The writer's pack gauges (spec "Observability"): each interval, one GET of the pointer,
-/// with its age by the bucket's clock. `behind_bytes` is the log bytes in generations at or
-/// above the pack generation. The first gauge lists the log once, from the pack generation on,
-/// and merges the writer's own log objects that landed meanwhile by their keys
-/// (`Counters::take_positions`). After that it keeps one sum per generation and adds the
-/// writer's own uploads to their generation (`Counters::take_sums`). When the pointer moves
-/// to a newer pack, it drops the generations below the new pack generation.
+/// The writer's pack gauges (spec "Observability"): each interval, one GET of the pointer.
+/// `behind_bytes` is the log bytes in generations at or above the pack generation. The first
+/// gauge lists the log once, from the pack generation on, and merges the writer's own log
+/// objects that landed meanwhile by their keys (`Counters::take_positions`). After that it
+/// keeps one sum per generation and adds the writer's own uploads to their generation
+/// (`Counters::take_sums`). When the pointer moves to a newer pack, it drops the generations
+/// below the new pack generation.
+///
+/// `age_seconds` is the time since the end of the oldest ended generation that no pack holds
+/// (at or above the pack generation), 0 when there is none. The end of a generation is the
+/// Last-Modified time of its last record (a seal-start or a fence record), by the bucket's
+/// clock: for a generation below the writer's generation at open, the age of that record in
+/// the one listing; for a generation this writer ends itself, the moment of its switch
+/// (`Counters::take_ended`). A generation that another process ends after the listing is not
+/// seen until the next open (spec rev 28, accepted).
 struct Gauges {
     store: Arc<dyn ObjectStore>,
     keys: Keys,
     retry: RetryPolicy,
     counters: Arc<Counters>,
+    /// The writer's generation when the gauges started: every generation below it has ended.
+    open_generation: u64,
     /// The log bytes per generation, at or above the last pack generation. `None` before
     /// the first listing.
     log: Option<BTreeMap<u64, u64>>,
+    /// The end of each ended generation at or above the last pack generation.
+    ends: BTreeMap<u64, Ended>,
 }
 
-/// One gauge: the pointer's pack generation and newest pack (`None` without a pack) and the
-/// bytes behind it.
+/// The end of a generation: `age` old at the moment `seen`.
+#[derive(Debug, Clone, Copy)]
+struct Ended {
+    seen: Instant,
+    age: Duration,
+}
+
+impl Ended {
+    fn age_now(&self) -> Duration {
+        self.seen.elapsed() + self.age
+    }
+}
+
+/// One gauge: the pointer's pack generation and newest pack (`None` without a pack), the
+/// bytes behind it and the age of the oldest ended generation that no pack holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gauge {
     pack: Option<(u64, NewestPack)>,
     behind_bytes: u64,
+    age: Duration,
 }
 
 impl Gauges {
@@ -520,11 +560,21 @@ impl Gauges {
                     "pack gauges: the log grew too much during the first listing".into(),
                 ));
             };
+            let listed_at = Instant::now();
             let mut seen: std::collections::BTreeSet<(u64, u64)> = Default::default();
             let mut log = BTreeMap::new();
-            for (pos, n) in listed {
-                seen.insert(pos);
-                *log.entry(pos.0).or_default() += n;
+            // The last record of each generation that ended before this writer's open.
+            let mut last: BTreeMap<u64, (u64, Duration)> = BTreeMap::new();
+            for o in listed {
+                seen.insert(o.pos);
+                *log.entry(o.pos.0).or_default() += o.size;
+                let (g, seq) = o.pos;
+                if g < self.open_generation {
+                    let e = last.entry(g).or_insert((seq, o.age));
+                    if seq >= e.0 {
+                        *e = (seq, o.age);
+                    }
+                }
             }
             for (g, seq, n) in own {
                 if seen.insert((g, seq)) {
@@ -532,6 +582,21 @@ impl Gauges {
                 }
             }
             self.log = Some(log);
+            for (g, (_, age)) in last {
+                self.ends.entry(g).or_insert(Ended {
+                    seen: listed_at,
+                    age,
+                });
+            }
+        }
+        for (g, at) in self.counters.take_ended() {
+            self.ends.insert(
+                g,
+                Ended {
+                    seen: at,
+                    age: Duration::ZERO,
+                },
+            );
         }
         let log = self.log.as_mut().expect("listed above");
         for (g, n) in self.counters.take_sums() {
@@ -539,18 +604,26 @@ impl Gauges {
         }
         // The pack holds the generations below its pack generation: they are not behind.
         log.retain(|g, _| *g >= from);
+        self.ends.retain(|g, _| *g >= from);
+        let age = self
+            .ends
+            .values()
+            .map(Ended::age_now)
+            .max()
+            .unwrap_or(Duration::ZERO);
         Ok(Gauge {
             pack: pointer.own,
             behind_bytes: log.values().sum(),
+            age,
         })
     }
 
     /// One gauge in its `buckwal.pack.gauges` span: `buckwal.prefix` (the database's bucket
     /// prefix, which the alert "packer not keeping up" groups by), `buckwal.pack.behind_bytes`,
-    /// and with a
-    /// pack `buckwal.pack.age_seconds`, `buckwal.pack.size_bytes` (the newest pack's size,
-    /// from the pointer) and `buckwal.pack.generation`, then `buckwal.outcome` (`ok`, or
-    /// `error` and `integrity` as other spans).
+    /// `buckwal.pack.age_seconds`, `buckwal.pack.size_bytes` (the newest pack's size, from the
+    /// pointer; 0 with no pack, and the alert then skips its ratio), with a pack
+    /// `buckwal.pack.generation`, then `buckwal.outcome` (`ok`, or `error` and `integrity` as
+    /// other spans). It is sent with the packer thread off (`BUCKWAL_PACK=0`) too.
     fn emit(&mut self) -> Result<()> {
         let span = tracing::info_span!(
             target: "buckwal",
@@ -566,9 +639,9 @@ impl Gauges {
         match &r {
             Ok(g) => {
                 span.record("buckwal.pack.behind_bytes", g.behind_bytes);
-                if let Some((generation, p)) = g.pack {
-                    span.record("buckwal.pack.age_seconds", p.age.as_secs());
-                    span.record("buckwal.pack.size_bytes", p.size);
+                span.record("buckwal.pack.age_seconds", g.age.as_secs());
+                span.record("buckwal.pack.size_bytes", g.pack.map_or(0, |(_, p)| p.size));
+                if let Some((generation, _)) = g.pack {
                     span.record("buckwal.pack.generation", generation);
                 }
                 span.record("buckwal.outcome", "ok");
@@ -619,12 +692,14 @@ fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> 
 
 impl PackerThreads {
     /// Start the gauges and, with `config.pack`, the packer thread, for a writer whose
-    /// bucket `store` holds; `keys` know the database id, `counters` are its bucket's.
+    /// bucket `store` holds; `keys` know the database id, `counters` are its bucket's, and
+    /// `generation` is the writer's generation now.
     pub(crate) fn spawn(
         config: &Config,
         store: Arc<dyn ObjectStore>,
         keys: Keys,
         counters: Arc<Counters>,
+        generation: u64,
     ) -> PackerThreads {
         let stop = Arc::new(AtomicBool::new(false));
         let packer = config.pack.then(|| {
@@ -635,12 +710,16 @@ impl PackerThreads {
                 packer_loop(&config, &store, &stop, first, Some(&db));
             })
         });
+        // From now on the writer's own switches are recorded, with when.
+        counters.track_ended();
         let gauges = Gauges {
             store,
             keys,
             retry: config.engine(crate::io::IoMode::Writer).retry,
             counters,
+            open_generation: generation,
             log: None,
+            ends: BTreeMap::new(),
         };
         let interval = config.pack_gauge_interval;
         let s = stop.clone();

@@ -768,10 +768,14 @@ impl ObjectStore for CountingStore<'_> {
     fn list_after(&self, prefix: &str, start_after: &str) -> StoreResult<Vec<String>> {
         self.inner.list_after(prefix, start_after)
     }
-    fn list_sized(&self, prefix: &str) -> StoreResult<Vec<(String, u64)>> {
+    fn list_sized(&self, prefix: &str) -> StoreResult<Vec<crate::store::Listed>> {
         self.inner.list_sized(prefix)
     }
-    fn list_sized_after(&self, prefix: &str, start_after: &str) -> StoreResult<Vec<(String, u64)>> {
+    fn list_sized_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> StoreResult<Vec<crate::store::Listed>> {
         self.inner.list_sized_after(prefix, start_after)
     }
     fn put_multipart(

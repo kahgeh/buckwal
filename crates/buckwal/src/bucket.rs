@@ -35,6 +35,10 @@ pub(crate) struct LogPos {
 /// it the record stops, and the next listing starts it again (`Counters::take_positions`).
 pub(crate) const MAX_LANDED_POSITIONS: usize = 100_000;
 
+/// The most generation ends that `Counters` keeps between two gauges. A writer switches at a
+/// WAL restart, so many fewer come in 5 minutes; past the limit the oldest ends are kept.
+pub(crate) const MAX_ENDED: usize = 1024;
+
 /// What `Counters` records of the log objects that land, for the writer's pack gauges.
 #[derive(Debug, Default)]
 pub(crate) enum Landed {
@@ -63,6 +67,10 @@ pub(crate) struct Counters {
     /// they list the log only once per open. Its size has a limit: one sum per generation
     /// after the first listing, and at most `MAX_LANDED_POSITIONS` keys before it.
     pub landed: Mutex<Landed>,
+    /// The generations this writer ended (its own switches and seals), each with the moment
+    /// its new head landed, for the gauges' `age_seconds`. `None` (the default) records
+    /// nothing: a writer with no gauges.
+    pub ended: Mutex<Option<Vec<(u64, Instant)>>>,
 }
 
 impl Counters {
@@ -96,6 +104,26 @@ impl Counters {
             Landed::Sums(m) => std::mem::take(m),
             _ => BTreeMap::new(),
         }
+    }
+
+    /// From now on, record each generation this writer ends (`note_ended`): the gauges call
+    /// it when they start, before the writer can switch.
+    pub(crate) fn track_ended(&self) {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+
+    /// This writer ended `generation` now. Kept only while tracked, up to `MAX_ENDED`.
+    pub(crate) fn note_ended(&self, generation: u64) {
+        let mut e = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = e.as_mut().filter(|v| v.len() < MAX_ENDED) {
+            v.push((generation, Instant::now()));
+        }
+    }
+
+    /// The generations ended since the last call, oldest first.
+    pub(crate) fn take_ended(&self) -> Vec<(u64, Instant)> {
+        let mut e = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        e.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     pub(crate) fn note_landed(&self, pos: LogPos, bytes: u64) {
@@ -1536,6 +1564,8 @@ impl Bucket {
         self.quiet = None;
         self.seal_etags.get_mut().unwrap().clear();
         self.counters.seals.fetch_add(1, Relaxed);
+        // Its last record (the seal-start record) is in the bucket: the generation ended.
+        self.counters.note_ended(sealed);
         let elapsed = start.elapsed();
         self.emit(if switched {
             Event::GenerationSwitched {

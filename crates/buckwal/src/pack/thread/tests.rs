@@ -7,8 +7,8 @@ use crate::format::Keys;
 use crate::pack::run::{pack_run_in, Clock, WORK_DIR_PREFIX};
 use crate::pack::{PackOutcome, PackPointer};
 use crate::store::{
-    CondPut, MemStore, MultipartDone, Object, ObjectStat, ObjectStore, PartSource, StatsSnap,
-    StoreError,
+    CondPut, Listed, MemStore, MultipartDone, Object, ObjectStat, ObjectStore, PartSource,
+    StatsSnap, StoreError,
 };
 use crate::telemetry::testing::Capture;
 use crate::{CheckpointMode, Connection, Value};
@@ -205,7 +205,7 @@ impl ObjectStore for TestStore {
         self.record("list_after", prefix);
         self.inner.list_after(prefix, start_after)
     }
-    fn list_sized(&self, prefix: &str) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized(&self, prefix: &str) -> std::result::Result<Vec<Listed>, StoreError> {
         self.record("list_sized", prefix);
         self.inner.list_sized(prefix)
     }
@@ -213,7 +213,7 @@ impl ObjectStore for TestStore {
         &self,
         prefix: &str,
         start_after: &str,
-    ) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+    ) -> std::result::Result<Vec<Listed>, StoreError> {
         self.record("list_sized_after", prefix);
         self.inner.list_sized_after(prefix, start_after)
     }
@@ -364,8 +364,8 @@ fn log_bytes_from(store: &dyn ObjectStore, from: u64) -> u64 {
         .list_sized(&keys().log_root())
         .unwrap()
         .iter()
-        .filter(|(k, _)| keys().parse_log(k).is_some_and(|(g, _)| g >= from))
-        .map(|(_, n)| n)
+        .filter(|l| keys().parse_log(&l.key).is_some_and(|(g, _)| g >= from))
+        .map(|l| l.size)
         .sum()
 }
 
@@ -851,12 +851,15 @@ fn gauges_use_pointer_last_modified_and_listing_sizes() {
         s.field("buckwal.pack.behind_bytes"),
         Some(&*log_bytes_from(&*mem, p.pack_generation).to_string())
     );
+    // The pointer is 1800 s old by the bucket's clock, but `age_seconds` is the time since
+    // the end of the oldest ended generation that no pack holds: the writer's own switch of
+    // the pack generation, a moment ago.
     let age: u64 = s
         .field("buckwal.pack.age_seconds")
         .unwrap()
         .parse()
         .unwrap();
-    assert!((1800..1830).contains(&age), "{age}");
+    assert!(age < 30, "{age}");
     assert_eq!(
         s.field("buckwal.pack.generation"),
         Some(&*p.pack_generation.to_string())
@@ -905,9 +908,158 @@ fn gauges_without_a_pack_count_the_whole_log() {
         s.field("buckwal.pack.behind_bytes"),
         Some(&*log_bytes_from(&*mem, 1).to_string())
     );
-    assert_eq!(s.field("buckwal.pack.age_seconds"), None, "no pack");
+    // No pack: size 0, and the age counts from the writer's own end of generation 1.
+    assert_eq!(s.field("buckwal.pack.size_bytes"), Some("0"));
     assert_eq!(s.field("buckwal.pack.generation"), None);
-    assert_eq!(s.field("buckwal.pack.size_bytes"), None);
+    let age = || -> u64 {
+        cap.spans()
+            .last_named("buckwal.pack.gauges")
+            .field("buckwal.pack.age_seconds")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let first = age();
+    assert!(first < 30, "{first}");
+    assert!(eventually(10, || age() > first), "the age grows");
+}
+
+/// Spec rev 27, Observability: a writer with `BUCKWAL_PACK=0` and no pack sends
+/// `buckwal.pack.gauges` with `size_bytes` 0, and its `age_seconds` grows from the end of the
+/// first generation. Here an earlier writer ended generation 1, 1000 s ago by the bucket's
+/// clock: the new writer finds that end in its one listing (the Last-Modified time of the
+/// generation's last record).
+#[test]
+fn gauges_without_a_pack_send_size_0_and_age_from_the_first_generation_end() {
+    let _gc = crate::trim::NoWriterGc::on();
+    let mem = Arc::new(MemStore::new());
+    let first = writer_on(mem.clone(), |d| {
+        let mut c = config(d);
+        c.pack = false;
+        c.pack_gauge_interval = Duration::from_secs(3600);
+        c
+    });
+    first.insert(1..=5);
+    first.end_generation();
+    drop(first);
+    mem.advance_clock(Duration::from_secs(1000));
+    let cap = Capture::new();
+    let dir = tempdir();
+    let db = tracing::subscriber::with_default(cap.subscriber(), || {
+        let mut c = config(dir.path());
+        c.pack = false;
+        c.pack_gauge_interval = Duration::from_millis(50);
+        open_with_store(c, mem.clone()).unwrap()
+    });
+    let w = Writer {
+        c: db.connect().unwrap(),
+        db,
+        dir,
+    };
+    assert_eq!(w.db.shared.packer_threads(), (false, true));
+    let gauges = || cap.spans().named("buckwal.pack.gauges").len();
+    assert!(eventually(10, || gauges() >= 2));
+    let field = |name: &str| -> Option<String> {
+        cap.spans()
+            .last_named("buckwal.pack.gauges")
+            .field(name)
+            .map(str::to_string)
+    };
+    let age = || -> u64 { field("buckwal.pack.age_seconds").unwrap().parse().unwrap() };
+    assert_eq!(field("buckwal.outcome").as_deref(), Some("ok"));
+    assert_eq!(field("buckwal.pack.size_bytes").as_deref(), Some("0"));
+    assert_eq!(field("buckwal.pack.generation"), None, "no pack");
+    let behind: u64 = field("buckwal.pack.behind_bytes").unwrap().parse().unwrap();
+    assert_eq!(behind, log_bytes_from(&*mem, 1), "all the log");
+    let a1 = age();
+    assert!((1000..1030).contains(&a1), "{a1}");
+    // It grows with time, and a later end (this writer's own switch) does not lower it.
+    w.insert(6..=8);
+    w.end_generation();
+    assert!(eventually(10, || age() > a1), "the age grows");
+    assert!(age() >= 1000);
+    assert!(pointer_of(&*mem).is_none());
+}
+
+/// Spec rev 27, Observability: a quiet writer whose newest pack holds every ended generation
+/// sends `age_seconds` 0, however old the pack is.
+#[test]
+fn gauges_of_a_quiet_writer_whose_pack_holds_every_ended_generation_send_age_0() {
+    let _gc = crate::trim::NoWriterGc::on();
+    let mem = Arc::new(MemStore::new());
+    let cap = Capture::new();
+    let w = tracing::subscriber::with_default(cap.subscriber(), || {
+        writer_on(mem.clone(), |d| {
+            let mut c = config(d);
+            c.pack = false;
+            c.pack_gauge_interval = Duration::from_millis(50);
+            c
+        })
+    });
+    w.insert(1..=10);
+    w.end_generation();
+    w.insert(11..=20);
+    w.end_generation();
+    let t = tempdir();
+    crate::pack::pack_with_store(&packer_cfg(&t, "p"), mem.clone()).unwrap();
+    let p = pointer_of(&*mem).unwrap();
+    assert_eq!(
+        p.pack_generation,
+        w.db.generation(),
+        "the pack holds every ended generation"
+    );
+    mem.advance_clock(Duration::from_secs(7200 * 3));
+    let gauges = || cap.spans().named("buckwal.pack.gauges").len();
+    let n = gauges();
+    assert!(eventually(10, || gauges() >= n + 3));
+    let spans = cap.spans();
+    let s = spans.last_named("buckwal.pack.gauges");
+    assert_eq!(s.field("buckwal.outcome"), Some("ok"));
+    assert_eq!(s.field("buckwal.pack.age_seconds"), Some("0"));
+    assert_eq!(
+        s.field("buckwal.pack.size_bytes"),
+        Some(&*p.size.to_string())
+    );
+    assert_eq!(
+        s.field("buckwal.pack.generation"),
+        Some(&*p.pack_generation.to_string())
+    );
+    // Then a generation ends: it waits for the packer, and the age counts from its end.
+    w.insert(21..=25);
+    w.end_generation();
+    let n = gauges();
+    assert!(eventually(10, || gauges() >= n + 2));
+    let age: u64 = cap
+        .spans()
+        .last_named("buckwal.pack.gauges")
+        .field("buckwal.pack.age_seconds")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(age < 30, "{age}");
+}
+
+/// The generations a writer ends itself are recorded (with when) only while its gauges
+/// track them, and the record has a limit.
+#[test]
+fn ended_record_is_off_without_gauges_and_bounded() {
+    let c = crate::bucket::Counters::default();
+    c.note_ended(1);
+    assert!(c.take_ended().is_empty(), "off");
+    c.track_ended();
+    let t = Instant::now();
+    c.note_ended(1);
+    c.note_ended(2);
+    let got = c.take_ended();
+    assert_eq!(got.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [1, 2]);
+    assert!(got.iter().all(|(_, at)| *at >= t));
+    assert!(c.take_ended().is_empty(), "taken");
+    for g in 0..(crate::bucket::MAX_ENDED as u64 + 10) {
+        c.note_ended(g);
+    }
+    let got = c.take_ended();
+    assert_eq!(got.len(), crate::bucket::MAX_ENDED);
+    assert_eq!(got[0].0, 0, "the oldest ends are kept");
 }
 
 #[test]

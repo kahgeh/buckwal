@@ -2,8 +2,8 @@
 //! Wraps any store and injects put failures on demand, to test that a failed upload is never
 //! acknowledged and that ambiguous (stored, then errored) puts are handled.
 use super::{
-    part_size_for, CondPut, MultipartDone, Object, ObjectStat, ObjectStore, PartSource, StatsSnap,
-    StoreError,
+    part_size_for, CondPut, Listed, MultipartDone, Object, ObjectStat, ObjectStore, PartSource,
+    StatsSnap, StoreError,
 };
 use std::sync::atomic::{
     AtomicU64,
@@ -212,15 +212,11 @@ impl ObjectStore for FaultStore {
         self.record("list_after", &format!("{prefix} {start_after}"));
         self.inner.list_after(prefix, start_after)
     }
-    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized(&self, prefix: &str) -> Result<Vec<Listed>, StoreError> {
         self.record("list_sized", prefix);
         self.inner.list_sized(prefix)
     }
-    fn list_sized_after(
-        &self,
-        prefix: &str,
-        start_after: &str,
-    ) -> Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized_after(&self, prefix: &str, start_after: &str) -> Result<Vec<Listed>, StoreError> {
         self.record("list_sized_after", &format!("{prefix} {start_after}"));
         self.inner.list_sized_after(prefix, start_after)
     }
@@ -520,6 +516,41 @@ mod tests {
         assert_eq!(s.events(), vec!["stat fast", "stat slow"]);
     }
 
+    /// The listing of a fault store returns each object's size and the time of its put as
+    /// the Last-Modified time (spec rev 28), and records the call.
+    #[test]
+    fn fault_store_listing_returns_size_and_put_time() {
+        let (m, s) = setup();
+        let before = std::time::SystemTime::now();
+        s.put("p/a", b"abc").unwrap();
+        let after = std::time::SystemTime::now();
+        m.advance_clock(Duration::from_secs(30));
+        s.put("p/b", b"de").unwrap();
+        let got = s.list_sized_after("p/", "p/").unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|l| (l.key.as_str(), l.size))
+                .collect::<Vec<_>>(),
+            [("p/a", 3), ("p/b", 2)]
+        );
+        assert!(
+            got[0].modified >= before && got[0].modified <= after,
+            "{got:?}"
+        );
+        assert!(got[0].age >= Duration::from_secs(30), "{got:?}");
+        assert!(got[1].modified >= got[0].modified + Duration::from_secs(30));
+        assert!(got[1].age < Duration::from_secs(1), "{got:?}");
+        let again = s.list_sized("p/").unwrap();
+        let modified =
+            |v: &[crate::store::Listed]| v.iter().map(|l| l.modified).collect::<Vec<_>>();
+        assert_eq!(
+            modified(&again),
+            modified(&got),
+            "the put time, not the listing time"
+        );
+        assert!(s.events().contains(&"list_sized_after p/ p/".to_string()));
+    }
+
     struct Bytes(Vec<u8>);
 
     impl crate::store::PartSource for Bytes {
@@ -552,7 +583,14 @@ mod tests {
             s.get_range("p/k", 1000, 1000).unwrap().unwrap(),
             &data[1000..2000]
         );
-        assert_eq!(s.list_sized("p/").unwrap(), vec![("p/k".to_string(), 2500)]);
+        let listed = s.list_sized("p/").unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|l| (l.key.as_str(), l.size))
+                .collect::<Vec<_>>(),
+            [("p/k", 2500)]
+        );
         let ev = s.events();
         assert!(ev.contains(&"put_multipart p/k".to_string()), "{ev:?}");
         assert!(ev.contains(&"get_range p/k".to_string()), "{ev:?}");

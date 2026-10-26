@@ -27,6 +27,20 @@ pub struct ObjectStat {
     pub size: u64,
 }
 
+/// One object of a listing (`list_sized`): its key, its size, and its Last-Modified time
+/// (spec rev 28: the pack gauges' `behind_bytes` and `age_seconds` come from it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub key: String,
+    pub size: u64,
+    /// The Last-Modified time, by the store's clock. On S3 a multipart object's time is the
+    /// start of its upload.
+    pub modified: std::time::SystemTime,
+    /// The object's age at the listing, by the store's clock (S3: the reply's `Date` minus
+    /// the Last-Modified time, 1 s resolution), so the caller's clock does not enter.
+    pub age: Duration,
+}
+
 /// The bytes of a multipart upload. A store reads each part from it by offset, so parts can be
 /// read in any order and from several threads.
 pub trait PartSource: Sync {
@@ -196,14 +210,22 @@ pub trait ObjectStore: Send + Sync {
         keys.retain(|k| k.as_str() > start_after);
         Ok(keys)
     }
-    /// The keys under `prefix` with their sizes in bytes, sorted ascending. The default lists,
-    /// then stats each key; S3 and the in-memory store read the sizes from the listing.
-    fn list_sized(&self, prefix: &str) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+    /// The objects under `prefix` with their sizes in bytes and Last-Modified times, sorted
+    /// ascending by key. The default lists, then stats each key, and its Last-Modified time
+    /// is the caller's clock less the age; S3 and the in-memory store read both values from
+    /// the listing.
+    fn list_sized(&self, prefix: &str) -> std::result::Result<Vec<Listed>, StoreError> {
         let mut out = Vec::new();
         for key in self.list(prefix)? {
             // A key deleted since the listing is left out.
             if let Some(st) = self.stat(&key)? {
-                out.push((key, st.size));
+                let now = std::time::SystemTime::now();
+                out.push(Listed {
+                    key,
+                    size: st.size,
+                    modified: now.checked_sub(st.age).unwrap_or(now),
+                    age: st.age,
+                });
             }
         }
         Ok(out)
@@ -214,9 +236,9 @@ pub trait ObjectStore: Send + Sync {
         &self,
         prefix: &str,
         start_after: &str,
-    ) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+    ) -> std::result::Result<Vec<Listed>, StoreError> {
         let mut keys = self.list_sized(prefix)?;
-        keys.retain(|(k, _)| k.as_str() > start_after);
+        keys.retain(|l| l.key.as_str() > start_after);
         Ok(keys)
     }
     /// Upload `source` as one object `key` in parts of `part_size` bytes (the last is smaller;
@@ -352,11 +374,32 @@ mod tests {
         );
         assert_eq!(s.get_range("k", 2000, 1000).unwrap().unwrap(), data[2000..]);
         assert_eq!(s.get_range("none", 0, 10).unwrap(), None);
+        let before = std::time::SystemTime::now();
         s.put("a", b"xy").unwrap();
+        s.0.advance_clock(Duration::from_secs(10));
+        let listed = s.list_sized("").unwrap();
         assert_eq!(
-            s.list_sized("").unwrap(),
-            vec![("a".to_string(), 2), ("k".to_string(), 2500)]
+            listed
+                .iter()
+                .map(|l| (l.key.as_str(), l.size))
+                .collect::<Vec<_>>(),
+            [("a", 2), ("k", 2500)]
         );
+        // The default stats each key: its age by the store's clock, and the Last-Modified
+        // time that age gives by the caller's clock (here 10 s before the put, as the store's
+        // clock moved 10 s).
+        assert!(listed[0].age >= Duration::from_secs(10), "{listed:?}");
+        let ten = Duration::from_secs(10);
+        assert!(
+            listed[0].modified >= before - ten - Duration::from_secs(1),
+            "{listed:?}"
+        );
+        assert!(
+            listed[0].modified <= std::time::SystemTime::now() - ten,
+            "{listed:?}"
+        );
+        let after = s.list_sized_after("", "a").unwrap();
+        assert_eq!(after.iter().map(|l| &l.key).collect::<Vec<_>>(), ["k"]);
         assert_eq!(s.abort_incomplete("", Duration::ZERO).unwrap(), 0);
     }
 

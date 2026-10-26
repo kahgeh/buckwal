@@ -261,7 +261,17 @@ fn s3_list_sized_after_returns_keys_after_with_sizes() {
         s.put(&format!("{p}{k}"), &vec![0u8; n]).unwrap();
     }
     let got = s.list_sized_after(&p, &format!("{p}a")).unwrap();
-    assert_eq!(got, [(format!("{p}b"), 22), (format!("{p}c"), 333)]);
+    let pairs: Vec<(String, u64)> = got.iter().map(|l| (l.key.clone(), l.size)).collect();
+    assert_eq!(pairs, [(format!("{p}b"), 22), (format!("{p}c"), 333)]);
+    // Each also has its Last-Modified time and its age by the bucket's clock (spec rev 28):
+    // the listing's ages agree with a HEAD's, to the 1 s resolution of both.
+    for l in &got {
+        let st = s.stat(&l.key).unwrap().unwrap();
+        let gap = st.age.abs_diff(l.age);
+        assert!(gap <= std::time::Duration::from_secs(2), "{l:?} {st:?}");
+        assert!(l.age < std::time::Duration::from_secs(120), "{l:?}");
+    }
+    assert!(got[0].modified <= got[1].modified, "{got:?}");
 }
 
 /// A conditional delete (spec rev 11, rule 1: a create removes a leftover `pack-latest` with
@@ -404,7 +414,14 @@ fn s3_multipart_40mb_then_range_reads() {
     }
     assert!(back == data, "ranges differ from the source");
     assert_eq!(s.stat(&key).unwrap().unwrap().size, 40_000_000);
-    assert_eq!(s.list_sized(&p).unwrap(), vec![(key.clone(), 40_000_000)]);
+    let listed = s.list_sized(&p).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|l| (l.key.clone(), l.size))
+            .collect::<Vec<_>>(),
+        vec![(key.clone(), 40_000_000)]
+    );
     // Past the end: cut short, then nothing.
     let tail = s.get_range(&key, 39_999_990, 100).unwrap().unwrap();
     assert_eq!(tail, &data[39_999_990..]);

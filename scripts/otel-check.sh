@@ -143,17 +143,19 @@ readme_queries
 # line `;;`. Each leaves out test runs, as README's queries do.
 ALERT_QUERIES="$(cat <<'SQL'
 -- packer not keeping up (warn): per database prefix, over 15 minutes, at least 3 gauges
--- spans with a pack, and every one of them behind by more than half the size of the pack, or
--- every one of them with a pack older than 2 hours
+-- spans, and every one of them with a pack behind by more than half the size of the pack
+-- (the ratio skips spans with size_bytes 0: no pack yet), or every one of them with an ended
+-- generation that no pack holds for more than 2 hours (this alone fires with no pack)
 SELECT SpanAttributes['buckwal.prefix'] AS prefix,
        count() AS spans,
-       min(toFloat64OrZero(SpanAttributes['buckwal.pack.behind_bytes'])
-           / greatest(toFloat64OrZero(SpanAttributes['buckwal.pack.size_bytes']), 1)) AS behind_share,
+       minIf(toFloat64OrZero(SpanAttributes['buckwal.pack.behind_bytes'])
+             / toFloat64OrZero(SpanAttributes['buckwal.pack.size_bytes']),
+             toFloat64OrZero(SpanAttributes['buckwal.pack.size_bytes']) > 0) AS behind_share,
        min(toUInt64OrZero(SpanAttributes['buckwal.pack.age_seconds'])) AS age_seconds
 FROM otel.otel_traces
 WHERE ServiceName = 'buckwal' AND SpanName = 'buckwal.pack.gauges'
   AND SpanAttributes['buckwal.outcome'] = 'ok'
-  AND SpanAttributes['buckwal.pack.size_bytes'] != ''
+  AND SpanAttributes['buckwal.pack.age_seconds'] != ''
   AND ResourceAttributes['deployment.environment.name'] != 'test'
   AND Timestamp > now() - INTERVAL 15 MINUTE
 GROUP BY prefix

@@ -34,10 +34,12 @@
 //!   `buckwal.elapsed_ms`, `buckwal.pack.failures`, `buckwal.outcome`: `packed`,
 //!   `nothing_to_do`, `superseded` or `failed`, with `buckwal.pack.failed_step`,
 //!   `buckwal.pack.failed_key` and `buckwal.error`) (`pack/run.rs`), and
-//!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes (`buckwal.prefix`,
-//!   `buckwal.pack.behind_bytes`,
-//!   `buckwal.pack.age_seconds`, `buckwal.pack.generation`, `buckwal.pack.size_bytes`,
-//!   `buckwal.outcome`) (`pack/thread.rs`);
+//!   `buckwal.pack.gauges`, the writer's gauges every 5 minutes, also with the packer thread
+//!   off and with no pack (`buckwal.prefix`, `buckwal.pack.behind_bytes`: the log bytes at or
+//!   above the pack generation, all of the log with no pack; `buckwal.pack.age_seconds`: the
+//!   time since the end of the oldest ended generation that no pack holds, 0 when none;
+//!   `buckwal.pack.size_bytes`: the newest pack's size, 0 with no pack; with a pack
+//!   `buckwal.pack.generation`; `buckwal.outcome`) (`pack/thread.rs`);
 //! - `buckwal.vacuum`, one per `buckwal vacuum` (`buckwal.vacuum.page_size`,
 //!   `buckwal.vacuum.pages_before`, `buckwal.vacuum.free_pages_before`,
 //!   `buckwal.vacuum.pages_after`, `buckwal.vacuum.free_pages_after`,

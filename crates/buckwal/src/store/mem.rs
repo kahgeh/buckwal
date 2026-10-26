@@ -1,14 +1,14 @@
 // Derived from tursodatabase/turso spike/objstore (MIT), commit 417bd81c0.
 //! In-process bucket for tests, with real ETags and conditional semantics.
 use super::{
-    part_count, part_size_for, read_part, sha256_of, CondPut, MultipartDone, Object, ObjectStat,
-    ObjectStore, PartSource, StatsSnap, StoreError,
+    part_count, part_size_for, read_part, sha256_of, CondPut, Listed, MultipartDone, Object,
+    ObjectStat, ObjectStore, PartSource, StatsSnap, StoreError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Record `status` on the current span's `s3.status`, as `S3Store` records each response's.
 fn status(code: u16) {
@@ -23,19 +23,27 @@ fn cond_status(r: &CondPut) -> u16 {
     }
 }
 
+/// A moment by the store's clock (the real clock + `clock_offset`): an `Instant` for ages,
+/// and the wall time that a listing returns as the Last-Modified time.
+#[derive(Debug, Clone, Copy)]
+struct Written {
+    at: Instant,
+    wall: SystemTime,
+}
+
 /// A multipart upload that has not completed: it holds no object, only a start time.
 struct Upload {
     id: u64,
     key: String,
-    /// When it started, by the store's clock (real now + `clock_offset`).
-    started: Instant,
+    /// When it started, by the store's clock.
+    started: Written,
 }
 
 #[derive(Default)]
 struct Inner {
     objects: BTreeMap<String, Object>,
-    /// When each key was last written, by the store's clock (real now + `clock_offset`).
-    written: BTreeMap<String, Instant>,
+    /// When each key was last written (its put time), by the store's clock.
+    written: BTreeMap<String, Written>,
     /// Added to the real clock: the test clock `advance_clock` moves.
     clock_offset: Duration,
     version: u64,
@@ -54,6 +62,23 @@ pub struct MemStore {
     deletes: AtomicU64,
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
+}
+
+impl Inner {
+    /// Now, by the store's clock.
+    fn now(&self) -> Written {
+        Written {
+            at: Instant::now() + self.clock_offset,
+            wall: SystemTime::now() + self.clock_offset,
+        }
+    }
+
+    /// The age of `key` now, by the store's clock (0 for a key with no put time).
+    fn age(&self, key: &str) -> Duration {
+        self.written.get(key).map_or(Duration::ZERO, |w| {
+            (Instant::now() + self.clock_offset).saturating_duration_since(w.at)
+        })
+    }
 }
 
 impl MemStore {
@@ -93,7 +118,7 @@ impl MemStore {
     }
 
     fn store_with_etag(inner: &mut Inner, key: &str, body: &[u8], etag: String) -> String {
-        let now = Instant::now() + inner.clock_offset;
+        let now = inner.now();
         inner.written.insert(key.to_string(), now);
         inner.objects.insert(
             key.to_string(),
@@ -154,12 +179,7 @@ impl ObjectStore for MemStore {
     fn get_aged(&self, key: &str) -> Result<Option<(Object, Duration)>, StoreError> {
         let v = {
             let inner = self.inner.lock().unwrap();
-            inner.objects.get(key).cloned().map(|o| {
-                let age = inner.written.get(key).map_or(Duration::ZERO, |w| {
-                    (Instant::now() + inner.clock_offset).saturating_duration_since(*w)
-                });
-                (o, age)
-            })
+            inner.objects.get(key).cloned().map(|o| (o, inner.age(key)))
         };
         self.gets.fetch_add(1, Relaxed);
         self.bytes_down
@@ -173,9 +193,7 @@ impl ObjectStore for MemStore {
             let inner = self.inner.lock().unwrap();
             inner.objects.get(key).map(|o| ObjectStat {
                 etag: o.etag.clone(),
-                age: inner.written.get(key).map_or(Duration::ZERO, |w| {
-                    (Instant::now() + inner.clock_offset).saturating_duration_since(*w)
-                }),
+                age: inner.age(key),
                 size: o.body.len() as u64,
             })
         };
@@ -200,16 +218,25 @@ impl ObjectStore for MemStore {
         Ok(keys)
     }
 
-    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>, StoreError> {
-        let out: Vec<(String, u64)> = self
-            .inner
-            .lock()
-            .unwrap()
+    /// Each object's size, and its put time (`written`) as its Last-Modified time.
+    fn list_sized(&self, prefix: &str) -> Result<Vec<Listed>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let now = inner.now();
+        let out: Vec<Listed> = inner
             .objects
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, o)| (k.clone(), o.body.len() as u64))
+            .map(|(k, o)| {
+                let w = inner.written.get(k).copied().unwrap_or(now);
+                Listed {
+                    key: k.clone(),
+                    size: o.body.len() as u64,
+                    modified: w.wall,
+                    age: now.at.saturating_duration_since(w.at),
+                }
+            })
             .collect();
+        drop(inner);
         self.lists
             .fetch_add(out.len().div_ceil(1000).max(1) as u64, Relaxed);
         status(200);
@@ -231,7 +258,7 @@ impl ObjectStore for MemStore {
         let id = {
             let mut inner = self.inner.lock().unwrap();
             inner.next_upload += 1;
-            let (id, started) = (inner.next_upload, Instant::now() + inner.clock_offset);
+            let (id, started) = (inner.next_upload, inner.now());
             inner.uploads.push(Upload {
                 id,
                 key: key.to_string(),
@@ -284,10 +311,11 @@ impl ObjectStore for MemStore {
 
     fn abort_incomplete(&self, prefix: &str, older_than: Duration) -> Result<u64, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let now = Instant::now() + inner.clock_offset;
+        let now = inner.now().at;
         let before = inner.uploads.len();
         inner.uploads.retain(|u| {
-            !(u.key.starts_with(prefix) && now.saturating_duration_since(u.started) >= older_than)
+            !(u.key.starts_with(prefix)
+                && now.saturating_duration_since(u.started.at) >= older_than)
         });
         let n = (before - inner.uploads.len()) as u64;
         self.lists.fetch_add(1, Relaxed);
@@ -337,8 +365,9 @@ impl ObjectStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::PartSource;
+    use crate::store::{Listed, PartSource};
     use std::sync::Arc;
+    use std::time::SystemTime;
 
     #[test]
     fn default_list_after_is_strictly_greater_sorted_and_prefix_bound() {
@@ -574,12 +603,53 @@ mod tests {
         s.put("a/2", b"two").unwrap();
         s.put("a/1", b"1").unwrap();
         s.put("b/1", b"xxxx").unwrap();
+        let pairs = |v: Vec<Listed>| -> Vec<(String, u64)> {
+            v.into_iter().map(|l| (l.key, l.size)).collect()
+        };
         assert_eq!(
-            s.list_sized("a/").unwrap(),
+            pairs(s.list_sized("a/").unwrap()),
             vec![("a/1".to_string(), 1), ("a/2".to_string(), 3)]
         );
         assert_eq!(s.stat("b/1").unwrap().unwrap().size, 4);
         assert_eq!(s.stats().lists, 1);
+        assert_eq!(
+            pairs(s.list_sized_after("a/", "a/1").unwrap()),
+            vec![("a/2".to_string(), 3)]
+        );
+    }
+
+    /// The listing returns the time of each put as the Last-Modified time, by the store's
+    /// clock, and the age at the listing as `stat` measures it (spec rev 28).
+    #[test]
+    fn list_sized_returns_the_put_time_as_last_modified() {
+        let s = MemStore::new();
+        let before = SystemTime::now();
+        s.put("a/1", b"1").unwrap();
+        let after = SystemTime::now();
+        s.advance_clock(Duration::from_secs(100));
+        s.put("a/2", b"22").unwrap();
+        let got = s.list_sized("a/").unwrap();
+        assert_eq!(got.len(), 2);
+        let (one, two) = (&got[0], &got[1]);
+        // The first put: its wall time, as the store's clock had it at the put.
+        assert!(one.modified >= before && one.modified <= after, "{one:?}");
+        assert!(
+            (Duration::from_secs(100)..Duration::from_secs(101)).contains(&one.age),
+            "{one:?}"
+        );
+        // The second put came after the clock moved 100 s.
+        let gap = two.modified.duration_since(one.modified).unwrap();
+        assert!(
+            (Duration::from_secs(100)..Duration::from_secs(101)).contains(&gap),
+            "{gap:?}"
+        );
+        assert!(two.age < Duration::from_secs(1), "{two:?}");
+        // A rewrite moves the Last-Modified time.
+        s.advance_clock(Duration::from_secs(50));
+        s.put("a/1", b"1").unwrap();
+        let again = s.list_sized("a/1").unwrap();
+        assert!(again[0].modified >= two.modified + Duration::from_secs(50));
+        assert!(again[0].age < Duration::from_secs(1));
     }
 
     #[test]

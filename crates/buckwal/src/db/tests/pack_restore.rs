@@ -166,7 +166,7 @@ impl ObjectStore for Recording {
     fn list_after(&self, p: &str, a: &str) -> std::result::Result<Vec<String>, StoreError> {
         self.inner.list_after(p, a)
     }
-    fn list_sized(&self, p: &str) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized(&self, p: &str) -> std::result::Result<Vec<crate::store::Listed>, StoreError> {
         self.inner.list_sized(p)
     }
     fn put_multipart(

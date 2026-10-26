@@ -2,8 +2,8 @@
 //! Generic S3 client: SigV4 over reqwest's blocking client. Endpoint, region, path style
 //! and credentials all come from settings; nothing here is specific to RustFS.
 use super::{
-    part_count, part_size_for, read_part, retry_store, sha256_of, CondPut, MultipartDone, Object,
-    ObjectStat, ObjectStore, PartSource, RetryPolicy, StatsSnap, StoreError,
+    part_count, part_size_for, read_part, retry_store, sha256_of, CondPut, Listed, MultipartDone,
+    Object, ObjectStat, ObjectStore, PartSource, RetryPolicy, StatsSnap, StoreError,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -188,6 +188,8 @@ pub(crate) struct ListPage {
     pub keys: Vec<String>,
     /// The `<Size>` of each entry, in the order of `keys`.
     pub sizes: Vec<u64>,
+    /// The `<LastModified>` of each entry, in the order of `keys` (`None`: not ISO 8601).
+    pub modified: Vec<Option<SystemTime>>,
     pub next: Option<String>,
 }
 
@@ -261,7 +263,56 @@ pub(crate) fn parse_list(xml: &str) -> ListPage {
         .into_iter()
         .filter_map(|v| v.trim().parse().ok())
         .collect();
-    ListPage { keys, sizes, next }
+    let modified = between(xml, "<LastModified>", "</LastModified>")
+        .into_iter()
+        .map(parse_iso8601)
+        .collect();
+    ListPage {
+        keys,
+        sizes,
+        modified,
+        next,
+    }
+}
+
+/// The objects of one ListObjectsV2 page whose reply has the `Date` header `date`: each key
+/// with its `<Size>` and `<LastModified>`, and its age as `Date - LastModified` (both from
+/// the bucket, so the caller's clock does not enter; 0 when a skew puts Last-Modified after
+/// Date). An entry without a size or a usable Last-Modified time, and a reply without a
+/// usable `Date`, are permanent errors.
+pub(crate) fn listed_page(
+    what: &str,
+    page: ListPage,
+    date: Option<&str>,
+) -> Result<Vec<Listed>, StoreError> {
+    let n = page.keys.len();
+    if page.sizes.len() != n || page.modified.len() != n {
+        return Err(StoreError::Permanent(format!(
+            "{what}: {n} keys but {} sizes and {} Last-Modified times in a reply",
+            page.sizes.len(),
+            page.modified.len()
+        )));
+    }
+    let now = date
+        .and_then(parse_http_date)
+        .ok_or_else(|| StoreError::Permanent(format!("{what}: no usable Date header")))?;
+    page.keys
+        .into_iter()
+        .zip(page.sizes)
+        .zip(page.modified)
+        .map(|((key, size), modified)| {
+            let modified = modified.ok_or_else(|| {
+                StoreError::Permanent(format!("{what}: bad LastModified of {key:?}"))
+            })?;
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            Ok(Listed {
+                key,
+                size,
+                modified,
+                age,
+            })
+        })
+        .collect()
 }
 
 struct Reply {
@@ -969,7 +1020,7 @@ impl S3Store {
         Ok(self
             .list_sized_from(prefix, start_after)?
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|l| l.key)
             .collect())
     }
 
@@ -977,7 +1028,8 @@ impl S3Store {
         &self,
         prefix: &str,
         start_after: Option<&str>,
-    ) -> Result<Vec<(String, u64)>, StoreError> {
+    ) -> Result<Vec<Listed>, StoreError> {
+        let what = format!("LIST {prefix}");
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -985,26 +1037,20 @@ impl S3Store {
             let r = self.send("GET", "", &q, &[], &[])?;
             self.lists.fetch_add(1, Relaxed);
             if r.status != 200 {
-                return Err(status_error(&format!("LIST {prefix}"), &r));
+                return Err(status_error(&what, &r));
             }
-            let page = parse_list(&String::from_utf8_lossy(&r.body));
-            if page.sizes.len() != page.keys.len() {
-                return Err(StoreError::Permanent(format!(
-                    "LIST {prefix}: {} keys but {} sizes in a reply",
-                    page.keys.len(),
-                    page.sizes.len()
-                )));
-            }
-            keys.extend(page.keys.into_iter().zip(page.sizes));
-            match page.next {
+            let mut page = parse_list(&String::from_utf8_lossy(&r.body));
+            let next = page.next.take();
+            keys.extend(listed_page(&what, page, r.date.as_deref())?);
+            match next {
                 Some(t) => token = Some(t),
                 None => break,
             }
         }
         if let Some(a) = start_after {
-            keys.retain(|(k, _)| k.as_str() > a);
+            keys.retain(|l| l.key.as_str() > a);
         }
-        keys.sort();
+        keys.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(keys)
     }
 }
@@ -1083,15 +1129,11 @@ impl ObjectStore for S3Store {
         self.list_from(prefix, Some(start_after))
     }
 
-    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized(&self, prefix: &str) -> Result<Vec<Listed>, StoreError> {
         self.list_sized_from(prefix, None)
     }
 
-    fn list_sized_after(
-        &self,
-        prefix: &str,
-        start_after: &str,
-    ) -> Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized_after(&self, prefix: &str, start_after: &str) -> Result<Vec<Listed>, StoreError> {
         self.list_sized_from(prefix, Some(start_after))
     }
 
@@ -1950,14 +1992,54 @@ mod tests {
         }
     }
 
+    /// A ListObjectsV2 page gives each object's key, size and Last-Modified time; the age of
+    /// each is the reply's `Date` minus its Last-Modified, by the bucket's clock (spec rev 28).
     #[test]
-    fn list_sized_page_pairs_keys_and_sizes() {
+    fn list_page_has_sizes_last_modified_and_ages() {
         let xml = "<ListBucketResult><IsTruncated>false</IsTruncated>\
-            <Contents><Key>a/1</Key><LastModified>x</LastModified><Size>12</Size></Contents>\
-            <Contents><Key>a/2&amp;</Key><Size>0</Size></Contents></ListBucketResult>";
+            <Contents><Key>a/1</Key><LastModified>2026-10-25T01:00:00.000Z</LastModified>\
+            <ETag>&quot;e1&quot;</ETag><Size>12</Size></Contents>\
+            <Contents><Key>a/2&amp;</Key><LastModified>2026-10-25T01:59:30.250Z</LastModified>\
+            <Size>0</Size></Contents></ListBucketResult>";
         let page = parse_list(xml);
         assert_eq!(page.keys, ["a/1", "a/2&"]);
         assert_eq!(page.sizes, [12, 0]);
+        let date = "Sun, 25 Oct 2026 02:00:00 GMT";
+        let got = listed_page("LIST a/", page, Some(date)).unwrap();
+        let t0 = parse_iso8601("2026-10-25T01:00:00Z").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Listed {
+                    key: "a/1".into(),
+                    size: 12,
+                    modified: t0,
+                    age: Duration::from_secs(3600),
+                },
+                Listed {
+                    key: "a/2&".into(),
+                    size: 0,
+                    modified: t0 + Duration::from_secs(3570),
+                    age: Duration::from_secs(30),
+                },
+            ]
+        );
+        // A clock skew that puts Last-Modified after Date ages it 0.
+        let skewed = listed_page(
+            "LIST a/",
+            parse_list(xml),
+            Some("Sun, 25 Oct 2026 01:30:00 GMT"),
+        )
+        .unwrap();
+        assert_eq!(skewed[1].age, Duration::ZERO);
+        // A page without a Date, or an entry without a usable Last-Modified or size, is an error.
+        assert!(listed_page("LIST a/", parse_list(xml), None).is_err());
+        let bad = "<ListBucketResult><Contents><Key>a/1</Key><LastModified>x</LastModified>\
+            <Size>1</Size></Contents></ListBucketResult>";
+        assert!(listed_page("LIST a/", parse_list(bad), Some(date)).is_err());
+        let no_size = "<ListBucketResult><Contents><Key>a/1</Key>\
+            <LastModified>2026-10-25T01:00:00Z</LastModified></Contents></ListBucketResult>";
+        assert!(listed_page("LIST a/", parse_list(no_size), Some(date)).is_err());
     }
 
     #[test]

@@ -452,6 +452,7 @@ fn open_impl(
             store.clone(),
             keys.clone(),
             engine.uploader.bucket_counters(),
+            engine.uploader.generation(),
         )
     });
     let uploader = engine.uploader.clone();

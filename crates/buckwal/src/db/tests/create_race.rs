@@ -102,7 +102,10 @@ impl ObjectStore for Interleave {
     ) -> std::result::Result<Vec<String>, StoreError> {
         self.inner.list_after(prefix, after)
     }
-    fn list_sized(&self, prefix: &str) -> std::result::Result<Vec<(String, u64)>, StoreError> {
+    fn list_sized(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<Vec<crate::store::Listed>, StoreError> {
         self.inner.list_sized(prefix)
     }
     fn put_multipart(
