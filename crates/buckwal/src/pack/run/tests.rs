@@ -879,6 +879,17 @@ fn skipped_generation_is_passed_over() {
             [(1, true), (2, true), (3, false)],
             "format 5: {format5}"
         );
+        if !format5 {
+            // The chain rule reads the old records, but a pack run refuses a bucket of format
+            // 1 to 4: it seals.
+            assert_eq!(
+                run(&cfg, mem.clone()).unwrap_err(),
+                Error::Unsupported(SEALING_BUCKET)
+            );
+            std::mem::forget(c);
+            std::mem::forget(b);
+            continue;
+        }
         let r = run(&cfg, mem.clone()).unwrap();
         packed(&r);
         assert_eq!(r.pack_generation, 4);
@@ -989,7 +1000,22 @@ fn missing_log_without_floor_is_an_error() {
         mem.delete(&k).unwrap();
     }
     let t = tempdir();
-    assert_log_incomplete(&mem, &t, keys().log_prefix(2));
+    // A pack run refuses a bucket of format 1 to 4, so the chain rule is checked on its own.
+    let cfg = packer(&t);
+    let retry = cfg.engine(crate::io::IoMode::Writer).retry;
+    let k = keys();
+    let r = LogReader {
+        store: &*mem,
+        keys: &k,
+        retry: &retry,
+        concurrency: 4,
+    };
+    let scanned = ended_generations(&r, 1, &head_of(&*mem)).unwrap();
+    assert_eq!(scanned.incomplete, Some(keys().log_prefix(2)));
+    assert_eq!(
+        run(&cfg, mem.clone()).unwrap_err(),
+        Error::Unsupported(SEALING_BUCKET)
+    );
     w.crash();
 }
 

@@ -11,7 +11,7 @@ use crate::store::{
     StatsSnap, StoreError,
 };
 use crate::telemetry::testing::Capture;
-use crate::{CheckpointMode, Connection, Value};
+use crate::{CheckpointMode, Connection, Error, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
@@ -734,6 +734,52 @@ fn bucket_pack_0_starts_no_thread() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(pointer_of(&*mem).is_none());
     assert_eq!(ts.calls_of("put_multipart", "pack/"), 0);
+}
+
+/// The refusal of a pack run of a bucket of format 1 to 4 (it seals).
+const SEALS: &str = "a pack run of a bucket of format 1 to 4 (it seals; run buckwal upgrade)";
+
+/// A bucket of format 1 to 4 seals and has no packs: the loop's check finds no run due, a
+/// pack run is refused before it writes anything, and `run_packer` (`buckwal packer`) stops
+/// at once with the same error.
+#[test]
+fn packer_refuses_a_bucket_of_format_1_to_4() {
+    let mem = Arc::new(MemStore::new());
+    let w = {
+        let _legacy = crate::format::LegacySeal::on();
+        plain_writer(mem.clone())
+    };
+    w.insert(1..=3);
+    w.end_generation();
+    w.insert(4..=5);
+    w.end_generation();
+    w.insert(6..=6);
+    let t = tempdir();
+    let mut cfg = packer_cfg(&t, "p");
+    cfg.pack_log_percent = 0;
+    mem.advance_clock(Duration::from_secs(7200));
+    assert_eq!(check(&cfg, &*mem).unwrap(), None);
+
+    let ts = TestStore::new(mem.clone());
+    let e = crate::pack::pack_with_store(&cfg, ts.clone()).unwrap_err();
+    assert_eq!(e, Error::Unsupported(SEALS));
+    let calls = ts.calls.lock().unwrap().clone();
+    assert!(
+        calls.iter().all(|c| c.starts_with("get ")),
+        "only reads: {calls:?}"
+    );
+    assert!(packs(&*mem).is_empty());
+    assert!(pointer_of(&*mem).is_none());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (s, store, c) = (stop.clone(), mem.clone(), cfg.clone());
+    let h = std::thread::spawn(move || run_packer_with_store(&c, store, s));
+    let ended = eventually(10, || h.is_finished());
+    stop.store(true, SeqCst);
+    let r = h.join().unwrap();
+    assert!(ended, "run_packer stops by itself");
+    assert_eq!(r, Err(Error::Unsupported(SEALS)));
+    assert!(e.to_string().contains("run buckwal upgrade"), "{e}");
 }
 
 #[test]

@@ -27,12 +27,12 @@
 //! `Database` drop stops both threads and joins them: a thread that waits wakes at once
 //! (`Thread::unpark`), and a run in progress ends as `failed` at the step `closed`
 //! (`run::pack_run_in`). A close is not a fault: it starts no back-off and logs no WARN.
-use super::run::{pack_run_in, PackOutcome, PackReport};
+use super::run::{pack_run_in, PackOutcome, PackReport, SEALING_BUCKET};
 use crate::bucket::Counters;
 use crate::clock::Stamp;
 use crate::config::Config;
-use crate::error::Result;
-use crate::format::Keys;
+use crate::error::{Error, Result};
+use crate::format::{Keys, FORMAT_V5};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -133,6 +133,10 @@ pub(crate) fn check(config: &Config, store: &dyn ObjectStore) -> Result<Option<R
         return Ok(None);
     };
     let head = keys.decode_head_open(&head.body)?;
+    // A bucket of format 1 to 4 seals: no pack run is ever due.
+    if head.format != FORMAT_V5 {
+        return Ok(None);
+    }
     let pointer = read_pointer_aged(store, &keys, &retry)?;
     let from = pointer.own.map_or(1, |(g, _)| g);
     let mut t = Trigger {
@@ -203,8 +207,9 @@ fn list_log_keys_from(
 /// Run the packer loop against the bucket `config` names until `stop` is set: a check at
 /// once, then one per minute, and a pack run when one is due (see the module docs). Returns
 /// promptly after `stop`; a run in progress stops before its upload. `Err` only for a
-/// configuration that cannot work (`Config::validate`, the key file); a failed check or run
-/// is logged and tried again.
+/// configuration that cannot work (`Config::validate`, the key file), and
+/// `Unsupported` at once for a bucket whose head is of format 1 to 4 (it seals; `buckwal
+/// upgrade` converts it); a failed check or run is logged and tried again.
 pub fn run_packer(config: &Config, stop: Arc<AtomicBool>) -> Result<()> {
     let store = config.s3_store()?;
     run_packer_with_store(config, store, stop)
@@ -218,7 +223,23 @@ pub fn run_packer_with_store(
 ) -> Result<()> {
     config.validate()?;
     crate::encryption::load(config)?;
+    refuse_sealing_bucket(config, &*store)?;
     packer_loop(config, &store, &stop, Instant::now(), None);
+    Ok(())
+}
+
+/// `Unsupported(SEALING_BUCKET)` when the bucket's head is of format 1 to 4. No head yet is
+/// fine: this build creates format 5.
+fn refuse_sealing_bucket(config: &Config, store: &dyn ObjectStore) -> Result<()> {
+    let keys = config.keys()?.for_open();
+    let retry = config.engine(crate::io::IoMode::Writer).retry;
+    let head_key = keys.head();
+    let Some(obj) = with_retry(&retry, &head_key, |_| store.get(&head_key))? else {
+        return Ok(());
+    };
+    if keys.decode_head_open(&obj.body)?.format != FORMAT_V5 {
+        return Err(Error::Unsupported(SEALING_BUCKET));
+    }
     Ok(())
 }
 

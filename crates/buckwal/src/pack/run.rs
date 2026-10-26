@@ -50,6 +50,10 @@ pub(crate) const PART_CONCURRENCY: usize = 8;
 /// The most pointer writes one run sends before it gives up (`Failed` at `pointer`), when each
 /// one gets a 412 or an unknown result and the pointer read after it still allows a retry.
 const MAX_POINTER_WRITES: u32 = 10;
+/// The refusal of a pack run, and of `run_packer`, against a bucket of format 1 to 4: such a
+/// bucket seals and reads no pack.
+pub(crate) const SEALING_BUCKET: &str =
+    "a pack run of a bucket of format 1 to 4 (it seals; run buckwal upgrade)";
 
 /// How a pack run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1057,15 +1061,10 @@ impl Run<'_> {
             .req(&head_key, || self.store.get(&head_key))?
             .ok_or_else(|| Error::NotFound(head_key.clone()))?;
         let head = self.keys.decode_head_open(&head_obj.body)?;
-        if head.journal_mode == JournalMode::Mvcc && head.format != FORMAT_V5 {
-            return Err(Error::Unsupported(
-                "a pack run of an MVCC bucket of format 2 or 4 (it seals)",
-            ));
-        }
-        if self.keys.coded() && self.keys.known_database_id().is_none() {
-            return Err(Error::Unsupported(
-                "a pack run of an encrypted bucket without a database id (format 3)",
-            ));
+        // Formats 1 to 4 seal and read no pack (as `pack::check` refuses them too); a format 5
+        // head always has a database id, so a coded pointer can be decoded.
+        if head.format != FORMAT_V5 {
+            return Err(Error::Unsupported(SEALING_BUCKET));
         }
         let pointer_now = self.read_pointer()?;
         let base = pointer_now.own().cloned();
