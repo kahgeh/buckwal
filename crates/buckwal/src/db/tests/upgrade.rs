@@ -499,3 +499,119 @@ fn upgrade_into_a_directory_with_a_database_is_refused() {
     assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     assert_eq!(head(&*store), before, "nothing written");
 }
+
+#[test]
+fn upgrade_that_stalls_before_its_pointer_write_leaves_a_newer_upgrade_alone() {
+    for kind in [Legacy::F1, Legacy::F4] {
+        let store = mem();
+        let k = Arc::new(tempdir());
+        legacy_bucket(kind, &store, &k);
+        // Run A stalls just before it reads the pointer; run B starts and finishes meanwhile.
+        let b_report: Arc<std::sync::Mutex<Option<UpgradeReport>>> = Arc::default();
+        {
+            let (store, k, out) = (store.clone(), k.clone(), b_report.clone());
+            crate::upgrade::before_pointer_read_for_test(move || {
+                let (_t, r) = upgrade_into(kind, store, &k);
+                *out.lock().unwrap() = Some(r.expect("run B"));
+            });
+        }
+        let (_a, a) = upgrade_into(kind, store.clone(), &k);
+        assert!(matches!(a, Err(Error::Fenced(_))), "{kind:?}: run A: {a:?}");
+        let b = b_report.lock().unwrap().take().expect("run B ran");
+        // The pointer and the head are run B's, and the bucket restores.
+        assert_upgraded(kind, &store, &k, &b);
+        let raw = store.get(&keys().pack_pointer()).unwrap().unwrap().body;
+        assert!(
+            String::from_utf8_lossy(&raw).contains(keys().relative(&b.pack_key)),
+            "{kind:?}: the pointer is not run B's"
+        );
+    }
+}
+
+#[test]
+fn upgrade_with_too_little_free_disk_fences_nothing() {
+    let store = mem();
+    let k = tempdir();
+    let (_t, db, c) = legacy_writer(Legacy::F1, &store, &k);
+    let before = head(&*store);
+    let r = {
+        let _free = crate::pack::run::FreeDiskForTest::set(4096);
+        upgrade_into(Legacy::F1, store.clone(), &k).1
+    };
+    match r {
+        Err(Error::Config(m)) => assert!(m.contains("free"), "{m}"),
+        r => panic!("expected Config, got {r:?}"),
+    }
+    assert_eq!(head(&*store), before, "nothing written");
+    // The old writer is not fenced.
+    put_rows(&c, 31..=31);
+    c.close().unwrap();
+    db.close().unwrap();
+    assert_eq!(restored(Legacy::F1, &store, &k).1, want(1..=31));
+}
+
+#[test]
+fn upgrade_of_a_bucket_that_never_sealed_restores_equal() {
+    let store = mem();
+    let k = tempdir();
+    let t = tempdir();
+    let db = {
+        let _seal = crate::format::LegacySeal::on();
+        open_with_store(config(&fresh(&t)), store.clone()).unwrap()
+    };
+    let c = db.connect().unwrap();
+    create(&c);
+    put_rows(&c, 1..=30);
+    // A crash: no close, so no checkpoint or seal at the end.
+    crash(db, vec![c]);
+    let h = head(&*store);
+    assert_eq!((h.format, h.manifest), (FORMAT, None));
+    let (_u, r) = upgrade_into(Legacy::F1, store.clone(), &k);
+    let r = r.unwrap();
+    assert_upgraded(Legacy::F1, &store, &k, &r);
+}
+
+#[test]
+fn upgrade_error_after_the_head_write_names_the_next_step() {
+    let store = mem();
+    let k = tempdir();
+    legacy_bucket(Legacy::F1, &store, &k);
+    // The first pointer PUT lands; its rewrite after the head fails.
+    let f = Arc::new(FaultStore::new(store.clone()));
+    f.only_keys_containing(&keys().pack_pointer());
+    f.fail_puts_after(1);
+    let t = tempdir();
+    let r = upgrade_with_store(&short(Legacy::F1, &fresh(&t), &k), f, &fresh(&t));
+    let m = match r {
+        Err(e) => e.to_string(),
+        Ok(r) => panic!("expected an error, got {r:?}"),
+    };
+    assert!(m.contains("already upgraded to format 5"), "{m}");
+    assert!(m.contains("restore"), "{m}");
+    assert_eq!(head(&*store).format, FORMAT_V5);
+    assert_eq!(restored(Legacy::F1, &store, &k).1, want(1..=30));
+    // A second run names the same next step.
+    let (_u, again) = upgrade_into(Legacy::F1, store.clone(), &k);
+    match again {
+        Err(Error::Config(m)) => assert!(m.contains("restore"), "{m}"),
+        r => panic!("expected Config, got {r:?}"),
+    }
+}
+
+#[test]
+fn upgrade_into_another_file_system_copies_the_pack() {
+    let store = mem();
+    let k = tempdir();
+    legacy_bucket(Legacy::F1, &store, &k);
+    let (t, r) = {
+        let _x = crate::restore::CrossDeviceForTest::set();
+        upgrade_into(Legacy::F1, store.clone(), &k)
+    };
+    let r = r.unwrap();
+    assert_eq!(
+        std::fs::read(fresh(&t).join("app.db")).unwrap(),
+        store.get(&r.pack_key).unwrap().unwrap().body
+    );
+    let db = open_with_store(config(&fresh(&t)), store.clone()).unwrap();
+    assert_eq!(all_rows(&db.connect().unwrap()), want(1..=30));
+}

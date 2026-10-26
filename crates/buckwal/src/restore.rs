@@ -1233,12 +1233,46 @@ pub(crate) fn move_restored(staging: &Path, dir: &Path) -> Result<()> {
     for f in RESTORED {
         let from = staging.join(f);
         if from.exists() {
-            fs::rename(&from, dir.join(f)).map_err(|e| io_err("move restored file", e))?;
+            rename_or_copy(&from, &dir.join(f))?;
         }
     }
     fsync_dir(dir)?;
     fs::remove_file(dir.join(RESTORING_FILE)).map_err(|e| io_err("remove restore marker", e))?;
     fsync_dir(dir)
+}
+
+/// Move the file `from` to `to`: a rename, or, when `to` is on another file system (`EXDEV`:
+/// for example a directory that is a mount point, with its staging directory in the parent),
+/// a copy that is fsynced, then the removal of `from`.
+pub(crate) fn rename_or_copy(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(test)]
+    let forced = CROSS_DEVICE.with(|f| f.get());
+    #[cfg(not(test))]
+    let forced = false;
+    let renamed = if forced {
+        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+    } else {
+        fs::rename(from, to)
+    };
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            fs::copy(from, to).map_err(|e| {
+                io_err(
+                    &format!("copy {} to another file system", from.display()),
+                    e,
+                )
+            })?;
+            fs::File::open(to)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| io_err("fsync a copied file", e))?;
+            fs::remove_file(from).map_err(|e| io_err("remove a copied file", e))
+        }
+        Err(e) => Err(io_err(
+            &format!("move {} to {}", from.display(), to.display()),
+            e,
+        )),
+    }
 }
 
 /// Remove what an interrupted restore of `dir` left: staging directories next to it
@@ -1266,4 +1300,29 @@ pub(crate) fn remove_restored(dir: &Path) -> Result<()> {
         }
     }
     fsync_dir(dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CROSS_DEVICE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: while alive, each rename of `rename_or_copy` on this thread fails as a rename to
+/// another file system does (`EXDEV`).
+#[cfg(test)]
+pub(crate) struct CrossDeviceForTest;
+
+#[cfg(test)]
+impl CrossDeviceForTest {
+    pub(crate) fn set() -> CrossDeviceForTest {
+        CROSS_DEVICE.with(|f| f.set(true));
+        CrossDeviceForTest
+    }
+}
+
+#[cfg(test)]
+impl Drop for CrossDeviceForTest {
+    fn drop(&mut self) {
+        CROSS_DEVICE.with(|f| f.set(false));
+    }
 }

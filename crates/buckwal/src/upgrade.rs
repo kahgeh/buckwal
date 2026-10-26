@@ -39,7 +39,7 @@ use crate::format::{Head, Keys, LocalState, FORMAT_V4, FORMAT_V5};
 use crate::pack::first::{self, FirstPack};
 use crate::restore::{
     apply_images_over, db_facts, fetch_generation, fsync_dir, local_format, move_restored,
-    repair_wal_without_log, replay, write_synced,
+    rename_or_copy, repair_wal_without_log, replay, write_synced,
 };
 use crate::store::{with_retry, CondPut, ObjectStore};
 use std::fs;
@@ -118,9 +118,13 @@ pub fn upgrade_with_store(
     let before = keys.decode_head_open(&obj.body)?;
     if before.format == FORMAT_V5 {
         return Err(Error::Config(
-            "the bucket is already of format 5: there is nothing to upgrade".into(),
+            "the bucket is already of format 5: there is nothing to upgrade. To continue the \
+             database on this machine, restore it, or open an empty directory as the writer \
+             (sql --claim)"
+                .into(),
         ));
     }
+    check_free_disk(&*store, &keys, &cfg, &before, &dir)?;
     let staging = staging_dir(&dir)?;
     let r = run(config, &cfg, &store, &keys, &dir, &staging, start);
     let _ = fs::remove_dir_all(&staging);
@@ -195,8 +199,7 @@ fn run(
     // Step 3: the pack and its codes.
     let pointer = first::upload_first(&**store, &new_keys, retry, &db, page_size, target)?;
     // Step 4: the pointer, while the head is still the takeover's.
-    check_head(&**store, keys, cfg, &etag)?;
-    let replaced_pointer = write_pointer(&**store, &new_keys, cfg, &pointer)?;
+    let replaced_pointer = write_pointer(&**store, keys, &new_keys, cfg, &pointer, &etag)?;
     // Step 5: the head at format 5, last.
     let new_head = Head {
         format: FORMAT_V5,
@@ -206,6 +209,8 @@ fn run(
         ..head.clone()
     };
     let new_etag = put_head(&**store, &new_keys, cfg, &new_head, &etag)?;
+    // From here on the bucket is a good format 5 bucket: the pointer names the pack. An error
+    // tells the operator so, and names the next step.
     first::rewrite_after_head(
         &**store,
         &new_keys,
@@ -213,7 +218,8 @@ fn run(
         &FirstPack {
             pointer: pointer.clone(),
         },
-    )?;
+    )
+    .map_err(after_head)?;
     tracing::info!(
         target: "buckwal",
         from_format = head.format,
@@ -226,7 +232,7 @@ fn run(
         "upgrade finished"
     );
     // Step 6: the restored copy of the new head in `dir`.
-    write_copy(&work, staging, dir, &new_head, &new_etag)?;
+    write_copy(&work, staging, dir, &new_head, &new_etag).map_err(after_head)?;
     Ok(UpgradeReport {
         from_format: head.format,
         from_generation: head.generation,
@@ -247,6 +253,69 @@ fn changed() -> Error {
          the database over); the bucket keeps its old format; run the upgrade again"
             .into(),
     )
+}
+
+/// The error of a step after the head write, which the bucket no longer needs: the same kind,
+/// with a text that tells the operator that the bucket is upgraded and what to do next.
+fn after_head(e: Error) -> Error {
+    let m = |m: String| {
+        format!(
+            "the bucket is already upgraded to format 5, but a step after the head write \
+             failed: {m}. Do not run the upgrade again: restore the database into an empty \
+             directory, or open an empty directory as the writer (sql --claim)"
+        )
+    };
+    match e {
+        Error::Fenced(s) => Error::Fenced(m(s)),
+        Error::Timeout(s) => Error::Timeout(m(s)),
+        Error::NotFound(s) => Error::NotFound(m(s)),
+        Error::Unsupported(s) => Error::Io(m(s.to_string())),
+        Error::UploadFailed(s) => Error::UploadFailed(m(s)),
+        Error::Locked(s) => Error::Locked(m(s)),
+        Error::AlreadyOpen(s) => Error::AlreadyOpen(m(s)),
+        Error::Corrupt(s) => Error::Corrupt(m(s)),
+        Error::Bucket(s) => Error::Bucket(m(s)),
+        Error::Engine(s) => Error::Engine(m(s)),
+        Error::Io(s) => Error::Io(m(s)),
+        Error::Config(s) => Error::Config(m(s)),
+        Error::Encryption(s) => Error::Encryption(m(s)),
+        Error::Stale(s) => Error::Stale(m(s)),
+    }
+}
+
+/// Before the takeover, so that a disk that is too small fences no writer: the filesystem that
+/// holds the staging directory (`dir`'s parent) must have the database size, `page_count ×
+/// page_size` of the head's manifest, plus 10% free (the rule of a pack run). A bucket that
+/// never sealed has no manifest; its database is only the log of one generation, and the
+/// check asks for nothing more.
+fn check_free_disk(
+    store: &dyn ObjectStore,
+    keys: &Keys,
+    cfg: &EngineConfig,
+    head: &Head,
+    dir: &Path,
+) -> Result<()> {
+    let Some(m) = head.manifest else {
+        return Ok(());
+    };
+    let key = keys.manifest(m);
+    let body = with_retry(&cfg.retry, &key, |_| store.get(&key))?
+        .ok_or_else(|| Error::NotFound(key.clone()))?
+        .body;
+    let manifest = keys.decode_manifest(&body, m)?;
+    let size = u64::from(manifest.page_count) * u64::from(manifest.page_size);
+    let need = size + size / 10;
+    let at = dir.parent().unwrap_or(dir);
+    let free = crate::pack::run::free_disk(at)?;
+    if free < need {
+        return Err(Error::Config(format!(
+            "{} has {free} bytes free; the upgrade needs {need} (the database, {size} bytes, \
+             plus 10%) to build the first pack. Nothing was written to the bucket, and the \
+             writer keeps running",
+            at.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Every page that manifest `m` names, written into `db` at its place, `cfg.upload_concurrency`
@@ -344,21 +413,41 @@ fn check_head(store: &dyn ObjectStore, keys: &Keys, cfg: &EngineConfig, etag: &s
 const MAX_ROUNDS: u32 = 10;
 
 /// Step 4: `pointer` as `pack-latest`: `If-None-Match` when there is none, else `If-Match` on
-/// the ETag of the leftover just read (the head is of the old format the whole time, so the
-/// leftover can only be an earlier upgrade run's). Returns whether a leftover was replaced.
+/// the ETag of the leftover just read. Returns whether a leftover was replaced.
+///
+/// Each round first checks that the head is still the takeover's (`etag`, read with `keys`).
+/// A leftover pointer whose pack generation is at or above this run's is never replaced: only
+/// a later upgrade run can have written it (each takeover raises the floor, so each later run
+/// has a higher pack generation), and that run may already have written its format 5 head. This
+/// run is then `Fenced`. So a run that stalls anywhere in this step cannot put its pointer over
+/// the pointer of a newer run.
 fn write_pointer(
     store: &dyn ObjectStore,
     keys: &Keys,
+    new_keys: &Keys,
     cfg: &EngineConfig,
     pointer: &crate::pack::PackPointer,
+    etag: &str,
 ) -> Result<bool> {
-    let key = keys.pack_pointer();
-    let body = keys.encode_pointer(pointer);
+    let key = new_keys.pack_pointer();
+    let body = new_keys.encode_pointer(pointer);
     let retry = &cfg.retry;
     for _ in 0..MAX_ROUNDS {
+        check_head(store, keys, cfg, etag)?;
+        #[cfg(test)]
+        if let Some(f) = BEFORE_POINTER_READ.with(|h| h.borrow_mut().take()) {
+            f();
+        }
         let (put, replaced) = match with_retry(retry, &key, |_| store.get(&key))? {
             // An earlier attempt of this write landed.
             Some(o) if o.body == body => return Ok(false),
+            Some(o)
+                if new_keys
+                    .pointer_pack_generation(&o.body)
+                    .is_some_and(|g| g >= pointer.pack_generation) =>
+            {
+                return Err(changed());
+            }
             Some(o) => (
                 with_retry(retry, &key, |_| store.put_if_match(&key, &body, &o.etag))?,
                 true,
@@ -408,8 +497,7 @@ fn put_head(
 fn write_copy(work: &Path, staging: &Path, dir: &Path, head: &Head, etag: &str) -> Result<()> {
     let copy = staging.join("copy");
     fs::create_dir_all(&copy).map_err(|e| io_err("create the upgrade's copy dir", e))?;
-    fs::rename(work.join(DB_FILE), copy.join(DB_FILE))
-        .map_err(|e| io_err("move the first pack", e))?;
+    rename_or_copy(&work.join(DB_FILE), &copy.join(DB_FILE))?;
     // The log of the head's generation is empty: nothing is written to it before a claim.
     write_synced(&copy.join(WAL_FILE), b"")?;
     if head.journal_mode == JournalMode::Mvcc {
@@ -504,4 +592,17 @@ fn staging_dir(dir: &Path) -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     Ok(parent.join(format!("{prefix}{}-{nanos}", std::process::id())))
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_POINTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: the next upgrade on this thread runs `f` once, in its pointer write, just before
+/// it reads the pointer (an upgrade that stalls there).
+#[cfg(test)]
+pub(crate) fn before_pointer_read_for_test(f: impl FnOnce() + 'static) {
+    BEFORE_POINTER_READ.with(|h| *h.borrow_mut() = Some(Box::new(f)));
 }

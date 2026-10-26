@@ -510,6 +510,14 @@ impl Keys {
         ok.then(|| (generation, run.to_string()))
     }
 
+    /// The pack generation of the pointer in `body`, from its `pack_key`, whatever its
+    /// `database_id` and with no integrity check: `None` when it is not a pointer. `buckwal
+    /// upgrade` reads a leftover pointer with it, which can be of another database id.
+    pub(crate) fn pointer_pack_generation(&self, body: &[u8]) -> Option<u64> {
+        let (p, _) = PackPointer::decode_fields(body).ok()?;
+        self.parse_pack(&self.join(&p.pack_key)).map(|(g, _)| g)
+    }
+
     /// The generation and run id of a pack codes key (`pack/<generation>/<run id>.codes`).
     pub(crate) fn parse_pack_codes(&self, key: &str) -> Option<(u64, String)> {
         self.parse_pack(key.strip_suffix(".codes")?)
