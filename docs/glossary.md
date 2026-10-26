@@ -84,7 +84,7 @@ One line per term, as the code on this branch uses it: the meaning, then "Not:",
 - **kept copy**: the file a packer keeps on its disk after a run, `<pack directory>/pack-copy/app.db` with `pack-copy/state.json`, equal to the pack it made, so the next run needs no download of the pack (only its codes and the log). A run uses it only when it holds the lock, the state file names the pointer's pack and every block matches the codes; else it deletes it and downloads. Not: cache, working copy, local pack.
 - **orphan pack**: a complete pack that the pointer never named, for example the pack of a run that was superseded or crashed. GC deletes it after the orphan grace. Not: stale pack, leftover.
 - **GC base**: the newest pack, at or below the pointer's pack generation, whose codes object is older than the pack keep time by the bucket's clock. GC deletes packs and log only below it. Not: GC floor, watermark.
-- **pack keep time**: how long GC keeps an older pack, and the log it needs, after a newer pack replaced it: 4 times the download time of the newest pack at 60 MB/s, at least the trim grace (10 min for 1 GB), or `BUCKWAL_PACK_KEEP_SECS`. Not: trim grace (a different, shorter wait), retention.
+- **pack keep time**: how long GC keeps an older pack, and the log it needs, after a newer pack replaced it: 4 times the download time of the newest pack at 60 MB/s, at least the trim grace (10 min for 1 GB), or `BUCKWAL_PACK_KEEP_SECS`. Not: trim grace (a different wait, shorter or equal), retention.
 - **orphan grace**: how long an orphan pack stays, from its upload start, before GC deletes it (`BUCKWAL_PACK_ORPHAN_GRACE_SECS`, 6 h by default). A pack run gives up at half of it. Not: trim grace (a different, shorter wait), timeout.
 
 ## Not yet consistent

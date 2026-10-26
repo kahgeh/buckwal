@@ -21,7 +21,7 @@ pub(crate) struct PackCodes {
 /// What every code covers, besides its own kind and data.
 struct Binding<'a> {
     keys: &'a Keys,
-    /// The database id ("" in a plaintext bucket, which has none).
+    /// The database id. A format 5 head has one in a plaintext bucket too.
     id: String,
     pack_key: &'a str,
     pack_generation: u64,
