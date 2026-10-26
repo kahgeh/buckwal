@@ -521,7 +521,7 @@ The revised spec replaced some of the notes above.
 - **Container.** With `BUCKWAL_RUSTFS_NOTIFY_PORT` set in TLS mode, `scripts/rustfs.sh` sets
   `RUSTFS_OUTBOUND_ALLOW_ORIGINS=https://host.containers.internal:<port>`, mounts the pass's
   `ca.pem` read only and sets `SSL_CERT_FILE`. `scripts/test.sh` gives the port (9305 + 10N) to the
-  `tls-rest` group only.
+  `tls-rest` group, and to pass 2 in serial mode.
 - **Bounds.** The test `tls_rustfs_delivers_events_to_a_replica_listener` does not write one
   object at a time. It waits 5 s for a lone commit after a 7 s quiet period, then 15 s for the last
   of ten commits written at once. Measured in nine solo runs: 0.14 to 0.70 s and 4.9 to 5.2 s.
