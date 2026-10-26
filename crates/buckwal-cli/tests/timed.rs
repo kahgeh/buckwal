@@ -5,6 +5,10 @@
 //!    longer than about four small requests (its own log upload, the seal-start record, the
 //!    head move and the WAL header record). The size-limit checkpoint pause is measured on
 //!    its own (the spec: the README states its value).
+//!    Two short phases at 50 ms add the commit that restarts the WAL itself (a PASSIVE
+//!    checkpoint, then one commit): with batching Off, its own log record and three small
+//!    requests; as a background commit (`background 5ms 64 1MiB 1000`), the records queued
+//!    before it, then three small requests (spec rev 31).
 //! 2. 20 ms added: a restore of a 1 GB pack with no log after it is fully local within 10 s,
 //!    and its open returns before the blocks are all local (Choice C).
 //! 3. 20 ms added: a pack run on 1 GB, 10% changed, finishes within 30 s.
@@ -29,7 +33,8 @@
 //! The delay proxy is a TCP proxy in this file: it holds the first bytes of each new request
 //! on a connection (the first bytes after a response, or the first on a new connection) for
 //! the delay, then forwards. So each request waits the delay once, and a large body or
-//! response streams at full speed after it.
+//! response streams at full speed after it. A new connection also waits the delay once for
+//! its TCP connect.
 mod common;
 
 use buckwal::store::s3::{S3Config, S3Store};
@@ -59,6 +64,13 @@ const SMALL_CAP: usize = 1500;
 const GOAL_REQUESTS: f64 = 4.0;
 /// "About" four: the measured commit passes at up to half a request more.
 const ABOUT: f64 = 0.5;
+/// Tries of the in-commit switch phases.
+const IN_COMMIT_TRIES: usize = 3;
+/// The background setting of the spec's timed test, its `max_behind`, and the record uploads
+/// the spec counts for it (about 57 commits per record).
+const BACKGROUND: &str = "background 5ms 64 1MiB 1000";
+const MAX_BEHIND: u32 = 1000;
+const BACKGROUND_UPLOADS: u32 = 18;
 const GOAL_RESTORE: Duration = Duration::from_secs(10);
 const GOAL_PACK: Duration = Duration::from_secs(30);
 
@@ -79,11 +91,20 @@ impl DelayProxy {
         std::thread::spawn(move || {
             for c in l.incoming() {
                 let Ok(client) = c else { continue };
-                // A failed connect drops the client: its request fails, as at a store outage.
-                let Ok(server) = TcpStream::connect(&upstream) else {
-                    continue;
-                };
-                pipe(client, server, d.clone(), r.clone());
+                let (d, r, upstream) = (d.clone(), r.clone(), upstream.clone());
+                // A new connection waits the delay once for its TCP connect, as on a real
+                // link, on its own thread so the accept loop goes on.
+                std::thread::spawn(move || {
+                    let ms = d.load(SeqCst);
+                    if ms > 0 {
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
+                    // A failed connect drops the client: its request fails, as at an outage.
+                    let Ok(server) = TcpStream::connect(&upstream) else {
+                        return;
+                    };
+                    pipe(client, server, d, r);
+                });
             }
         });
         DelayProxy {
@@ -141,10 +162,12 @@ fn pipe(client: TcpStream, server: TcpStream, delay_ms: Arc<AtomicU64>, requests
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
+            // Before the write: once the client has the response, its next request must find
+            // the flag set, or that request would skip its delay.
+            answered.store(true, SeqCst);
             if to.write_all(&buf[..n]).is_err() {
                 break;
             }
-            answered.store(true, SeqCst);
         }
         let _ = to.shutdown(Shutdown::Write);
     });
@@ -159,6 +182,7 @@ fn record(cfg: &mut Config, events: &Events) {
         if matches!(
             e,
             Event::GenerationSwitched { .. }
+                | Event::LogUploaded { .. }
                 | Event::MaintenanceStarted { .. }
                 | Event::MaintenanceFinished { .. }
                 | Event::MaintenanceSkipped { .. }
@@ -289,6 +313,18 @@ fn verdict(pass: bool) -> &'static str {
     }
 }
 
+/// The verdict of a wait of `n` small requests against "about four": above 4.0 and up to
+/// 4.0 + `ABOUT` is "about four", not a clean pass.
+fn about_four(n: f64) -> &'static str {
+    if n <= GOAL_REQUESTS {
+        "pass"
+    } else if n <= GOAL_REQUESTS + ABOUT {
+        "about four"
+    } else {
+        "miss"
+    }
+}
+
 fn env_u64(k: &str, default: u64) -> u64 {
     std::env::var(k)
         .ok()
@@ -326,16 +362,15 @@ fn small_put_median(ctx: &Ctx, endpoint: &str) -> Duration {
 }
 
 /// The time intervals during which a maintenance run held calls back (its gate wait and its
-/// checkpoint), from the `MaintenanceFinished` events.
+/// checkpoint), from the `MaintenanceFinished` events. `elapsed` is the whole run and
+/// includes `gate_wait`.
 fn maintenance_intervals(events: &Events) -> Vec<(Instant, Instant)> {
     events
         .lock()
         .unwrap()
         .iter()
         .filter_map(|(t, e)| match e {
-            Event::MaintenanceFinished {
-                gate_wait, elapsed, ..
-            } => Some((*t - *elapsed - *gate_wait, *t)),
+            Event::MaintenanceFinished { elapsed, .. } => Some((*t - *elapsed, *t)),
             _ => None,
         })
         .collect()
@@ -361,6 +396,105 @@ fn blocks_file(dir: &Path) -> PathBuf {
     dir.join("app.db-blocks")
 }
 
+/// One commit that did a generation switch.
+struct SwitchCommit {
+    wait: Duration,
+    /// Background commits behind (not yet in the bucket) just before it.
+    behind: u64,
+    /// Log records with commits that landed during its wait, before its switch.
+    records_before: usize,
+    /// The mean commits per record of those records.
+    commits_per_record: Option<f64>,
+    /// Background: the commits made to fill the queue before the checkpoint, and their time.
+    fill_commits: usize,
+    fill_time: Duration,
+}
+
+/// Open the writer of `dir` (packer thread off) with `batching` (Off when `None`), and
+/// `IN_COMMIT_TRIES` times: a few small commits (background: until `MAX_BEHIND` commits are
+/// behind, or 4000 commits, or 10 s), a PASSIVE checkpoint, then one small commit. Returns
+/// the commits that did the switch, and how many switches came in the checkpoint call.
+fn switch_in_commit(
+    ctx: &Ctx,
+    dir: &Path,
+    via: &str,
+    rng: &mut Lcg,
+    rows: u64,
+    batching: Option<buckwal::Batching>,
+) -> (Vec<SwitchCommit>, usize) {
+    let events: Events = Arc::default();
+    let mut cfg = cfg_at(ctx, dir, via, false);
+    if let Some(b) = batching {
+        cfg.batching = b;
+    }
+    record(&mut cfg, &events);
+    let (db, conn) = open_writer(cfg);
+    let mut found = Vec::new();
+    let mut in_checkpoint = 0;
+    for _ in 0..IN_COMMIT_TRIES {
+        let fill = Instant::now();
+        let mut fill_commits = 0;
+        loop {
+            small(&conn, rng, rows);
+            fill_commits += 1;
+            let enough = match batching {
+                None => fill_commits >= 5,
+                Some(_) => {
+                    db.upload_stats().commits_behind >= u64::from(MAX_BEHIND)
+                        || fill_commits >= 4000
+                        || fill.elapsed() > Duration::from_secs(10)
+                }
+            };
+            if enough {
+                break;
+            }
+        }
+        let fill_time = fill.elapsed();
+        let t = Instant::now();
+        conn.checkpoint(CheckpointMode::Passive).expect("passive");
+        let t_end = Instant::now();
+        in_checkpoint += switch_times(&events)
+            .iter()
+            .filter(|(s, _)| t <= *s && *s <= t_end)
+            .count();
+        let behind = db.upload_stats().commits_behind;
+        let c = small(&conn, rng, rows);
+        let end = c.start + c.wait;
+        let switched = switch_times(&events)
+            .into_iter()
+            .find(|(s, _)| c.start <= *s && *s <= end);
+        if let Some((at, _)) = switched {
+            let before: Vec<usize> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(u, e)| match e {
+                    Event::LogUploaded { commits, .. }
+                        if !commits.is_empty() && c.start <= *u && *u <= at =>
+                    {
+                        Some(commits.len())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let commits_per_record = (!before.is_empty())
+                .then(|| before.iter().sum::<usize>() as f64 / before.len() as f64);
+            found.push(SwitchCommit {
+                wait: c.wait,
+                behind,
+                records_before: before.len(),
+                commits_per_record,
+                fill_commits,
+                fill_time,
+            });
+        }
+        // Let the queue empty before the next try.
+        let _ = db.wait_durable(conn.last_commit().unwrap_or(0), Duration::from_secs(60));
+    }
+    close_writer(db, conn);
+    (found, in_checkpoint)
+}
+
 #[test]
 #[ignore = "timed: run alone on the solo RustFS container (file doc); not in ./scripts/test.sh"]
 fn timed_goal_packer_stage2() {
@@ -381,7 +515,7 @@ fn timed_goal_packer_stage2() {
     let proxy = DelayProxy::spawn(upstream);
     let via = proxy.endpoint();
     let mut out: Vec<String> = Vec::new();
-    let mut goals: Vec<(String, String, String, bool)> = Vec::new();
+    let mut goals: Vec<(String, String, String, &'static str)> = Vec::new();
     let mut note = |line: String| {
         eprintln!("timed: {line}");
         out.push(line);
@@ -585,7 +719,83 @@ fn timed_goal_packer_stage2() {
             ms(small_free),
             in_requests(small_free)
         ),
-        in_requests(small_free) <= limit,
+        about_four(in_requests(small_free)),
+    ));
+
+    // ---- Goal 1b: a generation switch inside an app commit, batching Off, at 50 ms. ----
+    // A PASSIVE checkpoint with no reader open backfills the whole WAL, so the next commit
+    // restarts the WAL: that commit does the switch (seal-start record, head move, WAL
+    // header record) and its own log record.
+    let (waits, in_checkpoint) = switch_in_commit(&ctx, &dir_w, &via, &mut rng, rows, None);
+    let r50b = small_put_median(&ctx, &via);
+    note(format!(
+        "in-commit switch, Off, 50 ms: {} tries, {} commits did the switch, {} switches came \
+         in the checkpoint call; their waits: [{}] (one small PUT now {})",
+        IN_COMMIT_TRIES,
+        waits.len(),
+        in_checkpoint,
+        waits
+            .iter()
+            .map(|s| format!("{} = {:.2} small requests", ms(s.wait), in_requests(s.wait)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        ms(r50b)
+    ));
+    let worst = waits.iter().map(|s| s.wait).max();
+    goals.push((
+        "1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small \
+         requests"
+            .into(),
+        format!("about 4 small requests (one = {})", ms(r50)),
+        match worst {
+            Some(w) => format!("{} = {:.2} small requests", ms(w), in_requests(w)),
+            None => "not measured: no commit did the switch".into(),
+        },
+        worst.map_or("not measured", |w| about_four(in_requests(w))),
+    ));
+
+    // ---- The background case: `background 5ms 64 1MiB 1000`, at 50 ms. ----
+    let batching: buckwal::Batching = BACKGROUND.parse().expect("background setting");
+    let (bg, _) = switch_in_commit(&ctx, &dir_w, &via, &mut rng, rows, Some(batching));
+    for (i, s) in bg.iter().enumerate() {
+        note(format!(
+            "background switch commit {i}: wait {} ; {} commits behind before it ; {} log \
+             records landed during its wait before the switch ; {} commits per record \
+             (mean of the records before it) ; filled the queue with {} commits in {}",
+            ms(s.wait),
+            s.behind,
+            s.records_before,
+            s.commits_per_record
+                .map_or("-".to_string(), |c| format!("{c:.1}")),
+            s.fill_commits,
+            ms(s.fill_time)
+        ));
+    }
+    // The spec's bound: the records queued before it (at most max_behind commits; about 18
+    // uploads, about 1 s at this setting and 50 ms), then three small requests.
+    let bound = r50 * (BACKGROUND_UPLOADS + 3);
+    let worst_bg = bg.iter().max_by_key(|s| s.wait);
+    goals.push((
+        format!("1c. background commit that restarts the WAL at 50 ms, `{BACKGROUND}`"),
+        format!(
+            "records queued before it (at most {MAX_BEHIND} commits, about \
+             {BACKGROUND_UPLOADS} uploads, about 1 s), then three small requests: about {} \
+             ({BACKGROUND_UPLOADS} + 3 small requests)",
+            ms(bound)
+        ),
+        match worst_bg {
+            Some(s) => format!(
+                "{} = {:.2} small requests; {} commits behind, {} records before the switch",
+                ms(s.wait),
+                in_requests(s.wait),
+                s.behind,
+                s.records_before
+            ),
+            None => "not measured: no background commit did the switch".into(),
+        },
+        worst_bg.map_or("not measured", |s| {
+            verdict(s.wait <= bound && s.behind <= u64::from(MAX_BEHIND))
+        }),
     ));
 
     // ---- Goal 3: a pack run at 20 ms, 10% changed. ----
@@ -631,13 +841,13 @@ fn timed_goal_packer_stage2() {
         ),
         format!("within {} s", GOAL_PACK.as_secs()),
         format!("{:.1} s", kept.elapsed.as_secs_f64()),
-        kept.elapsed <= GOAL_PACK,
+        verdict(kept.elapsed <= GOAL_PACK),
     ));
     goals.push((
         format!("3b. pack run at 20 ms, {size_mb} MiB, 10% changed, new pack directory"),
         format!("within {} s", GOAL_PACK.as_secs()),
         format!("{:.1} s", fresh.elapsed.as_secs_f64()),
-        fresh.elapsed <= GOAL_PACK,
+        verdict(fresh.elapsed <= GOAL_PACK),
     ));
 
     // ---- Goal 2: restore at 20 ms, a pack and no log after it. ----
@@ -690,7 +900,7 @@ fn timed_goal_packer_stage2() {
             t_local.as_secs_f64(),
             t_open.as_secs_f64()
         ),
-        t_local <= GOAL_RESTORE && blocks_at_open,
+        verdict(t_local <= GOAL_RESTORE && blocks_at_open),
     ));
 
     // ---- Goal 4: two packers at once at 20 ms, then GC. ----
@@ -807,19 +1017,20 @@ fn timed_goal_packer_stage2() {
                 "not only the newest pack"
             }
         ),
-        one_pack,
+        verdict(one_pack),
     ));
     note(format!("proxy requests: {}", proxy.requests.load(SeqCst)));
 
-    for (name, goal, measured, pass) in &goals {
-        note(format!(
-            "goal | {name} | {goal} | {measured} | {}",
-            verdict(*pass)
-        ));
+    for (name, goal, measured, result) in &goals {
+        note(format!("goal | {name} | {goal} | {measured} | {}", result));
     }
     if let Ok(path) = std::env::var("BUCKWAL_TIMED_RESULTS") {
         std::fs::write(&path, out.join("\n") + "\n").expect("write the results");
     }
-    let missed: Vec<&String> = goals.iter().filter(|g| !g.3).map(|g| &g.0).collect();
+    let missed: Vec<&String> = goals
+        .iter()
+        .filter(|g| g.3 == "miss")
+        .map(|g| &g.0)
+        .collect();
     assert!(missed.is_empty(), "goals missed: {missed:?}");
 }
