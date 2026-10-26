@@ -31,7 +31,7 @@ make_ca other-ca "buckwal unrelated CA"
 
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server/rustfs_key.pem
 openssl req -new -key server/rustfs_key.pem -subj /CN=localhost -out server.csr
-EXT="$(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n')"
+EXT="$(printf 'subjectAltName=DNS:localhost,DNS:host.containers.internal,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n')"
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -sha256 \
   -extfile <(printf '%s\n' "$EXT") -out server/rustfs_cert.pem
 
