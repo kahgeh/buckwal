@@ -33,6 +33,8 @@
 #             built once in a temporary git worktree (--locked --offline) and kept under the
 #             shared git directory (buckwal-released/<commit>/buckwal); the upgrade system test
 #             makes its format 1 and format 4 buckets with it (BUCKWAL_TEST_RELEASED_BIN).
+#             The timed packer test (crates/buckwal-cli/tests/timed.rs, names with
+#             `timed_goal_`) is in no pass and no group: run it alone (see its file doc).
 #   unit      fmt, clippy, unit tests only
 # BUCKWAL_TEST_SERIAL=1 ./scripts/test.sh runs the two passes one after the other on the
 # run slot's single container, the way this script ran before the groups: for a failure that might
@@ -258,7 +260,7 @@ serial_main() {
   echo "$PASS" >"$WORK0/pass"
   scripts/rustfs.sh reset
   eval "$(scripts/rustfs.sh env)"
-  BUCKWAL_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1 --skip tls_
+  BUCKWAL_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1 --skip tls_ --skip timed_goal_
   sample
   cli scan --all --expect present
   peak "$PASS"
@@ -271,7 +273,7 @@ serial_main() {
   export BUCKWAL_TLS_DIR="$TLS_DIR/m" BUCKWAL_ENCRYPTION_KEY_FILE="$TLS_DIR/m/encryption.key"
   scripts/rustfs.sh reset
   eval "$(scripts/rustfs.sh env)"
-  BUCKWAL_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1
+  BUCKWAL_KEEP_PREFIXES=1 cargo test --workspace --locked -- --ignored --test-threads=1 --skip timed_goal_
 
   # A short workload under the run id, so every span kind is exported, with a marker row the
   # scan must not find.
@@ -313,13 +315,15 @@ rustfs_of() {
 }
 
 # The cargo commands of a selection, with the test arguments after `--` given in "$@".
-#   all: every test target of the workspace (today's pass, as one command)
+#   all: every test target of the workspace (today's pass, as one command), less the timed
+#        tests (names with `timed_goal_`, crates/buckwal-cli/tests/timed.rs): they run alone
+#        on the solo container, never in a pass, and `sys` and `rest` never name their binary
 #   sys: the `system` binary of buckwal-cli
 #   rest: every other test target
 cargo_sel() {
   local sel="$1"; shift
   case "$sel" in
-    all) cargo test --workspace --locked -- "$@" ;;
+    all) cargo test --workspace --locked -- --skip timed_goal_ "$@" ;;
     sys) cargo test --locked -p buckwal-cli --test system -- "$@" ;;
     rest)
       local rc=0
