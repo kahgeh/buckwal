@@ -241,7 +241,8 @@ serial_main() {
   released_build
   export BUCKWAL_RUSTFS_NAME="buckwal-rustfs-s$SLOT" BUCKWAL_RUSTFS_VOLUME="buckwal-objects-s$SLOT" \
     BUCKWAL_RUSTFS_PORT="$((9304 + 10 * SLOT))"
-  check_ports "$BUCKWAL_RUSTFS_PORT"
+  export BUCKWAL_RUSTFS_NOTIFY_PORT="$(notify_port)"
+  check_ports "$BUCKWAL_RUSTFS_PORT" "$BUCKWAL_RUSTFS_NOTIFY_PORT"
   WORK0="$(mktemp -d "$TMP/buckwal-test.XXXXXX")"
   TLS_DIR="$(mktemp -d "$TMP/buckwal-tls.XXXXXX")"
   : >"$WORK0/disk"
@@ -298,7 +299,10 @@ serial_main() {
 # Parallel run: four groups, each with its own RustFS container, volume and port.
 # ---------------------------------------------------------------------------------------
 GROUPS_ALL=(plain-sys plain-rest tls-sys tls-rest)
-# Run slot N's ports are 9300 + 10N to 9303 + 10N (serial mode: 9304 + 10N).
+# Run slot N's ports are 9300 + 10N to 9303 + 10N (serial mode: 9304 + 10N). The listener port of
+# the replica delivery test is 9305 + 10N: RustFS may send bucket events to it (see rustfs.sh,
+# BUCKWAL_RUSTFS_NOTIFY_PORT). Only the container of that test gets it.
+notify_port() { echo $((9305 + 10 * SLOT)); }
 group_port() {
   case "$1" in
     plain-sys) echo $((9300 + 10 * SLOT)) ;; plain-rest) echo $((9301 + 10 * SLOT)) ;;
@@ -385,6 +389,7 @@ start_group() {
     case "$g" in
       tls-*) export BUCKWAL_TLS_DIR="$TLS_DIR/m" BUCKWAL_ENCRYPTION_KEY_FILE="$TLS_DIR/m/encryption.key" ;;
     esac
+    [[ "$g" == tls-rest ]] && export BUCKWAL_RUSTFS_NOTIFY_PORT="$(notify_port)"
     scripts/rustfs.sh reset
     eval "$(scripts/rustfs.sh env)"
     export BUCKWAL_KEEP_PREFIXES=1
@@ -436,7 +441,7 @@ parallel_main() {
   released_build
   check_test_lists
 
-  check_ports "$(group_port plain-sys)" "$(group_port plain-rest)" "$(group_port tls-sys)" "$(group_port tls-rest)"
+  check_ports "$(group_port plain-sys)" "$(group_port plain-rest)" "$(group_port tls-sys)" "$(group_port tls-rest)" "$(notify_port)"
   scripts/tls-material.sh "$TLS_DIR/m"
   (while kill -0 $$ 2>/dev/null && sleep 15; do sample_parallel; done) &
   SAMPLER=$!
