@@ -1797,7 +1797,7 @@ fn notify_setup_prefixes(ctx: &Ctx, bucket: &str) -> Vec<String> {
 }
 
 /// One call to the RustFS admin or S3 API with `curl` (the keys go in through stdin, not in
-/// the argument list): the status and the body.
+/// the argument list; the target's token is in `body` and so in it): the status and the body.
 fn rustfs_call(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
     use std::io::Write;
     let ca = ctx
@@ -1974,13 +1974,18 @@ impl PublicFollower {
         }
     }
 
-    /// The first line at or after `from` that `p` accepts, waiting up to `limit`.
+    /// Take in the lines that have arrived.
+    fn drain(&mut self) {
+        while let Ok(l) = self.rx.try_recv() {
+            self.lines.push(l);
+        }
+    }
+
+    /// Wait until a line at or after `from` is accepted by `p`, up to `limit`.
     fn wait_line(&mut self, from: usize, what: &str, limit: Duration, p: impl Fn(&str) -> bool) {
         let deadline = Instant::now() + limit;
         loop {
-            while let Ok(l) = self.rx.try_recv() {
-                self.lines.push(l);
-            }
+            self.drain();
             if self.lines[from.min(self.lines.len())..]
                 .iter()
                 .any(|l| p(l))
@@ -2048,6 +2053,7 @@ fn tls_rustfs_delivers_events_to_a_replica_listener() {
 
     let mut w = Writer::open(ctx.config(&ctx.dir("a")));
     w.insert_range(1..=20);
+    let started = Instant::now();
     let mut f = PublicFollower::spawn(
         &ctx,
         &ctx.dir("r"),
@@ -2070,12 +2076,21 @@ fn tls_rustfs_delivers_events_to_a_replica_listener() {
     );
 
     // A quiet period longer than RustFS's batching window, so the next event is a lone one.
+    let quiet_from = f.lines.len();
     std::thread::sleep(Duration::from_secs(7));
+    f.drain();
+    assert!(
+        !f.lines[quiet_from..]
+            .iter()
+            .any(|l| l.starts_with("notified ")),
+        "an event arrived in the quiet period: {:?}",
+        f.lines
+    );
     let from = f.lines.len();
     w.insert(21);
+    let t0 = Instant::now();
     let g = ctx.head().generation;
     let n = ctx.assert_log_contiguous(g);
-    let t0 = Instant::now();
     f.applied(from, g, n, Duration::from_secs(5));
     let lone = t0.elapsed();
     f.wait_line(from, "notified", Duration::from_secs(1), |l| {
@@ -2084,12 +2099,12 @@ fn tls_rustfs_delivers_events_to_a_replica_listener() {
 
     // A burst: the replica applies the last commit within 15 s.
     let from = f.lines.len();
+    let t0 = Instant::now();
     for id in 22..=31 {
         w.insert(id);
     }
     let g = ctx.head().generation;
     let n = ctx.assert_log_contiguous(g);
-    let t0 = Instant::now();
     f.applied(from, g, n, Duration::from_secs(15));
     eprintln!(
         "tls_rustfs_delivers_events_to_a_replica_listener: lone commit {lone:?}; last of a burst {:?}",
@@ -2099,6 +2114,12 @@ fn tls_rustfs_delivers_events_to_a_replica_listener() {
         l.starts_with("notified ")
     });
 
+    // The slow poll (60 s) never ran in the measured windows, so only events woke the replica.
+    assert!(
+        started.elapsed() < Duration::from_secs(55),
+        "the windows ran into the slow poll: {:?}",
+        started.elapsed()
+    );
     f.stop();
     w.close().expect("close writer");
 }

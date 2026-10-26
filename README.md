@@ -1061,7 +1061,7 @@ The replica keeps a *position file* `app.db-replica` (generation, stage, frame o
   - The listener must run when the target is made, and its certificate must name the host RustFS calls.
   - RustFS sends the token as `Authorization: Bearer <token>`.
   - Events sent while a listener is down are **kept** in the target's `queue_dir` and arrive after it starts (seen for a 10 s outage), unlike SNS.
-  - Delay: a lone event arrives in about 0.5 s. In a burst, the first event comes at once and the later events arrive together about 5 s later. The test bounds are 5 s for a lone commit and 15 s for the last commit of a burst (measured: 0.5 to 0.7 s and 4.9 to 5.1 s).
+  - Delay: a lone event arrives in about 0.5 s. In a burst, the first event comes at once and the later events arrive together about 5 s later. The test bounds are 5 s for a lone commit and 15 s for the last commit of a burst (measured: 0.1 to 0.7 s and 4.9 to 5.2 s).
 
 **Lag.**
 - On the notification path: the bucket's delivery delay, plus one LIST and one GET round trip, plus the writer's own commit time. S3's delay is not guaranteed (usually seconds, sometimes a minute or more), so on AWS this path is usually slower than polling every second would be. For sub-second lag on AWS, lower `BUCKWAL_REPLICA_POLL_MS` and pay the polling cost below.

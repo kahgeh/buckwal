@@ -512,6 +512,22 @@ The sequence that works, with the admin calls of Question 8:
   JSON. If the test uses the XML above, the text needs a change. That is a SPEC CHANGE for the coordinator
   (`crates/buckwal-cli/src/` is out of bounds for this branch).
 
+### As built in stage 2
+
+The revised spec replaced some of the notes above.
+
+- **One CA.** `scripts/tls-material.sh` now adds `DNS:host.containers.internal` to the server
+  certificate. The listener uses that certificate, so the pass's CA covers it. No second CA exists.
+- **Container.** With `BUCKWAL_RUSTFS_NOTIFY_PORT` set in TLS mode, `scripts/rustfs.sh` sets
+  `RUSTFS_OUTBOUND_ALLOW_ORIGINS=https://host.containers.internal:<port>`, mounts the pass's
+  `ca.pem` read only and sets `SSL_CERT_FILE`. `scripts/test.sh` gives the port (9305 + 10N) to the
+  `tls-rest` group only.
+- **Bounds.** The test `tls_rustfs_delivers_events_to_a_replica_listener` does not write one
+  object at a time. It waits 5 s for a lone commit after a 7 s quiet period, then 15 s for the last
+  of ten commits written at once. Measured in nine solo runs: 0.14 to 0.70 s and 4.9 to 5.2 s.
+- **XML.** The test builds the XML itself from the prefixes in the `buckwal notify-setup`
+  output. `notify-setup` still prints JSON for RustFS.
+
 ## Stage-2 design (the spec's "How it works", confirmed and corrected)
 
 Unchanged from the spec: start from today's restore, then follow the bucket from its own thread;
