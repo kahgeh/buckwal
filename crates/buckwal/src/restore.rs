@@ -705,7 +705,10 @@ struct Built {
 /// generation (`pack::run::scan_generations`, the pack run's own rule), each applied to
 /// `<dir>/app.db` with a local checkpoint (`apply_generation_over`). The head's generation is
 /// left for the caller, as the `-wal`. A log that is not as buckwal writes it is `Corrupt`. A
-/// pack (or its codes) that is gone sets `gone` and fails: the caller starts again.
+/// pack (or its codes) that is gone sets `gone` and fails: the caller starts again. A pointer
+/// whose pack generation is above the head's (a pack run moved it after this attempt read the
+/// head) sets `ahead` and fails before anything is fetched: the caller starts again and reads
+/// the head and the pointer again.
 #[allow(clippy::too_many_arguments)]
 fn apply_ended_generations(
     store: &Arc<dyn ObjectStore>,
@@ -714,9 +717,9 @@ fn apply_ended_generations(
     cfg: &EngineConfig,
     head: &Head,
     retries: &AtomicU64,
-    gone: &Arc<AtomicBool>,
-    read: &Mutex<Option<String>>,
+    marks: &AttemptMarks,
 ) -> Result<Built> {
+    let AttemptMarks { gone, ahead, read } = marks;
     let enc = cfg.encryption.as_deref();
     let pointer_key = keys.pack_pointer();
     // A pointer of another database (its `database_id` is not the head's) is no pointer
@@ -730,6 +733,15 @@ fn apply_ended_generations(
     let (blocks, from) = match own {
         Some((p, obj)) => {
             *read.lock().unwrap() = Some(p.pack_key.clone());
+            // The log of the head's generation must never be replayed over a newer pack.
+            if p.pack_generation > head.generation {
+                ahead.store(true, Relaxed);
+                return Err(Error::Stale(format!(
+                    "{pointer_key}: the pointer's pack generation {} is above the head's \
+                     generation {} that this restore read",
+                    p.pack_generation, head.generation
+                )));
+            }
             let from = p.pack_generation;
             let Some(codes) = counted(retries, &cfg.retry, &p.codes_key, || {
                 store.get(&p.codes_key)
@@ -891,17 +903,30 @@ pub(crate) fn is_gave_up(e: &Error) -> bool {
     matches!(e, Error::Timeout(m) if m == GAVE_UP)
 }
 
-/// Why a failed attempt may start again: what it found gone.
+/// What one attempt of [`restore_files`] found, beside its error: `gone` is set when the pack
+/// it read is gone, `ahead` when the pointer's pack generation was above the head it read, and
+/// `read` names the pack it read.
+#[derive(Default)]
+struct AttemptMarks {
+    gone: Arc<AtomicBool>,
+    ahead: AtomicBool,
+    read: Mutex<Option<String>>,
+}
+
+/// Why a failed attempt may start again: what it found gone, or a pointer above its head.
 fn restart_reason(
     store: &dyn ObjectStore,
     keys: &Keys,
     cfg: &EngineConfig,
     e: &Error,
-    pack_gone: bool,
+    marks: &AttemptMarks,
     read: Option<&str>,
 ) -> Option<&'static str> {
-    if pack_gone {
+    if marks.gone.load(Relaxed) {
         return Some("pack_missing");
+    }
+    if marks.ahead.load(Relaxed) {
+        return Some("pointer_ahead");
     }
     let log_gone = matches!(e, Error::NotFound(k) if k.starts_with(&keys.log_root()));
     // A log GC cut below a newer pack shows as a log the chain cannot follow (`Corrupt`) or an
@@ -913,10 +938,11 @@ fn restart_reason(
 
 /// Restore into `dir`, attempt by attempt (`restore_attempt`). An attempt that finds its pack
 /// or a log object it still needs gone (GC deleted it after a newer pack replaced the one it
-/// read) starts again from the pointer, at most `PACK_RESTARTS` (3) times; each restart logs a
-/// WARN `restore restarted` with its attempt number, the pack key and the reason
-/// (`pack_missing` or `log_missing`). The next "not found" ends the restore with
-/// `Timeout(GAVE_UP)` and one ERROR `restore gave up`. Every restore uses this rule: a plain
+/// read), or a pointer whose pack generation is above the head it read (a pack run moved the
+/// pointer between the two reads), starts again from the head and the pointer, at most
+/// `PACK_RESTARTS` (3) times; each restart logs a WARN `restore restarted` with its attempt
+/// number, the pack key and the reason (`pack_missing`, `log_missing` or `pointer_ahead`). The
+/// next such failure ends the restore with `Timeout(GAVE_UP)` and one ERROR `restore gave up`. Every restore uses this rule: a plain
 /// restore, the read-only open's, a takeover's and a replica's re-restore (`restore_staged`).
 /// `restarts` counts the restarts made.
 fn restore_files(
@@ -938,16 +964,13 @@ fn restore_files(
         }
     }
     let (mut report, page1) = loop {
-        let gone = Arc::new(AtomicBool::new(false));
-        let read = Mutex::new(None);
-        let e = match restore_attempt(&store, keys, dir, cfg, retries, &gone, &read) {
+        let marks = AttemptMarks::default();
+        let e = match restore_attempt(&store, keys, dir, cfg, retries, &marks) {
             Ok(r) => break r,
             Err(e) => e,
         };
-        let read = read.into_inner().unwrap();
-        let Some(reason) =
-            restart_reason(&*store, keys, cfg, &e, gone.load(Relaxed), read.as_deref())
-        else {
+        let read = marks.read.lock().unwrap().take();
+        let Some(reason) = restart_reason(&*store, keys, cfg, &e, &marks, read.as_deref()) else {
             return Err(e);
         };
         let attempt = *restarts + 1;
@@ -1005,16 +1028,14 @@ fn pointer_moved(
     }
 }
 
-/// One attempt of [`restore_files`]. `gone` is set when the pack it read is gone, and `read`
-/// names the pack it read.
+/// One attempt of [`restore_files`]; `marks` records what it found (`AttemptMarks`).
 fn restore_attempt(
     store: &Arc<dyn ObjectStore>,
     keys: &Keys,
     dir: &Path,
     cfg: &EngineConfig,
     retries: &AtomicU64,
-    gone: &Arc<AtomicBool>,
-    read: &Mutex<Option<String>>,
+    marks: &AttemptMarks,
 ) -> Result<(RestoreReport, Option<Vec<u8>>)> {
     let retry = &cfg.retry;
     let head_key = keys.head();
@@ -1027,7 +1048,7 @@ fn restore_attempt(
     // A format 5 bucket holds no page: the generations before the head's come from the pack
     // and the log since it.
     let built = match head.format {
-        FORMAT_V5 => apply_ended_generations(store, keys, dir, cfg, &head, retries, gone, read)?,
+        FORMAT_V5 => apply_ended_generations(store, keys, dir, cfg, &head, retries, marks)?,
         _ => Built {
             db: false,
             pack_key: None,

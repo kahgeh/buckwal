@@ -91,12 +91,14 @@ fn wait_complete(dir: &Path) {
 }
 
 /// A store over a `MemStore` that records each `get_range` (key, offset, length) and can hand
-/// out a saved pointer for the first pointer GET.
+/// out a saved pointer for the first pointer GET and a saved head for the first head GET.
 struct Recording {
     inner: Arc<MemStore>,
     ranges: Mutex<Vec<(String, u64, u64)>>,
     pointer_key: String,
     first_pointer: Mutex<Option<Vec<u8>>>,
+    head_key: String,
+    first_head: Mutex<Option<Vec<u8>>>,
     /// While set, a range GET past the first block waits.
     hold: std::sync::atomic::AtomicBool,
     /// Runs once, after the first range GET returns.
@@ -115,6 +117,8 @@ impl Recording {
             ranges: Mutex::new(Vec::new()),
             pointer_key: keys().pack_pointer(),
             first_pointer: Mutex::new(None),
+            head_key: keys().head(),
+            first_head: Mutex::new(None),
             hold: Default::default(),
             after_range: Mutex::new(None),
             after_get: Mutex::new(None),
@@ -141,6 +145,14 @@ impl ObjectStore for Recording {
                 return Ok(Some(Object {
                     body,
                     etag: "\"saved\"".into(),
+                }));
+            }
+        }
+        if k == self.head_key {
+            if let Some(body) = self.first_head.lock().unwrap().take() {
+                return Ok(Some(Object {
+                    body,
+                    etag: "\"saved-head\"".into(),
                 }));
             }
         }
@@ -1099,6 +1111,58 @@ fn restore_whose_log_was_deleted_restarts_from_the_newer_pack() {
         (w.field("attempt"), w.field("reason"), w.field("pack_key")),
         (Some("1"), Some("log_missing"), Some(old.pack_key.as_str()))
     );
+    assert_eq!(seen.outcome.as_deref(), Some("restored"));
+    let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
+    let vc = v.connect().unwrap();
+    integrity_ok(&vc);
+    assert_eq!(rows(&vc), want);
+    drop(vc);
+    drop(v);
+    crash(db, vec![c]);
+}
+
+/// A restore reads the head at generation H, then a pack run moves the pointer to a pack above
+/// H before the restore reads the pointer. The log of H must not be replayed over that newer
+/// pack: the restore starts again (reason `pointer_ahead`), reads the head and the pointer
+/// again, and equals the writer.
+#[test]
+fn restore_whose_pointer_is_above_its_head_restarts() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    let old_head = store.get(&keys().head()).unwrap().unwrap().body;
+    let read_generation = db.generation();
+    c.execute("UPDATE t SET v = 'h' WHERE id > 430", &[])
+        .unwrap();
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    insert_big(&c, 451..=453);
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    pack_now(store.clone(), &config(a.path()));
+    let new = pointer(&*store, &keys());
+    assert!(new.pack_generation > read_generation, "{new:?}");
+    c.execute("DELETE FROM t WHERE id BETWEEN 10 AND 20", &[])
+        .unwrap();
+    insert_big(&c, 454..=455);
+    let want = rows(&c);
+    let rec = Recording::new(store.clone());
+    *rec.first_head.lock().unwrap() = Some(old_head);
+    let r = tempdir();
+    let (rep, seen) =
+        seen(|| restore_with_store(&config(&fresh(&r)), rec.clone(), &fresh(&r)).unwrap());
+    assert_eq!(rep.generation, db.generation());
+    assert_eq!(rep.pack_key.as_deref(), Some(new.pack_key.as_str()));
+    assert_eq!(seen.restarted.len(), 1, "one restart");
+    let w = &seen.restarted[0];
+    assert_eq!(w.level, tracing::Level::WARN);
+    assert_eq!(
+        (w.field("attempt"), w.field("reason"), w.field("pack_key")),
+        (
+            Some("1"),
+            Some("pointer_ahead"),
+            Some(new.pack_key.as_str())
+        )
+    );
+    assert_eq!(seen.restarts.as_deref(), Some("1"));
     assert_eq!(seen.outcome.as_deref(), Some("restored"));
     let v = open_read_only_with_store(config(&fresh(&r)), store.clone()).unwrap();
     let vc = v.connect().unwrap();
