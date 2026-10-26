@@ -71,6 +71,9 @@ const IN_COMMIT_TRIES: usize = 3;
 const BACKGROUND: &str = "background 5ms 64 1MiB 1000";
 const MAX_BEHIND: u32 = 1000;
 const BACKGROUND_UPLOADS: u32 = 18;
+/// A background try counts only with at least this many commits behind (90% of
+/// `MAX_BEHIND`): a full queue.
+const FULL_QUEUE: u64 = MAX_BEHIND as u64 * 9 / 10;
 const GOAL_RESTORE: Duration = Duration::from_secs(10);
 const GOAL_PACK: Duration = Duration::from_secs(30);
 
@@ -410,10 +413,23 @@ struct SwitchCommit {
     fill_time: Duration,
 }
 
-/// Open the writer of `dir` (packer thread off) with `batching` (Off when `None`), and
-/// `IN_COMMIT_TRIES` times: a few small commits (background: until `MAX_BEHIND` commits are
-/// behind, or 4000 commits, or 10 s), a PASSIVE checkpoint, then one small commit. Returns
-/// the commits that did the switch, and how many switches came in the checkpoint call.
+/// What `switch_in_commit` found.
+struct SwitchTries {
+    /// The commits that did the switch, in the tries that count.
+    found: Vec<SwitchCommit>,
+    /// Switches that came in the checkpoint call, not in the commit.
+    in_checkpoint: usize,
+    /// Background: tries that did not count, because the queue was below `FULL_QUEUE`
+    /// commits behind just before the commit: (commits behind, the commit's wait).
+    short: Vec<(u64, Duration)>,
+}
+
+/// Open the writer of `dir` (packer thread off) with `batching` (Off when `None`). Then try:
+/// a few small commits (background: until `MAX_BEHIND` commits are behind, or 4000 commits,
+/// or 10 s), a PASSIVE checkpoint, then one small commit. Off makes `IN_COMMIT_TRIES` tries.
+/// Background counts a try only when at least `FULL_QUEUE` commits were behind just before
+/// the commit, and tries until `IN_COMMIT_TRIES` tries count, at most `2 * IN_COMMIT_TRIES`
+/// times.
 fn switch_in_commit(
     ctx: &Ctx,
     dir: &Path,
@@ -421,7 +437,7 @@ fn switch_in_commit(
     rng: &mut Lcg,
     rows: u64,
     batching: Option<buckwal::Batching>,
-) -> (Vec<SwitchCommit>, usize) {
+) -> SwitchTries {
     let events: Events = Arc::default();
     let mut cfg = cfg_at(ctx, dir, via, false);
     if let Some(b) = batching {
@@ -431,7 +447,17 @@ fn switch_in_commit(
     let (db, conn) = open_writer(cfg);
     let mut found = Vec::new();
     let mut in_checkpoint = 0;
-    for _ in 0..IN_COMMIT_TRIES {
+    let mut short = Vec::new();
+    let mut tries = 0;
+    while found.len() < IN_COMMIT_TRIES
+        && tries
+            < if batching.is_some() {
+                2 * IN_COMMIT_TRIES
+            } else {
+                IN_COMMIT_TRIES
+            }
+    {
+        tries += 1;
         let fill = Instant::now();
         let mut fill_commits = 0;
         loop {
@@ -460,6 +486,11 @@ fn switch_in_commit(
         let behind = db.upload_stats().commits_behind;
         let c = small(&conn, rng, rows);
         let end = c.start + c.wait;
+        if batching.is_some() && behind < FULL_QUEUE {
+            short.push((behind, c.wait));
+            let _ = db.wait_durable(conn.last_commit().unwrap_or(0), Duration::from_secs(60));
+            continue;
+        }
         let switched = switch_times(&events)
             .into_iter()
             .find(|(s, _)| c.start <= *s && *s <= end);
@@ -492,7 +523,11 @@ fn switch_in_commit(
         let _ = db.wait_durable(conn.last_commit().unwrap_or(0), Duration::from_secs(60));
     }
     close_writer(db, conn);
-    (found, in_checkpoint)
+    SwitchTries {
+        found,
+        in_checkpoint,
+        short,
+    }
 }
 
 #[test]
@@ -726,7 +761,8 @@ fn timed_goal_packer_stage2() {
     // A PASSIVE checkpoint with no reader open backfills the whole WAL, so the next commit
     // restarts the WAL: that commit does the switch (seal-start record, head move, WAL
     // header record) and its own log record.
-    let (waits, in_checkpoint) = switch_in_commit(&ctx, &dir_w, &via, &mut rng, rows, None);
+    let off = switch_in_commit(&ctx, &dir_w, &via, &mut rng, rows, None);
+    let (waits, in_checkpoint) = (off.found, off.in_checkpoint);
     let r50b = small_put_median(&ctx, &via);
     note(format!(
         "in-commit switch, Off, 50 ms: {} tries, {} commits did the switch, {} switches came \
@@ -756,7 +792,18 @@ fn timed_goal_packer_stage2() {
 
     // ---- The background case: `background 5ms 64 1MiB 1000`, at 50 ms. ----
     let batching: buckwal::Batching = BACKGROUND.parse().expect("background setting");
-    let (bg, _) = switch_in_commit(&ctx, &dir_w, &via, &mut rng, rows, Some(batching));
+    let tries = switch_in_commit(&ctx, &dir_w, &via, &mut rng, rows, Some(batching));
+    let bg = tries.found;
+    note(format!(
+        "background tries that did not count (fewer than {FULL_QUEUE} commits behind): {} {}",
+        tries.short.len(),
+        tries
+            .short
+            .iter()
+            .map(|(b, w)| format!("[{b} behind, wait {}]", ms(*w)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
     for (i, s) in bg.iter().enumerate() {
         note(format!(
             "background switch commit {i}: wait {} ; {} commits behind before it ; {} log \
@@ -791,10 +838,15 @@ fn timed_goal_packer_stage2() {
                 s.behind,
                 s.records_before
             ),
-            None => "not measured: no background commit did the switch".into(),
+            None => format!(
+                "not measured: no background commit with at least {FULL_QUEUE} commits behind \
+                 did the switch"
+            ),
         },
         worst_bg.map_or("not measured", |s| {
-            verdict(s.wait <= bound && s.behind <= u64::from(MAX_BEHIND))
+            verdict(
+                bg.len() == IN_COMMIT_TRIES && s.wait <= bound && s.behind <= u64::from(MAX_BEHIND),
+            )
         }),
     ));
 
@@ -1027,9 +1079,10 @@ fn timed_goal_packer_stage2() {
     if let Ok(path) = std::env::var("BUCKWAL_TIMED_RESULTS") {
         std::fs::write(&path, out.join("\n") + "\n").expect("write the results");
     }
+    // A goal that was not measured (no commit did the switch) fails the test too.
     let missed: Vec<&String> = goals
         .iter()
-        .filter(|g| g.3 == "miss")
+        .filter(|g| g.3 == "miss" || g.3 == "not measured")
         .map(|g| &g.0)
         .collect();
     assert!(missed.is_empty(), "goals missed: {missed:?}");
