@@ -3049,6 +3049,18 @@ fn packer_runs_during_commits() {
     assert!(g >= 2, "{packed}");
     soak.wait_acks_after(packed_at, 100);
     let during = soak.acks_around(started, false) - soak.acks_around(packed_at, false);
+    // The writer commits while the pack run runs: the pack run never holds a commit back.
+    assert!(
+        during > 0,
+        "no ack between the packer start and its pack line\n{}",
+        soak.tail()
+    );
+    let gap = soak.longest_ack_gap();
+    assert!(
+        gap < Duration::from_secs(5),
+        "the longest ack gap is {gap:?}\n{}",
+        soak.tail()
+    );
     let status = packer.sigterm();
     assert_eq!(status.code(), Some(0), "packer exit\n{}", packer.tail());
     assert_eq!(
@@ -3182,12 +3194,21 @@ fn vacuum_command() {
         "PRAGMA wal_checkpoint(TRUNCATE)",
     ]);
     ctx.ok(&args);
-    let refused = ctx.run(&["vacuum", "--dir", ctx.dir("other").to_str().unwrap()]);
+    let other = ctx.dir("other");
+    fs::create_dir(&other).unwrap();
+    let refused = ctx.run(&["vacuum", "--dir", other.to_str().unwrap()]);
     assert_eq!(
         refused.status.code(),
         Some(1),
         "vacuum of a directory the writer does not own\n{}\n{}",
         refused.stdout,
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains(
+            "holds no database this writer owns: run `buckwal vacuum` on the writer's own"
+        ),
+        "the refusal names its reason: {}",
         refused.stderr
     );
     let out = ctx.ok(&["vacuum", d]).stdout;
@@ -3332,7 +3353,9 @@ fn released_bin() -> PathBuf {
 
 /// One upgrade case: the released build makes a bucket of format `want_format` (1 plaintext,
 /// 4 encrypted) with a seal (pages and a manifest) and acked rows in the log after it, and is
-/// killed. This build's `upgrade` makes it a format 5 bucket: the head has no manifest, the
+/// killed. This build then writes the old-format bucket and seals it twice (it takes it over,
+/// and its PASSIVE checkpoints restart the WAL); with its disk lost, every ack restores. This
+/// build's `upgrade` then makes it a format 5 bucket: the head has no manifest, the
 /// restore holds every acked row, the upgrade's directory continues as the writer, and the
 /// released build refuses the bucket. GC then deletes every page and manifest, the restore
 /// still holds every row, and `scan` finds no plaintext in an encrypted bucket.
@@ -3373,6 +3396,43 @@ fn upgrade_case(name: &str, want_format: u64) {
     );
     assert!(!ctx.list("pages/").is_empty(), "{name}: page objects");
 
+    // This build as the writer of the old-format bucket: it takes the database over in a new
+    // directory, and its PASSIVE checkpoints restart the WAL, so it seals (pages, a manifest,
+    // the head move) as formats 1 to 4 do, with the pages the checkpoints backfilled. Killed
+    // after two seals and with its disk lost, every ack of both builds restores.
+    let legacy = ctx.dir("legacy");
+    let args = [
+        "--checkpoint",
+        "passive",
+        "--every",
+        "50",
+        "--start",
+        "1001",
+    ];
+    let mut ours = Soak::spawn(&ctx, &legacy, &args);
+    ours.wait_for("two seals", |s| s.count("event seal-finished") >= 2);
+    ours.kill();
+    assert!(ours.errors().is_empty(), "{name}: {:?}", ours.errors());
+    assert_eq!(
+        ours.count(SWITCHED),
+        0,
+        "{name}: a format {want_format} bucket seals"
+    );
+    let json = head_json(&ctx);
+    assert!(
+        json.contains(&format!("\"format\":{want_format}")),
+        "{name}: the bucket keeps format {want_format}: {json}"
+    );
+    let resealed = ctx.head();
+    assert!(
+        resealed.generation > sealed.generation && resealed.manifest.is_some(),
+        "{name}: this build sealed: {sealed:?} then {resealed:?}"
+    );
+    fs::remove_dir_all(&legacy).unwrap();
+    let mut lines = soak.lines.clone();
+    lines.extend(ours.lines.iter().cloned());
+    let legacy_v = restore_verify(&ctx, &lines);
+
     let up = ctx.dir("up");
     let ups = up.to_str().unwrap();
     let out = ctx.ok(&["upgrade", ups]).stdout;
@@ -3386,7 +3446,6 @@ fn upgrade_case(name: &str, want_format: u64) {
     let json = head_json(&ctx);
     assert!(json.contains("\"format\":5"), "{name}: {json}");
     assert_eq!(ctx.head().manifest, None, "{name}: {json}");
-    let mut lines = soak.lines.clone();
     let v = restore_verify(&ctx, &lines);
 
     // The upgrade's directory continues as the writer (its first open claims it).
@@ -3427,8 +3486,8 @@ fn upgrade_case(name: &str, want_format: u64) {
         );
     }
     eprintln!(
-        "{name}: {line}; restore after the upgrade: acked={} {}; {gc}; after GC: acked={} {}",
-        v.acked, v.restored, after.acked, after.restored
+        "{name}: this build sealed the old format: acked={} {}; {line}; restore after the upgrade: acked={} {}; {gc}; after GC: acked={} {}",
+        legacy_v.acked, legacy_v.restored, v.acked, v.restored, after.acked, after.restored
     );
 }
 

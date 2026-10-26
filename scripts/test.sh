@@ -91,8 +91,9 @@ released_build() {
     git worktree add --quiet --detach "$tree/src" "$RELEASED"
     (cd "$tree/src" && CARGO_TARGET_DIR="$tree/target" cargo build --quiet --locked --offline -p buckwal-cli)
     mkdir -p "$root"
-    cp "$tree/target/debug/buckwal" "$bin.new"
-    mv "$bin.new" "$bin"
+    # A name of this run only: two runs that build at once each move a whole file.
+    cp "$tree/target/debug/buckwal" "$bin.new.$$"
+    mv "$bin.new.$$" "$bin"
     released_tree_remove
   fi
   export BUCKWAL_TEST_RELEASED_BIN="$bin"
