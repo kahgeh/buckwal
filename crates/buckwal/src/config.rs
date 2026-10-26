@@ -225,7 +225,9 @@ pub struct Config {
     pub pack_max_age: Duration,
     /// How long GC keeps an orphan pack (a complete pack that no pointer named), from its
     /// upload start, by the bucket's clock (`BUCKWAL_PACK_ORPHAN_GRACE_SECS`). A pack run gives
-    /// up at half of it, so it never moves the pointer to a pack GC can delete. Above 0.
+    /// up at half of it, so it never moves the pointer to a pack GC can delete. Half of it must
+    /// exceed `3 x (retry_deadline + request_timeout)` (the requests after the run's time
+    /// check), and it must exceed `trim_grace` (`Config` otherwise).
     pub pack_orphan_grace: Duration,
     /// How long GC keeps an older pack, and the log it needs, after a newer pack replaced it
     /// (the *pack keep time*, by the bucket's clock). `None` (the default): 4 times the newest
@@ -640,6 +642,27 @@ impl Config {
                 "pack_orphan_grace (BUCKWAL_PACK_ORPHAN_GRACE_SECS) must be above 0".into(),
             ));
         }
+        // A pack run passes its time check at half the orphan grace at the latest; after it,
+        // the HEADs of the pack and its codes and the pointer PUT (three requests, each retried
+        // up to the retry deadline) must end before GC may delete the pack as an orphan.
+        let after_check = self
+            .retry_deadline
+            .saturating_add(self.request_timeout)
+            .saturating_mul(3);
+        if self.pack_orphan_grace / 2 <= after_check {
+            return Err(Error::Config(format!(
+                "pack_orphan_grace (BUCKWAL_PACK_ORPHAN_GRACE_SECS, {:?}) / 2 must exceed 3 x \
+                 (retry_deadline ({:?}) + request_timeout ({:?}))",
+                self.pack_orphan_grace, self.retry_deadline, self.request_timeout
+            )));
+        }
+        if self.pack_orphan_grace <= self.trim_grace {
+            return Err(Error::Config(format!(
+                "pack_orphan_grace (BUCKWAL_PACK_ORPHAN_GRACE_SECS, {:?}) must exceed trim_grace \
+                 ({:?})",
+                self.pack_orphan_grace, self.trim_grace
+            )));
+        }
         if self.pack_check_interval.is_zero() || self.pack_gauge_interval.is_zero() {
             return Err(Error::Config(
                 "pack_check_interval and pack_gauge_interval must be above 0".into(),
@@ -1030,6 +1053,8 @@ mod tests {
         c.request_timeout = Duration::from_secs(10);
         c.lease = defaults::MAX_SEAL_QUIET - c.request_timeout;
         c.trim_grace = defaults::MAX_SEAL_QUIET + Duration::from_secs(3600);
+        // The orphan grace must exceed the trim grace.
+        c.pack_orphan_grace = c.trim_grace + Duration::from_secs(1);
         assert_eq!(c.validate(), Ok(()), "exactly at the limit");
         c.lease += Duration::from_millis(1);
         match c.validate() {
@@ -1298,6 +1323,40 @@ mod tests {
         let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
         c.pack_orphan_grace = Duration::ZERO;
         assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("pack_orphan_grace")));
+    }
+
+    /// GC deletes an orphan pack after the orphan grace, and a pack run passes its time check
+    /// at half of it: the requests after that check (three retried requests: the two HEADs and
+    /// the pointer PUT) must end in the other half. The grace is also above the trim grace.
+    #[test]
+    fn pack_orphan_grace_must_outlast_the_requests_after_the_time_check() {
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        // Defaults: 3 x (30 s + 10 s) = 120 s, the trim grace 600 s.
+        let floor = 3 * (c.retry_deadline + c.request_timeout);
+        assert_eq!(floor, Duration::from_secs(120));
+        c.pack_orphan_grace = 2 * floor;
+        assert!(
+            matches!(c.validate(), Err(Error::Config(m)) if m.contains("pack_orphan_grace")),
+            "half the grace equal to the floor"
+        );
+        c.pack_orphan_grace = c.trim_grace;
+        assert!(
+            matches!(c.validate(), Err(Error::Config(m)) if m.contains("trim_grace")),
+            "the grace equal to the trim grace"
+        );
+        c.pack_orphan_grace = c.trim_grace + Duration::from_secs(1);
+        assert_eq!(c.validate(), Ok(()));
+        c.pack_orphan_grace = Duration::from_secs(20);
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("pack_orphan_grace")));
+
+        // The floor follows the retry deadline and the request timeout.
+        let mut c = Config::new("/d", "http://e", "b", "ak", "sk");
+        c.retry_deadline = Duration::from_secs(200);
+        c.trim_grace = Duration::from_secs(300);
+        c.pack_orphan_grace = Duration::from_secs(1260);
+        assert!(matches!(c.validate(), Err(Error::Config(m)) if m.contains("pack_orphan_grace")));
+        c.pack_orphan_grace = Duration::from_secs(1261);
+        assert_eq!(c.validate(), Ok(()));
     }
 
     #[test]
