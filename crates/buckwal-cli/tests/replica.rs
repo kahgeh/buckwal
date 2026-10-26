@@ -922,10 +922,10 @@ fn wake_and_settle(rep: &Rep) {
 }
 
 // ---------------------------------------------------------------------------------------
-// replica_paused_past_trim_grace_re_restores
+// replica_re_restores_from_pack
 // ---------------------------------------------------------------------------------------
 
-/// A `follow` child (poll 1 s) is stopped with SIGSTOP at generation G. The writer switches
+/// The spec's system test "a replica that re-restores from a pack". A `follow` child (poll 1 s) is stopped with SIGSTOP at generation G. The writer switches
 /// generation twice (G, G+1), a `pack` run packs both, and the `gc` command runs every second
 /// until `log/<G>/` is empty (a 6 s grace and a 6 s pack keep time: the new pack's codes are
 /// old enough after about 6 s). SIGCONT: the child re-restores from the newest pack, prints
@@ -936,9 +936,8 @@ fn wake_and_settle(rep: &Rep) {
 /// WARN.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn replica_paused_past_trim_grace_re_restores() {
-    let ctx = short_lease_ctx("replica_paused_past_trim_grace_re_restores")
-        .set("BUCKWAL_PACK_KEEP_SECS", "6");
+fn replica_re_restores_from_pack() {
+    let ctx = short_lease_ctx("replica_re_restores_from_pack").set("BUCKWAL_PACK_KEEP_SECS", "6");
     let mut a = Writer::open(short_lease(ctx.config(&ctx.dir("a"))));
     a.insert_range(1..=20);
     let c = ctx.dir("c");
@@ -951,10 +950,18 @@ fn replica_paused_past_trim_grace_re_restores() {
     a.seal();
     a.insert_range(31..=35);
     let head = ctx.head();
-    assert!(head.generation >= g0 + 2, "two seals: {g0} then {head:?}");
+    assert!(
+        head.generation >= g0 + 2,
+        "two switches: {g0} then {head:?}"
+    );
     let p = ctx.dir("p");
     let pack = ctx.ok(&["pack", "--dir", p.to_str().unwrap()]).stdout;
     eprintln!("paused: {}", pack.trim());
+    assert!(
+        pack.starts_with("pack outcome=packed ")
+            && pack.contains(&format!(" pack_generation={} ", head.generation)),
+        "the pack holds both ended generations: {pack}"
+    );
     wait_until(
         "GC to delete the paused replica's log",
         Duration::from_secs(60),

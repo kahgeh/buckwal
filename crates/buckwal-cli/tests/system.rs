@@ -79,11 +79,16 @@ struct Soak {
 
 impl Soak {
     fn spawn(ctx: &Ctx, dir: &Path, args: &[&str]) -> Soak {
+        Soak::spawn_of(ctx, Path::new(BIN), dir, args)
+    }
+
+    /// Like `spawn`, for the `buckwal` binary at `bin` (another build).
+    fn spawn_of(ctx: &Ctx, bin: &Path, dir: &Path, args: &[&str]) -> Soak {
         let mut all = vec!["soak", "--dir", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         let stderr = ctx.tmp.path().join(format!("soak-{}.stderr", nanos()));
         let mut child = ctx
-            .command(&all)
+            .command_of(bin, &all)
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
@@ -356,19 +361,24 @@ fn delta(a: &Stats, b: &Stats, key: &str) -> f64 {
 
 /// The smallest WAL size limit (`BUCKWAL_MAINTENANCE_WAL_MIB`, in MiB): about 254 frames of
 /// 4 KiB pages.
-const WINDOW_SEAL_WAL_MIB: &str = "1";
+const WINDOW_SWITCH_WAL_MIB: &str = "1";
+
+/// The soak line of a finished generation switch (format 5: the seal-start record, then the
+/// head move to the next generation).
+const SWITCHED: &str = "event generation-switched";
 
 /// The crash matrix for one mode: three runs, killed after `150`, `600` and `1500` acks.
 /// `auto` is the engine's own checkpoint (no `--checkpoint`). With `batching`, soak runs four
-/// connections under it.
+/// connections under it. No pack run happens (the writer's packer thread waits a minute
+/// first), so each restore applies the log of every generation from the first one.
 fn crash_matrix(mode: &str, batching: Option<&str>) {
     let tag = if batching.is_some() { "window_" } else { "" };
     for kill_after in [150, 600, 1500] {
         let mut ctx = Ctx::new(&format!("crash_{tag}{mode}_{kill_after}"));
         // Under 4 Window connections the engine never restarts the WAL after PASSIVE/FULL, so
-        // the maintenance checkpoint ends the generation (README "Maintenance checkpoint").
+        // the maintenance checkpoint at the WAL size limit ends the generation.
         if batching.is_some() && matches!(mode, "passive" | "full") {
-            ctx = ctx.set("BUCKWAL_MAINTENANCE_WAL_MIB", WINDOW_SEAL_WAL_MIB);
+            ctx = ctx.set("BUCKWAL_MAINTENANCE_WAL_MIB", WINDOW_SWITCH_WAL_MIB);
         }
         let dir = ctx.dir("db");
         let mut args = Vec::new();
@@ -380,46 +390,53 @@ fn crash_matrix(mode: &str, batching: Option<&str>) {
         }
         let mut soak = Soak::spawn(&ctx, &dir, &args);
         soak.wait_acks(kill_after);
-        let sealed_run = mode == "auto" && kill_after >= 1500;
-        if sealed_run {
-            // The auto-checkpoint (every 1000 WAL frames) seals in the commit after it.
-            soak.wait_for("a seal", |s| s.count("event seal-finished") >= 1);
+        let switched_run = mode == "auto" && kill_after >= 1500;
+        if switched_run {
+            // The auto-checkpoint (every 1000 WAL frames) restarts the WAL, and the commit
+            // after it switches the generation.
+            soak.wait_for("a generation switch", |s| s.count(SWITCHED) >= 1);
         }
         soak.kill();
         assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
-        if sealed_run {
+        let head = ctx.head();
+        if switched_run {
             assert!(
-                ctx.head().manifest.is_some(),
-                "{mode}: the bucket holds no sealed manifest after {kill_after} acks"
+                head.generation > 1,
+                "{mode}: the head is still at generation 1 after {kill_after} acks"
             );
         }
-        let seals = soak.count("event seal-finished");
+        let switches = soak.count(SWITCHED);
         if mode != "auto" {
             assert!(
                 soak.lines.iter().any(|l| l.starts_with("event checkpoint ")),
                 "{mode}: the soak's own checkpoint never ran before the kill after {kill_after} acks\n{}",
                 soak.tail()
             );
-            // Checkpoints keep sealing through the whole run (the last may be cut by the kill).
+            // Generations keep ending through the whole run (one switch per checkpoint, or
+            // per maintenance run at the 1 MiB WAL size limit; the last may be cut by the kill).
             assert!(
-                seals >= 1 && seals >= kill_after / 100 - 1,
-                "{mode}: {seals} seals before the kill after {kill_after} acks\n{}",
+                switches >= 1 && switches >= kill_after / 200,
+                "{mode}: {switches} generation switches before the kill after {kill_after} acks\n{}",
                 soak.tail()
             );
         }
+        assert!(
+            head.manifest.is_none(),
+            "{mode}: a format 5 head names no manifest"
+        );
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
         eprintln!(
-            "crash_{tag}{mode}: kill after {kill_after} acks: acked={} seals={seals} {} \
-             unacked_present={}",
-            v.acked, v.restored, v.unacked_present
+            "crash_{tag}{mode}: kill after {kill_after} acks: acked={} switches={switches} \
+             head generation={} {} unacked_present={}",
+            v.acked, head.generation, v.restored, v.unacked_present
         );
     }
 }
 
 /// The engine's own checkpoint (PASSIVE, every 1000 WAL frames; soak without
 /// `--checkpoint`): three runs, each killed after at least `kill_after` acks and at least one
-/// finished seal (the auto-checkpoint's WAL restart seals in the commit after it).
+/// generation switch (the auto-checkpoint's WAL restart switches in the commit after it).
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_auto() {
@@ -428,22 +445,21 @@ fn crash_auto() {
         let dir = ctx.dir("db");
         let mut soak = Soak::spawn(&ctx, &dir, &[]);
         soak.wait_acks(kill_after);
-        soak.wait_for("a seal", |s| s.count("event seal-finished") >= 1);
+        soak.wait_for("a generation switch", |s| s.count(SWITCHED) >= 1);
         soak.kill();
         assert!(soak.errors().is_empty(), "auto: {:?}", soak.errors());
-        let seals = soak.count("event seal-finished");
-        assert!(seals >= 1, "auto: no seal before the kill\n{}", soak.tail());
+        let switches = soak.count(SWITCHED);
         let acks = soak.acks();
         let head = ctx.head();
         assert!(
-            head.manifest.is_some(),
-            "auto: the bucket holds no sealed manifest"
+            head.generation > 1 && head.manifest.is_none(),
+            "auto: the head moved on with no manifest: {head:?}"
         );
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
         eprintln!(
-            "crash_auto: kill after {acks} acks (target {kill_after}): acked={} seals={seals} \
-             head generation={} {} unacked_present={}",
+            "crash_auto: kill after {acks} acks (target {kill_after}): acked={} \
+             switches={switches} head generation={} {} unacked_present={}",
             v.acked, head.generation, v.restored, v.unacked_present
         );
     }
@@ -480,9 +496,9 @@ fn crash_reopen() {
 }
 
 /// The crash matrix under the engine's own checkpoint, four Window connections. The 150- and
-/// 600-ack kills land before the first seal (the auto-checkpoint needs 1000 WAL frames), so
-/// they restore from the log alone; the 1500-ack run waits for a seal and checks that the
-/// head names a manifest before the wipe.
+/// 600-ack kills land before the first switch (the auto-checkpoint needs 1000 WAL frames), so
+/// they restore one generation; the 1500-ack run waits for a switch and checks that the head
+/// moved on before the wipe.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_window_auto() {
@@ -588,36 +604,71 @@ fn crash_window_kill_while_batched_commits_wait() {
     );
 }
 
-/// Killed while a seal's page PUTs are in flight (each delayed 200 ms): on the first seal,
-/// and on the third, when earlier generations are already sealed.
+/// How long each PUT of the head waits in the tests that kill a writer in the middle of a
+/// generation switch (soak `--head-put-delay-ms`).
+const HEAD_PUT_DELAY_MS: &str = "2000";
+
+/// A soak line for a log record that holds no commit: with `--batching` set the soak prints
+/// one for each such record. In these tests the only one is a switch's seal-start record (no
+/// takeover, no fence).
+const RECORD_WITHOUT_COMMIT: &str = "event log-uploaded -";
+
+/// Wait until switch number `nth` has uploaded its seal-start record and waits for its
+/// delayed head PUT, then SIGKILL the soak: `nth - 1` switches finished, and the head did not
+/// move: it still names the generation whose log ends with the seal-start record.
+fn kill_during_switch(ctx: &Ctx, soak: &mut Soak, nth: usize) {
+    soak.wait_for("a seal-start record", |s| {
+        s.count(RECORD_WITHOUT_COMMIT) >= nth
+    });
+    soak.kill();
+    assert_eq!(soak.count(SWITCHED), nth - 1, "{}", soak.tail());
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let last = soak.lines.iter().rev().find(|l| l.starts_with("event "));
+    assert_eq!(
+        last.map(String::as_str),
+        Some(RECORD_WITHOUT_COMMIT),
+        "the kill landed before the head move\n{}",
+        soak.tail()
+    );
+    // A head that moved would name a generation with no log yet.
+    let head = ctx.head();
+    let log = ctx.list(&format!("log/{:010}/", head.generation));
+    assert!(
+        !log.is_empty(),
+        "the killed switch did not move the head: {head:?}"
+    );
+}
+
+/// The soak arguments of a crash during a generation switch: a TRUNCATE checkpoint every 100
+/// commits (each one switches), Off batching (so the soak prints its log records), and every
+/// head PUT delayed.
+const SWITCH_CRASH_ARGS: [&str; 8] = [
+    "--checkpoint",
+    "truncate",
+    "--every",
+    "100",
+    "--batching",
+    "off",
+    "--head-put-delay-ms",
+    HEAD_PUT_DELAY_MS,
+];
+
+/// Killed in the middle of a generation switch, after its seal-start record and before its
+/// head move (each head PUT delayed 2 s): on the first switch, and on the third, when earlier
+/// generations have ended. The head still names the generation, whose log ends with the
+/// seal-start record, and every ack restores.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn crash_during_seal_upload() {
+fn crash_during_generation_switch() {
     for nth in [1, 3] {
-        let ctx = Ctx::new(&format!("crash_during_seal_upload_{nth}"));
+        let ctx = Ctx::new(&format!("crash_during_generation_switch_{nth}"));
         let dir = ctx.dir("db");
-        let args = [
-            "--checkpoint",
-            "truncate",
-            "--every",
-            "100",
-            "--page-put-delay-ms",
-            "200",
-        ];
-        let mut soak = Soak::spawn(&ctx, &dir, &args);
-        soak.wait_for("seal-started", |s| s.count("event seal-started") >= nth);
-        soak.kill();
-        assert_eq!(
-            soak.count("event seal-finished"),
-            nth - 1,
-            "{}",
-            soak.tail()
-        );
-        assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+        let mut soak = Soak::spawn(&ctx, &dir, &SWITCH_CRASH_ARGS);
+        kill_during_switch(&ctx, &mut soak, nth);
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
         eprintln!(
-            "crash_during_seal_upload: killed on seal-started #{nth}: acked={} {}",
+            "crash_during_generation_switch: killed in switch #{nth}: acked={} {}",
             v.acked, v.restored
         );
     }
@@ -658,13 +709,40 @@ fn maintenance_starts(lines: &[String]) -> Vec<(usize, usize)> {
     starts
 }
 
+/// `buckwal pack --dir <a new directory>`: its `pack ...` line. The run must pack or find
+/// nothing to do (the writer's packer thread may have packed first).
+fn pack_now(ctx: &Ctx) -> String {
+    let p = ctx.dir(&format!("packer-{}", nanos()));
+    let out = ctx.ok(&["pack", "--dir", p.to_str().unwrap()]).stdout;
+    let line = out.trim().to_string();
+    let outcome = line_field(&line, "outcome");
+    assert!(
+        outcome == "packed" || outcome == "nothing_to_do",
+        "{}: {line}",
+        ctx.name
+    );
+    line
+}
+
+/// The log objects of the generations at or above `generation`.
+fn log_objects_from(ctx: &Ctx, generation: u64) -> usize {
+    let root = format!("{}/log/", ctx.prefix());
+    let at_or_above = |k: &String| {
+        let rest = k.strip_prefix(&root).unwrap();
+        let g: u64 = rest.split('/').next().unwrap().parse().unwrap();
+        g >= generation
+    };
+    ctx.list("log/").iter().filter(|k| at_or_above(k)).count()
+}
+
 /// Sustained Window load (8 connections, `window 1ms`, at least 3000 acks). Without
-/// maintenance the generation never ends (the "before" run reports its seals and restore
-/// GETs, and asserts only that every ack restores). With it (WAL size limit 1 MiB), every run
+/// maintenance the generation never ends (the "before" run reports its switches and restore,
+/// and asserts only that every ack restores). With it (WAL size limit 1 MiB), every run
 /// starts at the limit to `MAINTENANCE_START_SLACK` frames past it, at least 2 runs start
-/// within the first 3000 acks, and a restore right after a maintenance run reads at most
-/// `MAINTENANCE_FRAMES` + 4 objects. Both: every acked id restores,
-/// integrity ok, the log contiguous.
+/// within the first 3000 acks, and each run ends the generation. After the kill, a pack run
+/// packs every ended generation, and the restore from that pack reads at most
+/// `MAINTENANCE_FRAMES` + 4 log objects: the maintenance runs bound the log a restore reads
+/// on top of a pack. Both: every acked id restores, integrity ok, the log contiguous.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn maintenance_bounds_generations_under_window_load() {
@@ -686,13 +764,13 @@ fn maintenance_bounds_generations_under_window_load() {
         let mut soak = Soak::spawn(&ctx, &dir, &MAINTENANCE_ARGS);
         soak.wait_acks(acks);
         if on {
-            // Kill right after a maintenance seal: the restore then reads the new
-            // generation, which a run ends again once its `-wal` reaches the limit.
+            // Kill right after a maintenance run: the restore then reads the new generation,
+            // which a run ends again once its `-wal` reaches the limit.
             soak.wait_prefixed("event maintenance-finished ");
         }
         soak.kill();
         assert!(soak.errors().is_empty(), "{name}: {:?}", soak.errors());
-        let seals = soak.count("event seal-finished");
+        let switches = soak.count(SWITCHED);
         let finished = soak
             .lines
             .iter()
@@ -705,12 +783,13 @@ fn maintenance_bounds_generations_under_window_load() {
             .count();
         let head = ctx.head();
         let log_objects = ctx.assert_log_contiguous(head.generation);
+        let pack = if on { Some(pack_now(&ctx)) } else { None };
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
-        let gets = field(&v.restored, "gets");
+        let restored_log = field(&v.restored, "log_objects");
         eprintln!(
-            "{name}: acked={} seals={seals} maintenance_runs={runs} \
-             maintenance_finished={finished} generation={} log_objects={log_objects} {}",
+            "{name}: acked={} switches={switches} maintenance_runs={runs} \
+             maintenance_finished={finished} generation={} log_objects={log_objects} {pack:?} {}",
             v.acked, head.generation, v.restored
         );
         if on {
@@ -728,13 +807,19 @@ fn maintenance_bounds_generations_under_window_load() {
                 "{name}: {early} runs started within {acks} acks: {starts:?}"
             );
             assert!(
-                finished >= 1,
-                "{name}: no maintenance seal\n{}",
+                finished >= 1 && switches >= finished,
+                "{name}: {finished} maintenance runs finished, {switches} switches\n{}",
                 soak.tail()
             );
+            let pack = pack.unwrap();
+            assert_eq!(
+                line_field(&pack, "pack_generation"),
+                head.generation.to_string(),
+                "{name}: the pack holds every ended generation: {pack}"
+            );
             assert!(
-                gets <= MAINTENANCE_FRAMES + 4,
-                "{name}: the restore read {gets} objects: {}",
+                restored_log <= MAINTENANCE_FRAMES + 4,
+                "{name}: the restore read {restored_log} log objects: {}",
                 v.restored
             );
         } else {
@@ -743,9 +828,9 @@ fn maintenance_bounds_generations_under_window_load() {
     }
 }
 
-/// A crash in the middle of a maintenance seal (its page PUTs delayed 200 ms each): killed
-/// after `event maintenance-started` and the seal's `event seal-started`, before the run
-/// ends. Every acked id restores, integrity ok, the log contiguous.
+/// A crash in the middle of a maintenance run's generation switch (each head PUT delayed
+/// 2 s): killed after `event maintenance-started` and the switch's seal-start record, before
+/// the run ends. Every acked id restores, integrity ok, the log contiguous.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn crash_during_maintenance_checkpoint_restores_every_ack() {
@@ -755,23 +840,23 @@ fn crash_during_maintenance_checkpoint_restores_every_ack() {
     );
     let dir = ctx.dir("db");
     let mut args = MAINTENANCE_ARGS.to_vec();
-    args.extend(["--page-put-delay-ms", "200"]);
+    args.extend(["--head-put-delay-ms", HEAD_PUT_DELAY_MS]);
     let mut soak = Soak::spawn(&ctx, &dir, &args);
-    // A maintenance run whose seal has started and that has not ended yet; each line is
-    // looked at once.
-    let (mut seen, mut run, mut sealing) = (0, None, false);
-    soak.wait_for("a maintenance seal in flight", |s| {
+    // A maintenance run whose switch has uploaded its seal-start record and that has not
+    // ended yet; each line is looked at once.
+    let (mut seen, mut run, mut switching) = (0, None, false);
+    soak.wait_for("a maintenance switch in flight", |s| {
         for (i, l) in s.lines.iter().enumerate().skip(seen) {
             if l.starts_with("event maintenance-started ") {
-                (run, sealing) = (Some(i), false);
+                (run, switching) = (Some(i), false);
             } else if is_maintenance_end(l) {
-                (run, sealing) = (None, false);
-            } else if l == "event seal-started" && run.is_some() {
-                sealing = true;
+                (run, switching) = (None, false);
+            } else if l == RECORD_WITHOUT_COMMIT && run.is_some() {
+                switching = true;
             }
         }
         seen = s.lines.len();
-        sealing
+        switching
     });
     let started = run.unwrap();
     soak.kill();
@@ -885,36 +970,95 @@ fn fault_window_rustfs_paused_ambiguous_put() {
     rustfs_paused_ambiguous_put("fault_window_rustfs_paused_ambiguous_put", &WINDOW_ARGS);
 }
 
-/// A sealed page object deleted from the bucket: restore succeeds (pages are fetched
-/// lazily), and the first read of that page fails naming its key. `extra` goes to soak.
-fn deleted_page_object_fails_read(name: &str, extra: &[&str]) {
-    let ctx = Ctx::new(name);
-    let dir = ctx.dir("db");
-    let mut args = vec![
-        "--checkpoint",
-        "truncate",
-        "--every",
-        "100",
-        "--count",
-        "300",
-    ];
-    args.extend_from_slice(extra);
-    Soak::spawn(&ctx, &dir, &args).finish();
-    let head = ctx.head();
-    let m = head.manifest.expect("closed soak sealed a manifest");
-    let m_gen: u64 = m.strip_prefix("manifest/").unwrap().parse().unwrap();
-    let pages = ctx.list(&format!("pages/{m_gen:010}/"));
-    // The highest page: a table leaf the scan reads (page 1 is fetched by restore itself).
-    let victim = pages.last().expect("sealed pages").clone();
-    assert!(!victim.ends_with("/0000000001"), "{pages:?}");
-    ctx.store().delete(&victim).unwrap();
+/// The key of `line`'s `pack_key=` (a `pack` line), with the prefix.
+fn pack_key(line: &str) -> String {
+    line_field(line, "pack_key").to_string()
+}
 
+/// A pack in the bucket damaged two ways, in both passes: one flipped byte, then the bytes of
+/// the older pack of the same database put under the newer pack's key. Each time `restore`
+/// fails with exit 1 and names the pack's key: the pack codes catch it (a SHA-256 code in
+/// pass 1, the integrity code under the key in pass 2; each code covers the pack key, the
+/// generation, the size and the block number). With the pack's own bytes back, the restore
+/// passes and holds every acked row. `sql` without `--claim` refuses the restored directory
+/// and leaves the head alone.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn fault_damaged_pack_fails_restore_naming_its_key() {
+    let ctx = Ctx::new("fault_damaged_pack_fails_restore_naming_its_key");
+    let encrypted = ctx
+        .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
+        .is_some_and(|k| !k.is_empty());
+    let dir = ctx.dir("db");
+    let args = |start: &str, count: &str| {
+        vec![
+            "--checkpoint",
+            "truncate",
+            "--every",
+            "100",
+            "--start",
+            start,
+            "--count",
+            count,
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>()
+    };
+    let run = |a: Vec<String>| {
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        let mut soak = Soak::spawn(&ctx, &dir, &a);
+        soak.finish();
+        assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+        soak.lines.clone()
+    };
+    let mut lines = run(args("1", "300"));
+    let older = pack_key(&pack_now(&ctx));
+    lines.extend(run(args("301", "100")));
+    let newer_line = pack_now(&ctx);
+    let newer = pack_key(&newer_line);
+    assert_ne!(older, newer, "the second pack run made a new pack");
+    let store = ctx.store();
+    let body = |k: &str| store.get(k).unwrap().expect("pack object").body;
+    let (old_bytes, new_bytes) = (body(&older), body(&newer));
+    let rel = newer
+        .strip_prefix(&format!("{}/", ctx.prefix()))
+        .unwrap()
+        .to_string();
+
+    let mut flipped = new_bytes.clone();
+    let mid = flipped.len() / 2;
+    flipped[mid] ^= 0xff;
+    for (what, bytes) in [("a flipped byte", &flipped), ("the older pack", &old_bytes)] {
+        store.put(&newer, bytes).unwrap();
+        let r = ctx.dir(&format!("restored-{}", nanos()));
+        let out = ctx.run(&["restore", "--dir", r.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{what}: restore must fail\n{}\n{}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains(&rel),
+            "{what}: stderr names the pack {rel}: {}",
+            out.stderr
+        );
+        eprintln!(
+            "fault_damaged_pack: {what} (encrypted={encrypted}): {}",
+            out.stderr.trim()
+        );
+    }
+
+    store.put(&newer, &new_bytes).unwrap();
+    let head = ctx.head();
+    let v = restore_verify(&ctx, &lines);
     let r = ctx.dir("restored");
     let r = r.to_str().unwrap();
     ctx.ok(&["restore", "--dir", r]);
-    let sql = "SELECT count(*), sum(length(payload)) FROM soak";
     // Without --claim, sql refuses the restored directory and leaves the head alone.
-    let out = ctx.run(&["sql", "--dir", r, sql]);
+    let out = ctx.run(&["sql", "--dir", r, "SELECT count(*) FROM soak"]);
     assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
     assert!(out.stderr.contains("--claim"), "{}", out.stderr);
     assert_eq!(
@@ -922,109 +1066,15 @@ fn deleted_page_object_fails_read(name: &str, extra: &[&str]) {
         head.writer_id,
         "a refused sql claimed"
     );
-    let out = ctx.run(&["sql", "--claim", "--dir", r, sql]);
-    assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
-    let key = victim.strip_prefix(&format!("{}/", ctx.prefix())).unwrap();
-    assert!(
-        out.stderr.contains(key),
-        "stderr names {key}: {}",
-        out.stderr
+    eprintln!(
+        "fault_damaged_pack: {newer_line}; after the repair: acked={} {}",
+        v.acked, v.restored
     );
-    eprintln!("{name}: deleted {key}; stderr: {}", out.stderr.trim());
-}
-
-#[test]
-#[ignore = "needs RustFS: ./scripts/test.sh"]
-fn fault_deleted_page_object_fails_read() {
-    deleted_page_object_fails_read("fault_deleted_page_object_fails_read", &[]);
-}
-
-#[test]
-#[ignore = "needs RustFS: ./scripts/test.sh"]
-fn fault_window_deleted_page_object_fails_read() {
-    deleted_page_object_fails_read("fault_window_deleted_page_object_fails_read", &WINDOW_ARGS);
-}
-
-/// Pass 2 (an encryption key): two sealed page objects swapped in the bucket. Restore
-/// succeeds (pages are fetched lazily) and the first read of either page fails with
-/// `integrity: <key>`, naming the object and nothing of its bytes. Pass 1 has no integrity
-/// codes: the test then only checks that the swap is not caught, so it is not vacuous.
-/// `extra` goes to soak.
-fn swapped_page_objects_fail_read(name: &str, extra: &[&str]) {
-    let ctx = Ctx::new(name);
-    let encrypted = ctx
-        .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
-        .is_some_and(|k| !k.is_empty());
-    let dir = ctx.dir("db");
-    let mut args = vec![
-        "--checkpoint",
-        "truncate",
-        "--every",
-        "100",
-        "--count",
-        "300",
-    ];
-    args.extend_from_slice(extra);
-    Soak::spawn(&ctx, &dir, &args).finish();
-    let head = ctx.head();
-    let m = head.manifest.expect("closed soak sealed a manifest");
-    let m_gen: u64 = m.strip_prefix("manifest/").unwrap().parse().unwrap();
-    let pages = ctx.list(&format!("pages/{m_gen:010}/"));
-    // The two highest pages: table leaves the scan reads (page 1 is fetched by restore itself).
-    assert!(pages.len() >= 3, "{pages:?}");
-    let (a, b) = (
-        pages[pages.len() - 1].clone(),
-        pages[pages.len() - 2].clone(),
-    );
-    let store = ctx.store();
-    let body = |k: &str| store.get(k).unwrap().expect("page object").body;
-    let (ba, bb) = (body(&a), body(&b));
-    assert_eq!(ba.len(), bb.len());
-    store.put(&a, &bb).unwrap();
-    store.put(&b, &ba).unwrap();
-
-    let r = ctx.dir("restored");
-    let r = r.to_str().unwrap();
-    ctx.ok(&["restore", "--dir", r]);
-    let out = ctx.run(&[
-        "sql",
-        "--claim",
-        "--dir",
-        r,
-        "SELECT count(*), sum(length(payload)) FROM soak",
-    ]);
-    if !encrypted {
-        eprintln!(
-            "{name}: no integrity codes: the swap read {}",
-            out.stdout.trim()
-        );
-        return;
-    }
-    assert_eq!(out.status.code(), Some(1), "{}\n{}", out.stdout, out.stderr);
-    let prefix = format!("{}/", ctx.prefix());
-    let keys = [
-        a.strip_prefix(&prefix).unwrap(),
-        b.strip_prefix(&prefix).unwrap(),
-    ];
-    assert!(
-        keys.iter().any(|k| out
-            .stderr
-            .contains(&format!("integrity: {}/{k}", ctx.prefix()))),
-        "stderr names an integrity failure of {keys:?}: {}",
-        out.stderr
-    );
-    eprintln!("{name}: swapped {a} and {b}; stderr: {}", out.stderr.trim());
-}
-
-#[test]
-#[ignore = "needs RustFS: ./scripts/test.sh"]
-fn encrypted_swapped_page_objects_fail_read() {
-    swapped_page_objects_fail_read("encrypted_swapped_page_objects_fail_read", &[]);
 }
 
 /// Pass 2 (an encryption key): a plaintext format 1 head put over the encrypted bucket's head
 /// while a writer runs. The running writer's head reads compare the head's bytes and fence
-/// (`the head was changed by another writer`) at its next seal, with no
+/// (`the head was changed by another writer`) at its next generation switch, with no
 /// `integrity check failed` record: the soak prints a fenced `error` line and keeps retrying,
 /// so the test waits for that line, then kills it. A fresh restore is an open, and a format 1 head under a key is the
 /// `Encryption` "no integrity codes" error there, again with no record. (The post-open
@@ -1047,11 +1097,11 @@ fn encrypted_downgraded_head_after_open_is_tampering() {
     let store = ctx.store();
     let key = format!("{}/head", ctx.prefix());
     let real = String::from_utf8(store.get(&key).unwrap().expect("head").body).unwrap();
-    assert!(real.contains("\"format\":4"), "{real}");
+    assert!(real.contains("\"format\":5"), "{real}");
     let old = format_1_head(&real);
     store.put(&key, old.as_bytes()).unwrap();
     // The soak does not exit when fenced: it prints `error ... fenced ...` and retries. Its
-    // next seal (a truncate checkpoint every 50 acks) reads the head and fences.
+    // next generation switch (a truncate checkpoint every 50 acks) reads the head and fences.
     let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
     soak.kill();
     let first = soak.lines[fenced].clone();
@@ -1083,8 +1133,9 @@ fn encrypted_downgraded_head_after_open_is_tampering() {
     );
 }
 
-/// A format 3 or 4 head's JSON as a format 1 head: `format` 1, without `journal_mode`, `key_check`
-/// and `integrity` (each a `"name":"value"` pair, whatever its place in the object).
+/// A format 5 head's JSON as a format 1 head: `format` 1, `"manifest":null`, and without
+/// `journal_mode`, `key_check`, `integrity` and `database_id` (each a `"name":"value"` pair,
+/// whatever its place in the object).
 fn format_1_head(real: &str) -> String {
     let mut pairs: Vec<String> = Vec::new();
     let inner = real.trim().trim_start_matches('{').trim_end_matches('}');
@@ -1096,6 +1147,10 @@ fn format_1_head(real: &str) -> String {
             "format" => pairs.push("\"format\":1".to_string()),
             _ => pairs.push(pair.to_string()),
         }
+    }
+    // A format 1 head always has `manifest` (null before the first seal); format 5 has none.
+    if !pairs.iter().any(|p| p.trim().starts_with("\"manifest\":")) {
+        pairs.push("\"manifest\":null".to_string());
     }
     format!("{{{}}}", pairs.join(","))
 }
@@ -1176,81 +1231,6 @@ fn second_process_is_refused() {
     restore_verify(&ctx, &soak.lines);
 }
 
-/// The coordinator's correction 1: pages a passive checkpoint backfilled into app.db before
-/// any seal must reach the bucket at the seal a later run makes.
-///
-/// A passive checkpoint backfills the whole WAL here (one connection, no readers), so the
-/// next commit restarts the WAL and seals: with `--every 100` the seal follows ack 100 with no
-/// gap to kill in. So the first run checkpoints first at ack 160 (past 150) with page PUTs
-/// delayed 2 s, and is killed on that first `event seal-started`: the checkpoint has
-/// backfilled app.db, no page PUT has finished and the head still names no manifest — the
-/// state "after a checkpoint, before any seal".
-#[test]
-#[ignore = "needs RustFS: ./scripts/test.sh"]
-fn passive_checkpoint_then_restart_then_seal() {
-    let ctx = Ctx::new("passive_checkpoint_then_restart_then_seal");
-    let dir = ctx.dir("db");
-    let args = [
-        "--checkpoint",
-        "passive",
-        "--every",
-        "160",
-        "--page-put-delay-ms",
-        "2000",
-    ];
-    let mut first = Soak::spawn(&ctx, &dir, &args);
-    first.wait_line("event seal-started");
-    first.kill();
-    let killed_at = first.acks();
-    assert!(killed_at > 150, "{killed_at}");
-    assert_eq!(first.count("event seal-finished"), 0);
-    let head = ctx.head();
-    assert_eq!(
-        (head.generation, head.manifest.as_deref()),
-        (1, None),
-        "no seal published"
-    );
-    let backfilled = fs::metadata(dir.join("app.db")).unwrap().len();
-    assert!(
-        backfilled > 8192,
-        "the passive checkpoint backfilled app.db: {backfilled}"
-    );
-    let dirty = fs::metadata(dir.join("app.db-dirty")).unwrap().len();
-    assert!(dirty > 0, "the backfilled pages are recorded as dirty");
-    assert!(ctx.list("pages/").is_empty(), "no page PUT finished");
-
-    let next = (first.last_ack() + 1).to_string();
-    let args = [
-        "--checkpoint",
-        "truncate",
-        "--every",
-        "100",
-        "--start",
-        &next,
-    ];
-    let mut second = Soak::spawn(&ctx, &dir, &args);
-    second.wait_line("event seal-finished");
-    second.kill();
-    assert!(first.errors().is_empty() && second.errors().is_empty());
-    let sealed = ctx.head();
-    assert!(
-        sealed.generation > 1 && sealed.manifest.is_some(),
-        "{sealed:?}"
-    );
-    fs::remove_dir_all(&dir).unwrap();
-    let mut lines = first.lines.clone();
-    lines.extend(second.lines.iter().cloned());
-    let v = restore_verify(&ctx, &lines);
-    eprintln!(
-        "passive_checkpoint_then_restart_then_seal: first run killed on seal-started after \
-         {killed_at} acks (app.db {backfilled} bytes, app.db-dirty {dirty} bytes); second run killed after seal-finished at \
-         {} acks; acked={} {}",
-        second.acks(),
-        v.acked,
-        v.restored
-    );
-}
-
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn writer_killed_and_restarted_on_own_disk() {
@@ -1306,8 +1286,8 @@ fn soak_rows(ctx: &Ctx, dir: &Path, claim: bool) -> (usize, usize) {
 fn background_killed_and_disk_lost_restores_a_prefix_and_catch_up_replays_the_rest() {
     let ctx = Ctx::new("background_killed_and_disk_lost");
     let dir = ctx.dir("db");
-    // The engine's own checkpoint seals near commit 500 (1000 WAL frames), and a seal first
-    // uploads the waiting commits: the pause must land before that. The soak has no end of its
+    // The engine's own checkpoint ends the generation near commit 500 (1000 WAL frames), and a
+    // generation switch first uploads the waiting commits: the pause must land before that. The soak has no end of its
     // own either.
     let mut soak = Soak::spawn(&ctx, &dir, &["--batching", BACKGROUND, "--count", "100000"]);
     soak.wait_acks(50);
@@ -1440,26 +1420,11 @@ fn mvcc_pragma_refused_then_all_acks_restore() {
     assert!(out.stderr.contains("[201]"), "{}", out.stderr);
 }
 
-/// Run `gc` every second until it trims against `head`'s own manifest (generation - 1), at
-/// most `limit`: its line. Polling for `outcome=trimmed` alone can stop at a trim against an
-/// older manifest (the newest old enough), which leaves the logs above it.
-fn gc_until_trimmed_against_head(ctx: &Ctx, head: &Head, limit: Duration) -> String {
-    let want = format!("trimmed_against={} ", head.generation - 1);
-    let start = Instant::now();
-    loop {
-        let out = ctx.ok(&["gc"]).stdout;
-        if out.contains("outcome=trimmed") && out.contains(&want) {
-            return out.trim().to_string();
-        }
-        assert!(
-            start.elapsed() < limit,
-            "{}: gc never trimmed against the head's manifest ({head:?}) within {limit:?}: {out}",
-            ctx.name
-        );
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
+/// GC after a pack bounds what a restore reads: 500 commits with a TRUNCATE checkpoint every
+/// 50 (each switches the generation), then `buckwal pack` (it holds every ended generation),
+/// then `gc` until no log below the head's generation is left (the pack's codes must be older
+/// than the pack keep time, here the 2 s trim grace). The restore then reads the head, the
+/// pointer, the codes, the pack and the log of the head's generation only.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn trimming_bounds_restore_gets() {
@@ -1482,11 +1447,15 @@ fn trimming_bounds_restore_gets() {
     soak.finish();
     assert!(soak.errors().is_empty(), "{:?}", soak.errors());
     let head = ctx.head();
-    // 500 commits at --every 50: a seal per checkpoint (the first at least) plus close.
-    assert!(head.generation >= 9, "checkpoints sealed: {head:?}");
-    // GC trims against a manifest once the bucket says it is 3.9 s old (2 s + 400 ms +
-    // 500 ms + 1 s).
-    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(15));
+    // 500 commits at --every 50: a switch per checkpoint, the close's included.
+    assert!(head.generation >= 10, "checkpoints switched: {head:?}");
+    let pack = pack_now(&ctx);
+    assert_eq!(
+        line_field(&pack, "pack_generation"),
+        head.generation.to_string(),
+        "{pack}"
+    );
+    let gc = gc_until_no_log_below(&ctx, head.generation, Duration::from_secs(20));
     let logs = ctx.list("log/");
     let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
     assert!(
@@ -1497,16 +1466,18 @@ fn trimming_bounds_restore_gets() {
     let v = restore_verify(&ctx, &soak.lines);
     let gets = field(&v.restored, "gets");
     let log_objects = field(&v.restored, "log_objects");
-    // head, manifest, page 1 (the MVCC check), then one GET per log object.
-    assert!(gets <= 3 + log_objects, "{}", v.restored);
+    // head, pointer, codes, the pack (one range GET of a pack under 16 MiB), then one GET per
+    // log object.
+    assert!(gets <= 4 + log_objects, "{}", v.restored);
     assert_eq!(
         log_objects,
         logs.len(),
         "restore read every log object left"
     );
     eprintln!(
-        "trimming_bounds_restore_gets: {} seals; {}; log/ holds {} keys of generation {}; {}",
-        soak.count("event seal-finished"),
+        "trimming_bounds_restore_gets: {} switches; {pack}; {}; log/ holds {} keys of \
+         generation {}; {}",
+        soak.count(SWITCHED),
         gc.trim(),
         logs.len(),
         head.generation,
@@ -1586,18 +1557,31 @@ fn several_connections_against_rustfs() {
     eprintln!("several_connections_against_rustfs: 400 inserts, {reads} reads in {elapsed:?}");
 }
 
+/// Every object under `log/` and the head, with its bytes (`None`: gone).
+fn log_and_head(ctx: &Ctx) -> Vec<(String, Option<Vec<u8>>)> {
+    let store = ctx.store();
+    let mut keys = ctx.list("log/");
+    keys.push(format!("{}/head", ctx.prefix()));
+    keys.into_iter()
+        .map(|k| {
+            let body = store.get(&k).expect("get").map(|o| o.body);
+            (k, body)
+        })
+        .collect()
+}
+
 /// B1 (merge review), end to end: writer A (in process, against RustFS) commits and goes
-/// idle; B restores and claims with `sql --claim`, commits and seals with a TRUNCATE
-/// checkpoint (and its close); then A closes, and its close-time TRUNCATE would seal the
-/// same generation again over B's pages. Every row either writer acked must restore, and
-/// `pages/G/*`, `manifest/G` and the head must be exactly what B's seal wrote.
+/// idle; B restores and claims with `sql --claim`, commits and switches the generation with a
+/// TRUNCATE checkpoint (and its close); then A closes, and its close would switch A's
+/// generation again behind B. Every row either writer acked must restore, and the head and
+/// every log object must be exactly what B left.
 ///
 /// A runs in process because the CLI has no way to hold a writer idle and then close it
 /// (soak acks until killed or `--count`, and SIGKILL or SIGTERM skips close).
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
-    let ctx = Ctx::new("idle_old_writer_closing_after_claim_and_seal_loses_nothing");
+fn idle_old_writer_closing_after_claim_and_switch_loses_nothing() {
+    let ctx = Ctx::new("idle_old_writer_closing_after_claim_and_switch_loses_nothing");
     let config = ctx.config(&ctx.dir("a"));
     let db_a = buckwal::open(config).expect("open A");
     let ca = db_a.connect().unwrap();
@@ -1626,34 +1610,26 @@ fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
     args.push("PRAGMA wal_checkpoint(TRUNCATE)");
     ctx.ok(&args);
     lines.extend((1001..=1010).map(|id| format!("ack {id}")));
-    let sealed = ctx.head();
-    assert_eq!(
-        (sealed.generation, sealed.manifest.is_some()),
-        (gen + 2, true),
-        "B's first seal after the takeover skips a generation: {sealed:?}"
+    let switched = ctx.head();
+    // B commits in A's generation after its fence record, then its first switch after the
+    // takeover moves past the takeover's floor (it skips a generation).
+    assert!(
+        switched.generation >= gen + 2 && switched.manifest.is_none(),
+        "B's switch after the takeover skips a generation: {switched:?}"
     );
-    // B's seal wrote its objects under G+1, not under A's generation G.
-    let key_gen = gen + 1;
-    let store = ctx.store();
-    let sealed_objects = || {
-        let mut keys = ctx.list(&format!("pages/{key_gen:010}/"));
-        keys.push(format!("{}/manifest/{key_gen:010}", ctx.prefix()));
-        keys.push(format!("{}/head", ctx.prefix()));
-        keys.into_iter()
-            .map(|k| {
-                let body = store.get(&k).expect("get").map(|o| o.body);
-                (k, body)
-            })
-            .collect::<Vec<_>>()
-    };
-    let before = sealed_objects();
+    let before = log_and_head(&ctx);
 
     let closed = ca.close().and_then(|()| db_a.close());
     assert!(
         matches!(closed, Ok(()) | Err(buckwal::Error::Fenced(_))),
         "A's close: {closed:?}"
     );
-    let after = sealed_objects();
+    let after = log_and_head(&ctx);
+    assert_eq!(
+        before.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        after.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        "A's close added or removed a log object"
+    );
     let changed: Vec<&String> = before
         .iter()
         .zip(&after)
@@ -1661,43 +1637,31 @@ fn idle_old_writer_closing_after_claim_and_seal_loses_nothing() {
         .map(|(b, _)| &b.0)
         .collect();
     assert!(
-        before.len() == after.len() && changed.is_empty(),
-        "A's close changed B's seal: {changed:?} ({} keys before, {} after)",
-        before.len(),
-        after.len()
+        changed.is_empty(),
+        "A's close changed B's objects: {changed:?}"
     );
-    assert_eq!(ctx.head(), sealed);
+    assert_eq!(ctx.head(), switched);
     let v = restore_verify(&ctx, &lines);
     eprintln!(
-        "idle_old_writer_closing_after_claim_and_seal_loses_nothing: A's close {closed:?}; \
-         acked={} {}",
-        v.acked, v.restored
+        "idle_old_writer_closing_after_claim_and_switch_loses_nothing: generation {gen} then \
+         {}; A's close {closed:?}; acked={} {}",
+        switched.generation, v.acked, v.restored
     );
 }
 
-/// Item 1 end to end: old writer A is stopped (SIGSTOP) in the middle of a seal, its page PUTs
-/// slowed; B takes over and seals, which moves the head two generations (B's pages and manifest
-/// go under G+1, never under A's G). Resumed (SIGCONT), A's late PUTs can only land on keys under
-/// G, which nothing references: every object B's seal wrote is byte-identical afterwards, and
-/// the restore holds every row either writer acked.
+/// Item 1 end to end, for the generation switch: old writer A is stopped (SIGSTOP) in the
+/// middle of a switch, after its seal-start record and before its head PUT (each head PUT
+/// delayed 2 s). B takes over (its head write raises the epoch, its fence record goes after
+/// A's seal-start record), commits and switches. Resumed (SIGCONT), A's late head PUT carries
+/// the ETag of the head B replaced, so it lands nowhere: every log object and the head stay
+/// byte-identical, and the restore holds every row either writer acked.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn late_put_from_fenced_writer_lands_on_unreferenced_key() {
-    let ctx = short_lease_ctx("late_put_from_fenced_writer_lands_on_unreferenced_key");
+fn late_head_put_from_fenced_writer_lands_nowhere() {
+    let ctx = short_lease_ctx("late_head_put_from_fenced_writer_lands_nowhere");
     let a = ctx.dir("a");
-    let mut soak = Soak::spawn(
-        &ctx,
-        &a,
-        &[
-            "--checkpoint",
-            "passive",
-            "--every",
-            "160",
-            "--page-put-delay-ms",
-            "2000",
-        ],
-    );
-    soak.wait_line("event seal-started");
+    let mut soak = Soak::spawn(&ctx, &a, &SWITCH_CRASH_ARGS);
+    soak.wait_line(RECORD_WITHOUT_COMMIT);
     soak.signal("STOP");
     let before = ctx.head();
     let b = ctx.dir("b");
@@ -1709,40 +1673,27 @@ fn late_put_from_fenced_writer_lands_on_unreferenced_key() {
         &["PRAGMA wal_checkpoint(TRUNCATE)"],
     );
     let head = ctx.head();
-    assert_eq!(
-        head.generation,
-        before.generation + 2,
-        "B's first seal skips a generation: {before:?} then {head:?}"
+    assert!(
+        head.generation >= before.generation + 2,
+        "B's first switch skips a generation: {before:?} then {head:?}"
     );
-    let key_gen = before.generation + 1;
-    let store = ctx.store();
-    let sealed_objects = || {
-        let mut keys = ctx.list(&format!("pages/{key_gen:010}/"));
-        keys.push(format!("{}/manifest/{key_gen:010}", ctx.prefix()));
-        keys.push(format!("{}/head", ctx.prefix()));
-        keys.into_iter()
-            .map(|k| {
-                let body = store.get(&k).expect("get").map(|o| o.body);
-                (k, body)
-            })
-            .collect::<Vec<_>>()
-    };
-    let sealed = sealed_objects();
-    assert!(sealed.len() > 2, "B's seal wrote pages: {sealed:?}");
+    let left = log_and_head(&ctx);
     soak.signal("CONT");
     std::thread::sleep(Duration::from_secs(6));
     soak.kill();
     assert_eq!(
-        sealed_objects(),
-        sealed,
-        "A's late PUTs changed B's seal (generation {key_gen})"
+        log_and_head(&ctx),
+        left,
+        "A's late head PUT changed B's objects (generation {} then {})",
+        before.generation,
+        head.generation
     );
+    assert_eq!(ctx.head(), head);
     let mut lines = soak.lines.clone();
     lines.extend(rows);
     let v = restore_verify(&ctx, &lines);
     eprintln!(
-        "late_put_from_fenced_writer_lands_on_unreferenced_key: generation {} then {}; \
-         acked={} {}",
+        "late_head_put_from_fenced_writer_lands_nowhere: generation {} then {}; acked={} {}",
         before.generation, head.generation, v.acked, v.restored
     );
 }
@@ -1858,8 +1809,9 @@ fn log_generations(ctx: &Ctx) -> std::collections::BTreeSet<u64> {
 }
 
 /// The lease self-fences a writer that was paused through a takeover and a GC: an Off soak in
-/// A is stopped (SIGSTOP) after 100 acks; B takes over, commits 10 rows and seals, and GC
-/// deletes A's generation's log, so A's next log key is free again. Resumed (SIGCONT), A's
+/// A is stopped (SIGSTOP) after 100 acks; B takes over, commits 10 rows and switches the
+/// generation, a pack run packs every ended generation, and GC deletes the log below the
+/// pack, A's generation's included, so A's next log key is free again. Resumed (SIGCONT), A's
 /// lease has lapsed: its head check must fence it before any append, so it acks nothing.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
@@ -1881,9 +1833,10 @@ fn paused_old_writer_is_fenced_after_resume() {
     let head = ctx.head();
     assert!(
         head.generation > before.generation,
-        "B sealed A's generation: {before:?} then {head:?}"
+        "B switched A's generation: {before:?} then {head:?}"
     );
-    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(20));
+    let pack = pack_now(&ctx);
+    let gc = gc_until_no_log_below(&ctx, head.generation, Duration::from_secs(30));
     let a_log = format!("log/{:010}/", before.generation);
     assert!(
         ctx.list(&a_log).is_empty(),
@@ -1917,7 +1870,7 @@ fn paused_old_writer_is_fenced_after_resume() {
     let shown = &tail[..tail.len().min(4)];
     eprintln!(
         "paused_old_writer_is_fenced_after_resume: A stopped after {} acks (generation {}, \
-         epoch {}); {took}; {gc}; after the CONT A printed {} lines ({late_acks} acks), the \
+         epoch {}); {took}; {pack}; {gc}; after the CONT A printed {} lines ({late_acks} acks), the \
          first {shown:?}; acked={} {}",
         soak.acks(),
         before.generation,
@@ -1929,8 +1882,9 @@ fn paused_old_writer_is_fenced_after_resume() {
 }
 
 /// GC from the CLI after five short-lived writers, each claiming a fresh directory, committing
-/// one row and sealing at close: the log of every generation but the head's is deleted once
-/// the head's manifest is old enough, and the five rows restore.
+/// one row and switching the generation at close, and one pack run: the log of every
+/// generation but the head's is deleted once the pack's codes are old enough, and the five
+/// rows restore.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn gc_cli_trims_after_short_lived_processes() {
@@ -1955,7 +1909,8 @@ fn gc_cli_trims_after_short_lived_processes() {
         before.len() > 1,
         "log/ holds more than one generation: {before:?} ({head:?})"
     );
-    let gc = gc_until_trimmed_against_head(&ctx, &head, Duration::from_secs(20));
+    let pack = pack_now(&ctx);
+    let gc = gc_until_no_log_below(&ctx, head.generation, Duration::from_secs(30));
     let logs = ctx.list("log/");
     let root = format!("{}/log/{:010}/", ctx.prefix(), head.generation);
     assert!(
@@ -1966,7 +1921,7 @@ fn gc_cli_trims_after_short_lived_processes() {
     let v = restore_verify(&ctx, &lines);
     eprintln!(
         "gc_cli_trims_after_short_lived_processes: log/ generations before GC {before:?}, \
-         head {head:?}; {gc}; log/ holds {} keys after; acked={} {}",
+         head {head:?}; {pack}; {gc}; log/ holds {} keys after; acked={} {}",
         logs.len(),
         v.acked,
         v.restored
@@ -2267,8 +2222,8 @@ fn ctx_deletes_its_prefix_unless_a_failure_is_kept() {
 //
 // Every test here runs in both passes of scripts/test.sh: pass 2 serves RustFS over HTTPS and
 // encrypts pages, the log and the head's contents with a key, so these tests also cover the
-// encrypted `.db-log`. Where a kill must land on one exact op boundary (between a seal and the
-// log truncate, between the log truncate and the WAL truncate, mid log PUT) the CLI cannot
+// encrypted `.db-log`. Where a kill must land on one exact op boundary (between a generation
+// switch and the log truncate, between the log truncate and the WAL truncate, mid log PUT) the CLI cannot
 // reach it: those boundaries are the library's fault-schedule tests (crates/buckwal/
 // tests/mvcc_fencing.rs); the kills here land on the process-level boundaries only.
 
@@ -2347,7 +2302,7 @@ fn mvcc_crash_group_commit() {
 }
 
 /// The soak's own checkpoint (`truncate`, then `reopen`) every 100 commits, killed after 350
-/// acks: at least two seals finished, the restore keeps every ack.
+/// acks: at least two generation switches finished, the restore keeps every ack.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn mvcc_crash_checkpoint() {
@@ -2359,79 +2314,71 @@ fn mvcc_crash_checkpoint() {
         soak.wait_acks(350);
         soak.kill();
         assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
-        let seals = soak.count("event seal-finished");
+        let switches = soak.count(SWITCHED);
         let checkpoints = soak.count(&format!("event checkpoint {mode}"));
         assert!(
             checkpoints >= 3,
             "{mode}: {checkpoints} checkpoints\n{}",
             soak.tail()
         );
-        // A reopen closes and opens the database; in MVCC that keeps the log and seals nothing.
         if mode == "truncate" {
-            assert!(seals >= 2, "{mode}: {seals} seals\n{}", soak.tail());
+            assert!(
+                switches >= 2,
+                "{mode}: {switches} switches\n{}",
+                soak.tail()
+            );
         }
         assert_mvcc_head(&ctx);
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
         eprintln!(
-            "mvcc_crash_checkpoint: {mode}: acked={} seals={seals} {} unacked_present={}",
+            "mvcc_crash_checkpoint: {mode}: acked={} switches={switches} {} unacked_present={}",
             v.acked, v.restored, v.unacked_present
         );
     }
 }
 
-/// Killed the moment a seal finishes (the 1st and the 3rd), when the log truncate and the WAL
-/// truncate that follow it are next: wherever the kill lands, every ack restores.
+/// Killed the moment a generation switch finishes (the 1st and the 3rd), when the log
+/// truncate and the WAL truncate that follow it are next: wherever the kill lands, every ack
+/// restores.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn mvcc_crash_right_after_seal() {
+fn mvcc_crash_right_after_generation_switch() {
     for nth in [1, 3] {
-        let ctx = Ctx::new(&format!("mvcc_crash_right_after_seal_{nth}"));
+        let ctx = Ctx::new(&format!("mvcc_crash_right_after_generation_switch_{nth}"));
         let dir = ctx.dir("db");
         let args = mvcc_soak(&["--checkpoint", "truncate", "--every", "100"]);
         let mut soak = Soak::spawn(&ctx, &dir, &args);
-        soak.wait_for("a finished seal", |s| s.count("event seal-finished") >= nth);
+        soak.wait_for("a finished switch", |s| s.count(SWITCHED) >= nth);
         soak.kill();
         assert!(soak.errors().is_empty(), "{:?}", soak.errors());
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
         eprintln!(
-            "mvcc_crash_right_after_seal: seal #{nth}: acked={} {}",
+            "mvcc_crash_right_after_generation_switch: switch #{nth}: acked={} {}",
             v.acked, v.restored
         );
     }
 }
 
-/// Killed while a seal's page PUTs are in flight (each delayed 200 ms), on the first seal and
-/// the third: the generation is not sealed, the log still holds the commits, every ack restores.
+/// Killed in the middle of a generation switch (after its seal-start record, before its
+/// delayed head PUT), on the first switch and the third: the head still names the
+/// generation, the log still holds the commits, every ack restores, and `verify --acked`
+/// finds every ack.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
-fn mvcc_crash_during_seal_upload() {
+fn mvcc_crash_during_generation_switch() {
     for nth in [1, 3] {
-        let ctx = Ctx::new(&format!("mvcc_crash_during_seal_upload_{nth}"));
+        let ctx = Ctx::new(&format!("mvcc_crash_during_generation_switch_{nth}"));
         let dir = ctx.dir("db");
-        let args = mvcc_soak(&[
-            "--checkpoint",
-            "truncate",
-            "--every",
-            "100",
-            "--page-put-delay-ms",
-            "200",
-        ]);
-        let mut soak = Soak::spawn(&ctx, &dir, &args);
-        soak.wait_for("seal-started", |s| s.count("event seal-started") >= nth);
-        soak.kill();
-        assert_eq!(
-            soak.count("event seal-finished"),
-            nth - 1,
-            "{}",
-            soak.tail()
-        );
-        assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+        let mut soak = Soak::spawn(&ctx, &dir, &mvcc_soak(&SWITCH_CRASH_ARGS));
+        kill_during_switch(&ctx, &mut soak, nth);
+        assert_mvcc_head(&ctx);
         fs::remove_dir_all(&dir).unwrap();
         let v = restore_verify(&ctx, &soak.lines);
+        assert!(v.acked >= 100 * nth, "acked={}", v.acked);
         eprintln!(
-            "mvcc_crash_during_seal_upload: killed on seal-started #{nth}: acked={} {}",
+            "mvcc_crash_during_generation_switch: killed in switch #{nth}: acked={} {}",
             v.acked, v.restored
         );
     }
@@ -2488,7 +2435,7 @@ fn verify_acked_on_plain_mvcc_restore() {
     let mut soak = Soak::spawn(&ctx, &dir, &mvcc_soak(&[]));
     soak.wait_acks(100);
     soak.kill();
-    assert_eq!(soak.count("event seal-finished"), 0, "{}", soak.tail());
+    assert_eq!(soak.count(SWITCHED), 0, "{}", soak.tail());
     let head = ctx.head();
     fs::remove_dir_all(&dir).unwrap();
     let v = restore_verify(&ctx, &soak.lines);
@@ -2500,39 +2447,6 @@ fn verify_acked_on_plain_mvcc_restore() {
     eprintln!(
         "verify_acked_on_plain_mvcc_restore: acked={} {}",
         v.acked, v.restored
-    );
-}
-
-/// A restore of a bucket whose writer died during a seal (the page PUTs delayed): the head
-/// still names the previous generation, and `verify --acked` finds every ack.
-#[test]
-#[ignore = "needs RustFS: ./scripts/test.sh"]
-fn verify_acked_on_mid_checkpoint_restore() {
-    let ctx = Ctx::new("verify_acked_on_mid_checkpoint_restore");
-    let dir = ctx.dir("db");
-    let args = mvcc_soak(&[
-        "--checkpoint",
-        "truncate",
-        "--every",
-        "100",
-        "--page-put-delay-ms",
-        "300",
-    ]);
-    let mut soak = Soak::spawn(&ctx, &dir, &args);
-    soak.wait_for("the 2nd seal-started", |s| {
-        s.count("event seal-started") >= 2
-    });
-    let head_before = ctx.head();
-    soak.kill();
-    assert_eq!(soak.count("event seal-finished"), 1, "{}", soak.tail());
-    // The killed seal published nothing.
-    assert_eq!(ctx.head().generation, head_before.generation);
-    fs::remove_dir_all(&dir).unwrap();
-    let v = restore_verify(&ctx, &soak.lines);
-    assert!(v.acked >= 200, "acked={}", v.acked);
-    eprintln!(
-        "verify_acked_on_mid_checkpoint_restore: head generation {}; acked={} {}",
-        head_before.generation, v.acked, v.restored
     );
 }
 
@@ -2892,7 +2806,7 @@ fn mvcc_gc_across_generations() {
 }
 
 /// The MVCC bucket in the harness's mode: with an encryption key (pass 2 of test.sh) no
-/// object of the prefix holds the marker row's text, log objects and sealed pages included;
+/// object of the prefix holds the marker row's text, log objects and the pack included;
 /// without one (pass 1) the same scan finds it, so the check is not vacuous.
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
@@ -2905,7 +2819,8 @@ fn mvcc_encrypted() {
     let d = dir.to_str().unwrap();
     let marker = format!("mvcc-marker-{}", nanos());
     let insert = format!("INSERT INTO m VALUES ('{marker}')");
-    // Rows in the log, then a checkpoint (sealed pages and the emptied log), then more rows.
+    // Rows in the log, then a checkpoint (it ends the generation and empties the log), then
+    // more rows, then a pack run that holds the ended generation.
     ctx.ok(&[
         "sql",
         "--claim",
@@ -2925,6 +2840,8 @@ fn mvcc_encrypted() {
         "PRAGMA wal_checkpoint(TRUNCATE)",
         &insert,
     ]);
+    let pack = pack_now(&ctx);
+    assert_eq!(line_field(&pack, "outcome"), "packed", "{pack}");
     let scan = if encrypted { "absent" } else { "present" };
     let out = ctx.run(&["scan", "--expect", scan, "--marker", &marker]);
     assert!(
@@ -2943,4 +2860,583 @@ fn mvcc_encrypted() {
         "mvcc_encrypted: encrypted={encrypted}: scan --expect {scan}: {}",
         out.stdout.trim()
     );
+}
+
+// ---- Packs (spec "Tests", System) ----
+//
+// The writer's packer thread waits a whole minute before its first check, so these tests
+// make their packs with `buckwal pack` (or `buckwal packer`, which checks at once).
+
+/// The GETs of a restore besides its log objects, for a pack under 16 MiB: the head, the
+/// pointer, the codes and one range GET of the pack. (A restore's `log_objects` counts the
+/// head's generation only; its `gets` counts every object it read.)
+const PACK_RESTORE_GETS: usize = 4;
+
+/// The pack generation of a `pack` line.
+fn pack_generation(line: &str) -> u64 {
+    line_field(line, "pack_generation").parse().unwrap()
+}
+
+/// SIGKILL of a writer with a pack in the bucket, then the loss of its disk: the restore reads
+/// the pack and the log of the generations from the pack on, no older log, and every acked
+/// row is there. Off (one connection) and Window (four connections). The pack run runs while
+/// the writer commits, and the writer switches the generation again after it.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn kill_writer_restore_from_pack_plus_log_loses_no_acked_commit() {
+    for (tag, extra) in [("off", &[][..]), ("window", &WINDOW_ARGS[..])] {
+        let ctx = Ctx::new(&format!("kill_writer_restore_from_pack_plus_log_{tag}"));
+        let dir = ctx.dir("db");
+        let mut args = vec!["--checkpoint", "truncate", "--every", "100"];
+        args.extend_from_slice(extra);
+        let mut soak = Soak::spawn(&ctx, &dir, &args);
+        soak.wait_for("two generation switches", |s| s.count(SWITCHED) >= 2);
+        let pack = pack_now(&ctx);
+        assert_eq!(line_field(&pack, "outcome"), "packed", "{pack}");
+        let g = pack_generation(&pack);
+        let switched = soak.count(SWITCHED);
+        soak.wait_for("a switch after the pack", |s| s.count(SWITCHED) > switched);
+        soak.wait_acks_after(Instant::now(), 50);
+        soak.kill();
+        assert!(soak.errors().is_empty(), "{tag}: {:?}", soak.errors());
+        let head = ctx.head();
+        assert!(
+            head.generation > g,
+            "{tag}: the writer switched after the pack: {head:?}"
+        );
+        let below = log_objects_from(&ctx, 1) - log_objects_from(&ctx, g);
+        assert!(below > 0, "{tag}: the log below the pack is still there");
+        let want = log_objects_from(&ctx, g);
+        fs::remove_dir_all(&dir).unwrap();
+        let v = restore_verify(&ctx, &soak.lines);
+        assert_eq!(
+            field(&v.restored, "gets"),
+            want + PACK_RESTORE_GETS,
+            "{tag}: the restore read the pack and the {want} log objects from generation {g} on \
+             only: {}",
+            v.restored
+        );
+        eprintln!(
+            "kill_writer_restore_from_pack_plus_log_{tag}: {pack}; head {head:?}; {below} log \
+             objects below the pack not read; acked={} {}",
+            v.acked, v.restored
+        );
+    }
+}
+
+/// A running `buckwal packer`, its stdout lines read on a thread into a channel.
+struct PackerProc {
+    child: Child,
+    rx: Receiver<String>,
+    lines: Vec<String>,
+    stderr: PathBuf,
+}
+
+impl PackerProc {
+    fn spawn(ctx: &Ctx, dir: &Path) -> PackerProc {
+        let stderr = ctx.tmp.path().join(format!("packer-{}.stderr", nanos()));
+        let mut child = ctx
+            .command(&["packer", "--dir", dir.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .expect("spawn packer");
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        PackerProc {
+            child,
+            rx,
+            lines: Vec::new(),
+            stderr,
+        }
+    }
+
+    fn tail(&self) -> String {
+        format!(
+            "packer stdout: {:?}\nstderr:\n{}",
+            self.lines,
+            fs::read_to_string(&self.stderr).unwrap_or_default()
+        )
+    }
+
+    /// Read lines until one starts with `prefix` (returned); fails on EOF or after `WAIT`.
+    fn wait_prefixed(&mut self, prefix: &str) -> String {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(line) => {
+                    let hit = line.starts_with(prefix);
+                    self.lines.push(line);
+                    if hit {
+                        return self.lines.last().unwrap().clone();
+                    }
+                }
+                Err(_) => panic!(
+                    "packer: no {prefix:?} line within {WAIT:?}\n{}",
+                    self.tail()
+                ),
+            }
+        }
+    }
+
+    /// SIGTERM, then the exit status and every line it printed.
+    fn sigterm(&mut self) -> std::process::ExitStatus {
+        let pid = self.child.id().to_string();
+        let status = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        assert!(status.success(), "kill -TERM {pid}: {status}");
+        let deadline = Instant::now() + WAIT;
+        let exited = loop {
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                break s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "packer did not exit\n{}",
+                self.tail()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        while let Ok(line) = self.rx.recv_timeout(Duration::from_secs(5)) {
+            self.lines.push(line);
+        }
+        exited
+    }
+}
+
+impl Drop for PackerProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `buckwal packer` (the packer loop as its own process, Choice E) runs while a writer
+/// commits: its first check, at once, packs every ended generation and prints
+/// `packed pack_generation=<g>`; the writer keeps acking during and after it, with no error.
+/// SIGTERM stops the packer with `packer stopped` and exit 0. After a SIGKILL of the writer
+/// and the loss of its disk, the restore reads that pack and the log from `g` on, and holds
+/// every acked row.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn packer_runs_during_commits() {
+    let ctx = Ctx::new("packer_runs_during_commits");
+    let dir = ctx.dir("db");
+    let args = [
+        "--checkpoint",
+        "truncate",
+        "--every",
+        "100",
+        "--connections",
+        "2",
+    ];
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.wait_for("a generation switch", |s| s.count(SWITCHED) >= 1);
+    let started = Instant::now();
+    let mut packer = PackerProc::spawn(&ctx, &ctx.dir("packer"));
+    let first = packer.wait_prefixed("packer started ");
+    let packed = packer.wait_prefixed("packed ");
+    let packed_at = Instant::now();
+    let g = pack_generation(&packed);
+    assert!(g >= 2, "{packed}");
+    soak.wait_acks_after(packed_at, 100);
+    let during = soak.acks_around(started, false) - soak.acks_around(packed_at, false);
+    let status = packer.sigterm();
+    assert_eq!(status.code(), Some(0), "packer exit\n{}", packer.tail());
+    assert_eq!(
+        packer.lines.last().map(String::as_str),
+        Some("packer stopped"),
+        "{}",
+        packer.tail()
+    );
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    let want = log_objects_from(&ctx, g);
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    assert_eq!(
+        field(&v.restored, "gets"),
+        want + PACK_RESTORE_GETS,
+        "the restore read the packer's pack and the {want} log objects from generation {g} on: {}",
+        v.restored
+    );
+    eprintln!(
+        "packer_runs_during_commits: {first}; {packed} ({during} acks while the packer ran \
+         its first check); longest ack gap {:?}; acked={} {}",
+        soak.longest_ack_gap(),
+        v.acked,
+        v.restored
+    );
+}
+
+/// MVCC with packs (Choice B): an MVCC soak in `BEGIN CONCURRENT` (four connections) with a
+/// TRUNCATE checkpoint every 100 commits; a pack run while it commits, more commits and a
+/// switch after it, then SIGKILL and the loss of the disk. The head stays MVCC, the restore
+/// reads the pack and the log from the pack generation on, and every ack is there. The
+/// restored copy, claimed by `sql`, commits in `BEGIN CONCURRENT` again.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn mvcc_with_packs() {
+    let ctx = Ctx::new("mvcc_with_packs");
+    let dir = ctx.dir("db");
+    let args = mvcc_soak(&[
+        "--connections",
+        "4",
+        "--checkpoint",
+        "truncate",
+        "--every",
+        "100",
+    ]);
+    let mut soak = Soak::spawn(&ctx, &dir, &args);
+    soak.wait_for("two generation switches", |s| s.count(SWITCHED) >= 2);
+    let pack = pack_now(&ctx);
+    assert_eq!(line_field(&pack, "outcome"), "packed", "{pack}");
+    let g = pack_generation(&pack);
+    let switched = soak.count(SWITCHED);
+    soak.wait_for("a switch after the pack", |s| s.count(SWITCHED) > switched);
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{:?}", soak.errors());
+    assert_mvcc_head(&ctx);
+    let want = log_objects_from(&ctx, g);
+    fs::remove_dir_all(&dir).unwrap();
+    let v = restore_verify(&ctx, &soak.lines);
+    assert_eq!(
+        field(&v.restored, "gets"),
+        want + PACK_RESTORE_GETS,
+        "the restore read the pack and the {want} log objects from generation {g} on: {}",
+        v.restored
+    );
+    let r = ctx.dir("claimed");
+    let rs = r.to_str().unwrap();
+    ctx.ok(&["restore", "--dir", rs]);
+    ctx.ok(&[
+        "sql",
+        "--claim",
+        "--dir",
+        rs,
+        "BEGIN CONCURRENT",
+        "INSERT INTO soak(id, payload) VALUES (900001, zeroblob(1024))",
+        "COMMIT",
+    ]);
+    let n = ctx.ok(&[
+        "sql",
+        "--dir",
+        rs,
+        "SELECT count(*) FROM soak WHERE id = 900001",
+    ]);
+    assert_eq!(n.stdout.trim(), "1");
+    assert_mvcc_head(&ctx);
+    eprintln!(
+        "mvcc_with_packs: {pack}; acked={} {}; the claimed copy committed in BEGIN CONCURRENT",
+        v.acked, v.restored
+    );
+}
+
+/// The value of `key=` in a `key=value` line, as a number.
+fn num_field(line: &str, key: &str) -> f64 {
+    line_field(line, key).parse().unwrap()
+}
+
+/// `buckwal vacuum` (Choice A): a writer's database with 400 rows of 3.5 KB, the upper half
+/// deleted, so more than a third of its pages are free. The CLI prints one `vacuumed` line
+/// whose numbers agree with each other: the same page size before and after, fewer pages, no
+/// free page after, a free-page share above 0.3 before, and the bytes before and after equal
+/// to the pages times the page size. A pack run after it makes a pack of `bytes_after` with
+/// a free-page share of 0, the restore holds the 200 rows left, and in pass 2 no object of
+/// the prefix holds the marker. `vacuum` of a directory the writer does not own is refused.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn vacuum_command() {
+    let ctx = Ctx::new("vacuum_command");
+    let encrypted = ctx
+        .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
+        .is_some_and(|k| !k.is_empty());
+    let dir = ctx.dir("db");
+    let d = dir.to_str().unwrap();
+    let marker = format!("vacuum-marker-{}", nanos());
+    let inserts: Vec<String> = (1..=400)
+        .map(|id| {
+            format!("INSERT INTO v(id, t) VALUES ({id}, '{marker}-{id}-' || hex(zeroblob(1750)))")
+        })
+        .collect();
+    let mut args = vec![
+        "sql",
+        "--claim",
+        "--dir",
+        d,
+        "CREATE TABLE v(id INTEGER PRIMARY KEY, t TEXT)",
+        "BEGIN",
+    ];
+    args.extend(inserts.iter().map(String::as_str));
+    args.extend([
+        "COMMIT",
+        "DELETE FROM v WHERE id > 200",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+    ]);
+    ctx.ok(&args);
+    let refused = ctx.run(&["vacuum", "--dir", ctx.dir("other").to_str().unwrap()]);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "vacuum of a directory the writer does not own\n{}\n{}",
+        refused.stdout,
+        refused.stderr
+    );
+    let out = ctx.ok(&["vacuum", d]).stdout;
+    let line = out.trim();
+    assert!(line.starts_with("vacuumed "), "{line}");
+    let page_size = num_field(line, "page_size");
+    let (before, free_before) = (
+        num_field(line, "pages_before"),
+        num_field(line, "free_pages_before"),
+    );
+    let (after, free_after) = (
+        num_field(line, "pages_after"),
+        num_field(line, "free_pages_after"),
+    );
+    let share = num_field(line, "free_page_share");
+    assert!(page_size >= 512.0, "{line}");
+    assert!(share > 0.3, "{line}");
+    assert!((share - free_before / before).abs() < 0.001, "{line}");
+    assert!(after < before && free_after == 0.0, "{line}");
+    assert_eq!(
+        num_field(line, "bytes_before"),
+        before * page_size,
+        "{line}"
+    );
+    assert_eq!(num_field(line, "bytes_after"), after * page_size, "{line}");
+    assert!(num_field(line, "ms") >= 0.0, "{line}");
+    let pack = pack_now(&ctx);
+    assert_eq!(line_field(&pack, "outcome"), "packed", "{pack}");
+    assert_eq!(
+        num_field(&pack, "size"),
+        num_field(line, "bytes_after"),
+        "{pack}"
+    );
+    assert_eq!(num_field(&pack, "free_page_share"), 0.0, "{pack}");
+    fs::remove_dir_all(&dir).unwrap();
+    let r = ctx.dir("restored");
+    let rs = r.to_str().unwrap();
+    ctx.ok(&["restore", "--dir", rs]);
+    let n = ctx.ok(&[
+        "sql",
+        "--claim",
+        "--dir",
+        rs,
+        "SELECT count(*), max(id) FROM v",
+    ]);
+    assert_eq!(n.stdout.trim(), "200\t200");
+    let v = ctx.ok(&["verify", "--dir", ctx.dir("verified").to_str().unwrap()]);
+    assert!(v.stdout.starts_with("verify ok "), "{}", v.stdout);
+    let expect = if encrypted { "absent" } else { "present" };
+    let scan = ctx.run(&["scan", "--expect", expect, "--marker", &marker]);
+    assert!(
+        scan.status.success(),
+        "scan --expect {expect}\n{}\n{}",
+        scan.stdout,
+        scan.stderr
+    );
+    eprintln!("vacuum_command: {line}; {pack}; scan --expect {expect} passed");
+}
+
+/// The head of the test's prefix, as JSON text.
+fn head_json(ctx: &Ctx) -> String {
+    let o = ctx.store().get(&format!("{}/head", ctx.prefix())).unwrap();
+    String::from_utf8(o.expect("head").body).unwrap()
+}
+
+/// A database created by this build (WAL and MVCC) writes no `pages/` and no `manifest/`
+/// object, through commits, generation switches, a close, a pack run and GC: its head is
+/// format 5 with no `manifest`, and `scan` counts `pages=0 manifest=0`.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn no_pages_or_manifest_objects_in_new_database() {
+    for mode in ["wal", "mvcc"] {
+        let ctx = short_lease_ctx(&format!("no_pages_or_manifest_objects_{mode}"));
+        let dir = ctx.dir("db");
+        let args = [
+            "--journal-mode",
+            mode,
+            "--checkpoint",
+            "truncate",
+            "--every",
+            "50",
+            "--count",
+            "300",
+        ];
+        let mut soak = Soak::spawn(&ctx, &dir, &args);
+        soak.finish();
+        assert!(soak.errors().is_empty(), "{mode}: {:?}", soak.errors());
+        let pack = pack_now(&ctx);
+        let head = ctx.head();
+        let gc = gc_until_no_log_below(&ctx, head.generation, Duration::from_secs(30));
+        let json = head_json(&ctx);
+        assert!(json.contains("\"format\":5"), "{mode}: {json}");
+        assert!(!json.contains("\"manifest\""), "{mode}: {json}");
+        assert_eq!(ctx.list("pages/"), Vec::<String>::new(), "{mode}");
+        assert_eq!(ctx.list("manifest/"), Vec::<String>::new(), "{mode}");
+        let expect = if ctx
+            .opt_var("BUCKWAL_ENCRYPTION_KEY_FILE")
+            .is_some_and(|k| !k.is_empty())
+        {
+            "absent"
+        } else {
+            "present"
+        };
+        let scan = ctx.ok(&["scan", "--expect", expect]).stdout;
+        let kinds = scan
+            .lines()
+            .find(|l| l.starts_with("scan kinds: "))
+            .unwrap_or_else(|| panic!("{mode}: no scan kinds line: {scan}"));
+        assert!(
+            kinds.contains(" pages=0 ") && kinds.contains(" manifest=0 "),
+            "{mode}: {kinds}"
+        );
+        assert!(
+            kinds.contains(" pack=1 ") && kinds.contains(" codes=1 "),
+            "{mode}: {kinds}"
+        );
+        let v = restore_verify(&ctx, &soak.lines);
+        eprintln!(
+            "no_pages_or_manifest_objects_{mode}: {pack}; {gc}; {kinds}; acked={}",
+            v.acked
+        );
+    }
+}
+
+/// The CLI of the build before format 5 (the released build at 3ac8ff3), which
+/// `scripts/test.sh` builds and names in `BUCKWAL_TEST_RELEASED_BIN`.
+fn released_bin() -> PathBuf {
+    let bin = std::env::var("BUCKWAL_TEST_RELEASED_BIN").unwrap_or_else(|_| {
+        panic!(
+            "BUCKWAL_TEST_RELEASED_BIN is not set: ./scripts/test.sh builds the CLI at 3ac8ff3 \
+             (released_build) and sets it"
+        )
+    });
+    let bin = PathBuf::from(bin);
+    assert!(
+        bin.is_file(),
+        "BUCKWAL_TEST_RELEASED_BIN: no file {}",
+        bin.display()
+    );
+    bin
+}
+
+/// One upgrade case: the released build makes a bucket of format `want_format` (1 plaintext,
+/// 4 encrypted) with a seal (pages and a manifest) and acked rows in the log after it, and is
+/// killed. This build's `upgrade` makes it a format 5 bucket: the head has no manifest, the
+/// restore holds every acked row, the upgrade's directory continues as the writer, and the
+/// released build refuses the bucket. GC then deletes every page and manifest, the restore
+/// still holds every row, and `scan` finds no plaintext in an encrypted bucket.
+fn upgrade_case(name: &str, want_format: u64) {
+    let rel = released_bin();
+    let mut ctx = Ctx::new(name)
+        .set("BUCKWAL_TRIM_GRACE_SECS", "2")
+        .set("BUCKWAL_LEASE_MS", "0")
+        .set("BUCKWAL_RETRY_DEADLINE_MS", "400")
+        .set("BUCKWAL_REQUEST_TIMEOUT_MS", "500");
+    let pass_key = ctx.opt_var(KEY_FILE_VAR).filter(|k| !k.is_empty());
+    let encrypted = want_format == 4;
+    if encrypted && pass_key.is_none() {
+        let k = write_key_file(&ctx, "upgrade");
+        ctx = ctx.set(KEY_FILE_VAR, k.to_str().unwrap());
+    }
+    if !encrypted {
+        // A plaintext bucket: pass 2's whole-bucket scan must not find it, so the prefix goes
+        // when the test ends.
+        ctx = ctx.set(KEY_FILE_VAR, "");
+        ctx.keep_all = false;
+    }
+    let old = ctx.dir("old");
+    let args = ["--checkpoint", "truncate", "--every", "50"];
+    let mut soak = Soak::spawn_of(&ctx, &rel, &old, &args);
+    soak.wait_acks(80);
+    soak.kill();
+    assert!(soak.errors().is_empty(), "{name}: {:?}", soak.errors());
+    let json = head_json(&ctx);
+    assert!(
+        json.contains(&format!("\"format\":{want_format}")),
+        "{name}: the released build made format {want_format}: {json}"
+    );
+    let sealed = ctx.head();
+    assert!(
+        sealed.manifest.is_some(),
+        "{name}: the released build sealed: {sealed:?}"
+    );
+    assert!(!ctx.list("pages/").is_empty(), "{name}: page objects");
+
+    let up = ctx.dir("up");
+    let ups = up.to_str().unwrap();
+    let out = ctx.ok(&["upgrade", ups]).stdout;
+    let line = out.trim().to_string();
+    assert!(line.starts_with("upgraded "), "{name}: {line}");
+    assert_eq!(
+        line_field(&line, "from_format"),
+        want_format.to_string(),
+        "{line}"
+    );
+    let json = head_json(&ctx);
+    assert!(json.contains("\"format\":5"), "{name}: {json}");
+    assert_eq!(ctx.head().manifest, None, "{name}: {json}");
+    let mut lines = soak.lines.clone();
+    let v = restore_verify(&ctx, &lines);
+
+    // The upgrade's directory continues as the writer (its first open claims it).
+    lines.extend(insert_rows(&ctx, &up, 900001..=900005, &["--claim"]));
+    // The released build refuses the format 5 bucket.
+    let refused = ctx.run_of(
+        &rel,
+        &["restore", "--dir", ctx.dir("old-restore").to_str().unwrap()],
+    );
+    assert_eq!(refused.status.code(), Some(1), "{name}\n{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("unsupported format 5"),
+        "{name}: {}",
+        refused.stderr
+    );
+
+    // GC deletes the pages and manifests of the old format once the pack is old enough.
+    let start = Instant::now();
+    let gc = loop {
+        let gc = ctx.ok(&["gc"]).stdout.trim().to_string();
+        if ctx.list("pages/").is_empty() && ctx.list("manifest/").is_empty() {
+            break gc;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{name}: GC left pages or manifests: {gc}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let after = restore_verify(&ctx, &lines);
+    if encrypted {
+        let scan = ctx.run(&["scan", "--expect", "absent"]);
+        assert!(
+            scan.status.success(),
+            "{name}: {}\n{}",
+            scan.stdout,
+            scan.stderr
+        );
+    }
+    eprintln!(
+        "{name}: {line}; restore after the upgrade: acked={} {}; {gc}; after GC: acked={} {}",
+        v.acked, v.restored, after.acked, after.restored
+    );
+}
+
+/// `buckwal upgrade` (Choice D) of a format 1 bucket (plaintext) and a format 4 bucket
+/// (encrypted), both made by the released build, in both passes.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn upgrade_format_1_and_4_buckets() {
+    upgrade_case("upgrade_format_1", 1);
+    upgrade_case("upgrade_format_4", 4);
 }

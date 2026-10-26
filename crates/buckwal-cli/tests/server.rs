@@ -1022,3 +1022,78 @@ fn serve_security_bind_rules_and_token() {
         );
     }
 }
+
+/// `serve --pack on|off` (Choice E) decides whether the server's writer runs the packer thread,
+/// whatever `BUCKWAL_PACK` says. Two servers run side by side, each on a database whose first
+/// generation already ended (a TRUNCATE checkpoint and the close of `sql`): one with
+/// `--pack on` under `BUCKWAL_PACK=0`, one with `--pack off` under `BUCKWAL_PACK=1`. The
+/// packer thread makes its first check one minute after the open. The `on` server's thread
+/// packs (its prefix gets `pack-latest`), and 15 s after that the `off` server's prefix still
+/// has no pack object: its packer thread never ran. Both serve a commit after that and stop
+/// clean, and every row restores in both.
+#[test]
+#[ignore = "needs RustFS: ./scripts/test.sh"]
+fn serve_pack() {
+    let mut runs = Vec::new();
+    for (flag, env) in [("on", "0"), ("off", "1")] {
+        let (ctx, access) = serve_ctx(&format!("serve_pack_{flag}"));
+        let ctx = ctx.set("BUCKWAL_PACK", env);
+        let dir = ctx.dir("db");
+        let d = dir.to_str().unwrap();
+        let inserts: Vec<String> = (1..=20)
+            .map(|id| format!("INSERT INTO soak(id, payload) VALUES ({id}, zeroblob(1024))"))
+            .collect();
+        let mut args = vec!["sql", "--claim", "--dir", d, CREATE];
+        args.extend(inserts.iter().map(String::as_str));
+        args.push("PRAGMA wal_checkpoint(TRUNCATE)");
+        ctx.ok(&args);
+        assert!(
+            ctx.head().generation > 1,
+            "serve_pack_{flag}: the first generation ended"
+        );
+        let mut acks: Vec<String> = (1..=20).map(|id| format!("ack {id}")).collect();
+        let server = ServerProc::spawn(&ctx, &access, &dir, &["--pack", flag]);
+        let opened = Instant::now();
+        acks.push(must_ack(&mut server.client().stream(Proto::V2), 1000));
+        runs.push((flag, ctx, server, opened, acks));
+    }
+    let packs = |ctx: &Ctx| ctx.list("pack");
+    let (on, off) = (&runs[0], &runs[1]);
+    let packed = wait_until(
+        "the --pack on server's pack",
+        Duration::from_secs(150),
+        || {
+            packs(&on.1)
+                .iter()
+                .any(|k| k.ends_with("/pack-latest"))
+                .then(Instant::now)
+        },
+    );
+    let after_open = packed - on.3;
+    assert!(
+        after_open >= Duration::from_secs(55),
+        "the packer thread waits a minute before its first check: packed {after_open:?} after the open"
+    );
+    // The off server opened after the on server: wait until it has been open as long as the on
+    // server was at its pack, plus 15 s.
+    let until = off.3 + after_open + Duration::from_secs(15);
+    std::thread::sleep(until.saturating_duration_since(Instant::now()));
+    assert_eq!(
+        packs(&off.1),
+        Vec::<String>::new(),
+        "serve --pack off: no pack object {:?} after the open",
+        off.3.elapsed()
+    );
+    for (flag, ctx, mut server, _, mut acks) in runs {
+        acks.push(must_ack(&mut server.client().stream(Proto::V2), 1001));
+        server.stop_clean();
+        let v = restore_verify(&ctx, &acks);
+        println!(
+            "serve_pack: --pack {flag}: pack objects {:?}; acked={} {}",
+            packs(&ctx),
+            v.acked,
+            v.restored
+        );
+    }
+    println!("serve_pack: the on server packed {after_open:?} after its open");
+}

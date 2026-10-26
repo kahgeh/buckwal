@@ -118,7 +118,7 @@ impl Soak<'_> {
             }
             _ => {}
         }));
-        let db = match self.args.page_put_delay_ms {
+        let db = match self.args.head_put_delay_ms {
             Some(ms) => {
                 let s = store(&cfg, Some(ms))?;
                 buckwal::open_with_store(cfg, s).map_err(err)?

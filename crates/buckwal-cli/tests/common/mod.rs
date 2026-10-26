@@ -220,7 +220,12 @@ impl Ctx {
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        self.command_of(Path::new(BIN), args)
+    }
+
+    /// Like `command`, for the `buckwal` binary at `bin` (another build).
+    pub fn command_of(&self, bin: &Path, args: &[&str]) -> Command {
+        let mut c = Command::new(bin);
         c.args(args);
         for k in OPTIONAL {
             c.env_remove(k);
@@ -240,6 +245,19 @@ impl Ctx {
             .envs(extra.iter().copied())
             .output()
             .unwrap_or_else(|e| panic!("run {args:?}: {e}"));
+        Run {
+            status: o.status,
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
+    }
+
+    /// Like `run`, for the `buckwal` binary at `bin` (another build).
+    pub fn run_of(&self, bin: &Path, args: &[&str]) -> Run {
+        let o = self
+            .command_of(bin, args)
+            .output()
+            .unwrap_or_else(|e| panic!("run {} {args:?}: {e}", bin.display()));
         Run {
             status: o.status,
             stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -554,7 +572,7 @@ impl Writer {
         self.acked.extend(ids);
     }
 
-    /// TRUNCATE checkpoint: ends the generation (a seal) before it returns.
+    /// TRUNCATE checkpoint: ends the generation (a generation switch) before it returns.
     pub fn seal(&self) {
         self.conn()
             .checkpoint(buckwal::CheckpointMode::Truncate)
@@ -565,7 +583,8 @@ impl Writer {
         self.acked.iter().sum()
     }
 
-    /// Close (a writer's close seals); the error a fenced writer gets is returned.
+    /// Close (a writer's close switches the generation); the error a fenced writer gets is
+    /// returned.
     pub fn close(mut self) -> Result<(), buckwal::Error> {
         let conn = self.conn.take().expect("open");
         let db = self.db.take().expect("open");

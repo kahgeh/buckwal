@@ -29,6 +29,10 @@
 #             is stale: the next run removes that slot's containers and takes it. The default
 #             container (buckwal-rustfs) is never touched. SIGINT, SIGTERM and SIGHUP stop the
 #             run, clean up and exit 128 + the signal number.
+#             Before the tests, the CLI of the build before format 5 (RELEASED below) is
+#             built once in a temporary git worktree (--locked --offline) and kept under the
+#             shared git directory (buckwal-released/<commit>/buckwal); the upgrade system test
+#             makes its format 1 and format 4 buckets with it (BUCKWAL_TEST_RELEASED_BIN).
 #   unit      fmt, clippy, unit tests only
 # BUCKWAL_TEST_SERIAL=1 ./scripts/test.sh runs the two passes one after the other on the
 # run slot's single container, the way this script ran before the groups: for a failure that might
@@ -69,6 +73,39 @@ RUN_ID="buckwal-$(date +%Y%m%d%H%M%S)-$$"
 SLOTS="${BUCKWAL_TEST_SLOTS:-2}"
 SLOT=""
 SLOT_ROOT="$(cd "$(git rev-parse --git-common-dir)" && pwd)/buckwal-test-slots"
+
+# The build before format 5 (packs) that `upgrade_format_1_and_4_buckets` makes its bucket
+# with: the CLI at RELEASED, built once with --locked --offline in a temporary git worktree,
+# and kept under the shared git directory (buckwal-released/<commit>/buckwal) for later runs
+# and worktrees. Exports BUCKWAL_TEST_RELEASED_BIN.
+RELEASED=3ac8ff3
+RELEASED_TREE=""
+released_build() {
+  local root bin tree
+  root="$(cd "$(git rev-parse --git-common-dir)" && pwd)/buckwal-released/$RELEASED"
+  bin="$root/buckwal"
+  if [[ ! -x "$bin" ]]; then
+    echo "test.sh: building the released CLI at $RELEASED (once; kept in $root)"
+    tree="$(mktemp -d "$TMP/buckwal-released.XXXXXX")"
+    RELEASED_TREE="$tree"
+    git worktree add --quiet --detach "$tree/src" "$RELEASED"
+    (cd "$tree/src" && CARGO_TARGET_DIR="$tree/target" cargo build --quiet --locked --offline -p buckwal-cli)
+    mkdir -p "$root"
+    cp "$tree/target/debug/buckwal" "$bin.new"
+    mv "$bin.new" "$bin"
+    released_tree_remove
+  fi
+  export BUCKWAL_TEST_RELEASED_BIN="$bin"
+  echo "released CLI ($RELEASED): $bin"
+}
+
+# Remove the temporary worktree of `released_build`, if one is left.
+released_tree_remove() {
+  [[ -n "$RELEASED_TREE" ]] || return 0
+  git worktree remove --force "$RELEASED_TREE/src" 2>/dev/null || git worktree prune
+  remove_dir "$RELEASED_TREE"
+  RELEASED_TREE=""
+}
 
 # Remove every container buckwal-rustfs-s<n>[-group] and volume buckwal-objects-s<n>[-group]:
 # the names of run slot $1, and no others (the patterns are anchored, so s1 never matches s10).
@@ -178,6 +215,7 @@ cleanup() {
   if [[ "${BUCKWAL_TEST_SERIAL:-}" != 1 ]]; then cleanup_parallel "$rc"; exit "$rc"; fi
   set +e
   trap '' PIPE
+  released_tree_remove
   if [[ -n "$SAMPLER" ]]; then
     kill "$SAMPLER" 2>/dev/null
     wait "$SAMPLER" 2>/dev/null
@@ -197,6 +235,7 @@ cleanup() {
 }
 
 serial_main() {
+  released_build
   export BUCKWAL_RUSTFS_NAME="buckwal-rustfs-s$SLOT" BUCKWAL_RUSTFS_VOLUME="buckwal-objects-s$SLOT" \
     BUCKWAL_RUSTFS_PORT="$((9304 + 10 * SLOT))"
   check_ports "$BUCKWAL_RUSTFS_PORT"
@@ -284,7 +323,7 @@ cargo_sel() {
     rest)
       local rc=0
       cargo test --locked -p buckwal -p buckwal-server -p buckwal-hrana-client -- "$@" || rc=$?
-      cargo test --locked -p buckwal-cli --bin buckwal --test replica --test server -- "$@" || rc=$?
+      cargo test --locked -p buckwal-cli --bin buckwal --test replica --test server --test telemetry -- "$@" || rc=$?
       return "$rc"
       ;;
   esac
@@ -360,6 +399,7 @@ cleanup_parallel() {
   local rc="$1" g
   set +e
   trap '' PIPE
+  released_tree_remove
   [[ -n "$SAMPLER" ]] && { kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null; }
   # A group still running (Ctrl-C): stop it before its container goes.
   local pid
@@ -388,6 +428,7 @@ parallel_main() {
 
   # Build every test binary once, so the four groups only run them.
   cargo test --workspace --locked --no-run
+  released_build
   check_test_lists
 
   check_ports "$(group_port plain-sys)" "$(group_port plain-rest)" "$(group_port tls-sys)" "$(group_port tls-rest)"

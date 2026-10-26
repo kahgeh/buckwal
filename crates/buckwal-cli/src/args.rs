@@ -31,7 +31,9 @@ pub struct SoakArgs {
     pub every: u64,
     pub start: i64,
     pub count: Option<u64>,
-    pub page_put_delay_ms: Option<u64>,
+    /// Delay each PUT of the head by this many ms (`--head-put-delay-ms`): a generation
+    /// switch then stays between its seal-start record and its head move that long.
+    pub head_put_delay_ms: Option<u64>,
     /// Threads, one connection each (at least 1).
     pub connections: usize,
     /// Set on the database after each open.
@@ -160,7 +162,7 @@ pub const USAGE: &str = "usage: buckwal <command> [options]
   sql     --dir DIR [--claim] [--batching SPEC] [--journal-mode wal|mvcc] SQL...
   stats   --dir DIR [--claim] [--batching SPEC] [--journal-mode wal|mvcc] SQL...
   soak    --dir DIR [--checkpoint passive|full|restart|truncate|reopen] [--every N]
-          [--start ID] [--count N] [--page-put-delay-ms N] [--connections N]
+          [--start ID] [--count N] [--head-put-delay-ms N] [--connections N]
           [--batching SPEC] [--batching-file PATH] [--stats-every N]
           [--journal-mode wal|mvcc] [--concurrent [all|mixed]]
   bench   --dir DIR --commits N [--connections N] [--batching SPEC] [--journal-mode wal|mvcc]
@@ -375,7 +377,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
                 count = Some(num(a, &value(a)?)?);
                 true
             }
-            ("soak", "--page-put-delay-ms") => {
+            ("soak", "--head-put-delay-ms") => {
                 delay = Some(num(a, &value(a)?)?);
                 true
             }
@@ -486,7 +488,7 @@ pub fn parse_with_mode(args: &[String]) -> Result<(Command, Option<JournalMode>)
             every,
             start,
             count,
-            page_put_delay_ms: delay,
+            head_put_delay_ms: delay,
             connections,
             batching: batching_spec,
             batching_file,
@@ -580,7 +582,7 @@ mod tests {
                 "5",
                 "--count",
                 "50",
-                "--page-put-delay-ms",
+                "--head-put-delay-ms",
                 "30"
             ]),
             Ok(Command::Soak(SoakArgs {
@@ -589,7 +591,7 @@ mod tests {
                 every: 7,
                 start: 5,
                 count: Some(50),
-                page_put_delay_ms: Some(30),
+                head_put_delay_ms: Some(30),
                 connections: 1,
                 batching: None,
                 batching_file: None,

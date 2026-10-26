@@ -177,7 +177,7 @@ pub fn writer_config(dir: &Path) -> CliResult<Config> {
     Ok(cfg)
 }
 
-/// The S3 store `config` names, optionally delaying page PUTs.
+/// The S3 store `config` names.
 pub fn s3_store(config: &Config) -> CliResult<Arc<dyn ObjectStore>> {
     let s3 = S3Store::new(S3Config {
         endpoint: config.endpoint.clone(),
@@ -193,16 +193,25 @@ pub fn s3_store(config: &Config) -> CliResult<Arc<dyn ObjectStore>> {
     Ok(Arc::new(s3))
 }
 
-/// The S3 store `config` names, optionally delaying page PUTs.
-pub fn store(config: &Config, page_put_delay_ms: Option<u64>) -> CliResult<Arc<dyn ObjectStore>> {
+/// The S3 store `config` names, optionally delaying each PUT of the head by
+/// `head_put_delay_ms` (soak `--head-put-delay-ms`).
+pub fn store(config: &Config, head_put_delay_ms: Option<u64>) -> CliResult<Arc<dyn ObjectStore>> {
     let s3 = s3_store(config)?;
-    let Some(ms) = page_put_delay_ms else {
+    let Some(ms) = head_put_delay_ms else {
         return Ok(s3);
     };
     let fault = FaultStore::new(s3);
-    fault.only_keys_containing("/pages/");
+    fault.only_keys_containing(&head_key(&config.prefix));
     fault.delay_puts(std::time::Duration::from_millis(ms));
     Ok(Arc::new(fault))
+}
+
+/// The key of the head under `prefix`.
+fn head_key(prefix: &str) -> String {
+    match prefix.trim_matches('/') {
+        "" => "head".into(),
+        p => format!("{p}/head"),
+    }
 }
 
 pub fn render(v: &Value) -> String {
@@ -663,6 +672,15 @@ mod tests {
 
     fn set(v: &[i64]) -> BTreeSet<i64> {
         v.iter().copied().collect()
+    }
+
+    /// `soak --head-put-delay-ms` delays only the head object: its key under the prefix, with
+    /// the slashes `Config::keys` drops.
+    #[test]
+    fn head_key_is_the_head_under_the_prefix() {
+        assert_eq!(head_key(""), "head");
+        assert_eq!(head_key("sys/t-1"), "sys/t-1/head");
+        assert_eq!(head_key("/sys/t-1/"), "sys/t-1/head");
     }
 
     #[test]
