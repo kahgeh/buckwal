@@ -426,6 +426,92 @@ real RustFS delivery goes under "Not tested until real use". The rest of the des
 else in the spec changes, except that the README's Replicas section should not promise RustFS
 notifications until someone has seen one arrive.
 
+## Question 8, again: RustFS delivers events when the container allows the origin (stage 1)
+
+Run on 2026-10-27 against the same RustFS 1.0.0 image as Question 8. The container name, volume and
+port were `buckwal-rustfs-e`, `buckwal-objects-e` and 9298. The container started with
+`RUSTFS_OUTBOUND_ALLOW_ORIGINS=<scheme>://host.containers.internal:9305`, set by hand with
+`podman run`, because `scripts/rustfs.sh` does not set it yet. The receiver was a throwaway
+`python3 -I` server on the host, outside this repo. It bound `0.0.0.0:9305` and printed each
+request. The calls are the admin calls of Question 8.
+
+**Result: observed. RustFS sends the events, over plain HTTP and over HTTPS.** Question 8 found
+that `http://host.containers.internal:9305/` failed to start ("initialization failed"). That
+failure happened because the origin was not in `RUSTFS_OUTBOUND_ALLOW_ORIGINS`. With the origin in
+the list, the target is `online` ("reachable") and delivers. Question 8 read the failure as a
+second guard. That reading was wrong.
+
+The sequence that works, with the admin calls of Question 8:
+
+1. Start the container with `RUSTFS_OUTBOUND_ALLOW_ORIGINS` and create the bucket.
+2. `PUT /rustfs/admin/v3/module-switches` with `{"notify_enabled":true,"audit_enabled":false}`.
+3. `PUT /rustfs/admin/v3/target/notify_webhook/<name>` with `enable`, `endpoint`, `auth_token` and
+   `queue_dir` set to `/tmp`. The receiver must listen at this moment: the target checks the
+   endpoint when it starts. A target PUT with no listener failed with "initialization failed".
+4. `PUT /<bucket>?notification` with one `QueueConfiguration` per prefix. The `Queue` value is
+   `arn:rustfs:sqs:us-east-1:<name>:webhook`, and the filter is
+   `<Filter><S3Key><FilterRule><Name>prefix</Name><Value>…</Value></FilterRule></S3Key></Filter>`.
+   RustFS accepts this XML and returns it on `GET /<bucket>?notification`. It does not accept
+   the JSON that `buckwal notify-setup` prints; the JSON is for the AWS CLI, so a test that
+   uses these steps must convert it (see stage 2 notes below).
+
+### The four questions
+
+1. **Prefixes: observed.** A PUT of `log/G/1`, `head` and `manifest` each gave one
+   `s3:ObjectCreated:Put` event. A PUT of `pages/p1`, `pages/x` and `other` gave none, in
+   every run. The prefix filter works.
+2. **Two targets: observed.** Targets `r1` and `r2` have different paths on the same origin
+   (`/notify` and `/notify-r2`) and different tokens. Rules for the same prefixes with each
+   target's ARN gave both targets the event for one PUT, 0.1 ms apart. The allow-list holds one
+   origin, so two targets can share it with different paths. Two replicas on two ports need two
+   origins in the list.
+3. **Contents, delay and loss: observed.**
+   - Contents: the body is JSON. `Key` is `<bucket>/<key>` (for example `buckwal/log/G/1`),
+     `EventName` is `s3:ObjectCreated:Put`, and `Records[0].s3.object` holds a URL-encoded `key`
+     (`log%2FG%2F1`), `size`, `eTag` (the MD5 of the body) and `sequencer`. The `Content-Type`
+     is `application/json`.
+   - Delay: one PUT after a quiet period arrived in 0.3 to 0.5 s (four runs). In a burst, the
+     first event arrived in 0.5 s, and every later event arrived together about 5.1 s after the
+     first (seven PUTs 35 ms apart: one event at +0.5 s, six at +5.6 s). Plan for up to
+     5.5 s. A replica that waits for the second event of a burst can miss a 5 s bound.
+   - Down listener: kept. With the receiver stopped, two PUTs were made. Ten seconds later the
+     receiver started, and the first event arrived 2 s later and the second 5 s after the first, for each of the two targets. The
+     `queue_dir` (`/tmp/rustfs-webhook-<name>`) is where RustFS holds them. A long outage and
+     the queue limit were not tested. This differs from SNS, which drops them.
+4. **Token and HTTPS: observed.**
+   - Token: the target sends `Authorization: Bearer <auth_token>`. The listener of `buckwal
+     follow` must accept a bearer token; the README says it does (Replicas, Authentication).
+   - HTTPS with no CA in the container: the target failed to start ("initialization failed").
+   - HTTPS with the CA mounted read only (`-v <ca.pem>:/ca/ca.pem:ro`) and
+     `-e SSL_CERT_FILE=/ca/ca.pem`: the target came `online` and delivered, with the bearer token.
+     The container needs no change to its image. This worked with RustFS serving plain HTTP, and
+     again with RustFS serving HTTPS from `scripts/tls-material.sh` material
+     (`RUSTFS_TLS_PATH`), so `SSL_CERT_FILE` does not break its own TLS.
+   - The listener's certificate must name `host.containers.internal`. The material of
+     `scripts/tls-material.sh` names only `localhost` and `127.0.0.1`, and the script deletes the
+     CA key, so the test cannot sign a new certificate under that CA. Stage 2 must make its own
+     small CA and listener certificate (see below).
+
+### Go or no-go for stage 2
+
+**Go**, with Choice A (b), in the HTTPS pass only. The notes for stage 2:
+
+- `scripts/rustfs.sh` must pass `RUSTFS_OUTBOUND_ALLOW_ORIGINS` (one `https://host.containers.internal:<port>`
+  origin per replica listener port), mount a CA read only and set `SSL_CERT_FILE` to it.
+- The CA must be able to sign a certificate with the name `host.containers.internal`. Because
+  `tls-material.sh` cannot, `rustfs.sh` (or the test) makes a second CA and a listener certificate,
+  and deletes the CA key. `SSL_CERT_FILE` takes one file; it can hold both CAs.
+- The listener must bind beyond 127.0.0.1 (for example `0.0.0.0`), with TLS and a token, as
+  ADR 0007 requires. The test needs the listener to be running when it creates the target.
+- The bucket notification must be XML for RustFS. `notify-setup` prints JSON for the AWS CLI.
+  The test takes the prefixes from the `notify-setup` output and builds the XML itself.
+- The 5 s batching window in bursts means the test must write one object at a time, and wait
+  for the replica, or the bound must allow 6 s. The spec's 5 s bound holds for a single
+  event after a quiet period.
+- `buckwal notify-setup` section 4 says the RustFS commands are untested and gives the `QueueConfigurations`
+  JSON. If the test uses the XML above, the text needs a change. That is a SPEC CHANGE for the coordinator
+  (`crates/buckwal-cli/src/` is out of bounds for this branch).
+
 ## Stage-2 design (the spec's "How it works", confirmed and corrected)
 
 Unchanged from the spec: start from today's restore, then follow the bucket from its own thread;
