@@ -1006,6 +1006,11 @@ struct Figures {
     pack_generation: u64,
     /// Inserts the engine refused as busy (retried); Off with 8 writers only.
     busy_retries: usize,
+    /// The error text and the time from the start of the call to the error of each refusal.
+    busy_refusals: Vec<(String, Duration)>,
+    /// The longest `elapsed` of the `GenerationSwitched` events, and their count.
+    max_switch: Duration,
+    switches: usize,
     /// The longest `gate_wait` and the longest whole run among the finished runs.
     max_gate_wait: Duration,
     max_run: Duration,
@@ -1092,15 +1097,18 @@ fn sustained(batching: Batching, wal_bytes: u64, commits: usize, put_delay: Dura
                 (db.clone(), next.clone(), load_end.clone(), rec.clone());
             thread::spawn(move || {
                 let c = db.connect().unwrap();
-                let mut busy = 0;
+                let mut busy = Vec::new();
                 loop {
                     let x = next.fetch_add(1, SeqCst);
                     if x >= commits {
                         break;
                     }
                     loop {
+                        let call = Instant::now();
                         match insert(&c, x as i64) {
-                            Err(Error::Engine(m)) if m.contains("busy") => busy += 1,
+                            Err(Error::Engine(m)) if m.contains("busy") => {
+                                busy.push((m, call.elapsed()))
+                            }
                             r => {
                                 r.unwrap();
                                 break;
@@ -1117,7 +1125,11 @@ fn sustained(batching: Batching, wal_bytes: u64, commits: usize, put_delay: Dura
             })
         })
         .collect();
-    let busy_retries = threads.into_iter().map(|h| h.join().unwrap()).sum();
+    let busy_refusals: Vec<(String, Duration)> = threads
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let busy_retries = busy_refusals.len();
     let elapsed = t.elapsed();
     wait_maintenance_quiet(&rec);
     let ev = rec.events();
@@ -1167,6 +1179,19 @@ fn sustained(batching: Batching, wal_bytes: u64, commits: usize, put_delay: Dura
         restore_generation: report.generation,
         pack_generation: packed.pack_generation,
         busy_retries,
+        busy_refusals,
+        max_switch: ev
+            .iter()
+            .filter_map(|e| match e {
+                Event::GenerationSwitched { elapsed, .. } => Some(*elapsed),
+                _ => None,
+            })
+            .max()
+            .unwrap_or_default(),
+        switches: ev
+            .iter()
+            .filter(|e| matches!(e, Event::GenerationSwitched { .. }))
+            .count(),
         max_gate_wait: finished(&ev).map(|(g, _)| g).max().unwrap_or_default(),
         max_run: finished(&ev).map(|(_, r)| r).max().unwrap_or_default(),
         elapsed,
