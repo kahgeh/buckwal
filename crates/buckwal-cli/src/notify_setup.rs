@@ -210,7 +210,7 @@ pub fn render(bucket: &str, replicas: u32, region: Option<&str>, topic: Option<&
     line(
         "# with the number of the target (replica<n>). For more than one replica, add the same two",
     );
-    line("# QueueConfiguration elements for each target.");
+    line("# QueueConfiguration elements for each target, and give each copy its own Id.");
     line("# If the database lives under a prefix P (BUCKWAL_PREFIX), start each prefix with P/.");
     line("");
     line("# notification-rustfs.xml");
