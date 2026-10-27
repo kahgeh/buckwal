@@ -1676,8 +1676,8 @@ fn a_failed_switch_ends_with_status_error_with_batching_off() {
         Some("upload_failed")
     );
     assert!(is_error(sw), "{:?}", sw.status);
-    // The switch runs at the WAL header write, before a commit span starts: the switch span
-    // alone carries the error.
+    // The switch runs at the WAL header write, before a commit span starts: no commit
+    // span carries the error.
     assert!(
         !spans
             .iter()
