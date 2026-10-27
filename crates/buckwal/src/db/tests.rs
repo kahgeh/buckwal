@@ -4633,6 +4633,7 @@ mod checkpoint_race;
 mod create_race;
 mod integrity;
 mod mvcc;
+mod outside_change;
 mod pack_restore;
 mod switch;
 mod telemetry;
