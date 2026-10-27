@@ -2723,6 +2723,7 @@ fn mvcc_takeover_fences_a_running_soak() {
     let before = ctx.head();
     let b = ctx.dir("b");
     let bs = b.to_str().unwrap();
+    let taken = Instant::now();
     let out = ctx.run(&["takeover", "--dir", bs]);
     let outcome = if out.status.success() {
         "took over"
@@ -2736,7 +2737,6 @@ fn mvcc_takeover_fences_a_running_soak() {
         "timed out (fence probes)"
     };
     assert_eq!(ctx.head().epoch, before.epoch + 1, "epoch after {outcome}");
-    let taken = Instant::now();
     let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
     let fenced_after = soak.stamps[fenced].saturating_duration_since(taken);
     soak.kill();
