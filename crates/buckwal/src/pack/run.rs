@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE};
 use crate::format::{Head, Keys, LogFile, LogRecord, FORMAT_V5};
 use crate::io::block_store::fetch_verified;
-use crate::restore::{apply_images_over, db_facts, fetch_generation, replay, Images};
+use crate::restore::{apply_images_over, db_facts, fetch_generation, quick_check, replay, Images};
 use crate::store::{
     part_size_for, sha256_of, with_retry, CondPut, ObjectStore, PartSource, RetryPolicy,
 };
@@ -372,7 +372,7 @@ pub(crate) fn pack_run(
 /// check; a run that fails before that has none: at `Config::validate`, the key file
 /// (`encryption::load`), the pack directory (`prepare_pack_dir`), the lock
 /// (`CopyLock::try_take`), or the head, pointer or codes GET), the time of each step
-/// (`buckwal.pack.read_ms`, `buckwal.pack.apply_ms`, `buckwal.pack.upload_ms`, `buckwal.pack.verify_ms`,
+/// (`buckwal.pack.read_ms`, `buckwal.pack.apply_ms`, `buckwal.pack.check_ms`, `buckwal.pack.upload_ms`, `buckwal.pack.verify_ms`,
 /// `buckwal.pack.publish_ms`; only the steps the run made), `buckwal.elapsed_ms`,
 /// `buckwal.pack.failures`, `buckwal.outcome` (`packed`, `nothing_to_do`, `superseded` or
 /// `failed`; `integrity` for a read that failed its integrity code) and, when it failed,
@@ -400,6 +400,7 @@ pub(crate) fn pack_run_in(
         buckwal.pack.reason = Empty,
         buckwal.pack.read_ms = Empty,
         buckwal.pack.apply_ms = Empty,
+        buckwal.pack.check_ms = Empty,
         buckwal.pack.upload_ms = Empty,
         buckwal.pack.verify_ms = Empty,
         buckwal.pack.publish_ms = Empty,
@@ -454,6 +455,7 @@ fn record_report(span: &tracing::Span, r: &PackReport) {
         let field = match *name {
             "read" => "buckwal.pack.read_ms",
             "apply" => "buckwal.pack.apply_ms",
+            "check" => "buckwal.pack.check_ms",
             "upload" => "buckwal.pack.upload_ms",
             "verify" => "buckwal.pack.verify_ms",
             "publish" => "buckwal.pack.publish_ms",
@@ -676,6 +678,61 @@ impl Drop for NoSpaceInApplyForTest {
     fn drop(&mut self) {
         NO_SPACE_IN_APPLY.with(|f| f.set(false));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CORRUPT_APPLIED_FILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: while alive, a run on this thread damages the applied file after the last apply
+/// and before the `quick_check` step. A plaintext file gets a bad b-tree page header. An
+/// encrypted file gets one changed byte in a page, so the decryption fails.
+#[cfg(test)]
+pub(crate) struct CorruptAppliedFileForTest;
+
+#[cfg(test)]
+impl CorruptAppliedFileForTest {
+    pub(crate) fn set() -> CorruptAppliedFileForTest {
+        CORRUPT_APPLIED_FILE.with(|f| f.set(true));
+        CorruptAppliedFileForTest
+    }
+}
+
+#[cfg(test)]
+impl Drop for CorruptAppliedFileForTest {
+    fn drop(&mut self) {
+        CORRUPT_APPLIED_FILE.with(|f| f.set(false));
+    }
+}
+
+/// Tests only: damage the applied file as `CorruptAppliedFileForTest` says.
+#[cfg(test)]
+fn corrupt_applied_file(db: &Path, encrypted: bool) -> Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(db)
+        .map_err(|e| io_err("open the applied file (test)", e))?;
+    let io = |e| io_err("corrupt the applied file (test)", e);
+    if encrypted {
+        // The header is not plain text, so the page size is the default one.
+        let at = 4096 + 2048;
+        let mut b = [0u8; 1];
+        f.seek(SeekFrom::Start(at)).map_err(io)?;
+        f.read_exact(&mut b).map_err(io)?;
+        b[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(at)).map_err(io)?;
+        f.write_all(&b).map_err(io)?;
+        return f.sync_all().map_err(io);
+    }
+    let mut head = [0u8; 100];
+    f.read_exact(&mut head).map_err(io)?;
+    let raw = u16::from_be_bytes([head[16], head[17]]) as u64;
+    let page_size = if raw == 1 { 65536 } else { raw };
+    f.seek(SeekFrom::Start(page_size)).map_err(io)?;
+    f.write_all(&[0xFF]).map_err(io)?;
+    f.sync_all().map_err(io)
 }
 
 /// Whether a test asks a run to stop as a crash of the process would: no clean-up of the kept
@@ -1138,6 +1195,7 @@ impl Run<'_> {
         let mut base_ready = false;
         let mut gone: Option<String> = None;
         let mut applied = 0u64;
+        let mut first_applied: Option<u64> = None;
         let (work, enc, store, keys, retry, stop) = (
             &self.work,
             self.enc,
@@ -1189,6 +1247,7 @@ impl Run<'_> {
             }
             apply_images_over(work, &images, &head, enc, None)?;
             applied += 1;
+            first_applied.get_or_insert(e.generation);
             #[cfg(test)]
             if kept.is_some() && CRASH_AFTER_APPLY.with(|f| f.get()) {
                 return Err(Error::Io(
@@ -1221,6 +1280,34 @@ impl Run<'_> {
             return Ok(Ran::without_pack(failed(CLOSED_STEP, None), current));
         }
         let pack_generation = scanned.pack_generation.expect("a generation was applied");
+        // Step 4b. The check of the applied file, before the upload: a damaged file never
+        // becomes the pack that the pointer names.
+        #[cfg(test)]
+        if CORRUPT_APPLIED_FILE.with(|f| f.get()) {
+            corrupt_applied_file(&db, self.enc.is_some())?;
+        }
+        let check = quick_check(&self.work, self.enc);
+        self.step("check");
+        let bad = match check {
+            Ok(first) if first == "ok" => None,
+            Ok(other) => Some(other),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(mut detail) = bad {
+            if let Some((i, _)) = detail.char_indices().nth(200) {
+                detail.truncate(i);
+            }
+            let first = first_applied.unwrap_or(pack_generation);
+            tracing::error!(
+                target: "buckwal",
+                pack_generation,
+                generations = format!("{first}-{pack_generation}"),
+                detail = %detail,
+                "pack quick_check failed"
+            );
+            self.error = Some(detail);
+            return Ok(Ran::without_pack(failed("quick_check", None), current));
+        }
         let facts = db_facts(&self.work, self.enc)?;
         let free = if facts.page_count == 0 {
             0.0

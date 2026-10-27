@@ -570,7 +570,10 @@ fn pack_applies_several_generations_and_restore_equals_writer_db() {
     assert_eq!(rows_of(&body, Some(&images.wal), None), w.ids());
     assert!(r.free_page_share >= 0.0 && r.free_page_share < 1.0);
     let names: Vec<_> = r.step_times.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["read", "apply", "upload", "verify", "publish"]);
+    assert_eq!(
+        names,
+        ["read", "apply", "check", "upload", "verify", "publish"]
+    );
     w.crash();
 }
 
@@ -2427,5 +2430,99 @@ fn a_run_that_errs_carries_its_source_and_reason() {
     assert_eq!(s.field("buckwal.pack.failed_step"), Some("error"));
     assert_eq!(s.field("buckwal.pack.source"), Some("downloaded"));
     assert_eq!(s.field("buckwal.pack.reason"), Some("check_failed"));
+    w.crash();
+}
+
+/// A pack run whose applied file is damaged ends at `quick_check`: it uploads nothing, moves no
+/// pointer and keeps no copy. It logs the ERROR record. The next good run packs.
+fn quick_check_failure_case(encrypted: bool) {
+    use crate::telemetry::testing::Capture;
+    let mem = Arc::new(MemStore::new());
+    let keydir = tempdir();
+    let t = tempdir();
+    let cfg = if encrypted {
+        enc_config(&t.path().join("packer"), &keydir)
+    } else {
+        packer(&t)
+    };
+    let w = if encrypted {
+        writer_with(&mem, |d| enc_config(d, &keydir))
+    } else {
+        writer(&mem)
+    };
+    w.insert(1..=3);
+    w.end_generation();
+    packed(&run(&cfg, mem.clone()).unwrap());
+    w.insert(4..=6);
+    w.end_generation();
+    let pointer = mem.get(&keys().pack_pointer()).unwrap().unwrap();
+    let packs_before = packs(&*mem);
+    let hs = HookStore::new(mem.clone());
+    let cap = Capture::new();
+    let r = tracing::subscriber::with_default(cap.subscriber(), || {
+        let _bad = CorruptAppliedFileForTest::set();
+        run(&cfg, hs.clone())
+    })
+    .unwrap();
+    assert_eq!(failed_at(&r, "quick_check"), None);
+    assert!(
+        !hs.calls()
+            .iter()
+            .any(|c| c.starts_with("put") && is_pack(c.split(' ').next_back().unwrap_or(""))),
+        "{:?}",
+        hs.calls()
+    );
+    assert_eq!(mem.get(&keys().pack_pointer()).unwrap().unwrap(), pointer);
+    assert_eq!(packs(&*mem), packs_before);
+    assert_no_copy(&cfg);
+    let errors: Vec<_> = cap
+        .spans()
+        .events
+        .iter()
+        .filter(|e| e.level == tracing::Level::ERROR && e.target == "buckwal")
+        .cloned()
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let e = &errors[0];
+    assert_eq!(e.field("message"), Some("pack quick_check failed"));
+    assert_eq!(e.field("pack_generation"), Some("3"));
+    assert_eq!(e.field("generations"), Some("2-3"));
+    assert!(e.field("detail").is_some_and(|d| d.len() <= 200), "{e:?}");
+    // Without the hook the next run packs.
+    packed(&run(&cfg, mem.clone()).unwrap());
+    w.crash();
+}
+
+#[test]
+fn quick_check_failure_uploads_nothing_and_moves_no_pointer() {
+    quick_check_failure_case(false);
+}
+
+#[test]
+fn quick_check_failure_on_an_encrypted_bucket_ends_at_quick_check() {
+    quick_check_failure_case(true);
+}
+
+#[test]
+fn good_run_records_check_ms() {
+    use crate::telemetry::testing::Capture;
+    let mem = Arc::new(MemStore::new());
+    let t = tempdir();
+    let cfg = packer(&t);
+    let w = writer(&mem);
+    w.insert(1..=3);
+    w.end_generation();
+    let cap = Capture::new();
+    let r = tracing::subscriber::with_default(cap.subscriber(), || run(&cfg, mem.clone())).unwrap();
+    packed(&r);
+    assert!(r.step_times.iter().any(|(n, _)| *n == "check"), "{r:?}");
+    let spans = cap.spans();
+    assert!(spans
+        .last_named("buckwal.pack")
+        .field("buckwal.pack.check_ms")
+        .is_some());
+    let r = run(&cfg, mem.clone()).unwrap();
+    assert_eq!(r.outcome, PackOutcome::NothingToDo, "{r:?}");
+    assert!(!r.step_times.iter().any(|(n, _)| *n == "check"), "{r:?}");
     w.crash();
 }

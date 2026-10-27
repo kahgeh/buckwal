@@ -447,8 +447,6 @@ pub(crate) fn db_facts(dir: &Path, enc: Option<&Encryption>) -> Result<DbFacts> 
 
 /// The result of `PRAGMA quick_check` on the database file `<dir>/app.db`: the first text value
 /// of the first row. It is `ok` when the engine finds no fault. An engine error is an `Err`.
-// The pack run calls it in the next change. Remove this `allow` then.
-#[allow(dead_code)]
 pub(crate) fn quick_check(dir: &Path, enc: Option<&Encryption>) -> Result<String> {
     const SQL: &str = "PRAGMA quick_check";
     let (db, conn) = open_local(dir, enc)?;
