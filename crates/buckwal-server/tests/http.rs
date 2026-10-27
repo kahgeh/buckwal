@@ -1445,3 +1445,29 @@ fn stream_is_given_back_after_a_client_disconnect() {
     );
     assert_eq!(restored(&store, "t", "id").len(), 1, "its insert committed");
 }
+
+#[test]
+// The pool may run the three requests on one thread or on several. This test is a regression
+// guard for the row at the COMMIT response. It does not prove a thread switch.
+fn begin_insert_commit_in_three_requests_is_in_the_bucket_at_the_commit_response() {
+    let s = start(Opts::default());
+    let c = s.client(None);
+    let mut st = c.stream(Proto::V2);
+    ok_pipeline(&st.pipeline(vec![execute(CREATE, &[])]).unwrap());
+    ok_pipeline(&st.pipeline(vec![execute("BEGIN", &[])]).unwrap());
+    ok_pipeline(
+        &st.pipeline(vec![execute(
+            "INSERT INTO t(id, body) VALUES (7, 'x')",
+            &[],
+        )])
+        .unwrap(),
+    );
+    ok_pipeline(&st.pipeline(vec![execute("COMMIT", &[])]).unwrap());
+    let ids = restored(&s.store, "t", "id");
+    eprintln!("row id 7, restored ids {ids:?}");
+    assert!(
+        ids.contains(&7),
+        "the row is in the bucket at the COMMIT response: {ids:?}"
+    );
+    ok_pipeline(&st.pipeline(vec![close()]).unwrap());
+}
