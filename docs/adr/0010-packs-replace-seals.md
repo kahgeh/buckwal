@@ -44,8 +44,8 @@ A seal uploaded every page that changed in a generation as its own object, then 
 
 ## Consequences
 
-- A commit no longer waits for page uploads. On RustFS with 50 ms added and a 1 GB database, the longest small commit waited 129 ms [119 ms] (2.22 [1.91] small requests), outside the size-limit pause. The commit that restarts the WAL with batching Off waited 251 to 282 ms, 4.04 to 4.71 small requests, which misses the goal of about four. The size-limit pause was 336 ms [343 ms]. The README, Costs, gives every figure and both misses.
-- A restore reads one pack in 16 MiB ranges, then the log since it. A 1 GB pack with no log after it was fully local in 3.3 s [3.5 s] at 20 ms, and the open returned at 0.7 s.
+- A commit no longer waits for page uploads. On RustFS with 50 ms added and a 1 GB database, the longest small commit waited 113 ms [132 ms] (1.94 [2.13] small requests), outside the size-limit pause. The commit that restarts the WAL with batching Off waited 237 to 278 ms, 4.08 to 4.51 small requests, within the goal of its request count plus 1.5 (5.5). The size-limit pause was 319 ms [338 ms]. The README, Costs, gives every figure.
+- A restore reads one pack in 16 MiB ranges, then the log since it. A 1 GB pack with no log after it was fully local in 3.5 s [3.6 s] at 20 ms, and the open returned at 0.6 s [0.7 s].
 - The bucket holds the whole database file as one object. In a plaintext bucket it opens in any SQLite tool.
 - Each pack run uploads the whole file. Its kept copy saves the download of the pack.
 - Every machine that runs a packer needs the writer's key file.
