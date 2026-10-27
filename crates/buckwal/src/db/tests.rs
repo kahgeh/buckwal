@@ -2456,17 +2456,18 @@ fn quiet_deadline_is_persisted() {
     let _a = writer_left_in_a_seal(&store, 5);
     let bt = tempdir();
     let b_dir = fresh(&bt);
+    let now_ms = || crate::bucket::unix_ms(std::time::SystemTime::now());
+    let before = now_ms();
     let rep = crate::takeover_with_store(quiet_config(&b_dir, None), store.clone()).unwrap();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let after = now_ms();
     assert_eq!(rep.quiet, QUIET, "{rep:?}");
     let s = state(&b_dir);
-    let want = now_ms + QUIET.as_millis() as u64;
+    // The deadline is set inside the takeover, so it lies between the two clock reads plus the
+    // quiet. One ms on each side is the clock's resolution.
+    let quiet = QUIET.as_millis() as u64;
     assert!(
-        s.seal_not_before_ms.abs_diff(want) <= 100,
-        "seal_not_before_ms {} is not within 100 ms of now + 800 ms ({want})",
+        (before + quiet - 1..=after + quiet + 1).contains(&s.seal_not_before_ms),
+        "seal_not_before_ms {} not within the takeover ({before}..={after}) + {quiet} ms",
         s.seal_not_before_ms
     );
     assert_eq!(s.seal_quiet_ms, QUIET.as_millis() as u64, "its length");
@@ -2778,6 +2779,9 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
     for id in 3001..=3010 {
         insert_kb(&cc, id);
     }
+    // Under load C's open and inserts may outlast the quiet: then the seal has nothing to wait
+    // for and sends no `SealQuiet`.
+    let before_seal = took.elapsed();
     cc.checkpoint(CheckpointMode::Truncate).unwrap();
     let sealed_after = took.elapsed();
     // Two takeovers before the first seal: the floor is G+3, so the seal's objects are
@@ -2814,10 +2818,17 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
         "{tag}: C's seal returned {sealed_after:?} after its takeover started"
     );
     let quiets = seal_quiets(&seen);
-    assert!(
-        matches!(quiets[..], [(g, wait)] if g == gen && wait <= CHAIN_QUIET),
-        "{tag}: {quiets:?}"
-    );
+    if before_seal >= CHAIN_QUIET {
+        assert!(
+            quiets.is_empty(),
+            "{tag}: no quiet was left at {before_seal:?}: {quiets:?}"
+        );
+    } else {
+        assert!(
+            matches!(quiets[..], [(g, wait)] if g == gen && wait <= CHAIN_QUIET),
+            "{tag}: quiet left at {before_seal:?}: {quiets:?}"
+        );
+    }
     crash(db_a, vec![ca]);
     cc.close().unwrap();
     db_c.close().unwrap();

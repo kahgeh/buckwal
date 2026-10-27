@@ -110,6 +110,8 @@ struct TestStore {
     on_pack_stat: Mutex<Option<Arc<AtomicBool>>>,
     /// When each multipart upload started.
     upload_times: Mutex<Vec<Instant>>,
+    /// When the first `get_aged` of the pack pointer (a pack check) came.
+    first_pointer_check: Mutex<Option<Instant>>,
     /// Bytes put and got around each multipart upload, outside any pack run, on the same
     /// in-memory store (another thread's traffic, as a writer makes).
     unrelated_bytes: std::sync::atomic::AtomicU64,
@@ -126,6 +128,7 @@ impl TestStore {
             on_log_get: Mutex::default(),
             on_pack_stat: Mutex::default(),
             upload_times: Mutex::default(),
+            first_pointer_check: Mutex::default(),
             unrelated_bytes: Default::default(),
         })
     }
@@ -182,6 +185,12 @@ impl ObjectStore for TestStore {
     }
     fn get_aged(&self, key: &str) -> std::result::Result<Option<(Object, Duration)>, StoreError> {
         self.record("get_aged", key);
+        if key.contains("pack-latest") {
+            self.first_pointer_check
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Instant::now);
+        }
         self.inner.get_aged(key)
     }
     fn stat(&self, key: &str) -> std::result::Result<Option<ObjectStat>, StoreError> {
@@ -809,17 +818,36 @@ fn thread_never_blocks_a_commit() {
     w.end_generation();
     // A pack run is in its upload, and it waits there.
     assert!(eventually(10, || ts.uploads_started.load(SeqCst) == 1));
-    let mut slowest = Duration::ZERO;
-    for id in 4..=40 {
-        let at = Instant::now();
-        w.insert(id..=id);
-        slowest = slowest.max(at.elapsed());
+    // A commit that waited for the held upload would never return: the upload is released only
+    // after the commits. So the check is that the commits return, not how long they take.
+    let (tx, rx) = std::sync::mpsc::channel::<Duration>();
+    let commits = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let mut slowest = Duration::ZERO;
+            for id in 4..=40 {
+                let at = Instant::now();
+                w.insert(id..=id);
+                slowest = slowest.max(at.elapsed());
+            }
+            // A generation switch too.
+            let at = Instant::now();
+            w.end_generation();
+            slowest = slowest.max(at.elapsed());
+            tx.send(slowest).unwrap();
+        });
+        let slowest = rx.recv_timeout(Duration::from_secs(10));
+        if slowest.is_err() {
+            // Release the upload so the thread ends and the scope can close.
+            ts.set_upload(Upload::Pass);
+        }
+        let joined = handle.join();
+        (slowest, joined)
+    });
+    if let (Err(std::sync::mpsc::RecvTimeoutError::Disconnected), Err(panic)) = &commits {
+        std::panic::resume_unwind(Box::new(format!("the commits panicked: {panic:?}")));
     }
-    // A generation switch too.
-    let at = Instant::now();
-    w.end_generation();
-    slowest = slowest.max(at.elapsed());
-    assert!(slowest < Duration::from_millis(500), "{slowest:?}");
+    let slowest = commits.0.expect("a commit waits for the pack run");
+    eprintln!("slowest commit or switch: {slowest:?}");
     assert!(pointer_of(&*mem).is_none(), "the run still waits");
     ts.set_upload(Upload::Pass);
     assert!(eventually(10, || pointer_of(&*mem).is_some()));
@@ -841,17 +869,34 @@ fn writer_packer_stops_promptly_on_drop() {
 fn writer_packer_waits_a_whole_interval_before_its_first_check() {
     let mem = Arc::new(MemStore::new());
     let ts = TestStore::new(mem.clone());
+    let interval = Duration::from_secs(2);
+    // The packer thread starts inside the open, so no check comes sooner than one interval
+    // after this instant, on any load.
+    let opened = Instant::now();
     let w = writer_on(ts.clone(), |d| {
         let mut c = config(d);
-        c.pack_check_interval = Duration::from_secs(2);
+        c.pack_check_interval = interval;
         c
     });
     w.insert(1..=3);
     w.end_generation();
-    std::thread::sleep(Duration::from_millis(500));
-    // A check reads the pointer with its age (the open's create reads it with a plain GET).
-    assert_eq!(ts.calls_of("get_aged", "pack-latest"), 0, "no check yet");
     assert!(eventually(10, || pointer_of(&*mem).is_some()));
+    // A check reads the pointer with its age (the open's create reads it with a plain GET).
+    assert!(eventually(10, || ts
+        .first_pointer_check
+        .lock()
+        .unwrap()
+        .is_some()));
+    let first = ts
+        .first_pointer_check
+        .lock()
+        .unwrap()
+        .expect("a check read the pointer");
+    assert!(
+        first.duration_since(opened) >= interval,
+        "the first check came {:?} after the open",
+        first.duration_since(opened)
+    );
 }
 
 // ---- The gauges ----
