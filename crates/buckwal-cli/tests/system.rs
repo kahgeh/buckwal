@@ -2121,8 +2121,6 @@ fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration, Duration) {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn telemetry_collector_down_and_blackhole() {
-    let (base_p50, base_wall, _) = bench_run("telemetry_off", &[("BUCKWAL_OTEL", "0")]);
-
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
     drop(closed);
@@ -2149,11 +2147,17 @@ fn telemetry_collector_down_and_blackhole() {
         })
     };
 
+    // The bench's work slows with the machine's load, so each case is compared with an off run
+    // made just before it.
+    let mut off_p50s = Vec::new();
     for (name, endpoint) in [
         ("telemetry_collector_down", &down),
         ("telemetry_collector_blackhole", &hole),
     ] {
-        let (p50, wall, _) = bench_run(
+        let (base_p50, base_wall, base_elapsed) =
+            bench_run("telemetry_off", &[("BUCKWAL_OTEL", "0")]);
+        off_p50s.push(base_p50);
+        let (p50, wall, elapsed) = bench_run(
             name,
             &[("BUCKWAL_OTEL", "1"), ("BUCKWAL_OTEL_ENDPOINT", endpoint)],
         );
@@ -2161,9 +2165,21 @@ fn telemetry_collector_down_and_blackhole() {
             p50 <= 2.0 * base_p50 + 1.0,
             "{name}: commit_p50_ms {p50} vs {base_p50} with telemetry off"
         );
+        // Outside the bench's work (process start, telemetry start and stop, exit): the 2 s
+        // stop budget, plus 1 s.
+        let (outside, base_outside) = (
+            wall.saturating_sub(elapsed),
+            base_wall.saturating_sub(base_elapsed),
+        );
         assert!(
-            wall <= base_wall + Duration::from_secs(3),
-            "{name}: wall {wall:?} vs {base_wall:?} with telemetry off"
+            outside <= base_outside + Duration::from_secs(3),
+            "{name}: outside the bench's work {outside:?} (wall {wall:?}, elapsed {elapsed:?}) vs \
+             {base_outside:?} with telemetry off"
+        );
+        // Inside the bench's work: a bad collector must not slow it.
+        assert!(
+            elapsed <= 2 * base_elapsed + Duration::from_secs(1),
+            "{name}: elapsed {elapsed:?} vs {base_elapsed:?} with telemetry off"
         );
     }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2172,7 +2188,7 @@ fn telemetry_collector_down_and_blackhole() {
     let accepted = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert!(accepted > 0, "the exporter connected to the blackhole");
     eprintln!(
-        "telemetry_collector_down_and_blackhole: off p50={base_p50} wall={base_wall:?}; \
+        "telemetry_collector_down_and_blackhole: off p50s={off_p50s:?}; \
          blackhole accepted {accepted} connections"
     );
 }
