@@ -100,6 +100,7 @@ pub(crate) fn writer_trimmed(
                 seal_not_before_ms: 0,
                 seal_quiet_ms: 0,
                 next_generation_floor: 0,
+                files: None,
             };
             s.write_atomic(dir).unwrap();
             (b, s)

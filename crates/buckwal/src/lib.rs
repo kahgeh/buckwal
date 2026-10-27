@@ -10,6 +10,7 @@ pub(crate) mod db;
 pub(crate) mod encryption;
 pub(crate) mod engine;
 pub mod error;
+pub(crate) mod file_record;
 pub(crate) mod files;
 pub(crate) mod format;
 pub(crate) mod gc;

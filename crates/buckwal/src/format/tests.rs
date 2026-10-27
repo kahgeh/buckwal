@@ -252,6 +252,7 @@ fn local_state_atomic_write() {
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
         next_generation_floor: 0,
+        files: None,
     };
     s.write_atomic(dir.path()).unwrap();
     assert_eq!(LocalState::read(dir.path()).unwrap(), Some(s.clone()));
@@ -296,6 +297,7 @@ fn local_state_refuses_absurd_seal_quiet() {
         seal_not_before_ms: 1,
         seal_quiet_ms: ms,
         next_generation_floor: 0,
+        files: None,
     };
     assert!(is_corrupt(LocalState::decode(&with(u64::MAX).encode())));
     assert!(is_corrupt(LocalState::decode(&with(86_400_001).encode())));
@@ -649,6 +651,7 @@ fn stage2_local_state_reads_with_defaults() {
         seal_not_before_ms: 99,
         seal_quiet_ms: 800,
         next_generation_floor: 0,
+        files: None,
     };
     assert_eq!(
         String::from_utf8(full.encode()).unwrap(),
@@ -837,6 +840,7 @@ fn local_state_v2_roundtrip() {
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
         next_generation_floor: 0,
+        files: None,
     };
     assert_eq!(LocalState::decode(&s.encode()).unwrap(), s);
     assert!(String::from_utf8(s.encode())
@@ -946,6 +950,7 @@ fn local_state_round_trips_the_floor_and_defaults_to_zero() {
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
         next_generation_floor: 12,
+        files: None,
     };
     assert!(String::from_utf8(s.encode())
         .unwrap()
@@ -1997,4 +2002,71 @@ mod packer_format {
         assert_eq!(k.new_format_packed(), 5);
         assert_eq!(coded(1).new_format_packed(), 5);
     }
+}
+
+fn state_with_files(files: Option<crate::file_record::FileRecord>) -> LocalState {
+    LocalState {
+        format: 5,
+        writer_id: "w1".into(),
+        generation: 3,
+        complete: true,
+        claimed: true,
+        head_etag: String::new(),
+        epoch: 0,
+        claim_id: String::new(),
+        seal_not_before_ms: 0,
+        seal_quiet_ms: 0,
+        next_generation_floor: 0,
+        files,
+    }
+}
+
+fn record(log: Option<(u64, [u8; 32])>) -> crate::file_record::FileRecord {
+    crate::file_record::FileRecord {
+        db_size: 8192,
+        db_mtime_ns: 1_700_000_000_123_456_789,
+        db_page1_sha256: [7; 32],
+        wal_size: 0,
+        wal_header_sha256: [9; 32],
+        log,
+        db_write_open: false,
+        clean_close: true,
+    }
+}
+
+#[test]
+fn local_state_with_files_round_trips() {
+    for log in [None, Some((32, [5u8; 32]))] {
+        let s = state_with_files(Some(record(log)));
+        assert_eq!(LocalState::decode(&s.encode()).unwrap(), s);
+    }
+}
+
+#[test]
+fn local_state_without_files_keeps_its_old_bytes() {
+    let s = state_with_files(None);
+    let text = String::from_utf8(s.encode()).unwrap();
+    assert!(!text.contains("files_"), "{text}");
+    assert!(text.ends_with(r#""seal_quiet_ms":0}"#), "{text}");
+    assert_eq!(LocalState::decode(text.as_bytes()).unwrap().files, None);
+}
+
+#[test]
+fn old_state_decodes_with_no_files() {
+    let old = br#"{"format":1,"writer_id":"w1","generation":3,"complete":true}"#;
+    assert_eq!(LocalState::decode(old).unwrap().files, None);
+}
+
+#[test]
+fn files_with_a_bad_hash_or_a_missing_key_is_corrupt() {
+    let good = String::from_utf8(state_with_files(Some(record(None))).encode()).unwrap();
+    let bad_hash = good.replace(&"07".repeat(32), "zz");
+    assert!(is_corrupt(LocalState::decode(bad_hash.as_bytes())));
+    let missing = good.replace(",\"files_clean_close\":true", "");
+    assert!(is_corrupt(LocalState::decode(missing.as_bytes())));
+    let half_log = good.replace(
+        "\"files_wal_size\":0",
+        "\"files_wal_size\":0,\"files_log_size\":1",
+    );
+    assert!(is_corrupt(LocalState::decode(half_log.as_bytes())));
 }

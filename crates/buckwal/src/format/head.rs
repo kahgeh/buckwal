@@ -9,6 +9,7 @@ use crate::config::defaults;
 use crate::config::JournalMode;
 use crate::encryption::IntegrityKey;
 use crate::error::{Error, Result};
+use crate::file_record::{FileRecord, Sha};
 use crate::files::{io_err, STATE_FILE};
 use std::fs::{self, File};
 use std::io::Write;
@@ -339,12 +340,77 @@ pub(crate) struct LocalState {
     pub seal_quiet_ms: u64,
     /// The lowest generation the next seal may use (0 before the key existed: none).
     pub next_generation_floor: u64,
+    /// The file record (outside-change-detect), `None` in a directory from before it existed.
+    /// Encoded as flat keys with the prefix `files_`: the parser reads flat objects only.
+    pub files: Option<FileRecord>,
+}
+
+fn sha_hex(h: &Sha) -> String {
+    hex::encode(h)
+}
+
+fn sha_from(o: &Obj, key: &str) -> Result<Sha> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(o.str(key)?, &mut out)
+        .map_err(|_| corrupt(&format!("local state: {key} is not 64 hex digits")))?;
+    Ok(out)
+}
+
+impl FileRecord {
+    fn encode(&self) -> String {
+        let log = match &self.log {
+            Some((size, sha)) => format!(
+                ",\"files_log_size\":{size},\"files_log_header_sha256\":\"{}\"",
+                sha_hex(sha)
+            ),
+            None => String::new(),
+        };
+        format!(
+            ",\"files_db_size\":{},\"files_db_mtime_ns\":{},\"files_db_page1_sha256\":\"{}\",\"files_wal_size\":{},\"files_wal_header_sha256\":\"{}\"{log},\"files_db_write_open\":{},\"files_clean_close\":{}",
+            self.db_size,
+            self.db_mtime_ns,
+            sha_hex(&self.db_page1_sha256),
+            self.wal_size,
+            sha_hex(&self.wal_header_sha256),
+            self.db_write_open,
+            self.clean_close
+        )
+    }
+
+    /// `None` when the state holds no file record. A record with some keys missing is Corrupt.
+    fn decode(o: &Obj) -> Result<Option<FileRecord>> {
+        if !o.has("files_db_size") {
+            return Ok(None);
+        }
+        let log = match (o.has("files_log_size"), o.has("files_log_header_sha256")) {
+            (true, true) => Some((
+                o.num("files_log_size")?,
+                sha_from(o, "files_log_header_sha256")?,
+            )),
+            (false, false) => None,
+            _ => {
+                return Err(corrupt(
+                    "local state: files_log_size and files_log_header_sha256 go together",
+                ))
+            }
+        };
+        Ok(Some(FileRecord {
+            db_size: o.num("files_db_size")?,
+            db_mtime_ns: o.num("files_db_mtime_ns")?,
+            db_page1_sha256: sha_from(o, "files_db_page1_sha256")?,
+            wal_size: o.num("files_wal_size")?,
+            wal_header_sha256: sha_from(o, "files_wal_header_sha256")?,
+            log,
+            db_write_open: o.bool("files_db_write_open")?,
+            clean_close: o.bool("files_clean_close")?,
+        }))
+    }
 }
 
 impl LocalState {
     pub(crate) fn encode(&self) -> Vec<u8> {
         format!(
-            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{},\"seal_quiet_ms\":{}{}}}",
+            "{{\"format\":{},\"writer_id\":{},\"generation\":{},\"complete\":{},\"claimed\":{},\"head_etag\":{},\"epoch\":{},\"claim_id\":{},\"seal_not_before_ms\":{},\"seal_quiet_ms\":{}{}{}}}",
             self.format,
             escape(&self.writer_id),
             self.generation,
@@ -361,6 +427,8 @@ impl LocalState {
             } else {
                 format!(",\"next_generation_floor\":{}", self.next_generation_floor)
             }
+            ,
+            self.files.as_ref().map(FileRecord::encode).unwrap_or_default()
         )
         .into_bytes()
     }
@@ -409,6 +477,7 @@ impl LocalState {
             } else {
                 0
             },
+            files: FileRecord::decode(&o)?,
         })
     }
 

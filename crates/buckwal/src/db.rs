@@ -708,6 +708,7 @@ fn create_new(
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
         next_generation_floor: 0,
+        files: None,
     };
     state.write_atomic(dir)?;
     Ok((bucket, state))
@@ -757,6 +758,7 @@ fn create_new_mvcc(
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
         next_generation_floor: 0,
+        files: None,
     };
     state.write_atomic(&staging)?;
     create::move_created(&staging, dir)?;

@@ -519,6 +519,7 @@ fn write_copy(work: &Path, staging: &Path, dir: &Path, head: &Head, etag: &str) 
         seal_not_before_ms: 0,
         seal_quiet_ms: 0,
         next_generation_floor: 0,
+        files: None,
     }
     .write_atomic(&copy)?;
     move_restored(&copy, dir)
