@@ -13,7 +13,7 @@ use super::stash::stash;
 use super::IoMode;
 use super::{read_at, sync_file, write_at};
 use crate::error::{Error, Result};
-use crate::file_record::DbFiles;
+use crate::file_record::{DbFiles, WriteGuard};
 use crate::files::{io_err, DIRTY_FILE};
 use crate::format::{Keys, LocalState, Manifest};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
@@ -267,6 +267,7 @@ impl BucketDbStorage {
             )));
         }
         let pos = (p as u64 - 1) * m.page_size as u64;
+        let _write = self.begin_db_write()?;
         write_at(&*self.file, &*self.io, pos, page.to_vec())
             .map_err(|e| io_err("write fetched page", e))?;
         self.lazy_gets.fetch_add(1, Relaxed);
@@ -472,11 +473,9 @@ impl BucketDbStorage {
     }
 
     /// A write to `app.db` is about to start (rule 1 of the file record).
-    fn begin_db_write(&self) -> turso_core::Result<()> {
-        match &self.files {
-            Some(f) => f.begin_write().map_err(stash),
-            None => Ok(()),
-        }
+    /// The guard lives until the write call has returned.
+    fn begin_db_write(&self) -> Result<Option<WriteGuard<'_>>> {
+        self.files.as_ref().map(|f| f.begin_write()).transpose()
     }
 
     /// fsync `app.db` and wait for it, then record its new part (rule 2 of the file record).
@@ -671,7 +670,7 @@ impl DatabaseStorage for BucketDbStorage {
             self.ensure_pages(page_idx, 1, buffer.len())
                 .map_err(stash)?;
         }
-        self.begin_db_write()?;
+        let _write = self.begin_db_write().map_err(stash)?;
         self.record_written(page_idx as u32, 1, buffer.len());
         self.inner.write_page(page_idx, buffer, io_ctx, c)
     }
@@ -688,7 +687,7 @@ impl DatabaseStorage for BucketDbStorage {
             self.ensure_pages(first_page_idx, buffers.len(), page_size)
                 .map_err(stash)?;
         }
-        self.begin_db_write()?;
+        let _write = self.begin_db_write().map_err(stash)?;
         self.record_written(first_page_idx as u32, buffers.len(), page_size);
         self.inner
             .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
@@ -718,7 +717,7 @@ impl DatabaseStorage for BucketDbStorage {
         if let Some(b) = &self.blocks {
             b.truncate(len as u64).map_err(stash)?;
         }
-        self.begin_db_write()?;
+        let _write = self.begin_db_write().map_err(stash)?;
         if let Some(ps) = std::num::NonZeroU32::new(self.page_size.load(SeqCst)) {
             let pages = (len as u64 / ps.get() as u64).min(u32::MAX as u64) as u32;
             self.bucket_pages.store(pages, SeqCst);

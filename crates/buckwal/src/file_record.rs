@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
@@ -278,9 +278,21 @@ pub(crate) struct DbFiles {
     dir: PathBuf,
     mvcc: bool,
     inner: Mutex<Inner>,
-    /// Counts the writes to `app.db`; `end_write` keeps `db_write_open` on when a write came
-    /// after the fsync it follows started.
-    writes: AtomicU64,
+    /// Counts the writes to `app.db` that started; `end_write` keeps `db_write_open` on when a
+    /// write started after the fsync it follows did.
+    started: AtomicU64,
+    /// The writes that started and have not ended (their [`WriteGuard`] is alive). An fsync
+    /// that starts while one is in flight does not cover it.
+    inflight: AtomicUsize,
+}
+
+/// A write to `app.db` that has started. Dropped when the write call has returned.
+pub(crate) struct WriteGuard<'a>(&'a DbFiles);
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, SeqCst);
+    }
 }
 
 impl DbFiles {
@@ -293,7 +305,8 @@ impl DbFiles {
                 state,
                 write_open: false,
             }),
-            writes: AtomicU64::new(0),
+            started: AtomicU64::new(0),
+            inflight: AtomicUsize::new(0),
         }
     }
 
@@ -316,11 +329,13 @@ impl DbFiles {
     /// Rule 1. Call before every write to `app.db`. Only the first call after a record does
     /// work: it sets `db_write_open` on and `clean_close` off and fsyncs the local state (when
     /// a record exists on disk).
-    pub(crate) fn begin_write(&self) -> Result<()> {
-        self.writes.fetch_add(1, SeqCst);
+    pub(crate) fn begin_write(&self) -> Result<WriteGuard<'_>> {
+        self.started.fetch_add(1, SeqCst);
+        self.inflight.fetch_add(1, SeqCst);
+        let guard = WriteGuard(self);
         let mut inner = self.inner.lock().unwrap();
         if inner.write_open {
-            return Ok(());
+            return Ok(guard);
         }
         // With no record on disk, an open checks nothing whatever happens, so the first rule 1
         // needs no fsync of its own: the record starts at the first rule 2. (A state write in
@@ -343,20 +358,29 @@ impl DbFiles {
                 h();
             }
         }
-        Ok(())
+        Ok(guard)
     }
 
     /// The token for `end_write`. Call it before the fsync of `app.db` starts.
-    pub(crate) fn sync_token(&self) -> u64 {
-        self.writes.load(SeqCst)
+    /// `None` while a write is in flight: that fsync does not cover it, so no `end_write`
+    /// may follow it.
+    pub(crate) fn sync_token(&self) -> Option<u64> {
+        if self.inflight.load(SeqCst) > 0 {
+            return None;
+        }
+        Some(self.started.load(SeqCst))
     }
 
     /// Rule 2. Call after the fsync of `app.db` that started at `token`. Writes the new
     /// `app.db` part and sets `db_write_open` off, unless a write came after the fsync started
     /// (then the flag stays on, and the next fsync ends it).
-    pub(crate) fn end_write(&self, token: u64) -> Result<()> {
+    pub(crate) fn end_write(&self, token: Option<u64>) -> Result<()> {
+        let Some(token) = token else {
+            return Ok(());
+        };
         let mut inner = self.inner.lock().unwrap();
-        if !inner.write_open || self.writes.load(SeqCst) != token {
+        if !inner.write_open || self.started.load(SeqCst) != token || self.inflight.load(SeqCst) > 0
+        {
             return Ok(());
         }
         close_write_in(&self.dir, &mut inner.state)?;

@@ -212,3 +212,39 @@ fn mark_in_use_turns_clean_close_off_and_writes_it() {
     mark_in_use(d.path(), &mut s).unwrap();
     assert!(LocalState::read(d.path()).unwrap().is_none());
 }
+
+#[test]
+fn an_fsync_that_starts_while_a_write_is_in_flight_ends_nothing() {
+    let d = dir_with_files();
+    let s = closed(d.path(), false);
+    let files = DbFiles::new(d.path(), false, s);
+    let guard = files.begin_write().unwrap();
+    // The fsync starts while the write is in flight: no token.
+    assert_eq!(files.sync_token(), None);
+    // A token taken before the write started is no good once the write is in flight.
+    drop(guard);
+    let token = files.sync_token();
+    let guard = files.begin_write().unwrap();
+    files.end_write(token).unwrap();
+    assert!(
+        LocalState::read(d.path())
+            .unwrap()
+            .unwrap()
+            .files
+            .unwrap()
+            .db_write_open
+    );
+    // The write ended, and no write started after this token: the record is written.
+    drop(guard);
+    let token = files.sync_token();
+    assert!(token.is_some());
+    files.end_write(token).unwrap();
+    assert!(
+        !LocalState::read(d.path())
+            .unwrap()
+            .unwrap()
+            .files
+            .unwrap()
+            .db_write_open
+    );
+}

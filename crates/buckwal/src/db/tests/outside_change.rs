@@ -354,3 +354,37 @@ fn restore_after_a_refusal_has_every_acked_commit() {
         (151..=210).collect::<Vec<_>>()
     );
 }
+
+/// Test 7, the lazy page fetch of formats 1 to 4: a read that fetches a page writes `app.db`,
+/// so it follows rule 1. A crash after the read, with a checkpoint's record before it, is not
+/// refused.
+#[test]
+fn crash_after_a_lazy_page_fetch_opens() {
+    let _legacy = crate::format::LegacySeal::on();
+    let store = mem();
+    let _a = super::closed_writer(&store, 3000);
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let db = open_mem(&store, r.path());
+    let c = db.connect().unwrap();
+    insert(&c, 3001).unwrap();
+    c.checkpoint(CheckpointMode::Passive).unwrap();
+    let lazy = || {
+        let open = db.shared.open.lock().unwrap();
+        open.as_ref().unwrap().engine.storage.lazy_gets()
+    };
+    let gets_before = lazy();
+    let before = state(r.path())
+        .files
+        .expect("a record after the checkpoint");
+    assert!(!before.db_write_open);
+    // Reads every page: the pages that are not local yet are fetched into `app.db`.
+    let n = c.query("SELECT count(*) FROM t", &[]).unwrap()[0][0]
+        .as_int()
+        .unwrap();
+    assert_eq!(n, 3001);
+    assert!(lazy() > gets_before, "the read fetched no page");
+    let img = copy_db_files(r.path());
+    crash(db, vec![c]);
+    assert_eq!(open_ids(&store, img.path()), (1..=3001).collect::<Vec<_>>());
+}

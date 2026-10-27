@@ -485,9 +485,7 @@ impl BlockStore {
             let start = b as u64 * BLOCK_SIZE;
             let end = (start + block.len() as u64).min(limit);
             if start < end {
-                if let Some(f) = &self.files {
-                    f.begin_write()?;
-                }
+                let _write = self.files.as_ref().map(|f| f.begin_write()).transpose()?;
                 self.db
                     .write_all_at(&block[..(end - start) as usize], start)
                     .map_err(|e| io_err("write a fetched block", e))?;
