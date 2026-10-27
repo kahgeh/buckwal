@@ -1436,7 +1436,8 @@ fn status_of_outcome(outcome: &'static str) -> opentelemetry::trace::Status {
 #[test]
 fn a_failure_outcome_ends_the_span_with_status_error() {
     // `failed`: a pack run that ended without a new pointer (`buckwal.pack`).
-    for outcome in ["error", "integrity", "fenced", "failed"] {
+    // `upload_failed`: a generation switch that failed on an upload error.
+    for outcome in ["error", "integrity", "fenced", "failed", "upload_failed"] {
         assert!(
             matches!(
                 status_of_outcome(outcome),
