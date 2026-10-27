@@ -952,9 +952,15 @@ fn gauges_send_age_0_before_the_first_generation_ends() {
     assert_eq!(s.field("buckwal.outcome"), Some("ok"));
     assert_eq!(s.field("buckwal.pack.age_seconds"), Some("0"));
     assert_eq!(s.field("buckwal.pack.size_bytes"), Some("0"));
-    assert_eq!(
-        s.field("buckwal.pack.behind_bytes"),
-        Some(&*log_bytes_from(&*mem, 1).to_string())
+    // A later gauge sees the whole log: the first one can come before the last commit.
+    assert!(
+        eventually(10, || {
+            cap.spans()
+                .last_named("buckwal.pack.gauges")
+                .field("buckwal.pack.behind_bytes")
+                == Some(&*log_bytes_from(&*mem, 1).to_string())
+        }),
+        "behind_bytes is all the log"
     );
 }
 
@@ -988,17 +994,25 @@ fn gauges_without_a_pack_count_the_whole_log() {
     // No pack: size 0, and the age counts from the writer's own end of generation 1.
     assert_eq!(s.field("buckwal.pack.size_bytes"), Some("0"));
     assert_eq!(s.field("buckwal.pack.generation"), None);
-    let age = || -> u64 {
+    // The last gauge span can still be open, with no age yet: read until one has it.
+    let age = || -> Option<u64> {
         cap.spans()
             .last_named("buckwal.pack.gauges")
-            .field("buckwal.pack.age_seconds")
-            .unwrap()
+            .field("buckwal.pack.age_seconds")?
             .parse()
-            .unwrap()
+            .ok()
     };
-    let first = age();
+    let mut first = None;
+    assert!(eventually(10, || {
+        first = age();
+        first.is_some()
+    }));
+    let first = first.unwrap();
     assert!(first < 30, "{first}");
-    assert!(eventually(10, || age() > first), "the age grows");
+    assert!(
+        eventually(10, || age().is_some_and(|a| a > first)),
+        "the age grows"
+    );
 }
 
 /// Spec rev 27, Observability: a writer with `BUCKWAL_PACK=0` and no pack sends
@@ -1046,8 +1060,12 @@ fn gauges_without_a_pack_send_size_0_and_age_from_the_first_generation_end() {
     assert_eq!(field("buckwal.outcome").as_deref(), Some("ok"));
     assert_eq!(field("buckwal.pack.size_bytes").as_deref(), Some("0"));
     assert_eq!(field("buckwal.pack.generation"), None, "no pack");
-    let behind: u64 = field("buckwal.pack.behind_bytes").unwrap().parse().unwrap();
-    assert_eq!(behind, log_bytes_from(&*mem, 1), "all the log");
+    // A later gauge sees the whole log: the first one can come before the last commit.
+    let behind = || -> Option<u64> { field("buckwal.pack.behind_bytes")?.parse().ok() };
+    assert!(
+        eventually(10, || behind() == Some(log_bytes_from(&*mem, 1))),
+        "all the log"
+    );
     let a1 = age();
     assert!((1000..1030).contains(&a1), "{a1}");
     // It grows with time, and a later end (this writer's own switch) does not lower it.
