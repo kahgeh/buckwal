@@ -1437,7 +1437,15 @@ fn status_of_outcome(outcome: &'static str) -> opentelemetry::trace::Status {
 fn a_failure_outcome_ends_the_span_with_status_error() {
     // `failed`: a pack run that ended without a new pointer (`buckwal.pack`).
     // `upload_failed`: a generation switch that failed on an upload error.
-    for outcome in ["error", "integrity", "fenced", "failed", "upload_failed"] {
+    // `corrupt`: an open that buckwal refused for an outside change (`buckwal.open`).
+    for outcome in [
+        "error",
+        "integrity",
+        "fenced",
+        "failed",
+        "upload_failed",
+        "corrupt",
+    ] {
         assert!(
             matches!(
                 status_of_outcome(outcome),
@@ -1639,6 +1647,40 @@ fn exported_switch(b: Batching, fail_head: bool) -> Vec<SpanData> {
 
 fn is_error(s: &SpanData) -> bool {
     matches!(s.status, opentelemetry::trace::Status::Error { .. })
+}
+
+/// An open that buckwal refuses for an outside change ends its `buckwal.open` span with status
+/// Error, so a search on `StatusCode = 'Error'` finds it.
+#[test]
+fn a_refused_open_ends_with_status_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemStore::new());
+    let db = crate::open_with_store(config(dir.path()), store.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+    conn.close().unwrap();
+    db.close().unwrap();
+    // Another tool grows the file while buckwal is closed.
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("app.db"))
+        .unwrap();
+    std::io::Write::write_all(&mut &file, &[0u8; 4096]).unwrap();
+    drop(file);
+    let (sub, p, spans, _logs) = test_pipeline(None);
+    let r = tracing::subscriber::with_default(sub, || {
+        crate::open_with_store(config(dir.path()), store.clone())
+    });
+    assert!(r.is_err());
+    p.force_flush();
+    let got = spans.get_finished_spans().unwrap();
+    let open = got
+        .iter()
+        .find(|s| s.name == "buckwal.open")
+        .expect("open span");
+    assert_eq!(attr(open, "buckwal.outcome").as_deref(), Some("corrupt"));
+    assert!(is_error(open), "{:?}", open.status);
 }
 
 /// A failed switch alerts on its own: with a background commit no commit span has an outcome.
