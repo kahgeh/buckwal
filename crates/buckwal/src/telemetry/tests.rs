@@ -1663,7 +1663,7 @@ fn a_failed_switch_ends_with_status_error_after_a_background_commit() {
     );
 }
 
-/// With batching Off the failed switch ends with status Error too.
+/// With batching Off the failed switch ends with status Error too, and no commit span does.
 #[test]
 fn a_failed_switch_ends_with_status_error_with_batching_off() {
     let spans = exported_switch(Batching::Off, true);
@@ -1676,6 +1676,15 @@ fn a_failed_switch_ends_with_status_error_with_batching_off() {
         Some("upload_failed")
     );
     assert!(is_error(sw), "{:?}", sw.status);
+    // The switch runs at the WAL header write, before a commit span starts: the switch span
+    // alone carries the error.
+    assert!(
+        !spans
+            .iter()
+            .filter(|s| s.name == "buckwal.commit")
+            .any(is_error),
+        "no commit span ends with status Error"
+    );
 }
 
 /// A switch that succeeds ends `switched` with status Unset.
