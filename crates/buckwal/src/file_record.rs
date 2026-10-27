@@ -330,8 +330,14 @@ impl DbFiles {
     /// work: it sets `db_write_open` on and `clean_close` off and fsyncs the local state (when
     /// a record exists on disk).
     pub(crate) fn begin_write(&self) -> Result<WriteGuard<'_>> {
-        self.started.fetch_add(1, SeqCst);
+        // Order matters (with `sync_token` and `end_write`): `inflight` first, then `started`.
+        // `sync_token` reads `started` first and `inflight` second. A write that is not yet
+        // counted in `started` when the token reads it has either raised `inflight` before the
+        // token's second read (the token is None) or raises both after it, so `end_write` then
+        // sees `started` changed or `inflight` above 0. With the order the other way round, a
+        // write could land between the two reads of the token with both counters unchanged.
         self.inflight.fetch_add(1, SeqCst);
+        self.started.fetch_add(1, SeqCst);
         let guard = WriteGuard(self);
         let mut inner = self.inner.lock().unwrap();
         if inner.write_open {
@@ -365,10 +371,12 @@ impl DbFiles {
     /// `None` while a write is in flight: that fsync does not cover it, so no `end_write`
     /// may follow it.
     pub(crate) fn sync_token(&self) -> Option<u64> {
+        // `started` first, then `inflight` (see `begin_write`).
+        let started = self.started.load(SeqCst);
         if self.inflight.load(SeqCst) > 0 {
             return None;
         }
-        Some(self.started.load(SeqCst))
+        Some(started)
     }
 
     /// Rule 2. Call after the fsync of `app.db` that started at `token`. Writes the new
