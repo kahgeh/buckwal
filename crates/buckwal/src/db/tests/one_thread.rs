@@ -59,12 +59,21 @@ fn commit_on_another_thread_after_a_spill_is_in_the_bucket_at_the_ack() {
     let dir = tempdir();
     let (db, c) = writer(&store, dir.path(), Batching::Off);
     c.execute("BEGIN", &[]).unwrap();
-    // About 1030 frames: pages spill into the `-wal` before the commit.
+    let wal = dir.path().join(crate::files::WAL_FILE);
+    let before = std::fs::metadata(&wal).map_or(0, |m| m.len());
+    // A blob of 9 MB is about 2200 pages: more than the page cache holds before it spills.
     c.execute(
-        "INSERT INTO t(id, v) VALUES (?, randomblob(4200000))",
+        "INSERT INTO t(id, v) VALUES (?, randomblob(9000000))",
         &[Value::from_i64(ROW)],
     )
     .unwrap();
+    // The spill is in the local `-wal` before the COMMIT. If the engine stops it, the test fails.
+    let spilled = std::fs::metadata(&wal).map_or(0, |m| m.len());
+    assert!(
+        spilled > before,
+        "no page spilled: -wal {before} -> {spilled} bytes"
+    );
+    eprintln!("commit_on_another_thread: -wal {before} -> {spilled} bytes before COMMIT");
     let spill_thread = thread::current().id();
     // The thread of the COMMIT writes its last op, so it must run the sync.
     let (c, commit_thread) = thread::spawn(move || {
