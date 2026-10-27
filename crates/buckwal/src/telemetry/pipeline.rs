@@ -36,10 +36,11 @@ const SCOPE: &str = "buckwal";
 const RUN_ID: &str = "test_run_id";
 
 /// The `buckwal.outcome` values that are failures: their span ends with status Error
-/// (`failed` is a pack run's, `buckwal.pack`, except at the step `closed`). The maintenance skips, `sealed`, the replica's
+/// (`failed` is a pack run's, `buckwal.pack`, except at the step `closed`; `upload_failed` is the
+/// generation switch's, `buckwal.generation_switch`). The maintenance skips, `sealed`, the replica's
 /// outcomes, the prefetch's `stopped` and `complete`, a pack run's `packed`, `nothing_to_do`
 /// and `superseded`, and the server's client-side outcomes are not failures.
-const FAILURE_OUTCOMES: [&str; 4] = ["error", "integrity", "fenced", "failed"];
+const FAILURE_OUTCOMES: [&str; 5] = ["error", "integrity", "fenced", "failed", "upload_failed"];
 
 /// The machine's name, `None` when the system does not give one.
 pub(super) fn host_name() -> Option<String> {

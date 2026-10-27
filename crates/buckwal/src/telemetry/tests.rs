@@ -1600,6 +1600,95 @@ fn a_failed_maintenance_checkpoint_records_error_on_its_span() {
     assert!(matches!(status, opentelemetry::trace::Status::Error { .. }));
 }
 
+/// Runs ten inserts on a store whose head PUTs fail (`fail_head`) or not, in batching `b`, until a
+/// `buckwal.generation_switch` span ends; returns the finished spans.
+fn exported_switch(b: Batching, fail_head: bool) -> Vec<SpanData> {
+    let dir = tempfile::tempdir().unwrap();
+    let (sub, _p, exporter, _logs) = test_pipeline(None);
+    tracing::subscriber::with_default(sub, || {
+        let fault = Arc::new(FaultStore::new(Arc::new(MemStore::new())));
+        let mut c = config(dir.path());
+        c.batching = b;
+        c.maintenance_wal_bytes = 16 << 10;
+        c.retry_deadline = Duration::from_millis(100);
+        c.request_timeout = Duration::from_millis(50);
+        let db = crate::open_with_store(c, fault.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        if fail_head {
+            // The test prefix is empty: the head's key is `head`.
+            fault.only_keys_containing("head");
+            fault.fail_puts_after(0);
+        }
+        for i in 0..10 {
+            let _ = insert(&conn, i);
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let spans = exporter.get_finished_spans().unwrap();
+            if spans.iter().any(|s| s.name == "buckwal.generation_switch") {
+                break spans;
+            }
+            assert!(Instant::now() < until, "no generation switch ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })
+}
+
+fn is_error(s: &SpanData) -> bool {
+    matches!(s.status, opentelemetry::trace::Status::Error { .. })
+}
+
+/// A failed switch alerts on its own: with a background commit no commit span has an outcome.
+#[test]
+fn a_failed_switch_ends_with_status_error_after_a_background_commit() {
+    let spans = exported_switch(background(10), true);
+    let sw = spans
+        .iter()
+        .find(|s| s.name == "buckwal.generation_switch")
+        .unwrap();
+    assert_eq!(
+        attr(sw, "buckwal.outcome").as_deref(),
+        Some("upload_failed")
+    );
+    assert!(is_error(sw), "{:?}", sw.status);
+    assert!(
+        spans
+            .iter()
+            .filter(|s| s.name == "buckwal.commit")
+            .all(|c| attr(c, "buckwal.outcome").is_none()),
+        "a background commit span has no outcome"
+    );
+}
+
+/// With batching Off the failed switch ends with status Error too.
+#[test]
+fn a_failed_switch_ends_with_status_error_with_batching_off() {
+    let spans = exported_switch(Batching::Off, true);
+    let sw = spans
+        .iter()
+        .find(|s| s.name == "buckwal.generation_switch")
+        .unwrap();
+    assert_eq!(
+        attr(sw, "buckwal.outcome").as_deref(),
+        Some("upload_failed")
+    );
+    assert!(is_error(sw), "{:?}", sw.status);
+}
+
+/// A switch that succeeds ends `switched` with status Unset.
+#[test]
+fn a_successful_switch_ends_unset() {
+    let spans = exported_switch(Batching::Off, false);
+    let sw = spans
+        .iter()
+        .find(|s| s.name == "buckwal.generation_switch")
+        .unwrap();
+    assert_eq!(attr(sw, "buckwal.outcome").as_deref(), Some("switched"));
+    assert!(matches!(sw.status, opentelemetry::trace::Status::Unset));
+}
+
 /// Removes `OTEL_RESOURCE_ATTRIBUTES` when dropped, so a failed assertion leaves none.
 struct ResourceEnvGuard;
 
