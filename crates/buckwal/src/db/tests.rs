@@ -2472,11 +2472,19 @@ fn quiet_deadline_is_persisted() {
     );
     assert_eq!(s.seal_quiet_ms, QUIET.as_millis() as u64, "its length");
     let (hook, seen) = recorder();
+    // The reopen starts the quiet again from its open; under load it may have run out by the
+    // seal, and then the seal sends no `SealQuiet`.
+    let reopened = Instant::now();
     let db_b = open_with_store(quiet_config(&b_dir, Some(hook)), store.clone()).unwrap();
     let cb = db_b.connect().unwrap();
     insert(&cb, 1001).unwrap();
     cb.checkpoint(CheckpointMode::Truncate).unwrap();
-    assert_eq!(seal_quiets(&seen).len(), 1, "the reopen kept the quiet");
+    let quiets = seal_quiets(&seen);
+    assert!(
+        quiets.len() == 1 || (quiets.is_empty() && reopened.elapsed() >= QUIET),
+        "the reopen kept the quiet: {quiets:?} after {:?}",
+        reopened.elapsed()
+    );
     let s = state(&b_dir);
     assert_eq!(
         (s.seal_not_before_ms, s.seal_quiet_ms),
@@ -2774,6 +2782,8 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
     let rep_c =
         crate::takeover_with_store(chain_config(&c_dir, batching, None), store.clone()).unwrap();
     let (hook, seen) = recorder();
+    // C's open starts the quiet again in full (the claimed state holds a pending deadline).
+    let c_open = Instant::now();
     let db_c = open_with_store(chain_config(&c_dir, batching, Some(hook)), store.clone()).unwrap();
     let cc = db_c.connect().unwrap();
     for id in 3001..=3010 {
@@ -2781,9 +2791,9 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
     }
     // Under load C's open and inserts may outlast the quiet: then the seal has nothing to wait
     // for and sends no `SealQuiet`.
-    let before_seal = took.elapsed();
     cc.checkpoint(CheckpointMode::Truncate).unwrap();
     let sealed_after = took.elapsed();
+    let open_to_seal = c_open.elapsed();
     // Two takeovers before the first seal: the floor is G+3, so the seal's objects are
     // under G+2.
     assert_eq!(head(&*store).generation, gen + 3, "C sealed G");
@@ -2818,16 +2828,14 @@ fn chained_takeover_over_a_writer_mid_seal(batching: crate::Batching, b_commits:
         "{tag}: C's seal returned {sealed_after:?} after its takeover started"
     );
     let quiets = seal_quiets(&seen);
-    if before_seal >= CHAIN_QUIET {
-        assert!(
-            quiets.is_empty(),
-            "{tag}: no quiet was left at {before_seal:?}: {quiets:?}"
-        );
-    } else {
-        assert!(
-            matches!(quiets[..], [(g, wait)] if g == gen && wait <= CHAIN_QUIET),
-            "{tag}: quiet left at {before_seal:?}: {quiets:?}"
-        );
+    match quiets[..] {
+        [(g, wait)] => assert!(g == gen && wait <= CHAIN_QUIET, "{tag}: {quiets:?}"),
+        // No event: the quiet had run out before the seal looked, so the seal came late enough.
+        [] => assert!(
+            open_to_seal >= CHAIN_QUIET,
+            "{tag}: no SealQuiet, but the seal came {open_to_seal:?} after C's open"
+        ),
+        _ => panic!("{tag}: more than one SealQuiet: {quiets:?}"),
     }
     crash(db_a, vec![ca]);
     cc.close().unwrap();
