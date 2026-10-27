@@ -2486,10 +2486,12 @@ fn quick_check_failure_case(encrypted: bool) {
     let e = &errors[0];
     assert_eq!(e.field("message"), Some("pack quick_check failed"));
     assert_eq!(e.field("pack_generation"), Some("3"));
-    assert_eq!(e.field("generations"), Some("2-3"));
+    assert_eq!(e.field("generations"), Some("2-2"));
     assert!(e.field("detail").is_some_and(|d| d.len() <= 200), "{e:?}");
     // Without the hook the next run packs.
-    packed(&run(&cfg, mem.clone()).unwrap());
+    let r = run(&cfg, mem.clone()).unwrap();
+    packed(&r);
+    assert_eq!(source_of(&r), downloaded(DownloadReason::None));
     w.crash();
 }
 

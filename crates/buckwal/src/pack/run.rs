@@ -10,9 +10,11 @@
 //!    (`restore::apply_images_over`: a WAL generation's `-wal`, an MVCC one's `-wal` and
 //!    `app.db-log`), in `<pack dir>/pack-copy/` (the run holds the lock of the kept copy) or
 //!    in `<pack dir>/pack-work-<run id>` (another run holds it).
-//! 5. Upload the database file as `pack/<G>/<run id>` in 16 MiB parts, 8 at once.
-//! 6. Check the upload: the HEAD size and the SHA-256 of each part. Then upload the codes.
-//! 7. HEAD the pack and its codes, then move the pointer with `If-Match` on its ETag
+//! 5. Check the applied file with `PRAGMA quick_check` (`restore::quick_check`). A result other
+//!    than `ok` ends the run as `failed` at `quick_check`, before any upload.
+//! 6. Upload the database file as `pack/<G>/<run id>` in 16 MiB parts, 8 at once.
+//! 7. Check the upload: the HEAD size and the SHA-256 of each part. Then upload the codes.
+//! 8. HEAD the pack and its codes, then move the pointer with `If-Match` on its ETag
 //!    (`If-None-Match` for the first pointer). A 412 or an unknown result reads the pointer
 //!    again and goes on as it names this run's pack, an equal or higher one, the old one, or
 //!    a lower one.
@@ -68,7 +70,7 @@ pub enum PackOutcome {
     /// The run stopped at `step`; `key` is the object it concerns, when there is one. The
     /// steps: `log_incomplete` (a generation below the head's does not end with a seal-start
     /// record, or the chain of generations breaks; nothing is uploaded), `download`, `upload`,
-    /// `verify size`, `verify checksum`, `upload codes`, `head`, `time limit`, `pointer` (more
+    /// `quick_check` (the applied file fails `PRAGMA quick_check`; nothing is uploaded), `verify size`, `verify checksum`, `upload codes`, `head`, `time limit`, `pointer` (more
     /// than `MAX_POINTER_WRITES` writes, 10) and `pointer read`. The run moved no pointer, and
     /// it deleted its pack and codes when the pointer did not name them. A pack can still stay
     /// behind as an orphan, which GC deletes after the orphan grace: after `pointer read`, when
@@ -1196,6 +1198,7 @@ impl Run<'_> {
         let mut gone: Option<String> = None;
         let mut applied = 0u64;
         let mut first_applied: Option<u64> = None;
+        let mut last_applied: Option<u64> = None;
         let (work, enc, store, keys, retry, stop) = (
             &self.work,
             self.enc,
@@ -1248,6 +1251,7 @@ impl Run<'_> {
             apply_images_over(work, &images, &head, enc, None)?;
             applied += 1;
             first_applied.get_or_insert(e.generation);
+            last_applied = Some(e.generation);
             #[cfg(test)]
             if kept.is_some() && CRASH_AFTER_APPLY.with(|f| f.get()) {
                 return Err(Error::Io(
@@ -1298,10 +1302,11 @@ impl Run<'_> {
                 detail.truncate(i);
             }
             let first = first_applied.unwrap_or(pack_generation);
+            let last = last_applied.unwrap_or(first);
             tracing::error!(
                 target: "buckwal",
                 pack_generation,
-                generations = format!("{first}-{pack_generation}"),
+                generations = format!("{first}-{last}"),
                 detail = %detail,
                 "pack quick_check failed"
             );
