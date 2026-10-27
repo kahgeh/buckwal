@@ -1208,6 +1208,8 @@ fn sustained_window_load_seals_and_bounds_restore_gets() {
     const COMMITS: usize = 4800;
     // 8 connections' in-flight commits, the seal-start record and the WAL-header record.
     const SLACK: u64 = 16;
+    // The busy timeout of every connection (`BUSY_TIMEOUT`, conn.rs:33, which is `pub(crate)`).
+    const ENGINE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
     let win = w(1, 64, 1 << 20);
     let before = sustained(win, 0, COMMITS, Duration::from_millis(1));
     eprintln!("window before (maintenance off): {before:?}");
@@ -1215,7 +1217,16 @@ fn sustained_window_load_seals_and_bounds_restore_gets() {
     eprintln!("window after (maintenance at {THRESHOLD}): {after:?}");
     // A format 5 generation switch uploads no page, so the engine's own WAL restarts now end
     // generations under load too, at no fixed size: the baseline is for the record only.
-    assert_eq!((before.busy_retries, after.busy_retries), (0, 0));
+    // A busy refusal under load is tursodb's busy timeout, which buckwal does not change: the
+    // engine retries a locked statement and gives up after 5 s. The count depends on the load,
+    // so the test fixes none. Each refusal must be that timeout, not another fault.
+    for (text, waited) in before.busy_refusals.iter().chain(&after.busy_refusals) {
+        assert_eq!(text, "database is busy (locked)", "{before:?} {after:?}");
+        assert!(
+            *waited >= ENGINE_BUSY_TIMEOUT - Duration::from_millis(100),
+            "{text}: {waited:?}"
+        );
+    }
     assert_eq!(before.maintenance_runs, 0);
     assert!(after.seals_under_load > 0, "{after:?}");
     assert!(
