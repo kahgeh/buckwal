@@ -1,9 +1,40 @@
 //! The file record (spec outside-change-detect): what buckwal keeps in the local state about
 //! `app.db`, its `-wal` and, in MVCC mode, `app.db-log`, to detect a change made outside
-//! buckwal. The helper that keeps it correct and checks it at open is added with its rules.
+//! buckwal.
+//!
+//! Two rules keep the `app.db` part correct, and every writer of `app.db` follows them
+//! through [`DbFiles`]:
+//! 1. Before the first write to `app.db` after a record, [`DbFiles::begin_write`] sets
+//!    `db_write_open` on and `clean_close` off, and fsyncs the local state.
+//! 2. After the fsync of `app.db`, [`DbFiles::end_write`] writes the new `app.db` part and sets
+//!    `db_write_open` off.
+//!
+//! A clean close writes the whole record ([`DbFiles::write_clean_close`]). [`check_at_open`]
+//! compares the files with the record before reconcile.
+use crate::error::{Error, Result};
+use crate::files::{io_err, DB_FILE, LOG_FILE, WAL_FILE};
+use crate::format::LocalState;
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 /// A SHA-256, as raw bytes.
 pub(crate) type Sha = [u8; 32];
+
+/// The bytes of `app.db` that stand for its first page: one page at the default page size.
+/// The page size is not known here (an encrypted header cannot be read), and these bytes hold
+/// the whole header, with the change counter.
+const PAGE1_BYTES: usize = 4096;
+/// The header of a `-wal`, and of an `app.db-log`.
+const HEADER_BYTES: usize = 32;
+
+/// The refusal of an open that finds a changed file.
+const CHANGED: &str =
+    "app.db was changed outside buckwal since buckwal last used it; restore into a new directory";
 
 /// The details of the database files at one moment, with the two flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,3 +56,254 @@ pub(crate) struct FileRecord {
     /// True when a clean close wrote the record.
     pub clean_close: bool,
 }
+
+fn sha(bytes: &[u8]) -> Sha {
+    Sha256::digest(bytes).into()
+}
+
+/// Up to `n` bytes from the start of `path`; none when the file is missing.
+fn head_bytes(path: &Path, n: usize) -> Result<Vec<u8>> {
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err("open for the file record", e)),
+    };
+    let mut buf = Vec::with_capacity(n);
+    f.take(n as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| io_err("read for the file record", e))?;
+    Ok(buf)
+}
+
+/// The size of `path`, and its modification time in ns; `(0, 0)` when it is missing.
+fn size_and_time(path: &Path) -> Result<(u64, u64)> {
+    match fs::metadata(path) {
+        Ok(m) => {
+            let ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64);
+            Ok((m.len(), ns))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, 0)),
+        Err(e) => Err(io_err("stat for the file record", e)),
+    }
+}
+
+/// The `app.db` part: size, modification time, and the SHA-256 of the first page.
+fn db_part(dir: &Path) -> Result<(u64, u64, Sha)> {
+    let path = dir.join(DB_FILE);
+    let (size, ns) = size_and_time(&path)?;
+    Ok((size, ns, sha(&head_bytes(&path, PAGE1_BYTES)?)))
+}
+
+/// A `-wal` or `-log` part: size and the SHA-256 of the header.
+fn header_part(dir: &Path, name: &str) -> Result<(u64, Sha)> {
+    let path = dir.join(name);
+    let (size, _) = size_and_time(&path)?;
+    Ok((size, sha(&head_bytes(&path, HEADER_BYTES)?)))
+}
+
+/// The whole record now, with the given flags.
+fn capture(dir: &Path, mvcc: bool, db_write_open: bool, clean_close: bool) -> Result<FileRecord> {
+    let (db_size, db_mtime_ns, db_page1_sha256) = db_part(dir)?;
+    let (wal_size, wal_header_sha256) = header_part(dir, WAL_FILE)?;
+    let log = if mvcc {
+        Some(header_part(dir, LOG_FILE)?)
+    } else {
+        None
+    };
+    Ok(FileRecord {
+        db_size,
+        db_mtime_ns,
+        db_page1_sha256,
+        wal_size,
+        wal_header_sha256,
+        log,
+        db_write_open,
+        clean_close,
+    })
+}
+
+fn changed(file: &str, detail: &str) -> Error {
+    tracing::error!(target: "buckwal", file, detail, "files changed outside buckwal");
+    Error::Corrupt(CHANGED.into())
+}
+
+/// Compare the files in `dir` with the file record of `state`, before reconcile. Writes
+/// nothing. `Corrupt` (and one ERROR log) when a file differs. What it compares depends on the
+/// flags (spec, "What buckwal checks at open"):
+/// - no record: nothing;
+/// - `db_write_open` on: nothing (the write was unfinished, so `app.db` cannot be compared);
+/// - `clean_close` off, `db_write_open` off (a crash): the `app.db` part only;
+/// - `clean_close` on: the `app.db` part, the `-wal` part and (MVCC) the `-log` part.
+pub(crate) fn check_at_open(dir: &Path, state: &LocalState) -> Result<()> {
+    let Some(rec) = &state.files else {
+        return Ok(());
+    };
+    if rec.db_write_open {
+        return Ok(());
+    }
+    let (size, ns, page1) = db_part(dir)?;
+    if size != rec.db_size {
+        return Err(changed(DB_FILE, "size"));
+    }
+    if ns != rec.db_mtime_ns {
+        return Err(changed(DB_FILE, "time"));
+    }
+    if page1 != rec.db_page1_sha256 {
+        return Err(changed(DB_FILE, "page1"));
+    }
+    if !rec.clean_close {
+        return Ok(());
+    }
+    let (wal_size, wal_header) = header_part(dir, WAL_FILE)?;
+    if wal_size != rec.wal_size {
+        return Err(changed(WAL_FILE, "size"));
+    }
+    if wal_header != rec.wal_header_sha256 {
+        return Err(changed(WAL_FILE, "wal_header"));
+    }
+    if let Some((log_size, log_header)) = &rec.log {
+        let (size, header) = header_part(dir, LOG_FILE)?;
+        if size != *log_size {
+            return Err(changed(LOG_FILE, "size"));
+        }
+        if header != *log_header {
+            return Err(changed(LOG_FILE, "wal_header"));
+        }
+    }
+    Ok(())
+}
+
+/// What the helper keeps between calls, under one lock.
+struct Inner {
+    /// The local state as last written. Every write of `app.db-durable` after the open goes
+    /// through [`DbFiles`], so the `files` part of it is never lost.
+    state: LocalState,
+    /// True from `begin_write` until an `end_write` that no write overtook.
+    write_open: bool,
+}
+
+/// The one writer of `app.db-durable` once the engine is open, and the keeper of the file
+/// record. Lock order: a caller's own lock (the dirty mutex) first, this one after.
+pub(crate) struct DbFiles {
+    dir: PathBuf,
+    mvcc: bool,
+    inner: Mutex<Inner>,
+    /// Counts the writes to `app.db`; `end_write` keeps `db_write_open` on when a write came
+    /// after the fsync it follows started.
+    writes: AtomicU64,
+}
+
+impl DbFiles {
+    /// `state` is the local state the open ended with (after the check and the reconcile).
+    pub(crate) fn new(dir: &Path, mvcc: bool, state: LocalState) -> DbFiles {
+        DbFiles {
+            dir: dir.to_path_buf(),
+            mvcc,
+            inner: Mutex::new(Inner {
+                state,
+                write_open: false,
+            }),
+            writes: AtomicU64::new(0),
+        }
+    }
+
+    fn write(&self, inner: &mut Inner) -> Result<()> {
+        inner.state.write_atomic(&self.dir)
+    }
+
+    /// Write `state` (the caller's copy of the other fields) with the current file record.
+    /// Every writer of `app.db-durable` after the open calls this and no other write.
+    pub(crate) fn write_state(&self, state: &LocalState) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let files = inner.state.files.take();
+        inner.state = LocalState {
+            files,
+            ..state.clone()
+        };
+        self.write(&mut inner)
+    }
+
+    /// Turn `clean_close` off and fsync the local state, when a record exists. A read-only
+    /// open calls it before reconcile can write the `-wal`.
+    pub(crate) fn start_use(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(rec) = &mut inner.state.files else {
+            return Ok(());
+        };
+        if !rec.clean_close {
+            return Ok(());
+        }
+        rec.clean_close = false;
+        self.write(&mut inner)
+    }
+
+    /// Rule 1. Call before every write to `app.db`. Only the first call after a record does
+    /// work: it sets `db_write_open` on and `clean_close` off and fsyncs the local state.
+    pub(crate) fn begin_write(&self) -> Result<()> {
+        self.writes.fetch_add(1, SeqCst);
+        let mut inner = self.inner.lock().unwrap();
+        if inner.write_open {
+            return Ok(());
+        }
+        // No record yet (a directory from before the record, or a new one): start one whose
+        // `db_write_open` is on, so nothing is compared until the first `end_write`.
+        let mvcc = self.mvcc;
+        let rec = inner.state.files.get_or_insert_with(|| FileRecord {
+            db_size: 0,
+            db_mtime_ns: 0,
+            db_page1_sha256: sha(&[]),
+            wal_size: 0,
+            wal_header_sha256: sha(&[]),
+            log: mvcc.then(|| (0, sha(&[]))),
+            db_write_open: true,
+            clean_close: false,
+        });
+        rec.db_write_open = true;
+        rec.clean_close = false;
+        self.write(&mut inner)?;
+        inner.write_open = true;
+        Ok(())
+    }
+
+    /// The token for `end_write`. Call it before the fsync of `app.db` starts.
+    pub(crate) fn sync_token(&self) -> u64 {
+        self.writes.load(SeqCst)
+    }
+
+    /// Rule 2. Call after the fsync of `app.db` that started at `token`. Writes the new
+    /// `app.db` part and sets `db_write_open` off, unless a write came after the fsync started
+    /// (then the flag stays on, and the next fsync ends it).
+    pub(crate) fn end_write(&self, token: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.write_open || self.writes.load(SeqCst) != token {
+            return Ok(());
+        }
+        let (size, ns, page1) = db_part(&self.dir)?;
+        if let Some(rec) = &mut inner.state.files {
+            rec.db_size = size;
+            rec.db_mtime_ns = ns;
+            rec.db_page1_sha256 = page1;
+            rec.db_write_open = false;
+        }
+        self.write(&mut inner)?;
+        inner.write_open = false;
+        Ok(())
+    }
+
+    /// The whole record, with `clean_close` on. Call it once, at the end of a close, after
+    /// the engine, the uploader and the packer have stopped.
+    pub(crate) fn write_clean_close(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.files = Some(capture(&self.dir, self.mvcc, false, true)?);
+        self.write(&mut inner)?;
+        inner.write_open = false;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;
