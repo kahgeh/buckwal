@@ -982,7 +982,8 @@ fn a_whole_head_copied_over_another_database_fails_at_the_first_object_read() {
             );
         }
     }
-    // Over a database that holds log records but no manifest: the first record fails.
+    // Over a database that holds log records but no manifest: a record of the generation
+    // fails, the first that a fetch thread reads.
     {
         let store = mem();
         let _x = unsealed_writer("x", &store, &k);
@@ -992,13 +993,14 @@ fn a_whole_head_copied_over_another_database_fails_at_the_first_object_read() {
         let h = head_at(&store, "y");
         assert_eq!(h.manifest, None);
         let yk = Keys::new("y");
-        let first = keys_under(&store, "y")
+        let records: Vec<String> = keys_under(&store, "y")
             .into_iter()
-            .find(|x| yk.parse_log(x).is_some_and(|(g, _)| g == h.generation))
-            .expect("y holds a log record");
+            .filter(|x| yk.parse_log(x).is_some_and(|(g, _)| g == h.generation))
+            .collect();
+        assert!(!records.is_empty(), "y holds a log record");
         assert_integrity(
             read_at(Reader::ReadOnly, Mode::Wal, "y", &store, &k, &hex),
-            std::slice::from_ref(&first),
+            &records,
             "unsealed y",
         );
     }
