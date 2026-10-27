@@ -194,7 +194,7 @@ pub(crate) fn reconcile_files(
             Reconciled::Level | Reconciled::Ahead { .. } => &wal_local,
             Reconciled::Behind | Reconciled::NewGeneration => &images.wal,
         };
-        seed_database_file(dir, bytes, &head, cfg.journal_mode)?;
+        seed_database_file(dir, bytes, &head, cfg.journal_mode, state)?;
     }
     if mvcc && !cfg.read_only {
         // A crash between the seal's steps 6 and 8 leaves WAL frames next to a cut log.
@@ -314,7 +314,16 @@ pub(crate) fn replace_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
 
 /// Never sealed: an empty or missing database file next to a WAL with frames would be read
 /// as a new database and the WAL deleted, so seed it as a restore does (`page_one_seed`).
-fn seed_database_file(dir: &Path, wal: &[u8], head: &Head, mode: JournalMode) -> Result<()> {
+///
+/// A write to `app.db`, so it follows the two rules of the file record (`file_record`): the
+/// local state says a write is open before the rename, and holds the new `app.db` part after.
+fn seed_database_file(
+    dir: &Path,
+    wal: &[u8],
+    head: &Head,
+    mode: JournalMode,
+    state: &mut LocalState,
+) -> Result<()> {
     let len = match fs::metadata(dir.join(DB_FILE)) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -327,7 +336,10 @@ fn seed_database_file(dir: &Path, wal: &[u8], head: &Head, mode: JournalMode) ->
     if seed.is_empty() {
         return Ok(());
     }
-    replace_file(dir, DB_FILE, &seed)
+    crate::file_record::begin_offline_write(dir, state, mode == JournalMode::Mvcc)?;
+    // `replace_file` fsyncs the new file before its rename.
+    replace_file(dir, DB_FILE, &seed)?;
+    crate::file_record::end_offline_write(dir, state)
 }
 
 #[cfg(test)]

@@ -446,15 +446,13 @@ impl BucketDbStorage {
             self.complete.store(true, SeqCst);
             return Ok(());
         }
-        let r = sync_file(&*self.file, &*self.io)
-            .map_err(|e| io_err("fsync db", e))
-            .and_then(|_| {
-                let state = LocalState {
-                    complete: true,
-                    ..dirty.state.clone()
-                };
-                self.write_state(&mut dirty, state)
-            });
+        let r = self.sync_db().and_then(|_| {
+            let state = LocalState {
+                complete: true,
+                ..dirty.state.clone()
+            };
+            self.write_state(&mut dirty, state)
+        });
         self.complete.store(true, SeqCst);
         r
     }
@@ -471,6 +469,24 @@ impl BucketDbStorage {
         }
         dirty.state = state;
         Ok(())
+    }
+
+    /// A write to `app.db` is about to start (rule 1 of the file record).
+    fn begin_db_write(&self) -> turso_core::Result<()> {
+        match &self.files {
+            Some(f) => f.begin_write().map_err(stash),
+            None => Ok(()),
+        }
+    }
+
+    /// fsync `app.db` and wait for it, then record its new part (rule 2 of the file record).
+    fn sync_db(&self) -> Result<()> {
+        let token = self.files.as_ref().map(|f| f.sync_token());
+        sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
+        match (&self.files, token) {
+            (Some(f), Some(t)) => f.end_write(t),
+            _ => Ok(()),
+        }
     }
 
     fn record_written(&self, first: u32, count: usize, page_size: usize) {
@@ -525,7 +541,7 @@ impl BucketDbStorage {
     /// and a reopen replaces it, `reconcile`).
     pub(crate) fn switch_generation(&self) -> Result<u64> {
         let mut dirty = self.dirty.lock().unwrap();
-        sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
+        self.sync_db()?;
         let generation = self.uploader.switch_generation()?;
         if let Some(b) = &self.blocks {
             b.set_generation(generation);
@@ -583,7 +599,7 @@ impl BucketDbStorage {
             pages.push((p, bytes));
         }
         let generation = self.uploader.seal_generation(pages, ps, page_count)?;
-        sync_file(&*self.file, &*self.io).map_err(|e| io_err("fsync db", e))?;
+        self.sync_db()?;
         // Only a claimed writer seals (a read-only open never writes), and the head's ETag
         // changed with this seal, so none is kept. A takeover quiet (seal-not-before and its
         // length) applied to the generation just sealed: cleared. The writer id, the epoch and
@@ -655,6 +671,7 @@ impl DatabaseStorage for BucketDbStorage {
             self.ensure_pages(page_idx, 1, buffer.len())
                 .map_err(stash)?;
         }
+        self.begin_db_write()?;
         self.record_written(page_idx as u32, 1, buffer.len());
         self.inner.write_page(page_idx, buffer, io_ctx, c)
     }
@@ -671,6 +688,7 @@ impl DatabaseStorage for BucketDbStorage {
             self.ensure_pages(first_page_idx, buffers.len(), page_size)
                 .map_err(stash)?;
         }
+        self.begin_db_write()?;
         self.record_written(first_page_idx as u32, buffers.len(), page_size);
         self.inner
             .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
@@ -679,7 +697,17 @@ impl DatabaseStorage for BucketDbStorage {
         // Uploads nothing. Formats 1 to 4: the pages go up when the generation is sealed, and
         // their numbers are made durable before the database file is.
         self.persist_dirty().map_err(stash)?;
-        self.inner.sync(c, sync_type)
+        let Some(files) = &self.files else {
+            return self.inner.sync(c, sync_type);
+        };
+        // Rule 2 needs the fsync done, so wait for it here, as `sync_file` does.
+        let token = files.sync_token();
+        let done = self.inner.sync(c, sync_type)?;
+        if !done.finished() {
+            self.io.wait_for_completion(done.clone())?;
+        }
+        files.end_write(token).map_err(stash)?;
+        Ok(done)
     }
     fn size(&self) -> turso_core::Result<u64> {
         let bucket = self.bucket_pages.load(SeqCst) as u64 * self.page_size.load(SeqCst) as u64;
@@ -690,6 +718,7 @@ impl DatabaseStorage for BucketDbStorage {
         if let Some(b) = &self.blocks {
             b.truncate(len as u64).map_err(stash)?;
         }
+        self.begin_db_write()?;
         if let Some(ps) = std::num::NonZeroU32::new(self.page_size.load(SeqCst)) {
             let pages = (len as u64 / ps.get() as u64).min(u32::MAX as u64) as u32;
             self.bucket_pages.store(pages, SeqCst);

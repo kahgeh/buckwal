@@ -3573,6 +3573,11 @@ fn torn_page_one_image(store: &Arc<MemStore>, cfg: impl Fn(&Path) -> Config) -> 
     assert!(b.len() >= 4096, "{} bytes", b.len());
     b[2048..4096].fill(0);
     std::fs::write(&path, b).unwrap();
+    // The tear is an outside change to `app.db`, which the open refuses before the engine reads
+    // page 1 (outside-change-detect). Drop the file record so the engine's own check is reached.
+    let mut s = state(img.path());
+    s.files = None;
+    s.write_atomic(img.path()).unwrap();
     img
 }
 

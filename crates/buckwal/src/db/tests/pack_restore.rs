@@ -1457,3 +1457,54 @@ fn claim_from_an_empty_directory_restores_every_acked_commit() {
         assert_eq!(rows(&v.connect().unwrap()), want, "{batching:?}");
     }
 }
+
+/// A crash in the middle of the background fetch of a restored pack (outside-change-detect):
+/// `app.db` has its full size, but its blocks are not all local. The copy is taken when the
+/// first block write has been announced, and again when the fetch has ended without a clean
+/// close. Neither open is refused, and both have every row.
+#[test]
+fn crash_during_the_background_fetch_of_a_restored_pack_opens() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = packed_writer(&store, config(a.path()));
+    let want = rows(&c);
+    crash(db, vec![c]);
+    let b = tempdir();
+    let dir = fresh(&b);
+    let image = Arc::new(Mutex::new(None::<TempDir>));
+    let watched = b.path().canonicalize().unwrap().join("db");
+    let (from, slot) = (dir.clone(), image.clone());
+    let hook: crate::file_record::WriteHook = Arc::new(move || {
+        slot.lock()
+            .unwrap()
+            .get_or_insert_with(|| copy_db_files(&from));
+    });
+    crate::file_record::AFTER_BEGIN
+        .lock()
+        .unwrap()
+        .push((watched.clone(), hook));
+    let db = open_mem(&store, &dir);
+    wait_complete(&dir);
+    crate::file_record::AFTER_BEGIN
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != watched);
+    let mid = image
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the fetch wrote nothing");
+    // No record yet (the restore wrote none): an open checks nothing; with one, a write is open.
+    assert!(state(mid.path()).files.is_none_or(|f| f.db_write_open));
+    assert!(mid.path().join(BLOCKS_FILE).exists());
+    let after = copy_db_files(&dir);
+    crash(db, vec![]);
+    for img in [&mid, &after] {
+        let db = open_mem(&store, img.path());
+        wait_complete(img.path());
+        let c = db.connect().unwrap();
+        assert_eq!(rows(&c), want);
+        c.close().unwrap();
+        db.close().unwrap();
+    }
+}

@@ -162,6 +162,9 @@ pub(crate) struct BlockStore {
     gone: Arc<AtomicBool>,
     /// Pack bytes fetched by this store.
     fetched: AtomicU64,
+    /// The file record's helper, when the directory is open (the fetch is a write to
+    /// `app.db`: it follows the two rules). None in a restore, which runs before any record.
+    files: Option<Arc<crate::file_record::DbFiles>>,
 }
 
 impl BlockStore {
@@ -303,6 +306,7 @@ impl BlockStore {
             restore,
             gone,
             fetched: AtomicU64::new(0),
+            files: crate::file_record::lookup(dir),
         })
     }
 
@@ -481,6 +485,9 @@ impl BlockStore {
             let start = b as u64 * BLOCK_SIZE;
             let end = (start + block.len() as u64).min(limit);
             if start < end {
+                if let Some(f) = &self.files {
+                    f.begin_write()?;
+                }
                 self.db
                     .write_all_at(&block[..(end - start) as usize], start)
                     .map_err(|e| io_err("write a fetched block", e))?;
@@ -490,7 +497,11 @@ impl BlockStore {
         if new.is_empty() {
             return Ok(());
         }
+        let token = self.files.as_ref().map(|f| f.sync_token());
         self.db.sync_data().map_err(|e| io_err("fsync app.db", e))?;
+        if let (Some(f), Some(t)) = (&self.files, token) {
+            f.end_write(t)?;
+        }
         for &b in &new {
             flags
                 .write_all_at(&[1], LIMIT_LEN + b as u64)

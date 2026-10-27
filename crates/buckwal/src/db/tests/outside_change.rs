@@ -3,6 +3,7 @@
 use super::*;
 use crate::files::DB_FILE;
 use crate::telemetry::testing::Capture;
+use std::sync::Mutex;
 use turso_core::{
     Database as Engine, DatabaseOpts, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO,
 };
@@ -203,4 +204,153 @@ fn outside_change_while_open_sqlite3() {
     );
     c.close().unwrap();
     db.close().unwrap();
+}
+
+/// Rows of `t` as ids, from a database that opened without a refusal.
+fn open_ids(store: &Arc<MemStore>, dir: &Path) -> Vec<i64> {
+    let db = open_with_store(config(dir), store.clone())
+        .unwrap_or_else(|e| panic!("the open of {} was refused: {e}", dir.display()));
+    let c = db.connect().unwrap();
+    let ids = c
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    c.close().unwrap();
+    db.close().unwrap();
+    ids
+}
+
+/// A writer with rows 1..=20, a TRUNCATE checkpoint, then rows 21..=30 that stay in the `-wal`.
+fn writer_with_wal_rows(store: &Arc<MemStore>, dir: &Path) -> (Database, Connection) {
+    let db = open_mem(store, dir);
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=20 {
+        insert(&c, id).unwrap();
+    }
+    c.checkpoint(CheckpointMode::Truncate).unwrap();
+    for id in 21..=30 {
+        insert(&c, id).unwrap();
+    }
+    (db, c)
+}
+
+/// Test 6: a checkpoint, then more commits, then a crash. The open succeeds and has every row.
+#[test]
+fn crash_after_checkpoint_and_more_commits_opens() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = writer_with_wal_rows(&store, a.path());
+    let img = copy_db_files(a.path());
+    crash(db, vec![c]);
+    let rec = state(img.path())
+        .files
+        .expect("a record after the checkpoint");
+    assert!(!rec.clean_close && !rec.db_write_open);
+    assert_eq!(open_ids(&store, img.path()), (1..=30).collect::<Vec<_>>());
+}
+
+/// Test 7, the explicit checkpoint: a crash after `begin_write` and before the write ends.
+/// `app.db` is then in an unknown state (here: a new modification time), and the open succeeds.
+#[test]
+fn crash_in_the_middle_of_a_checkpoint_opens() {
+    // Modes that restart the WAL also switch the generation in the bucket, which a copy taken in
+    // the middle of the checkpoint cannot match; the write path is the same.
+    for mode in [CheckpointMode::Passive, CheckpointMode::Full] {
+        let store = mem();
+        let a = tempdir();
+        let (db, c) = writer_with_wal_rows(&store, a.path());
+        let image = Arc::new(Mutex::new(None::<TempDir>));
+        let (from, slot) = (a.path().to_path_buf(), image.clone());
+        let hook: crate::file_record::WriteHook = Arc::new(move || {
+            slot.lock()
+                .unwrap()
+                .get_or_insert_with(|| copy_db_files(&from));
+        });
+        crate::file_record::AFTER_BEGIN
+            .lock()
+            .unwrap()
+            .push((a.path().canonicalize().unwrap(), hook));
+        c.checkpoint(mode).unwrap();
+        crate::file_record::AFTER_BEGIN
+            .lock()
+            .unwrap()
+            .retain(|(d, _)| *d != a.path().canonicalize().unwrap());
+        crash(db, vec![c]);
+        let img = image
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the checkpoint wrote nothing");
+        assert!(state(img.path()).files.unwrap().db_write_open);
+        std::fs::File::options()
+            .write(true)
+            .open(img.path().join(DB_FILE))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(open_ids(&store, img.path()), (1..=30).collect::<Vec<_>>());
+    }
+}
+
+/// Test 7, the seed of a never-sealed database at open: a crash image of a writer that never
+/// checkpointed has an empty `app.db` and frames in the `-wal`. The open seeds `app.db`, and a
+/// crash after the seed, then a reopen, is not refused.
+#[test]
+fn crash_around_the_seed_of_a_never_sealed_database_opens() {
+    let store = mem();
+    let a = tempdir();
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=10 {
+        insert(&c, id).unwrap();
+    }
+    let img = copy_db_files(a.path());
+    crash(db, vec![c]);
+    let db = open_mem(&store, img.path());
+    let c = db.connect().unwrap();
+    let ids: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+    let again = copy_db_files(img.path());
+    crash(db, vec![c]);
+    assert_eq!(open_ids(&store, again.path()), (1..=10).collect::<Vec<_>>());
+}
+
+/// Test 8: an outside change to `app.db` after a crash, while no `app.db` write was
+/// unfinished, is refused: the `app.db` part of the check works after a crash too.
+#[test]
+fn outside_vacuum_after_a_crash_is_refused() {
+    let store = mem();
+    let a = tempdir();
+    let (db, c) = writer_with_wal_rows(&store, a.path());
+    let img = copy_db_files(a.path());
+    crash(db, vec![c]);
+    let rec = state(img.path()).files.unwrap();
+    assert!(!rec.clean_close && !rec.db_write_open);
+    outside_vacuum(img.path());
+    assert_refused(open_with_store(config(img.path()), store.clone()));
+}
+
+/// Test 10: after a refusal, a restore into a new directory has every acked commit.
+#[test]
+fn restore_after_a_refusal_has_every_acked_commit() {
+    let store = mem();
+    let dir = tempdir();
+    closed_writer(&store, dir.path());
+    outside_vacuum(dir.path());
+    assert_refused(open_with_store(config(dir.path()), store.clone()));
+    let r = tempdir();
+    restore_with_store(&config(&fresh(&r)), store.clone(), &fresh(&r)).unwrap();
+    assert_eq!(
+        open_ids(&store, &fresh(&r)),
+        (151..=210).collect::<Vec<_>>()
+    );
 }

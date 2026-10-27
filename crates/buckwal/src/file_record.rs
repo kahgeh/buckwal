@@ -178,6 +178,14 @@ pub(crate) fn check_at_open(dir: &Path, state: &LocalState) -> Result<()> {
     Ok(())
 }
 
+/// Tests only: a hook per directory, called once `begin_write` has set `db_write_open` on and
+/// fsynced the state, before the write it announces. A test copies the directory in it, which
+/// is a crash in the middle of a write to `app.db`.
+#[cfg(test)]
+pub(crate) type WriteHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+pub(crate) static AFTER_BEGIN: Mutex<Vec<(PathBuf, WriteHook)>> = Mutex::new(Vec::new());
+
 /// The open `DbFiles` of each directory in this process. A directory has one open at a time (the
 /// directory lock), and the storage of its engine finds its helper here: the storage is built
 /// in `engine.rs`, which an open reaches with no place for one more argument. A replica or a
@@ -212,6 +220,49 @@ pub(crate) fn mark_in_use(dir: &Path, state: &mut LocalState) -> Result<()> {
     }
 }
 
+/// Rule 1 on `state`: `db_write_open` on, `clean_close` off. With no record yet (a directory
+/// from before the record, or a new one) it starts one whose `db_write_open` is on, so nothing
+/// is compared until the first rule 2.
+fn open_write_in(state: &mut LocalState, mvcc: bool) {
+    let rec = state.files.get_or_insert_with(|| FileRecord {
+        db_size: 0,
+        db_mtime_ns: 0,
+        db_page1_sha256: sha(&[]),
+        wal_size: 0,
+        wal_header_sha256: sha(&[]),
+        log: mvcc.then(|| (0, sha(&[]))),
+        db_write_open: true,
+        clean_close: false,
+    });
+    rec.db_write_open = true;
+    rec.clean_close = false;
+}
+
+/// Rule 2 on `state`: the new `app.db` part, `db_write_open` off.
+fn close_write_in(dir: &Path, state: &mut LocalState) -> Result<()> {
+    let (size, ns, page1) = db_part(dir)?;
+    if let Some(rec) = &mut state.files {
+        rec.db_size = size;
+        rec.db_mtime_ns = ns;
+        rec.db_page1_sha256 = page1;
+        rec.db_write_open = false;
+    }
+    Ok(())
+}
+
+/// Rule 1 for a writer that has no [`DbFiles`] yet (the seed of a never-sealed database,
+/// during reconcile): set it in `state` and fsync the local state, before the write.
+pub(crate) fn begin_offline_write(dir: &Path, state: &mut LocalState, mvcc: bool) -> Result<()> {
+    open_write_in(state, mvcc);
+    state.write_atomic(dir)
+}
+
+/// Rule 2 for that writer, after the fsync of `app.db`.
+pub(crate) fn end_offline_write(dir: &Path, state: &mut LocalState) -> Result<()> {
+    close_write_in(dir, state)?;
+    state.write_atomic(dir)
+}
+
 /// What the helper keeps between calls, under one lock.
 struct Inner {
     /// The local state as last written. Every write of `app.db-durable` after the open goes
@@ -223,8 +274,6 @@ struct Inner {
 
 /// The one writer of `app.db-durable` once the engine is open, and the keeper of the file
 /// record. Lock order: a caller's own lock (the dirty mutex) first, this one after.
-// The write rules are called by the `app.db` writers (the next commit removes this allow).
-#[allow(dead_code)]
 pub(crate) struct DbFiles {
     dir: PathBuf,
     mvcc: bool,
@@ -234,7 +283,6 @@ pub(crate) struct DbFiles {
     writes: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl DbFiles {
     /// `state` is the local state the open ended with (after the check and the reconcile).
     pub(crate) fn new(dir: &Path, mvcc: bool, state: LocalState) -> DbFiles {
@@ -266,30 +314,35 @@ impl DbFiles {
     }
 
     /// Rule 1. Call before every write to `app.db`. Only the first call after a record does
-    /// work: it sets `db_write_open` on and `clean_close` off and fsyncs the local state.
+    /// work: it sets `db_write_open` on and `clean_close` off and fsyncs the local state (when
+    /// a record exists on disk).
     pub(crate) fn begin_write(&self) -> Result<()> {
         self.writes.fetch_add(1, SeqCst);
         let mut inner = self.inner.lock().unwrap();
         if inner.write_open {
             return Ok(());
         }
-        // No record yet (a directory from before the record, or a new one): start one whose
-        // `db_write_open` is on, so nothing is compared until the first `end_write`.
-        let mvcc = self.mvcc;
-        let rec = inner.state.files.get_or_insert_with(|| FileRecord {
-            db_size: 0,
-            db_mtime_ns: 0,
-            db_page1_sha256: sha(&[]),
-            wal_size: 0,
-            wal_header_sha256: sha(&[]),
-            log: mvcc.then(|| (0, sha(&[]))),
-            db_write_open: true,
-            clean_close: false,
-        });
-        rec.db_write_open = true;
-        rec.clean_close = false;
-        self.write(&mut inner)?;
+        // With no record on disk, an open checks nothing whatever happens, so the first rule 1
+        // needs no fsync of its own: the record starts at the first rule 2. (A state write in
+        // between persists the flag, which is safe.)
+        let first = inner.state.files.is_none();
+        open_write_in(&mut inner.state, self.mvcc);
+        if !first {
+            self.write(&mut inner)?;
+        }
         inner.write_open = true;
+        #[cfg(test)]
+        {
+            let hook = AFTER_BEGIN
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(d, _)| *d == self.dir)
+                .map(|(_, h)| h.clone());
+            if let Some(h) = hook {
+                h();
+            }
+        }
         Ok(())
     }
 
@@ -306,14 +359,10 @@ impl DbFiles {
         if !inner.write_open || self.writes.load(SeqCst) != token {
             return Ok(());
         }
-        let (size, ns, page1) = db_part(&self.dir)?;
-        if let Some(rec) = &mut inner.state.files {
-            rec.db_size = size;
-            rec.db_mtime_ns = ns;
-            rec.db_page1_sha256 = page1;
-            rec.db_write_open = false;
-        }
-        self.write(&mut inner)?;
+        close_write_in(&self.dir, &mut inner.state)?;
+        // Without the fsync of the directory: a lost rename leaves the record of rule 1, which
+        // says a write is open, so the next open checks nothing (safe, only weaker).
+        inner.state.write_atomic_lazy(&self.dir)?;
         inner.write_open = false;
         Ok(())
     }

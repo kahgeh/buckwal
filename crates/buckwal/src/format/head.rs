@@ -483,6 +483,21 @@ impl LocalState {
 
     /// Temp file in `dir`, fsync, rename over `app.db-durable`, fsync `dir`.
     pub(crate) fn write_atomic(&self, dir: &Path) -> Result<()> {
+        self.write_renamed(dir)?;
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io_err("fsync state dir", e))
+    }
+
+    /// [`write_atomic`](Self::write_atomic) without the fsync of `dir`: a crash can lose the
+    /// rename, and the old file stays whole. Only for a write that the old file may stand in
+    /// for (the file record's rule 2: the old record says `db_write_open`, so an open checks
+    /// nothing).
+    pub(crate) fn write_atomic_lazy(&self, dir: &Path) -> Result<()> {
+        self.write_renamed(dir)
+    }
+
+    fn write_renamed(&self, dir: &Path) -> Result<()> {
         let tmp = dir.join(format!("{STATE_FILE}.tmp"));
         let dst = dir.join(STATE_FILE);
         let mut f = File::create(&tmp).map_err(|e| io_err("create temp state", e))?;
@@ -490,10 +505,7 @@ impl LocalState {
             .map_err(|e| io_err("write state", e))?;
         f.sync_all().map_err(|e| io_err("fsync state", e))?;
         drop(f);
-        fs::rename(&tmp, &dst).map_err(|e| io_err("rename state", e))?;
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| io_err("fsync state dir", e))
+        fs::rename(&tmp, &dst).map_err(|e| io_err("rename state", e))
     }
 
     pub(crate) fn read(dir: &Path) -> Result<Option<LocalState>> {

@@ -380,7 +380,6 @@ fn open_impl(
     // Before reconcile, which can write the `-wal`, and before any write to the bucket: a file
     // that another tool changed stops the open, and nothing changes. Then the mark of a clean
     // close goes off, because this process may now write the files.
-    let mut local_files = None;
     if let Some(state) = &mut local {
         let span = tracing::info_span!(target: "buckwal", "buckwal.open", buckwal.outcome = Empty);
         span.in_scope(|| crate::file_record::check_at_open(&dir, state))
@@ -393,7 +392,6 @@ fn open_impl(
                 span.record("buckwal.outcome", outcome);
             })?;
         crate::file_record::mark_in_use(&dir, state)?;
-        local_files = state.files.clone();
     }
 
     let (bucket, state, reconciled) = match local {
@@ -447,10 +445,7 @@ fn open_impl(
     let files = Arc::new(DbFiles::new(
         &dir,
         cfg.journal_mode == JournalMode::Mvcc,
-        LocalState {
-            files: local_files,
-            ..state.clone()
-        },
+        state.clone(),
     ));
     // Before the engine opens: its storage finds the helper by directory.
     crate::file_record::register(&files);

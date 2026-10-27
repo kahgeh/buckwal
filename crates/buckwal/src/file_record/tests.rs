@@ -142,6 +142,10 @@ fn begin_write_without_a_record_starts_one_with_write_open_on() {
     let d = dir_with_files();
     let files = DbFiles::new(d.path(), false, base_state());
     files.begin_write().unwrap();
+    // Nothing is on disk yet: an open would check nothing anyway.
+    assert!(LocalState::read(d.path()).unwrap().is_none());
+    // A state write in between persists the flag, and an open still checks nothing.
+    files.write_state(&base_state()).unwrap();
     let on_disk = LocalState::read(d.path()).unwrap().unwrap();
     assert!(on_disk.files.as_ref().unwrap().db_write_open);
     check_at_open(d.path(), &on_disk).unwrap();
