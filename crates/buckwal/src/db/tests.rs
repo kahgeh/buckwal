@@ -825,6 +825,15 @@ fn copy_db_files(from: &Path) -> TempDir {
     ] {
         if from.join(f).exists() {
             std::fs::copy(from.join(f), to.path().join(f)).unwrap();
+            // A crash leaves the files as they were: keep the modification time, which the
+            // file record compares (`fs::copy` keeps it on macOS only).
+            let mtime = std::fs::metadata(from.join(f)).unwrap().modified().unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(to.path().join(f))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
         }
     }
     to
