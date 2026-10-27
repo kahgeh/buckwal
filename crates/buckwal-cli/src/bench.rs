@@ -205,6 +205,7 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
         e => c.maintenance.record(e),
     }));
     let fault = Arc::new(FaultStore::new(s3_store(&cfg)?));
+    let opened_at = Instant::now();
     let db = buckwal::open_with_store(cfg, fault.clone()).map_err(err)?;
     if let Some(b) = a.batching {
         db.set_batching(b).map_err(err)?;
@@ -240,6 +241,7 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
     let log_objects_max = counters.maintenance.log_objects_max();
 
     db.close().map_err(err)?;
+    let elapsed = opened_at.elapsed();
     // The seal at close uploads pages, so count them after it.
     let page_puts = puts(&fault, "/pages/");
 
@@ -248,6 +250,7 @@ pub fn run(a: &BenchArgs) -> CliResult<()> {
     sorted.sort();
     let seals = counters.seals.lock().unwrap().clone();
     say(&format!("commits={commits}"));
+    say(&format!("elapsed_ms={}", ms(elapsed)));
     say(&format!("commit_p50_ms={}", ms(pct(&sorted, 0.50))));
     say(&format!("commit_p95_ms={}", ms(pct(&sorted, 0.95))));
     say(&format!("commit_p99_ms={}", ms(pct(&sorted, 0.99))));

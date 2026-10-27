@@ -2093,8 +2093,9 @@ fn batching_mixed_connections_against_rustfs() {
     );
 }
 
-/// `bench --commits 300` with `extra` settings: (commit p50 in ms, wall time).
-fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration) {
+/// `bench --commits 300` with `extra` settings: (commit p50 in ms, wall time, bench's own
+/// `elapsed_ms` as a duration).
+fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration, Duration) {
     let mut ctx = Ctx::new(name);
     for (k, v) in extra {
         ctx = ctx.set(k, v);
@@ -2103,12 +2104,15 @@ fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration) {
     let started = Instant::now();
     let out = ctx.ok(&["bench", "--dir", dir.to_str().unwrap(), "--commits", "300"]);
     let wall = started.elapsed();
-    let p50 = key_values(&out.stdout, "")["commit_p50_ms"];
+    let values = key_values(&out.stdout, "");
+    let p50 = values["commit_p50_ms"];
+    let elapsed = Duration::from_secs_f64(values["elapsed_ms"] / 1000.0);
     eprintln!(
-        "{name}: commit_p50_ms={p50} wall={wall:?} stderr: {}",
+        "{name}: commit_p50_ms={p50} wall={wall:?} elapsed_ms={elapsed:?} outside={:?} stderr: {}",
+        wall.saturating_sub(elapsed),
         out.stderr.trim()
     );
-    (p50, wall)
+    (p50, wall, elapsed)
 }
 
 /// Telemetry on, its collector (a) refusing connections, (b) accepting them and never
@@ -2117,7 +2121,7 @@ fn bench_run(name: &str, extra: &[(&str, &str)]) -> (f64, Duration) {
 #[test]
 #[ignore = "needs RustFS: ./scripts/test.sh"]
 fn telemetry_collector_down_and_blackhole() {
-    let (base_p50, base_wall) = bench_run("telemetry_off", &[("BUCKWAL_OTEL", "0")]);
+    let (base_p50, base_wall, _) = bench_run("telemetry_off", &[("BUCKWAL_OTEL", "0")]);
 
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
@@ -2149,7 +2153,7 @@ fn telemetry_collector_down_and_blackhole() {
         ("telemetry_collector_down", &down),
         ("telemetry_collector_blackhole", &hole),
     ] {
-        let (p50, wall) = bench_run(
+        let (p50, wall, _) = bench_run(
             name,
             &[("BUCKWAL_OTEL", "1"), ("BUCKWAL_OTEL_ENDPOINT", endpoint)],
         );
