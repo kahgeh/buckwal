@@ -319,6 +319,11 @@ fn crash_around_the_seed_of_a_never_sealed_database_opens() {
         .map(|r| r[0].as_int().unwrap())
         .collect();
     assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+    // The seed followed the rules: the record holds the seeded `app.db`, with no write open.
+    let rec = state(img.path()).files.expect("a record after the seed");
+    assert!(!rec.db_write_open);
+    let len = std::fs::metadata(img.path().join(DB_FILE)).unwrap().len();
+    assert!(len > 0 && rec.db_size > 0, "{len} {}", rec.db_size);
     let again = copy_db_files(img.path());
     crash(db, vec![c]);
     assert_eq!(open_ids(&store, again.path()), (1..=10).collect::<Vec<_>>());
@@ -387,4 +392,113 @@ fn crash_after_a_lazy_page_fetch_opens() {
     let img = copy_db_files(r.path());
     crash(db, vec![c]);
     assert_eq!(open_ids(&store, img.path()), (1..=3001).collect::<Vec<_>>());
+}
+
+/// Test 7, the engine's automatic checkpoint: enough commits make the engine checkpoint on its
+/// own, inside a commit (a generation switch follows). A crash after it is not refused.
+#[test]
+fn crash_after_the_engines_automatic_checkpoint_opens() {
+    let store = mem();
+    let a = tempdir();
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    let mut n = 0;
+    while db.generation() == 1 {
+        n += 1;
+        c.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            &[Value::from_i64(n), Value::build_text("x".repeat(2000))],
+        )
+        .unwrap();
+        assert!(n < 5000, "the engine never checkpointed on its own");
+    }
+    let rec = state(a.path())
+        .files
+        .expect("a record after the automatic checkpoint");
+    assert!(!rec.clean_close);
+    let img = copy_db_files(a.path());
+    crash(db, vec![c]);
+    assert_eq!(open_ids(&store, img.path()), (1..=n).collect::<Vec<_>>());
+}
+
+/// Test 7, the background prefetch of formats 1 to 4: it writes `app.db` through the same
+/// fetch as a read does. A crash after it, and after a checkpoint's record, is not refused.
+#[test]
+fn crash_after_the_prefetch_of_formats_1_to_4_opens() {
+    let _legacy = crate::format::LegacySeal::on();
+    let store = mem();
+    let _a = super::closed_writer(&store, 3000);
+    let r = tempdir();
+    restore_with_store(&config(r.path()), store.clone(), r.path()).unwrap();
+    let mut cfg = config(r.path());
+    cfg.prefetch = true;
+    let db = open_with_store(cfg, store.clone()).unwrap();
+    let done = {
+        let open = db.shared.open.lock().unwrap();
+        open.as_ref()
+            .unwrap()
+            .engine
+            .prefetch
+            .as_ref()
+            .unwrap()
+            .done
+            .clone()
+    };
+    let t = Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "prefetch never ended"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let img = copy_db_files(r.path());
+    crash(db, vec![]);
+    assert_eq!(open_ids(&store, img.path()), (1..=3000).collect::<Vec<_>>());
+}
+
+/// Test 7, a crash during the seed of a never-sealed database: the seed is a write to
+/// `app.db` (a rename over an empty file), so it follows the two rules. The image is a crash
+/// image of a writer that never checkpointed (an empty `app.db`, frames in the `-wal`). Rule 1
+/// of the seed ran, and the crash came before the rename (empty `app.db`) or after it (seeded
+/// `app.db`) and before rule 2. Neither open is refused.
+#[test]
+fn crash_during_the_seed_of_a_never_sealed_database_opens() {
+    let store = mem();
+    let a = tempdir();
+    let db = open_mem(&store, a.path());
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=10 {
+        insert(&c, id).unwrap();
+    }
+    let before = copy_db_files(a.path());
+    crash(db, vec![c]);
+    // A record from an earlier checkpoint-less run does not exist: make one that a previous
+    // clean close would have left (app.db empty, record of it), then run rule 1 of the seed.
+    let mut s = state(before.path());
+    s.files = None;
+    crate::file_record::begin_offline_write(before.path(), &mut s, false).unwrap();
+    let on_disk = state(before.path());
+    assert!(on_disk.files.as_ref().unwrap().db_write_open);
+    // Crash before the rename: the empty app.db stays. The open seeds it.
+    let seeded_image = copy_db_files(before.path());
+    assert_eq!(
+        open_ids(&store, before.path()),
+        (1..=10).collect::<Vec<_>>()
+    );
+    // Crash after the rename, before rule 2: the seeded app.db with the record of rule 1.
+    let mut s = state(seeded_image.path());
+    s.files = None;
+    crate::file_record::begin_offline_write(seeded_image.path(), &mut s, false).unwrap();
+    std::fs::copy(
+        before.path().join(DB_FILE),
+        seeded_image.path().join(DB_FILE),
+    )
+    .unwrap();
+    assert_eq!(
+        open_ids(&store, seeded_image.path()),
+        (1..=10).collect::<Vec<_>>()
+    );
 }
