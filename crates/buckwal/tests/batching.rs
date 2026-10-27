@@ -1224,7 +1224,7 @@ fn sustained_window_load_seals_and_bounds_restore_gets() {
         assert_eq!(text, "database is busy (locked)", "{before:?} {after:?}");
         assert!(
             *waited >= ENGINE_BUSY_TIMEOUT - Duration::from_millis(100),
-            "{text}: {waited:?}"
+            "{text}: {waited:?} {before:?} {after:?}"
         );
     }
     assert_eq!(before.maintenance_runs, 0);
