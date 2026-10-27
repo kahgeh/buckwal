@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-26
-- Spec: `packer` (rev 31, sha256 313b6589c4a9)
+- Spec: `packer` (rev 33, sha256 b15074de42d1)
 - Decision record in the README: How it works, Packs, Bucket format v5, D33
 - Replaces: ADR 0002 in part, ADR 0003 in part and ADR 0004. ADR 0005 stays.
 
