@@ -184,8 +184,9 @@ SPEC is `off` or `window <max_wait> <max_commits> <max_bytes>` (e.g. 'window 10m
 without --batching, BUCKWAL_BATCHING applies.
 follow runs a read replica until SIGTERM or SIGINT and prints a status line per event; --poll-ms
 overrides BUCKWAL_REPLICA_POLL_MS, and BUCKWAL_REPLICA_NOTIFY_* start the notification listener.
-notify-setup only prints the AWS CLI commands and bucket notification JSON (and RustFS
-equivalents, untested) that route bucket events to N replicas; it runs nothing.
+notify-setup only prints the AWS CLI commands and bucket notification JSON, and the RustFS
+curl commands with their notification XML, that route bucket events to N replicas; it runs
+nothing.
 pack runs one pack run now and exits: 0 when it packed, found nothing to do or was superseded,
 1 when it failed. packer runs the packer loop until SIGTERM or SIGINT. Both need the key file
 of an encrypted bucket. DIR is their pack directory (the kept copy, its lock and the working

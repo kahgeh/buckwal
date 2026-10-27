@@ -1769,31 +1769,24 @@ fn replica_sync_spans_reach_clickhouse() {
 // tls_rustfs_delivers_events_to_a_replica_listener
 // ---------------------------------------------------------------------------------------
 
-/// The prefixes `buckwal notify-setup` prints for its RustFS rules, in order, without
-/// duplicates (the test keeps no copy, so it stays right when the command changes them).
-fn notify_setup_prefixes(ctx: &Ctx, bucket: &str) -> Vec<String> {
+/// The bucket notification XML that `buckwal notify-setup` prints for RustFS, with `target`
+/// in place of `replica<n>` and `key_prefix` in front of each filter prefix (the test keeps no
+/// copy of the XML, so it stays right when the command changes it).
+fn notify_setup_xml(ctx: &Ctx, bucket: &str, target: &str, key_prefix: &str) -> String {
     let out = ctx
         .ok(&["notify-setup", "--bucket", bucket, "--replicas", "1"])
         .stdout;
-    let rustfs = out
-        .split("notification-rustfs.json")
-        .nth(1)
-        .expect("a RustFS block in the notify-setup output");
-    let mut prefixes: Vec<String> = Vec::new();
-    for l in rustfs.lines() {
-        let Some(rest) = l.split("\"Name\": \"prefix\", \"Value\": \"").nth(1) else {
-            continue;
-        };
-        let p = rest.split('"').next().unwrap().to_string();
-        if !prefixes.contains(&p) {
-            prefixes.push(p);
-        }
-    }
+    let start = out
+        .find("<NotificationConfiguration>")
+        .expect("the RustFS XML in the notify-setup output");
+    let end = "</NotificationConfiguration>";
+    let xml = &out[start..start + out[start..].find(end).expect("the end of the XML") + end.len()];
     assert!(
-        prefixes.iter().any(|p| p == "log/") && prefixes.iter().any(|p| p == "head"),
-        "prefixes of notify-setup: {prefixes:?}"
+        xml.contains("<Value>log/</Value>") && xml.contains("<Value>head</Value>"),
+        "{xml}"
     );
-    prefixes
+    xml.replace("replica<n>", target)
+        .replace("<Value>", &format!("<Value>{key_prefix}/"))
 }
 
 /// One call to the RustFS admin or S3 API with `curl` (the keys go in through stdin, not in
@@ -1846,13 +1839,13 @@ struct RustfsTarget<'a> {
 impl<'a> RustfsTarget<'a> {
     /// The admin calls of docs/read-replicas-recon.md ("Question 8, again"): the target
     /// checks its endpoint when it starts, so the listener must already run. RustFS takes
-    /// the bucket notification as XML, not the JSON that `notify-setup` prints.
+    /// the bucket notification as the XML that `notify-setup` prints.
     fn create(
         ctx: &'a Ctx,
         name: &str,
         endpoint: &str,
         token: &str,
-        prefixes: &[String],
+        notification: &str,
     ) -> RustfsTarget<'a> {
         let t = RustfsTarget {
             ctx,
@@ -1882,25 +1875,13 @@ impl<'a> RustfsTarget<'a> {
                 Some(&target),
             ),
         );
-        let rules: String = prefixes
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                format!(
-                    "<QueueConfiguration><Id>buckwal-{i}</Id><Queue>arn:rustfs:sqs:us-east-1:{name}:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>{}/{p}</Value></FilterRule></S3Key></Filter></QueueConfiguration>",
-                    ctx.prefix()
-                )
-            })
-            .collect();
         expect_ok(
             "bucket notification",
             rustfs_call(
                 ctx,
                 "PUT",
                 &format!("/{}?notification", ctx.var("BUCKWAL_BUCKET")),
-                Some(&format!(
-                    "<NotificationConfiguration>{rules}</NotificationConfiguration>"
-                )),
+                Some(notification),
             ),
         );
         t
@@ -2066,13 +2047,14 @@ fn tls_rustfs_delivers_events_to_a_replica_listener() {
     f.applied(0, g, n, Duration::from_secs(60));
 
     // The listener runs, so the target can start.
-    let prefixes = notify_setup_prefixes(&ctx, &ctx.var("BUCKWAL_BUCKET"));
+    let name = format!("e{:x}", nanos());
+    let notification = notify_setup_xml(&ctx, &ctx.var("BUCKWAL_BUCKET"), &name, &ctx.prefix());
     let _target = RustfsTarget::create(
         &ctx,
-        &format!("e{:x}", nanos()),
+        &name,
         &format!("https://host.containers.internal:{port}/notify"),
         &token,
-        &prefixes,
+        &notification,
     );
 
     // A quiet period longer than RustFS's batching window, so the next event is a lone one.
