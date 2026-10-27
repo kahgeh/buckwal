@@ -10,8 +10,6 @@ pub(crate) mod db;
 pub(crate) mod encryption;
 pub(crate) mod engine;
 pub mod error;
-// Unused until the open and the close call it (the next commit removes this allow).
-#[allow(dead_code)]
 pub(crate) mod file_record;
 pub(crate) mod files;
 pub(crate) mod format;

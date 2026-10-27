@@ -120,9 +120,10 @@ fn read_only_plain_restore_runs_early_wal_truncate_locally() {
         .collect();
     // Observed: a restored format 5 MVCC directory holds the whole first pack as `app.db`
     // (one block, local after the restore), so the bootstrap writes no file: the database
-    // file, the log, the empty `-wal` and the state stay as they were. (A format 2 restore
-    // left an empty `app.db`, which the bootstrap wrote.)
-    assert_eq!(changed, Vec::<&str>::new());
+    // file, the log and the empty `-wal` stay as they were. (A format 2 restore left an empty
+    // `app.db`, which the bootstrap wrote.) Only the state changes: a read-only open writes
+    // the file record at its own clean close (outside-change-detect).
+    assert_eq!(changed, vec!["app.db-durable"]);
     assert!(read(&dir, "app.db-wal").is_empty());
 }
 

@@ -7,6 +7,7 @@ use crate::create::{self, clear_interrupted_create};
 use crate::encryption::{self, check_page_one};
 use crate::engine::{engine_error, open_engine, Engine, EngineDb};
 use crate::error::{Error, Result};
+use crate::file_record::DbFiles;
 use crate::files::{io_err, DB_FILE, LOCK_FILE, RESTORING_FILE};
 use crate::format::{Head, Keys, LocalState, LogRecord, FORMAT, FORMAT_V2};
 use crate::maintenance::{Gate, Maintenance, MaintenanceConfig};
@@ -104,6 +105,9 @@ struct Open {
     packer: Option<PackerThreads>,
     /// Dropped last: the lock outlives every file of the engine.
     guard: Option<DirGuard>,
+    /// The file record. A clean close writes it, after the packer has stopped.
+    /// None for a replica, which this record leaves out.
+    files: Option<Arc<DbFiles>>,
 }
 
 /// Shared by every [`Database`] handle and [`Connection`] of one open.
@@ -227,6 +231,7 @@ impl Shared {
             trimmer,
             packer,
             guard,
+            files,
         } = open;
         // Now, so that a pack run in progress stops while the rest shuts down.
         if let Some(p) = &packer {
@@ -245,6 +250,11 @@ impl Shared {
         }
         if let Some(p) = packer {
             p.join();
+        }
+        // The engine, the uploader and the packer have stopped, and the lock is still held:
+        // nothing writes the files now. A failure leaves `clean_close` off, which is safe.
+        if let Some(Err(e)) = files.map(|f| f.write_clean_close()) {
+            tracing::warn!(target: "buckwal", error = %e, "the file record was not written at close");
         }
         drop(guard);
     }
@@ -360,13 +370,31 @@ fn open_impl(
         // entry is younger than half the orphan grace, so only a crashed run's goes.
         crate::pack::run::sweep_work_dirs(&config);
     }
-    let local = LocalState::read(&dir)?;
+    let mut local = LocalState::read(&dir)?;
     // The recorded mode first: an MVCC directory opened as WAL is "switching back", not just
     // an MVCC file. Before the claim, the epoch raise or any other write to the bucket.
     if let Some(state) = &local {
         refuse_journal_mode_mismatch(state_mode(state), cfg.journal_mode)?;
     }
     refuse_mvcc_file(&dir.join(DB_FILE), cfg.journal_mode)?;
+    // Before reconcile, which can write the `-wal`, and before any write to the bucket: a file
+    // that another tool changed stops the open, and nothing changes. Then the mark of a clean
+    // close goes off, because this process may now write the files.
+    let mut local_files = None;
+    if let Some(state) = &mut local {
+        let span = tracing::info_span!(target: "buckwal", "buckwal.open", buckwal.outcome = Empty);
+        span.in_scope(|| crate::file_record::check_at_open(&dir, state))
+            .inspect_err(|e| {
+                let outcome = if matches!(e, Error::Corrupt(_)) {
+                    "corrupt"
+                } else {
+                    "error"
+                };
+                span.record("buckwal.outcome", outcome);
+            })?;
+        crate::file_record::mark_in_use(&dir, state)?;
+        local_files = state.files.clone();
+    }
 
     let (bucket, state, reconciled) = match local {
         Some(state) => {
@@ -416,6 +444,16 @@ fn open_impl(
         }
     };
 
+    let files = Arc::new(DbFiles::new(
+        &dir,
+        cfg.journal_mode == JournalMode::Mvcc,
+        LocalState {
+            files: local_files,
+            ..state.clone()
+        },
+    ));
+    // Before the engine opens: its storage finds the helper by directory.
+    crate::file_record::register(&files);
     // GC on the writer's own thread (never a read-only open's, never on a commit's path).
     let (trim_tx, trim_rx) = if read_only || crate::trim::no_writer_gc() {
         (None, None)
@@ -484,6 +522,7 @@ fn open_impl(
                 trimmer,
                 packer,
                 guard: Some(guard),
+                files: Some(files),
             })),
             connections: AtomicUsize::new(0),
             batching: Mutex::new(config.batching),
@@ -524,6 +563,7 @@ pub(crate) fn replica_database(
                 trimmer: None,
                 packer: None,
                 guard: None,
+                files: None,
             })),
             connections: AtomicUsize::new(0),
             batching: Mutex::new(Batching::Off),

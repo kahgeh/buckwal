@@ -13,6 +13,7 @@ use super::stash::stash;
 use super::IoMode;
 use super::{read_at, sync_file, write_at};
 use crate::error::{Error, Result};
+use crate::file_record::DbFiles;
 use crate::files::{io_err, DIRTY_FILE};
 use crate::format::{Keys, LocalState, Manifest};
 use crate::store::{with_retry, ObjectStore, RetryPolicy};
@@ -100,6 +101,9 @@ pub(crate) struct BucketDbStorage {
     /// whole fetch, and by `write_page`, so a fetch never overwrites a newer write.
     local: Mutex<HashSet<u32>>,
     dirty: Mutex<Dirty>,
+    /// The file record's helper (outside-change-detect): the one writer of `app.db-durable`.
+    /// None for a replica, which keeps no record.
+    files: Option<Arc<DbFiles>>,
     lazy_gets: AtomicU64,
     /// A read-only open: every engine write is refused (fetched pages are still cached),
     /// unless `mvcc`.
@@ -145,7 +149,9 @@ impl BucketDbStorage {
             .manifest
             .as_ref()
             .map_or((0, 0), |m| (m.page_size, m.page_count));
+        let files = crate::file_record::lookup(&p.dir);
         BucketDbStorage {
+            files,
             inner: turso_core::storage::database::DatabaseFile::new(p.file.clone()),
             file: p.file,
             io: p.io,
@@ -459,7 +465,10 @@ impl BucketDbStorage {
     /// stale copy. `state` is built from `Dirty::state` and becomes it once written; the file
     /// is never read back.
     fn write_state(&self, dirty: &mut Dirty, state: LocalState) -> Result<()> {
-        state.write_atomic(&self.dir)?;
+        match &self.files {
+            Some(files) => files.write_state(&state)?,
+            None => state.write_atomic(&self.dir)?,
+        }
         dirty.state = state;
         Ok(())
     }

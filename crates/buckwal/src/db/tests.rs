@@ -3525,6 +3525,11 @@ fn encrypted_damaged_page_fails_authentication() {
     assert!(b.len() >= 2 * ps, "{} bytes", b.len());
     b[ps + 200] ^= 1; // page 2: t's root
     std::fs::write(&path, b).unwrap();
+    // The damage is an outside change, which the open refuses before the engine reads a page
+    // (outside-change-detect). Drop the file record so the engine's own check is reached.
+    let mut s = state(a.path());
+    s.files = None;
+    s.write_atomic(a.path()).unwrap();
     let db = open_with_store(enc_config(a.path(), &k, &key_hex()), store.clone()).unwrap();
     let c = db.connect().unwrap();
     match c.query("SELECT id FROM t ORDER BY id", &[]) {

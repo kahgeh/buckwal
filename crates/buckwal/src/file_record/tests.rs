@@ -194,12 +194,17 @@ fn write_state_keeps_the_file_record() {
 }
 
 #[test]
-fn start_use_turns_clean_close_off() {
+fn mark_in_use_turns_clean_close_off_and_writes_it() {
     let d = dir_with_files();
-    let s = closed(d.path(), false);
-    let files = DbFiles::new(d.path(), false, s);
-    files.start_use().unwrap();
+    let mut s = closed(d.path(), false);
+    mark_in_use(d.path(), &mut s).unwrap();
+    assert!(!s.files.as_ref().unwrap().clean_close);
     let rec = LocalState::read(d.path()).unwrap().unwrap().files.unwrap();
     assert!(!rec.clean_close);
     assert!(!rec.db_write_open);
+    // No record: nothing is written.
+    let d = dir_with_files();
+    let mut s = base_state();
+    mark_in_use(d.path(), &mut s).unwrap();
+    assert!(LocalState::read(d.path()).unwrap().is_none());
 }

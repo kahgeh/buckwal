@@ -9,7 +9,8 @@
 //! 2. After the fsync of `app.db`, [`DbFiles::end_write`] writes the new `app.db` part and sets
 //!    `db_write_open` off.
 //!
-//! A clean close writes the whole record ([`DbFiles::write_clean_close`]). [`check_at_open`]
+//! A clean close writes the whole record ([`DbFiles::write_clean_close`]); [`mark_in_use`] turns
+//! the mark off at open. [`check_at_open`]
 //! compares the files with the record before reconcile.
 use crate::error::{Error, Result};
 use crate::files::{io_err, DB_FILE, LOG_FILE, WAL_FILE};
@@ -19,7 +20,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
 /// A SHA-256, as raw bytes.
@@ -177,6 +178,40 @@ pub(crate) fn check_at_open(dir: &Path, state: &LocalState) -> Result<()> {
     Ok(())
 }
 
+/// The open `DbFiles` of each directory in this process. A directory has one open at a time (the
+/// directory lock), and the storage of its engine finds its helper here: the storage is built
+/// in `engine.rs`, which an open reaches with no place for one more argument. A replica or a
+/// test that opens an engine alone registers nothing, and its storage keeps no record.
+static REGISTRY: Mutex<Vec<(PathBuf, Weak<DbFiles>)>> = Mutex::new(Vec::new());
+
+/// Make `files` the helper of its directory, and forget the helpers that are gone.
+pub(crate) fn register(files: &Arc<DbFiles>) {
+    let mut r = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    r.retain(|(d, w)| *d != files.dir && w.strong_count() > 0);
+    r.push((files.dir.clone(), Arc::downgrade(files)));
+}
+
+/// The open helper of `dir`, if one was registered and is still open.
+pub(crate) fn lookup(dir: &Path) -> Option<Arc<DbFiles>> {
+    let r = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    r.iter()
+        .find(|(d, _)| d == dir)
+        .and_then(|(_, w)| w.upgrade())
+}
+
+/// Turn `clean_close` off in `state` and fsync it, when it holds a record that a clean close
+/// wrote. A writer open and a read-only open call it after the check and before reconcile,
+/// which can write the `-wal`.
+pub(crate) fn mark_in_use(dir: &Path, state: &mut LocalState) -> Result<()> {
+    match &mut state.files {
+        Some(rec) if rec.clean_close => {
+            rec.clean_close = false;
+            state.write_atomic(dir)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// What the helper keeps between calls, under one lock.
 struct Inner {
     /// The local state as last written. Every write of `app.db-durable` after the open goes
@@ -188,6 +223,8 @@ struct Inner {
 
 /// The one writer of `app.db-durable` once the engine is open, and the keeper of the file
 /// record. Lock order: a caller's own lock (the dirty mutex) first, this one after.
+// The write rules are called by the `app.db` writers (the next commit removes this allow).
+#[allow(dead_code)]
 pub(crate) struct DbFiles {
     dir: PathBuf,
     mvcc: bool,
@@ -197,6 +234,7 @@ pub(crate) struct DbFiles {
     writes: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl DbFiles {
     /// `state` is the local state the open ended with (after the check and the reconcile).
     pub(crate) fn new(dir: &Path, mvcc: bool, state: LocalState) -> DbFiles {
@@ -224,20 +262,6 @@ impl DbFiles {
             files,
             ..state.clone()
         };
-        self.write(&mut inner)
-    }
-
-    /// Turn `clean_close` off and fsync the local state, when a record exists. A read-only
-    /// open calls it before reconcile can write the `-wal`.
-    pub(crate) fn start_use(&self) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(rec) = &mut inner.state.files else {
-            return Ok(());
-        };
-        if !rec.clean_close {
-            return Ok(());
-        }
-        rec.clean_close = false;
         self.write(&mut inner)
     }
 
