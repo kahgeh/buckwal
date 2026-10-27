@@ -445,6 +445,36 @@ pub(crate) fn db_facts(dir: &Path, enc: Option<&Encryption>) -> Result<DbFacts> 
     Ok(facts)
 }
 
+/// The result of `PRAGMA quick_check` on the database file `<dir>/app.db`: the first text value
+/// of the first row. It is `ok` when the engine finds no fault. An engine error is an `Err`.
+// The pack run calls it in the next change. Remove this `allow` then.
+#[allow(dead_code)]
+pub(crate) fn quick_check(dir: &Path, enc: Option<&Encryption>) -> Result<String> {
+    const SQL: &str = "PRAGMA quick_check";
+    let (db, conn) = open_local(dir, enc)?;
+    let verdict = (|| {
+        let rows = conn
+            .query(SQL)
+            .map_err(|e| local_engine(SQL, e))?
+            .ok_or_else(|| Error::Engine(format!("{SQL} returned no statement")))?
+            .run_collect_rows()
+            .map_err(|e| local_engine(SQL, e))?;
+        rows.first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.to_text())
+            .map(str::to_string)
+            .ok_or_else(|| Error::Engine("PRAGMA quick_check returned no text".into()))
+    })();
+    // Close the connection also when the query failed.
+    let closed = conn
+        .close()
+        .map_err(|e| local_engine("close the local database", e));
+    drop(db);
+    let verdict = verdict?;
+    closed?;
+    Ok(verdict)
+}
+
 /// Apply one ended generation of a WAL database, its `-wal` image `wal`, to the database file
 /// `<dir>/app.db` with a local checkpoint of the engine: write the image as `<dir>/app.db-wal`,
 /// open the engine over the two local files (`open_local`), run a TRUNCATE checkpoint and
@@ -1348,5 +1378,56 @@ impl CrossDeviceForTest {
 impl Drop for CrossDeviceForTest {
     fn drop(&mut self) {
         CROSS_DEVICE.with(|f| f.set(false));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database `<dir>/app.db` with table `t` and 200 rows, all in the file (no `-wal`).
+    fn build_db(dir: &Path) {
+        let (db, conn) = open_local(dir, None).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 0..200 {
+            conn.execute(format!("INSERT INTO t VALUES ({id}, 'row {id}')"))
+                .unwrap();
+        }
+        conn.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+        conn.close().unwrap();
+        drop(db);
+    }
+
+    #[test]
+    fn quick_check_of_a_good_file_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        build_db(dir.path());
+        assert_eq!(quick_check(dir.path(), None).unwrap(), "ok");
+    }
+
+    #[test]
+    fn quick_check_of_a_file_with_a_bad_page_is_not_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        build_db(dir.path());
+        let (db, conn) = open_local(dir.path(), None).unwrap();
+        let root =
+            pragma_int(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'").unwrap();
+        let page_size = pragma_int(&conn, "PRAGMA page_size").unwrap();
+        conn.close().unwrap();
+        drop(db);
+        let path = dir.path().join(DB_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        // The first byte of a b-tree page is its type flag.
+        let at = usize::try_from(page_size * (root - 1)).unwrap();
+        bytes[at] = 0xFF;
+        fs::write(&path, bytes).unwrap();
+        // An engine error is also a fault found.
+        if let Ok(verdict) = quick_check(dir.path(), None) {
+            assert_ne!(verdict, "ok");
+        }
     }
 }
