@@ -84,11 +84,27 @@ impl Soak {
 
     /// Like `spawn`, for the `buckwal` binary at `bin` (another build).
     fn spawn_of(ctx: &Ctx, bin: &Path, dir: &Path, args: &[&str]) -> Soak {
+        Soak::spawn_of_env(ctx, bin, dir, args, &[])
+    }
+
+    /// Like `spawn`, with the extra environment variables `env` for the soak only.
+    fn spawn_env(ctx: &Ctx, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Soak {
+        Soak::spawn_of_env(ctx, Path::new(BIN), dir, args, env)
+    }
+
+    fn spawn_of_env(
+        ctx: &Ctx,
+        bin: &Path,
+        dir: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Soak {
         let mut all = vec!["soak", "--dir", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         let stderr = ctx.tmp.path().join(format!("soak-{}.stderr", nanos()));
-        let mut child = ctx
-            .command_of(bin, &all)
+        let mut command = ctx.command_of(bin, &all);
+        command.envs(env.iter().copied());
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
@@ -2675,7 +2691,14 @@ fn mvcc_takeover_cli() {
 fn mvcc_takeover_fences_a_running_soak() {
     let ctx = Ctx::new("mvcc_takeover_fences_a_running_soak");
     let a = ctx.dir("a");
-    let mut soak = Soak::spawn(&ctx, &a, &mvcc_soak(&["--connections", "4"]));
+    // A seal fences the old writer after a timed-out takeover, so make the seal come after
+    // about 4 MiB of log, not the default 64 MiB, which a loaded machine takes over 120 s to write.
+    let mut soak = Soak::spawn_env(
+        &ctx,
+        &a,
+        &mvcc_soak(&["--connections", "4"]),
+        &[("BUCKWAL_MAINTENANCE_WAL_MIB", "4")],
+    );
     soak.wait_acks(200);
     let before = ctx.head();
     let b = ctx.dir("b");
@@ -2693,7 +2716,9 @@ fn mvcc_takeover_fences_a_running_soak() {
         "timed out (fence probes)"
     };
     assert_eq!(ctx.head().epoch, before.epoch + 1, "epoch after {outcome}");
+    let taken = Instant::now();
     let fenced = soak.wait_fenced_then_no_ack(Duration::from_secs(2));
+    let fenced_after = soak.stamps[fenced].saturating_duration_since(taken);
     soak.kill();
     // A takeover that timed out resumes by opening the directory: it must then continue.
     let rows = if out.status.success() {
@@ -2706,8 +2731,8 @@ fn mvcc_takeover_fences_a_running_soak() {
     let v = restore_verify(&ctx, &lines);
     assert_mvcc_head(&ctx);
     eprintln!(
-        "mvcc_takeover_fences_a_running_soak: {outcome}; soak acks={}; first fenced error {:?}; \
-         acked={} {}",
+        "mvcc_takeover_fences_a_running_soak: {outcome}; soak acks={}; first fenced error {:?} \
+         after {fenced_after:?}; acked={} {}",
         soak.acks(),
         soak.lines[fenced],
         v.acked,
