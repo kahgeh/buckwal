@@ -1019,3 +1019,121 @@ fn a_failed_switch_says_upload_failed_on_its_span() {
     assert_eq!(span.field("buckwal.outcome"), Some("upload_failed"));
     assert_eq!(up.generation(), 1);
 }
+
+/// A background setting that flushes at every commit.
+fn background_now() -> Batching {
+    Batching::Background {
+        max_wait: Duration::from_secs(60),
+        max_commits: 1,
+        max_bytes: 1 << 20,
+        max_behind: 1,
+    }
+}
+
+/// Commit 1 (background) goes in doubt, and the bucket answers again. When `then_submit` is
+/// set, commit 2 (background) settles it in the same flush; otherwise the uploader settles
+/// it alone, from `publish_degraded`. `after_confirm` runs after each confirm, with the
+/// position and the `commits_acked` count at that moment.
+fn settle_a_background_doubt(
+    then_submit: bool,
+    after_confirm: impl Fn(u64, u64) + Send + Sync + 'static,
+) -> (Arc<Uploader>, Arc<StatsCell>) {
+    let mem = Arc::new(MemStore::new());
+    let fault = Arc::new(FaultStore::new(mem));
+    let stats: Arc<StatsCell> = Arc::default();
+    let u = Uploader::spawn(
+        bucket_with(fault.clone(), short()),
+        None,
+        None,
+        stats.clone(),
+    );
+    let s = stats.clone();
+    *u.durable.after_confirm.lock().unwrap() = Some(Box::new(move |upto| {
+        after_confirm(upto, s.snapshot().commits_acked)
+    }));
+    fault.fail_puts_after(0);
+    assert!(u.submit_log(op(0), background_now()).wait().is_err());
+    fault.fail_puts_after(u64::MAX);
+    if then_submit {
+        // Not waited for: its reply comes after the pause of the hook.
+        drop(u.submit_log(op(1), background_now()));
+    }
+    (u, stats)
+}
+
+/// Wait until `commit` is durable. The failed record sets a failure that a wait reports until
+/// a record lands, so a failed wait is tried again.
+fn await_durable(u: &Uploader, commit: u64) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while u.wait_durable(commit, Duration::from_secs(10)).is_err() {
+        assert!(Instant::now() < until, "commit {commit} is not durable");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_flush_counts_the_settled_background_commits_before_it_confirms_them() {
+    let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let s = seen.clone();
+    let (u, stats) = settle_a_background_doubt(true, move |upto, acked| {
+        s.lock().unwrap().push((upto, acked))
+    });
+    await_durable(&u, 2);
+    assert_eq!(stats.snapshot().commits_acked, 2);
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    // Every commit here is a background one: a position `upto` is confirmed only when the
+    // count already holds `upto` acks.
+    for (upto, acked) in seen.iter() {
+        assert!(
+            acked >= upto,
+            "confirmed {upto} with {acked} counted: {seen:?}"
+        );
+    }
+}
+
+/// `wait_durable` returns the moment the confirm wakes it. A pause after the confirm gives it
+/// the time to read the count before the uploader goes on.
+fn wait_durable_sees_the_count(then_submit: bool) {
+    let (u, stats) = settle_a_background_doubt(then_submit, |_, _| {
+        std::thread::sleep(Duration::from_millis(300))
+    });
+    // The failed record sets a failure that a wait reports until a record lands.
+    await_durable(&u, 1);
+    let seen = stats.snapshot().commits_acked;
+    assert!(seen >= 1, "wait_durable(1) returned with {seen} counted");
+}
+
+#[test]
+fn wait_durable_on_a_settled_background_commit_sees_it_counted_in_flush() {
+    wait_durable_sees_the_count(true);
+}
+
+#[test]
+fn wait_durable_on_a_settled_background_commit_sees_it_counted_in_settled() {
+    wait_durable_sees_the_count(false);
+}
+
+#[test]
+fn an_event_hook_can_wait_durable_for_its_own_commit() {
+    let mem = Arc::new(MemStore::new());
+    let me: Arc<std::sync::OnceLock<std::sync::Weak<Uploader>>> = Arc::default();
+    let (tx, rx) = mpsc::channel();
+    let hook_me = me.clone();
+    let hook: EventHook = Arc::new(move |e: &Event| {
+        if let Event::CommitAcked { commit, .. } = e {
+            let u = hook_me.get().and_then(|w| w.upgrade()).expect("uploader");
+            let _ = tx.send(u.wait_durable(*commit, Duration::from_secs(10)));
+        }
+    });
+    let u = Uploader::spawn(bucket(mem), None, Some(hook), Arc::default());
+    me.set(Arc::downgrade(&u)).unwrap();
+    let t = u.submit_log(op(0), background_now());
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the hook did not return");
+    assert!(r.is_ok(), "{r:?}");
+    t.wait().unwrap();
+    // The uploader is not blocked.
+    u.submit_log(op(1), Batching::Off).wait().unwrap();
+}

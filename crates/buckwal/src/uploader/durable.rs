@@ -33,10 +33,16 @@ pub(crate) struct Dropped {
     pub last: u64,
 }
 
+#[cfg(test)]
+pub(crate) type ConfirmHook = Box<dyn Fn(u64) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct Durable {
     state: Mutex<State>,
     changed: Condvar,
+    /// Test only: runs at the end of every `confirmed`, with its `upto`, after the waiters woke.
+    #[cfg(test)]
+    pub(crate) after_confirm: Mutex<Option<ConfirmHook>>,
 }
 
 fn stopped() -> Error {
@@ -64,6 +70,10 @@ impl Durable {
         s.failure = None;
         drop(s);
         self.changed.notify_all();
+        #[cfg(test)]
+        if let Some(hook) = &*crate::db::lock(&self.after_confirm) {
+            hook(upto);
+        }
     }
 
     /// A record failed with `e`. A fenced writer stays fenced. A waiter gets `Fenced` or

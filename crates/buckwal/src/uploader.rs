@@ -563,19 +563,39 @@ impl Worker {
 
     /// The bucket has nothing left to settle. A record that went in doubt is in the bucket
     /// now (the settle put it at its seq): its commits are durable, and background ones are
-    /// acked here. An earlier failure no longer holds once nothing is owed either.
+    /// acked here. The count comes before the confirm, so a `wait_durable` that returns
+    /// already sees it. An earlier failure no longer holds once nothing is owed either.
     fn settled(&mut self) {
-        if let Some(doubt) = self.doubt.take() {
-            if let Some(last) = doubt.iter().map(|(_, c)| *c).max() {
-                self.durable.confirmed(last);
-            }
-            for (batching, commit) in doubt {
-                if matches!(batching, Batching::Background { .. }) {
-                    self.stats.record_background_ack();
-                    self.emit(Event::CommitAcked { commit, batching });
-                }
+        let doubt = self.count_doubt_acks();
+        if let Some(last) = doubt.iter().map(|(_, c)| *c).max() {
+            self.durable.confirmed(last);
+        }
+        self.emit_doubt_acks(doubt);
+        self.recovered();
+    }
+
+    /// Take the record that went in doubt, and count its background commits as acked.
+    /// The caller confirms them and then reports them (`emit_doubt_acks`).
+    fn count_doubt_acks(&mut self) -> Vec<(Batching, u64)> {
+        let doubt = self.doubt.take().unwrap_or_default();
+        for (batching, _) in &doubt {
+            if matches!(batching, Batching::Background { .. }) {
+                self.stats.record_background_ack();
             }
         }
+        doubt
+    }
+
+    fn emit_doubt_acks(&self, doubt: Vec<(Batching, u64)>) {
+        for (batching, commit) in doubt {
+            if matches!(batching, Batching::Background { .. }) {
+                self.emit(Event::CommitAcked { commit, batching });
+            }
+        }
+    }
+
+    /// An earlier failure no longer holds once nothing is owed.
+    fn recovered(&self) {
         if self.owed.is_empty() && !self.last_failed.load(SeqCst) {
             self.durable.recovered();
         }
@@ -674,17 +694,26 @@ impl Worker {
             Ok(a) => {
                 drop(commit_spans);
                 // Counted, reported and published before any reply, so a waiter that sees
-                // its ack also sees the record.
+                // its ack also sees the record. Every background commit is counted before
+                // the confirm that makes it durable, so `wait_durable(n)` returns with
+                // `commits_acked` counting every background commit up to `n`.
                 let commits: Vec<u64> = waiters.iter().map(|(_, c, _)| *c).collect();
                 self.stats.record_put(commits.len() as u64, a.bytes);
                 self.last_failed.store(false, SeqCst);
-                self.durable
-                    .confirmed(commits.iter().copied().max().unwrap_or(0));
-                // If this append settled a record that went in doubt before it (the bucket settles it first),
-                // its commits are older, so their acks come before the new record's.
-                // `confirmed` never moves the position back, so its order here does not matter.
+                // If this append settled a record that went in doubt before it (the bucket
+                // settles it first), its commits are older, so their acks come before the
+                // new record's. A good append has settled it, so it is in the bucket.
+                let doubt = self.count_doubt_acks();
+                for (batching, _, _) in &waiters {
+                    if matches!(batching, Batching::Background { .. }) {
+                        self.stats.record_background_ack();
+                    }
+                }
+                // The new record's last commit is newer than the in-doubt ones.
+                let last = commits.iter().copied().max().unwrap_or(0);
+                self.durable.confirmed(last);
                 if !self.bucket.degraded() {
-                    self.settled();
+                    self.recovered();
                 }
                 // How long the commits still behind have waited: what a lost machine would
                 // lose now. The span closes before any reply.
@@ -693,6 +722,7 @@ impl Worker {
                     self.durable.behind().1.as_millis() as u64,
                 );
                 drop(span);
+                self.emit_doubt_acks(doubt);
                 self.emit(Event::LogUploaded {
                     generation: a.pos.generation,
                     seq: a.pos.seq,
@@ -702,7 +732,6 @@ impl Worker {
                 // A background commit's call has returned: it is acked here, when it is durable.
                 for (batching, commit, _) in &waiters {
                     if matches!(batching, Batching::Background { .. }) {
-                        self.stats.record_background_ack();
                         self.emit(Event::CommitAcked {
                             commit: *commit,
                             batching: *batching,

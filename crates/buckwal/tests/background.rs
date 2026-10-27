@@ -209,17 +209,25 @@ fn a_background_commit_returns_before_its_put_and_is_durable_in_order() {
     let s = db.upload_stats();
     assert_eq!((s.commits_behind, s.oldest_behind), (0, Duration::ZERO));
     assert_eq!(s.commits_acked, acked_before + 3, "acked when durable");
-    // The acks came from the uploader thread, not the committing one.
-    let acks: Vec<_> = rec
-        .events()
-        .into_iter()
-        .filter_map(|(t, e)| match e {
-            Event::CommitAcked { commit, batching } if commit > last - 3 => {
-                Some((t, commit, batching))
-            }
-            _ => None,
-        })
-        .collect();
+    // The acks came from the uploader thread, not the committing one. A `CommitAcked` event
+    // can arrive after `wait_durable` returns (the counter is the sure signal), so wait for it.
+    let t = Instant::now();
+    let acks = loop {
+        let acks: Vec<_> = rec
+            .events()
+            .into_iter()
+            .filter_map(|(t, e)| match e {
+                Event::CommitAcked { commit, batching } if commit > last - 3 => {
+                    Some((t, commit, batching))
+                }
+                _ => None,
+            })
+            .collect();
+        if acks.len() >= 3 || t.elapsed() > GENEROUS {
+            break acks;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
     assert_eq!(acks.len(), 3, "{acks:?}");
     assert!(acks
         .iter()
