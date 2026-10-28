@@ -408,7 +408,12 @@ impl ShippingFile {
         self.release_if_durable();
         let b = ctx::current().unwrap_or(Batching::Off);
         // Read once: the branch further below must agree with the held header decision made here.
-        let degraded = self.uploader.degraded();
+        // A held header with a pending `truncate(0)` goes out in one blocking record,
+        // `[T0, header, frames]`: a header record of its own, then `[T0, frames]`, would let
+        // the truncate cut the header away.
+        let degraded = self.uploader.degraded()
+            || (self.held.lock().unwrap().is_some()
+                && ops.iter().any(|o| matches!(o, Op::Truncate { len: 0 })));
         let background = matches!(b, Batching::Background { .. }) && !degraded;
         if background {
             // A held header ships alone first, as an `Off` record, and the call waits for it.
@@ -1494,6 +1499,57 @@ mod tests {
         );
         let flat: Vec<&Op> = all[before..].iter().flatten().collect();
         assert!(flat.contains(&&header_op(1)), "the header never shipped");
+    }
+
+    /// The same order in a background commit: the record must still be `[T0, header, frames]`,
+    /// shipped and waited for, not a header record then `[T0, frames]`.
+    #[test]
+    fn background_with_a_pending_truncate_zero_never_cuts_the_header() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let before = all_records(&mem, &e).len();
+        let _g = ctx::enter(background());
+        truncate_to(&f, &io, 0);
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![5u8; 100]);
+        sync_of(&f, &io).unwrap();
+        let all = all_records(&mem, &e);
+        for (i, r) in all[before..].iter().enumerate() {
+            let ops: Vec<String> = r
+                .iter()
+                .map(|o| match o {
+                    Op::Write { off, bytes } => format!("W{off}+{}", bytes.len()),
+                    Op::Truncate { len } => format!("T{len}"),
+                })
+                .collect();
+            eprintln!("background_truncate_zero: record {} ops {ops:?}", i + 1);
+        }
+        let flat: Vec<&Op> = all[before..].iter().flatten().collect();
+        let header_at = flat
+            .iter()
+            .position(|o| **o == header_op(1))
+            .expect("header");
+        assert!(
+            !flat[header_at..]
+                .iter()
+                .any(|o| matches!(o, Op::Truncate { .. })),
+            "a truncate follows the header: {flat:?}"
+        );
+        assert_eq!(
+            all[before..].to_vec(),
+            vec![vec![
+                Op::Truncate { len: 0 },
+                header_op(1),
+                Op::Write {
+                    off: WAL_HEADER as u64,
+                    bytes: vec![5u8; 100]
+                }
+            ]],
+            "one blocking record"
+        );
+        assert!(f.held.lock().unwrap().is_none());
     }
 
     /// No truncate pending: the header stays first.
