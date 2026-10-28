@@ -104,12 +104,21 @@ struct HeldHeader {
     carried_in: Option<u64>,
 }
 
+/// The header op of a record that `with_held` made: the write of the header at offset 0.
+fn header_in(ops: &[Op]) -> Op {
+    ops.iter()
+        .find(|o| matches!(o, Op::Write { off: 0, bytes } if bytes.len() >= WAL_HEADER))
+        .cloned()
+        .expect("a record with the held header has it")
+}
+
 /// The ERROR record for a new generation whose first record has no header: the commit fails
 /// with `Corrupt` before it is acked. `expected` is true while the generation is fresh. The
 /// record names the generation only.
 fn check_header_first(ops: &[Op], expected: bool, generation: u64) -> Result<()> {
+    // A truncate to 0 can come before the header (`with_held`).
     let ok = matches!(
-        ops.first(),
+        ops.iter().find(|o| !matches!(o, Op::Truncate { len: 0 })),
         Some(Op::Write { off: 0, bytes }) if bytes.len() >= WAL_HEADER
     );
     if !expected || ok {
@@ -296,15 +305,21 @@ impl ShippingFile {
         self.fresh_generation.store(false, SeqCst);
     }
 
-    /// `ops` with the held header op first, and whether there is one. The header stays held.
+    /// `ops` with the held header op in front, and whether there is one. The header stays
+    /// held. A `Truncate { len: 0 }` in `ops` was written before the header (the header write
+    /// came after it), so the header goes after the last such truncate: a truncate after the
+    /// header would cut it away. Every other op keeps its order.
     fn with_held(&self, ops: Vec<Op>) -> (Vec<Op>, bool) {
         let held = self.held.lock().unwrap();
         let Some(h) = held.as_ref() else {
             return (ops, false);
         };
-        let mut all = Vec::with_capacity(ops.len() + 1);
-        all.push(h.op.clone());
-        all.extend(ops);
+        let at = ops
+            .iter()
+            .rposition(|o| matches!(o, Op::Truncate { len: 0 }))
+            .map_or(0, |i| i + 1);
+        let mut all = ops;
+        all.insert(at, h.op.clone());
         (all, true)
     }
 
@@ -315,7 +330,7 @@ impl ShippingFile {
         if !held {
             return Ok(());
         }
-        let sent = ops[0].clone();
+        let sent = header_in(&ops);
         // The header record has a span of its own: the background commit's span shows its own
         // batching and has no `buckwal.ack_wait`. A failure shows on the commit's span.
         let span = Span::none();
@@ -340,7 +355,7 @@ impl ShippingFile {
         if ops.is_empty() {
             return Ok(());
         }
-        let sent = held.then(|| ops[0].clone());
+        let sent = held.then(|| header_in(&ops));
         let commit = commit.unwrap_or_else(Span::none);
         let ticket = self.submit(&commit, ops, Batching::Off, Batching::Off);
         let r = ticket.wait_in(&commit);
@@ -412,7 +427,7 @@ impl ShippingFile {
             self.fresh_generation.load(SeqCst),
             self.uploader.generation(),
         )?;
-        let sent = held.then(|| ops[0].clone());
+        let sent = held.then(|| header_in(&ops));
         if b == Batching::Off || degraded {
             let ticket = self.submit(&span, ops, Batching::Off, b);
             let (commit, submitted) = (ticket.commit, ticket.submitted);
@@ -1438,6 +1453,75 @@ mod tests {
             "the truncate is recorded"
         );
         assert!(f.held.lock().unwrap().is_none());
+    }
+
+    /// A `truncate(0)` still pending at the commit sync, then a header write and a frame
+    /// write. The header op must not come before a truncate in a record, or the truncate would
+    /// cut the header away.
+    #[test]
+    fn pending_truncate_zero_never_follows_the_header_in_a_record() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let before = all_records(&mem, &e).len();
+        truncate_to(&f, &io, 0);
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![5u8; 100]);
+        sync_of(&f, &io).unwrap();
+        let all = all_records(&mem, &e);
+        for (i, r) in all[before..].iter().enumerate() {
+            let ops: Vec<String> = r
+                .iter()
+                .map(|o| match o {
+                    Op::Write { off, bytes } => format!("W{off}+{}", bytes.len()),
+                    Op::Truncate { len } => format!("T{len}"),
+                })
+                .collect();
+            eprintln!("truncate_zero_then_header: record {} ops {ops:?}", i + 1);
+        }
+        assert_eq!(
+            all[before..].to_vec(),
+            vec![vec![
+                Op::Truncate { len: 0 },
+                header_op(1),
+                Op::Write {
+                    off: WAL_HEADER as u64,
+                    bytes: vec![5u8; 100]
+                }
+            ]],
+            "the record is [T0, header, frames]"
+        );
+        let flat: Vec<&Op> = all[before..].iter().flatten().collect();
+        assert!(flat.contains(&&header_op(1)), "the header never shipped");
+    }
+
+    /// No truncate pending: the header stays first.
+    #[test]
+    fn without_a_pending_truncate_the_header_stays_first() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let before = all_records(&mem, &e).len();
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![5u8; 100]);
+        sync_of(&f, &io).unwrap();
+        let all = all_records(&mem, &e);
+        eprintln!(
+            "header_first_without_truncate: {} record(s)",
+            all.len() - before
+        );
+        assert_eq!(
+            all[before..].to_vec(),
+            vec![vec![
+                header_op(1),
+                Op::Write {
+                    off: WAL_HEADER as u64,
+                    bytes: vec![5u8; 100]
+                }
+            ]]
+        );
     }
 
     /// A `truncate(32)` after other pending ops is recorded as before.
