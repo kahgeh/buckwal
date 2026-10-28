@@ -5,6 +5,11 @@
 //! rewrite of the WAL header with new salts, or a truncate to 0, starts a new generation:
 //! the old one is sealed first (D6), or, in a format 5 bucket, ended with a generation switch.
 //!
+//! The WAL header write of a WAL database is not a pending op. It is the held header, which
+//! stays set until a log record that carries it is in the bucket. An `Off` or Window commit
+//! record of the generation starts with it. A sync with no op apart from the header ships
+//! nothing. `ship_pending` ships it first, too.
+//!
 //! In an MVCC database (`in_mvcc`) the `-wal` holds only checkpoint frames, and the end of a
 //! generation (the switch, or the seal of formats 2 and 4) is `LogDurableStorage`'s, before
 //! the engine cuts the log: this file never seals or switches (not at a new
@@ -91,6 +96,32 @@ impl CommitSpans {
     }
 }
 
+/// The WAL header op of the current generation, while no confirmed record carries it.
+struct HeldHeader {
+    op: Op,
+    /// The commit number of the newest queued Window record that carries it. The header is
+    /// confirmed when `Uploader::durable_commit` reaches it.
+    carried_in: Option<u64>,
+}
+
+/// The ERROR record for a new generation whose first record has no header: the commit fails
+/// with `Corrupt` before it is acked. `expected` is true while a header is held. The seq is
+/// not known here, so it is 0.
+fn check_header_first(ops: &[Op], expected: bool, generation: u64) -> Result<()> {
+    let ok = matches!(
+        ops.first(),
+        Some(Op::Write { off: 0, bytes }) if bytes.len() >= WAL_HEADER
+    );
+    if !expected || ok {
+        return Ok(());
+    }
+    let seq = 0u64;
+    tracing::error!(target: "buckwal", generation, seq, "log record without WAL header");
+    Err(Error::Corrupt(format!(
+        "log record without WAL header (generation {generation})"
+    )))
+}
+
 pub(crate) struct ShippingFile {
     inner: Arc<dyn File>,
     io: Arc<dyn IO>,
@@ -108,6 +139,9 @@ pub(crate) struct ShippingFile {
     commit: Mutex<Option<CommitSpans>>,
     /// The current generation's WAL header (its first 32 bytes), once one is known.
     header: Mutex<Option<Vec<u8>>>,
+    /// The held header (the module doc); always `None` in MVCC mode. Locked after `pending`,
+    /// `last_writer` and `commit`.
+    held: Mutex<Option<HeldHeader>>,
     /// The highest offset + length written since the current generation's header (the
     /// maintenance trigger's `-wal` measure; shared with `Engine::wal_bytes`). Reset at a
     /// new generation's header and at `truncate(0)`.
@@ -150,6 +184,7 @@ impl ShippingFile {
             last_writer: Mutex::new(None),
             commit: Mutex::new(None),
             header: Mutex::new(header),
+            held: Mutex::new(None),
             high_water,
             mode,
             mvcc: false,
@@ -230,11 +265,38 @@ impl ShippingFile {
         ticket
     }
 
-    /// Ship the ops written since the last sync as one log record and wait for it (a seal
-    /// does; it acks nothing, so their commit span closes here). On failure they belong to
-    /// the uploader (in doubt, or dropped as an `Off` sync), so they are not requeued.
+    /// Clear the held header when the Window record that carries it is in the bucket.
+    fn release_if_durable(&self) {
+        let mut held = self.held.lock().unwrap();
+        let confirmed = matches!(
+            &*held,
+            Some(HeldHeader { carried_in: Some(n), .. }) if self.uploader.durable_commit() >= *n
+        );
+        if confirmed {
+            *held = None;
+        }
+    }
+
+    /// `ops` with the held header op first, and whether there is one. The header stays held.
+    fn with_held(&self, ops: Vec<Op>) -> (Vec<Op>, bool) {
+        let held = self.held.lock().unwrap();
+        let Some(h) = held.as_ref() else {
+            return (ops, false);
+        };
+        let mut all = Vec::with_capacity(ops.len() + 1);
+        all.push(h.op.clone());
+        all.extend(ops);
+        (all, true)
+    }
+
+    /// Ship the ops written since the last sync, with the held header first, as one log
+    /// record and wait for it (a seal does; it acks nothing, so their commit span closes
+    /// here). A held header alone ships, too. On failure the ops belong to the uploader (in
+    /// doubt, or dropped as an `Off` sync), so they are not requeued. The header stays held.
     fn ship_pending(&self) -> Result<()> {
         let (ops, commit) = self.take_pending();
+        self.release_if_durable();
+        let (ops, _) = self.with_held(ops);
         if ops.is_empty() {
             return Ok(());
         }
@@ -242,7 +304,9 @@ impl ShippingFile {
         let ticket = self.submit(&commit, ops, Batching::Off, Batching::Off);
         let r = ticket.wait_in(&commit);
         record_outcome(&commit, &r);
-        r.map(|_| ())
+        r?;
+        *self.held.lock().unwrap() = None;
+        Ok(())
     }
 
     /// A commit's ops, with the setting of the `Connection` call it runs in (`Off` outside
@@ -252,6 +316,13 @@ impl ShippingFile {
     /// queues too, and the call returns once it is fsynced: it waits only while more than
     /// `max_behind` background commits wait (`Connection::await_acks`), and the uploader acks
     /// it when its record lands.
+    ///
+    /// In a WAL database a record starts with the held header (`with_held`, checked by
+    /// `check_header_first`). A sync with no op of its own ships nothing, the held header
+    /// included. An `Off` (or degraded) record clears the held header when it is in the
+    /// bucket. A Window record notes its commit number, and a later ship clears the header
+    /// once that commit is durable (`release_if_durable`). A failed record leaves the header
+    /// held, so the next record carries it again.
     ///
     /// Returns the commit's span (`None` with nothing to ship), which goes with its ack. A
     /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`). The span then ends
@@ -268,6 +339,9 @@ impl ShippingFile {
             self.ship_checkpoint_frames(ops, &span)?;
             return Ok(Some(span));
         }
+        self.release_if_durable();
+        let (ops, held) = self.with_held(ops);
+        check_header_first(&ops, held, self.uploader.generation())?;
         let b = ctx::current().unwrap_or(Batching::Off);
         if b == Batching::Off || self.uploader.degraded() {
             let ticket = self.submit(&span, ops, Batching::Off, b);
@@ -278,6 +352,9 @@ impl ShippingFile {
             // span says `ok` even if the call fails later and its ack is never collected.
             record_outcome(&span, &r);
             r?;
+            if held {
+                *self.held.lock().unwrap() = None;
+            }
             ctx::push(PendingAck::Done {
                 commit,
                 waited: submitted.elapsed(),
@@ -293,6 +370,11 @@ impl ShippingFile {
             ctx::push(PendingAck::Background { max_behind });
         } else {
             let ticket = self.submit(&span, ops, b, b);
+            if held {
+                if let Some(h) = self.held.lock().unwrap().as_mut() {
+                    h.carried_in = Some(ticket.commit);
+                }
+            }
             ctx::note_commit(ticket.commit);
             ctx::push(PendingAck::Waiting {
                 ticket,
@@ -336,7 +418,17 @@ impl ShippingFile {
             }
             self.high_water.store(0, SeqCst);
         }
-        *h = Some(header[..header.len().min(WAL_HEADER)].to_vec());
+        let head = &header[..header.len().min(WAL_HEADER)];
+        *h = Some(head.to_vec());
+        if !self.mvcc {
+            *self.held.lock().unwrap() = Some(HeldHeader {
+                op: Op::Write {
+                    off: 0,
+                    bytes: head.to_vec(),
+                },
+                carried_in: None,
+            });
+        }
         Ok(())
     }
 
@@ -353,6 +445,33 @@ impl ShippingFile {
     /// bootstrap) reach the local file only, never the bucket.
     fn local_only(&self) -> bool {
         (self.mode == IoMode::ReadOnly && self.mvcc) || self.mode == IoMode::Replica
+    }
+
+    /// The write ops of consecutive `bufs` from `pos`, without the first `skip` bytes (the
+    /// held header).
+    fn ops_of(&self, pos: u64, bufs: &[&[u8]], skip: usize) -> Vec<Op> {
+        let mut off = pos;
+        let mut skip = skip;
+        let mut ops = Vec::with_capacity(bufs.len());
+        for b in bufs {
+            let drop = skip.min(b.len());
+            skip -= drop;
+            if drop < b.len() {
+                ops.push(Op::Write {
+                    off: off + drop as u64,
+                    bytes: b[drop..].to_vec(),
+                });
+            }
+            off += b.len() as u64;
+        }
+        ops
+    }
+
+    /// A header write that is held, not pending, still counts for the `-wal` measure.
+    fn note_header_written(&self, header: bool, end: u64, r: &turso_core::Result<Completion>) {
+        if header && r.is_ok() {
+            self.high_water.fetch_max(end, SeqCst);
+        }
     }
 
     /// Record `ops` once the inner call that issued them returned `Ok`: a write or truncate
@@ -400,14 +519,20 @@ impl File for ShippingFile {
         if self.local_only() {
             return self.inner.pwrite(pos, buffer, c);
         }
+        let header = pos == 0 && !self.mvcc;
         if pos == 0 {
             self.on_header(buffer.as_slice())?;
         }
-        let op = Op::Write {
-            off: pos,
-            bytes: buffer.as_slice().to_vec(),
+        // The header is held, not pending; bytes past it are ops.
+        let skip = if header {
+            buffer.len().min(WAL_HEADER)
+        } else {
+            0
         };
-        self.record_if_ok(vec![op], self.inner.pwrite(pos, buffer, c))
+        let ops = self.ops_of(pos, &[buffer.as_slice()], skip);
+        let r = self.inner.pwrite(pos, buffer, c);
+        self.note_header_written(header, skip as u64, &r);
+        self.record_if_ok(ops, r)
     }
     fn pwritev(
         &self,
@@ -424,16 +549,16 @@ impl File for ShippingFile {
                 self.on_header(first.as_slice())?;
             }
         }
-        let mut off = pos;
-        let mut ops = Vec::with_capacity(buffers.len());
-        for b in &buffers {
-            ops.push(Op::Write {
-                off,
-                bytes: b.as_slice().to_vec(),
-            });
-            off += b.len() as u64;
-        }
-        self.record_if_ok(ops, self.inner.pwritev(pos, buffers, c))
+        let header = pos == 0 && !self.mvcc;
+        let skip = match buffers.first() {
+            Some(first) if header => first.len().min(WAL_HEADER),
+            _ => 0,
+        };
+        let slices: Vec<&[u8]> = buffers.iter().map(|b| b.as_slice()).collect();
+        let ops = self.ops_of(pos, &slices, skip);
+        let r = self.inner.pwritev(pos, buffers, c);
+        self.note_header_written(header, skip as u64, &r);
+        self.record_if_ok(ops, r)
     }
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
         if self.local_only() {
@@ -743,6 +868,15 @@ mod tests {
                     .pwrite(0, Arc::new(Buffer::new(h)), Completion::new_write(|_| {}))
                     .unwrap();
                 io.wait_for_completion(c).unwrap();
+                // A frame, so the sync has a commit to ship (a header alone ships nothing).
+                let c = fr
+                    .pwrite(
+                        WAL_HEADER as u64,
+                        Arc::new(Buffer::new(vec![1u8; 100])),
+                        Completion::new_write(|_| {}),
+                    )
+                    .unwrap();
+                io.wait_for_completion(c).unwrap();
                 wrote_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
                 sync(fr)
@@ -790,6 +924,15 @@ mod tests {
                 .pwrite(0, Arc::new(Buffer::new(h)), Completion::new_write(|_| {}))
                 .unwrap();
             io.wait_for_completion(c).unwrap();
+            // A frame, so the sync has a commit to ship (a header alone ships nothing).
+            let c = f
+                .pwrite(
+                    WAL_HEADER as u64,
+                    Arc::new(Buffer::new(vec![1u8; 100])),
+                    Completion::new_write(|_| {}),
+                )
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
             f.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
                 .and_then(|c| io.wait_for_completion(c))
         };
@@ -817,10 +960,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (e, _conn) = writer(fault.clone(), d.path());
         let (f, io) = shipping_over_local(&e, d.path());
-        let put = |f: &ShippingFile, bytes: Vec<u8>| {
+        let put = |f: &ShippingFile, pos: u64, bytes: Vec<u8>| {
             let c = f
                 .pwrite(
-                    0,
+                    pos,
                     Arc::new(Buffer::new(bytes)),
                     Completion::new_write(|_| {}),
                 )
@@ -829,8 +972,14 @@ mod tests {
         };
         let mut h = vec![0u8; WAL_HEADER];
         h[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        // The header is held; the spilled frame is the first pending op, on another thread.
         std::thread::scope(|s| {
-            s.spawn(|| put(&f, h.clone())).join().unwrap();
+            s.spawn(|| {
+                put(&f, 0, h.clone());
+                put(&f, WAL_HEADER as u64, vec![1u8; 100]);
+            })
+            .join()
+            .unwrap();
         });
         let puts = || {
             fault
@@ -840,12 +989,287 @@ mod tests {
                 .count()
         };
         let before = puts();
-        put(&f, h.clone());
+        put(&f, WAL_HEADER as u64 + 100, vec![2u8; 100]);
         let c = f
             .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
             .unwrap();
         io.wait_for_completion(c).unwrap();
         assert!(puts() > before, "the commit's sync did not upload");
         assert!(f.pending.lock().unwrap().is_empty());
+    }
+
+    // Held header tests.
+
+    /// A WAL header (32 bytes) whose salts are `epoch`.
+    fn header_of(epoch: u8) -> Vec<u8> {
+        let mut h = vec![0u8; WAL_HEADER];
+        h[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        h[EPOCH].fill(epoch);
+        h
+    }
+
+    fn write_at(f: &ShippingFile, io: &Arc<dyn IO>, pos: u64, bytes: Vec<u8>) {
+        let c = f
+            .pwrite(
+                pos,
+                Arc::new(Buffer::new(bytes)),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    fn sync_of(f: &ShippingFile, io: &Arc<dyn IO>) -> turso_core::Result<()> {
+        let c = f.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?;
+        io.wait_for_completion(c)
+    }
+
+    /// The ops of each log record of `generation` that holds ops, in order.
+    fn records_of(mem: &MemStore, generation: u64) -> Vec<Vec<Op>> {
+        use crate::format::{decode_record, LogRecord};
+        use crate::store::ObjectStore;
+        let keys = crate::engine::tests::keys();
+        let mut out = Vec::new();
+        for seq in 1.. {
+            let Some(o) = mem.get(&keys.log(generation, seq)).unwrap() else {
+                break;
+            };
+            if let LogRecord::Extents { syncs, .. } = decode_record(&o.body).unwrap() {
+                out.extend(syncs.into_iter().filter(|ops| !ops.is_empty()));
+            }
+        }
+        out
+    }
+
+    fn all_records(mem: &MemStore, e: &crate::engine::Engine) -> Vec<Vec<Op>> {
+        (1..=e.uploader.generation())
+            .flat_map(|g| records_of(mem, g))
+            .collect()
+    }
+
+    fn header_op(epoch: u8) -> Op {
+        Op::Write {
+            off: 0,
+            bytes: header_of(epoch),
+        }
+    }
+
+    /// The header write of a restart ships nothing and has no local-fsync span. The commit's
+    /// sync ships one record: the header, then the frames.
+    #[test]
+    fn header_sync_ships_nothing() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let cap = crate::telemetry::testing::Capture::new();
+        tracing::subscriber::with_default(cap.subscriber(), || {
+            let before = all_records(&mem, &e).len();
+            write_at(&f, &io, 0, header_of(1));
+            sync_of(&f, &io).unwrap();
+            let after = all_records(&mem, &e).len();
+            eprintln!("header_sync_ships_nothing: records {before} -> {after}");
+            assert_eq!(before, after, "a header sync shipped a record");
+            let fsyncs = cap.spans().named("buckwal.local_fsync").len();
+            eprintln!("header_sync_ships_nothing: local_fsync spans {fsyncs}");
+            assert_eq!(fsyncs, 0, "a header sync has a local_fsync span");
+            assert!(f.held.lock().unwrap().is_some());
+            write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+            sync_of(&f, &io).unwrap();
+            let all = all_records(&mem, &e);
+            eprintln!("header_sync_ships_nothing: records {}", all.len());
+            assert_eq!(all.len(), before + 1);
+            let last = all.last().unwrap();
+            assert_eq!(
+                last,
+                &vec![
+                    header_op(1),
+                    Op::Write {
+                        off: WAL_HEADER as u64,
+                        bytes: vec![7u8; 100]
+                    }
+                ]
+            );
+            assert!(f.held.lock().unwrap().is_none(), "an Off record clears it");
+        });
+    }
+
+    /// `durable_commit` reaches the number of an Off record and of a Window batch's record
+    /// (the held header relies on it).
+    #[test]
+    fn durable_commit_moves_for_off_and_window_records() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let commit = |epoch: u8, b: Batching| {
+            let _g = ctx::enter(b);
+            write_at(&f, &io, 0, header_of(epoch));
+            write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+            sync_of(&f, &io).unwrap();
+            let n = match ctx::take().pop().unwrap() {
+                PendingAck::Done { commit, .. } => commit,
+                PendingAck::Waiting { ticket, .. } => {
+                    let n = ticket.commit;
+                    ticket.wait().unwrap();
+                    n
+                }
+                PendingAck::Background { .. } => unreachable!(),
+            };
+            (
+                n,
+                e.uploader
+                    .wait_durable(n, std::time::Duration::from_secs(5)),
+            )
+        };
+        let (n, r) = commit(1, Batching::Off);
+        eprintln!(
+            "durable_commit_moves: Off commit {n}, durable {}",
+            e.uploader.durable_commit()
+        );
+        r.unwrap();
+        assert!(e.uploader.durable_commit() >= n);
+        let window = Batching::Window {
+            max_wait: std::time::Duration::from_millis(20),
+            max_commits: 100,
+            max_bytes: 1 << 20,
+        };
+        let (n, r) = commit(2, window);
+        eprintln!(
+            "durable_commit_moves: Window commit {n}, durable {}",
+            e.uploader.durable_commit()
+        );
+        r.unwrap();
+        assert!(e.uploader.durable_commit() >= n);
+    }
+
+    /// Two restarts with no commit: the first header ships into its own generation.
+    #[test]
+    fn restart_twice_ships_the_first_header_into_its_own_generation() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(1));
+        sync_of(&f, &io).unwrap();
+        let g = e.uploader.generation();
+        write_at(&f, &io, 0, header_of(2));
+        sync_of(&f, &io).unwrap();
+        let first = records_of(&mem, g);
+        eprintln!(
+            "restart_twice: generation {g} holds {} record(s), then generation {}",
+            first.len(),
+            e.uploader.generation()
+        );
+        assert_eq!(first.last(), Some(&vec![header_op(1)]));
+        assert_eq!(e.uploader.generation(), g + 1);
+        assert!(
+            f.held.lock().unwrap().is_some(),
+            "the second header is held"
+        );
+    }
+
+    /// A close right after a header sync: `ship_pending` ships the lone held header.
+    #[test]
+    fn ship_pending_with_only_the_held_header_ships_it() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(1));
+        sync_of(&f, &io).unwrap();
+        let before = all_records(&mem, &e).len();
+        f.ship_pending().unwrap();
+        let all = all_records(&mem, &e);
+        eprintln!(
+            "ship_pending_with_only_the_held_header: records {before} -> {}",
+            all.len()
+        );
+        assert_eq!(all.len(), before + 1);
+        assert_eq!(all.last(), Some(&vec![header_op(1)]));
+        assert!(f.held.lock().unwrap().is_none());
+    }
+
+    /// A sync on another thread (a passive checkpoint's) takes neither the held header nor
+    /// the ops of the thread that wrote them.
+    #[test]
+    fn passive_sync_on_another_thread_keeps_the_held_header() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+        let before = all_records(&mem, &e).len();
+        std::thread::scope(|s| {
+            s.spawn(|| sync_of(&f, &io).unwrap()).join().unwrap();
+        });
+        let after = all_records(&mem, &e).len();
+        eprintln!("passive_sync: records {before} -> {after}, held set");
+        assert_eq!(before, after);
+        assert!(f.held.lock().unwrap().is_some());
+        assert_eq!(f.pending.lock().unwrap().len(), 1, "the frame stays");
+    }
+
+    /// The sharp check: a first record without the header fails with `Corrupt` and an ERROR.
+    #[test]
+    fn check_header_first_rejects_a_record_without_the_header() {
+        let cap = crate::telemetry::testing::Capture::new();
+        let frame = Op::Write {
+            off: WAL_HEADER as u64,
+            bytes: vec![7u8; 100],
+        };
+        let r = tracing::subscriber::with_default(cap.subscriber(), || {
+            let ok = check_header_first(&[header_op(1), frame.clone()], true, 7);
+            assert!(ok.is_ok());
+            assert!(check_header_first(std::slice::from_ref(&frame), false, 7).is_ok());
+            check_header_first(std::slice::from_ref(&frame), true, 7)
+        });
+        assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
+        let errors: Vec<_> = cap
+            .spans()
+            .events
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .collect();
+        eprintln!("check_header_first: {errors:?}");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].field("message"),
+            Some("log record without WAL header")
+        );
+        assert_eq!(errors[0].field("generation"), Some("7"));
+        assert!(errors[0].field("seq").is_some());
+    }
+
+    /// An MVCC `-wal` never holds a header: the op goes to the pending ops as before.
+    #[test]
+    fn mvcc_never_holds_a_header() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem, d.path());
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let path = d.path().join("mvcc-wal");
+        let local = io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+        let f = ShippingFile::new(
+            local,
+            io.clone(),
+            e.uploader.clone(),
+            e.storage.clone(),
+            Arc::default(),
+            IoMode::Writer,
+        )
+        .unwrap()
+        .in_mvcc();
+        write_at(&f, &io, 0, header_of(1));
+        eprintln!(
+            "mvcc_never_holds_a_header: pending {:?}, held set {}",
+            f.pending.lock().unwrap().len(),
+            f.held.lock().unwrap().is_some()
+        );
+        assert_eq!(*f.pending.lock().unwrap(), vec![header_op(1)]);
+        assert!(f.held.lock().unwrap().is_none());
     }
 }
