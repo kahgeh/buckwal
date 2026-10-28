@@ -36,12 +36,12 @@ fn switch_record_names(store: &MemStore, g: u64) -> Option<u64> {
 
 /// The commit whose WAL header write restarts the WAL (a PASSIVE checkpoint backfilled the whole
 /// WAL first) waits for three small PUTs: the seal-start record, the head move and its own
-/// record. No GET, no list, no page. The engine's restart also syncs the new WAL header alone
-/// before the commit's frames, and that sync ships its own small record (`log/2/1`, as before
-/// the switch), so the bucket sees four PUTs in all. The trimmer is off: its GC pass after the
+/// record. No GET, no list, no page. The engine's restart syncs the new WAL header alone
+/// before the commit's frames, and that sync ships nothing: the held header goes in the
+/// commit's record (`log/2/1`, header first, then the frames). The trimmer is off: its GC pass after the
 /// switch reads the head on its own thread, not on the commit's path.
 #[test]
-fn commit_that_restarts_wal_makes_four_small_puts() {
+fn commit_that_restarts_wal_makes_three_small_puts() {
     let store = mem();
     let t = tempdir();
     let cfg = config(t.path());
@@ -59,21 +59,25 @@ fn commit_that_restarts_wal_makes_four_small_puts() {
     insert(&c, 21).unwrap();
     let d = store.stats().since(&before);
     assert_eq!(db.generation(), 2);
-    assert_eq!((d.puts, d.gets, d.lists, d.deletes), (4, 0, 0, 0), "{d:?}");
+    assert_eq!((d.puts, d.gets, d.lists, d.deletes), (3, 0, 0, 0), "{d:?}");
     assert!(d.bytes_up < 64 * 1024, "{d:?}");
     assert_eq!(switch_record_names(&store, 1), Some(2));
-    // The new WAL header's own sync (32 bytes, no frame), then the commit's frames.
-    assert_eq!(log_seqs(&*store, 2), [1, 2]);
-    let header_only = match decode_record(&store.get(&keys().log(2, 1)).unwrap().unwrap().body)
+    // One record: the new WAL header, then the commit's frames.
+    assert_eq!(log_seqs(&*store, 2), [1]);
+    let header_first = match decode_record(&store.get(&keys().log(2, 1)).unwrap().unwrap().body)
         .unwrap()
     {
-        LogRecord::Extents { syncs, .. } => syncs
-            .iter()
-            .flatten()
-            .all(|op| !matches!(op, crate::format::Op::Write { off, bytes } if off + bytes.len() as u64 > 32)),
+        LogRecord::Extents { syncs, .. } => {
+            let ops: Vec<_> = syncs.iter().flatten().collect();
+            ops.len() > 1
+                && matches!(ops[0], crate::format::Op::Write { off: 0, bytes } if bytes.len() == 32)
+        }
         r => panic!("{r:?}"),
     };
-    assert!(header_only, "log/2/1 holds more than the WAL header");
+    assert!(
+        header_first,
+        "log/2/1 does not hold the WAL header, then frames"
+    );
     let h = head(&*store);
     assert_eq!((h.format, h.generation, h.manifest), (FORMAT_V5, 2, None));
     no_pages_and_no_manifests(&store);
