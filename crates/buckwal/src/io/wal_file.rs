@@ -105,8 +105,8 @@ struct HeldHeader {
 }
 
 /// The ERROR record for a new generation whose first record has no header: the commit fails
-/// with `Corrupt` before it is acked. `expected` is true while the generation is fresh. The seq is
-/// not known here, so it is 0.
+/// with `Corrupt` before it is acked. `expected` is true while the generation is fresh. The
+/// record names the generation only.
 fn check_header_first(ops: &[Op], expected: bool, generation: u64) -> Result<()> {
     let ok = matches!(
         ops.first(),
@@ -115,8 +115,7 @@ fn check_header_first(ops: &[Op], expected: bool, generation: u64) -> Result<()>
     if !expected || ok {
         return Ok(());
     }
-    let seq = 0u64;
-    tracing::error!(target: "buckwal", generation, seq, "log record without WAL header");
+    tracing::error!(target: "buckwal", generation, "log record without WAL header");
     Err(Error::Corrupt(format!(
         "log record without WAL header (generation {generation})"
     )))
@@ -368,6 +367,14 @@ impl ShippingFile {
     /// once that commit is durable (`release_if_durable`). A failed record leaves the header
     /// held, so the next record carries it again.
     ///
+    /// A background commit (uploader not degraded) with a held header ships the header first,
+    /// alone, as an `Off` record (`ship_held_alone`) and waits for it. Only then does the
+    /// commit queue, without the header. This keeps a crash from leaving an empty generation
+    /// in the bucket while the local `-wal` holds the commit. If the header record fails, the
+    /// commit fails, its ops are dropped and the header stays held. The failure sets the
+    /// outcome `error` on the commit span. A degraded uploader blocks the commit like an `Off`
+    /// commit, and its record carries the header itself.
+    ///
     /// Returns the commit's span (`None` with nothing to ship), which goes with its ack. A
     /// blocking wait records its `buckwal.outcome` here (`ok`, or `error`). The span then ends
     /// with this sync's `local_fsync` on `ok`, and with the failed `ack_wait` on `error` (the
@@ -385,7 +392,7 @@ impl ShippingFile {
         }
         self.release_if_durable();
         let b = ctx::current().unwrap_or(Batching::Off);
-        // Read once: the branch below must agree with the held header decision above.
+        // Read once: the branch further below must agree with the held header decision made here.
         let degraded = self.uploader.degraded();
         let background = matches!(b, Batching::Background { .. }) && !degraded;
         if background {
@@ -1317,7 +1324,7 @@ mod tests {
             Some("log record without WAL header")
         );
         assert_eq!(errors[0].field("generation"), Some("7"));
-        assert!(errors[0].field("seq").is_some());
+        assert!(errors[0].field("seq").is_none(), "the record names no seq");
     }
 
     /// An MVCC `-wal` never holds a header: the op goes to the pending ops as before.
@@ -1398,6 +1405,41 @@ mod tests {
         );
     }
 
+    /// `truncate(0)` after a restart header keeps the usual path: it seals the generation (the
+    /// held header ships into it), then the truncate is recorded. The skip is for length 32.
+    #[test]
+    fn truncate_to_zero_after_a_restart_header_seals_and_records() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![3u8; 100]);
+        sync_of(&f, &io).unwrap();
+        let g = e.uploader.generation();
+        write_at(&f, &io, 0, header_of(2));
+        let g1 = e.uploader.generation();
+        truncate_to(&f, &io, 0);
+        let g2 = e.uploader.generation();
+        eprintln!(
+            "truncate_to_zero: generation {g} -> {g1} -> {g2}, pending {:?}",
+            f.pending.lock().unwrap().clone()
+        );
+        assert_eq!(g1, g + 1, "the header write sealed");
+        assert_eq!(g2, g1 + 1, "truncate(0) sealed");
+        assert_eq!(
+            records_of(&mem, g1).last(),
+            Some(&vec![header_op(2)]),
+            "the held header shipped into its generation"
+        );
+        assert_eq!(
+            f.pending.lock().unwrap().clone(),
+            vec![Op::Truncate { len: 0 }],
+            "the truncate is recorded"
+        );
+        assert!(f.held.lock().unwrap().is_none());
+    }
+
     /// A `truncate(32)` after other pending ops is recorded as before.
     #[test]
     fn truncate_to_32_after_other_ops_is_recorded() {
@@ -1474,7 +1516,7 @@ mod tests {
 
     fn background() -> Batching {
         Batching::Background {
-            max_wait: std::time::Duration::from_millis(100),
+            max_wait: std::time::Duration::from_secs(2),
             max_commits: 100,
             max_bytes: 1 << 20,
             max_behind: 10,
@@ -1544,9 +1586,19 @@ mod tests {
         let r = sync_of(&f, &io);
         eprintln!("background_header_failure: {r:?}");
         assert!(r.is_err());
+        // The engine wraps the upload error as an internal error.
+        let text = format!("{r:?}");
+        assert!(
+            text.contains("InternalError") && text.contains("upload failed"),
+            "{text}"
+        );
+        assert!(
+            f.fresh_generation.load(SeqCst),
+            "the generation stays fresh after the failure"
+        );
         assert!(f.held.lock().unwrap().is_some(), "the header stays held");
         assert!(ctx::take().is_empty(), "the commit was queued");
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let after = all_records(&mem, &e).len();
         eprintln!("background_header_failure: records {before} -> {after}");
         assert_eq!(before, after, "a record landed");
