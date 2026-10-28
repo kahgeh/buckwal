@@ -1274,7 +1274,7 @@ mod tests {
         );
     }
 
-    /// A close right after a header sync: `ship_pending` ships the lone held header.
+    /// A seal or a `Truncate` checkpoint right after a header sync: `ship_pending` ships the lone held header.
     #[test]
     fn ship_pending_with_only_the_held_header_ships_it() {
         let mem = Arc::new(MemStore::new());

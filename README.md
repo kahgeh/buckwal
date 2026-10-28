@@ -254,7 +254,7 @@ The API:
 | `commits_behind` | Background commits that returned and wait for the bucket now. |
 | `oldest_behind` | How long ago the oldest waiting background commit returned; zero when none waits. |
 
-A commit that restarts the WAL with batching Off or Window sends the engine's new WAL header and its frames in one record, so that restart adds no record and no count. The header record of a background commit, and the header record at a close or `Truncate` checkpoint, still count as a commit in these counters. So a run of N commits can show a few more than N.
+A commit that restarts the WAL with batching Off or Window sends the engine's new WAL header and its frames in one record, so that restart adds no record and no count. The header record of a background commit, and the header record at a `Truncate` checkpoint (a close that checkpoints), still count as a commit in these counters. So a run of N commits can show a few more than N.
 
 After an ambiguous log PUT (its reply was lost, so the record may have landed), `commits_uploaded`, `log_puts` and `log_put_bytes` undercount. That record's commits get an error ack at once. When the record is later settled at its log position, it is in the bucket, but these counters never count it.
 
