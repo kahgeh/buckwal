@@ -2,14 +2,16 @@
 //! measures the four stage 2 goals of the packer spec:
 //!
 //! 1. 50 ms added per request, 1 GB, commits that change 10% of the pages: no commit waits
-//!    longer than about four small requests (its own log upload, the seal-start record, the
-//!    head move and the WAL header record). The size-limit checkpoint pause is measured on
+//!    longer than about four small requests (the goal value is unchanged; a commit that
+//!    restarts the WAL now needs three: the seal-start record, the head move and one record
+//!    with the WAL header and the commit). The size-limit checkpoint pause is measured on
 //!    its own (the spec: the README states its value).
 //!    Two short phases at 50 ms add the commit that restarts the WAL itself (a PASSIVE
 //!    checkpoint, then one commit). Its goal is its request count plus at most
 //!    `RESTART_MARGIN` (1.5) small requests (spec rev 33). One small request is the median
-//!    small PUT of the same run. With batching Off, the count is 4 (its own log record and
-//!    three small requests), so the goal is at most 5.5. As a background commit
+//!    small PUT of the same run. With batching Off, the count is 3 (the seal-start record,
+//!    the head move and one record with the WAL header and the commit), so the goal is at
+//!    most 4.5. As a background commit
 //!    (`background 5ms 64 1MiB 1000`, a full queue), the count is `BACKGROUND_UPLOADS` + 3
 //!    = 21 (the records queued before it, then three small requests), so the goal is at
 //!    most 22.5.
@@ -68,9 +70,9 @@ const SMALL_CAP: usize = 1500;
 const GOAL_REQUESTS: f64 = 4.0;
 /// "About" four: the measured commit passes at up to half a request more.
 const ABOUT: f64 = 0.5;
-/// The request count of the commit that restarts the WAL with batching Off: its own log
-/// record, the seal-start record, the head move and the WAL header record.
-const OFF_RESTART_COUNT: f64 = 4.0;
+/// The request count of the commit that restarts the WAL with batching Off: the seal-start
+/// record, the head move and one record with the WAL header and the commit.
+const OFF_RESTART_COUNT: f64 = 3.0;
 /// The margin of a commit that restarts the WAL, in small requests, above its request count
 /// (spec rev 33). It covers the fsync, the WAL header write and the checkpoint.
 const RESTART_MARGIN: f64 = 1.5;
@@ -346,9 +348,9 @@ fn restart_wait(count: f64, n: f64) -> &'static str {
 
 #[test]
 fn restart_wait_bounds() {
-    assert_eq!(restart_wait(OFF_RESTART_COUNT, 4.0), "pass");
-    assert_eq!(restart_wait(OFF_RESTART_COUNT, 5.5), "pass");
-    assert_eq!(restart_wait(OFF_RESTART_COUNT, 5.51), "miss");
+    assert_eq!(restart_wait(OFF_RESTART_COUNT, 3.0), "pass");
+    assert_eq!(restart_wait(OFF_RESTART_COUNT, 4.5), "pass");
+    assert_eq!(restart_wait(OFF_RESTART_COUNT, 4.51), "miss");
     let bg = f64::from(BACKGROUND_UPLOADS + 3);
     assert_eq!(bg, 21.0);
     assert_eq!(restart_wait(bg, 22.5), "pass");
@@ -806,8 +808,8 @@ fn timed_goal_packer_stage2() {
     ));
     let worst = waits.iter().map(|s| s.wait).max();
     goals.push((
-        "1b. commit that restarts the WAL at 50 ms, batching Off: own log record + three small \
-         requests"
+        "1b. commit that restarts the WAL at 50 ms, batching Off: three requests: seal-start \
+         record, head move, one record with the header and the commit"
             .into(),
         format!(
             "count {OFF_RESTART_COUNT:.0} + at most {RESTART_MARGIN} = at most {:.1} small \
