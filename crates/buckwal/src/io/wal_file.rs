@@ -26,7 +26,7 @@ use crate::files::io_err;
 use crate::format::{LogFile, Op};
 use crate::uploader::{op_bytes, Ticket, Uploader};
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 use tracing::field::{display, Empty};
@@ -105,7 +105,7 @@ struct HeldHeader {
 }
 
 /// The ERROR record for a new generation whose first record has no header: the commit fails
-/// with `Corrupt` before it is acked. `expected` is true while a header is held. The seq is
+/// with `Corrupt` before it is acked. `expected` is true while the generation is fresh. The seq is
 /// not known here, so it is 0.
 fn check_header_first(ops: &[Op], expected: bool, generation: u64) -> Result<()> {
     let ok = matches!(
@@ -142,6 +142,9 @@ pub(crate) struct ShippingFile {
     /// The held header (the module doc); always `None` in MVCC mode. Locked after `pending`,
     /// `last_writer` and `commit`.
     held: Mutex<Option<HeldHeader>>,
+    /// A new generation of a WAL database began (`on_header`) and no record that starts with
+    /// its header is accepted yet. `check_header_first` tests it, independent of `held`.
+    fresh_generation: AtomicBool,
     /// The highest offset + length written since the current generation's header (the
     /// maintenance trigger's `-wal` measure; shared with `Engine::wal_bytes`). Reset at a
     /// new generation's header and at `truncate(0)`.
@@ -185,6 +188,7 @@ impl ShippingFile {
             commit: Mutex::new(None),
             header: Mutex::new(header),
             held: Mutex::new(None),
+            fresh_generation: AtomicBool::new(false),
             high_water,
             mode,
             mvcc: false,
@@ -277,6 +281,22 @@ impl ShippingFile {
         }
     }
 
+    /// A record that started with `sent` (the header op it carried) was confirmed
+    /// (`carried_in` is `None`) or queued in a Window batch as commit `carried_in`. Do
+    /// nothing if the held header is not `sent`. Else clear it, or note the commit, and end
+    /// the fresh generation.
+    fn settle_held(&self, sent: &Op, carried_in: Option<u64>) {
+        let mut held = self.held.lock().unwrap();
+        if held.as_ref().map(|h| &h.op) != Some(sent) {
+            return;
+        }
+        match carried_in {
+            Some(n) => held.as_mut().unwrap().carried_in = Some(n),
+            None => *held = None,
+        }
+        self.fresh_generation.store(false, SeqCst);
+    }
+
     /// `ops` with the held header op first, and whether there is one. The header stays held.
     fn with_held(&self, ops: Vec<Op>) -> (Vec<Op>, bool) {
         let held = self.held.lock().unwrap();
@@ -296,16 +316,19 @@ impl ShippingFile {
     fn ship_pending(&self) -> Result<()> {
         let (ops, commit) = self.take_pending();
         self.release_if_durable();
-        let (ops, _) = self.with_held(ops);
+        let (ops, held) = self.with_held(ops);
         if ops.is_empty() {
             return Ok(());
         }
+        let sent = held.then(|| ops[0].clone());
         let commit = commit.unwrap_or_else(Span::none);
         let ticket = self.submit(&commit, ops, Batching::Off, Batching::Off);
         let r = ticket.wait_in(&commit);
         record_outcome(&commit, &r);
         r?;
-        *self.held.lock().unwrap() = None;
+        if let Some(sent) = sent {
+            self.settle_held(&sent, None);
+        }
         Ok(())
     }
 
@@ -341,7 +364,12 @@ impl ShippingFile {
         }
         self.release_if_durable();
         let (ops, held) = self.with_held(ops);
-        check_header_first(&ops, held, self.uploader.generation())?;
+        check_header_first(
+            &ops,
+            self.fresh_generation.load(SeqCst),
+            self.uploader.generation(),
+        )?;
+        let sent = held.then(|| ops[0].clone());
         let b = ctx::current().unwrap_or(Batching::Off);
         if b == Batching::Off || self.uploader.degraded() {
             let ticket = self.submit(&span, ops, Batching::Off, b);
@@ -352,8 +380,8 @@ impl ShippingFile {
             // span says `ok` even if the call fails later and its ack is never collected.
             record_outcome(&span, &r);
             r?;
-            if held {
-                *self.held.lock().unwrap() = None;
+            if let Some(sent) = &sent {
+                self.settle_held(sent, None);
             }
             ctx::push(PendingAck::Done {
                 commit,
@@ -370,10 +398,8 @@ impl ShippingFile {
             ctx::push(PendingAck::Background { max_behind });
         } else {
             let ticket = self.submit(&span, ops, b, b);
-            if held {
-                if let Some(h) = self.held.lock().unwrap().as_mut() {
-                    h.carried_in = Some(ticket.commit);
-                }
+            if let Some(sent) = &sent {
+                self.settle_held(sent, Some(ticket.commit));
             }
             ctx::note_commit(ticket.commit);
             ctx::push(PendingAck::Waiting {
@@ -421,6 +447,7 @@ impl ShippingFile {
         let head = &header[..header.len().min(WAL_HEADER)];
         *h = Some(head.to_vec());
         if !self.mvcc {
+            self.fresh_generation.store(true, SeqCst);
             *self.held.lock().unwrap() = Some(HeldHeader {
                 op: Op::Write {
                     off: 0,
@@ -596,6 +623,19 @@ impl File for ShippingFile {
             }
             *h = None;
         }
+        // The engine's restart writes the header, then truncates to 32 bytes over the old
+        // frames. While only the held header was written since, the new generation's image
+        // holds only the header, so the truncate is no op for the bucket.
+        let header_only = len == WAL_HEADER as u64
+            && !self.mvcc
+            && self.pending.lock().unwrap().is_empty()
+            && matches!(
+                &*self.held.lock().unwrap(),
+                Some(HeldHeader {
+                    carried_in: None,
+                    ..
+                })
+            );
         let r = self.inner.truncate(len, c);
         if len == 0 && r.is_ok() {
             self.high_water.store(0, SeqCst);
@@ -605,6 +645,9 @@ impl File for ShippingFile {
             && self.shipped_generation.load(SeqCst) != self.uploader.generation()
         {
             // A generation change's truncate: the new generation holds none of this file.
+            return r;
+        }
+        if header_only {
             return r;
         }
         self.record_if_ok(vec![Op::Truncate { len }], r)
@@ -1270,6 +1313,127 @@ mod tests {
             f.held.lock().unwrap().is_some()
         );
         assert_eq!(*f.pending.lock().unwrap(), vec![header_op(1)]);
+        assert!(f.held.lock().unwrap().is_none());
+    }
+
+    fn truncate_to(f: &ShippingFile, io: &Arc<dyn IO>, len: u64) {
+        let c = f.truncate(len, Completion::new_trunc(|_| {})).unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    /// The engine's restart writes the header, then `truncate(32)` over old frames. The
+    /// truncate is a no-op for the bucket (the new generation holds only the header), so the
+    /// header sync ships nothing, and the commit's record is `[header, frames]`.
+    #[test]
+    fn truncate_to_the_header_after_a_restart_header_is_not_an_op() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![3u8; 100]);
+        sync_of(&f, &io).unwrap();
+        assert_eq!(f.inner.size().unwrap(), WAL_HEADER as u64 + 100);
+        let before = all_records(&mem, &e).len();
+        write_at(&f, &io, 0, header_of(2));
+        truncate_to(&f, &io, WAL_HEADER as u64);
+        sync_of(&f, &io).unwrap();
+        let mid = all_records(&mem, &e).len();
+        eprintln!(
+            "truncate_to_the_header: records {before} -> {mid}, size {}",
+            f.inner.size().unwrap()
+        );
+        assert_eq!(before, mid, "the header sync shipped a record");
+        assert_eq!(f.inner.size().unwrap(), WAL_HEADER as u64);
+        assert!(f.pending.lock().unwrap().is_empty());
+        write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+        sync_of(&f, &io).unwrap();
+        let all = all_records(&mem, &e);
+        eprintln!("truncate_to_the_header: records {}", all.len());
+        assert_eq!(all.len(), mid + 1);
+        assert_eq!(
+            all.last().unwrap(),
+            &vec![
+                header_op(2),
+                Op::Write {
+                    off: WAL_HEADER as u64,
+                    bytes: vec![7u8; 100]
+                }
+            ]
+        );
+    }
+
+    /// A `truncate(32)` after other pending ops is recorded as before.
+    #[test]
+    fn truncate_to_32_after_other_ops_is_recorded() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem, d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+        truncate_to(&f, &io, WAL_HEADER as u64);
+        eprintln!(
+            "truncate_to_32_after_other_ops: pending {:?}",
+            f.pending.lock().unwrap().len()
+        );
+        let p = f.pending.lock().unwrap().clone();
+        assert_eq!(p.len(), 2);
+        assert_eq!(
+            p[1],
+            Op::Truncate {
+                len: WAL_HEADER as u64
+            }
+        );
+    }
+
+    /// A fresh generation whose held header was cleared by mistake: the sync fails with
+    /// `Corrupt` and logs the ERROR record.
+    #[test]
+    fn a_fresh_generation_without_its_held_header_fails_the_sync() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let cap = crate::telemetry::testing::Capture::new();
+        let before = all_records(&mem, &e).len();
+        let r = tracing::subscriber::with_default(cap.subscriber(), || {
+            write_at(&f, &io, 0, header_of(1));
+            *f.held.lock().unwrap() = None;
+            write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+            sync_of(&f, &io)
+        });
+        let errors = cap
+            .spans()
+            .events
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .count();
+        eprintln!("fresh_generation_without_header: {r:?}, ERROR records {errors}");
+        assert!(r.is_err());
+        assert_eq!(errors, 1);
+        assert_eq!(all_records(&mem, &e).len(), before, "nothing shipped");
+    }
+
+    /// A held header that is not the one a record carried stays held.
+    #[test]
+    fn a_record_clears_only_the_header_it_carried() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem, d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        write_at(&f, &io, 0, header_of(2));
+        f.settle_held(&header_op(1), None);
+        eprintln!(
+            "record_clears_only_its_header: held set {}",
+            f.held.lock().unwrap().is_some()
+        );
+        assert!(f.held.lock().unwrap().is_some());
+        assert!(f.fresh_generation.load(SeqCst));
+        f.settle_held(&header_op(2), Some(9));
+        assert_eq!(f.held.lock().unwrap().as_ref().unwrap().carried_in, Some(9));
+        assert!(!f.fresh_generation.load(SeqCst));
+        f.settle_held(&header_op(2), None);
         assert!(f.held.lock().unwrap().is_none());
     }
 }
