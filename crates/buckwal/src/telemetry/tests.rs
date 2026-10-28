@@ -2022,9 +2022,22 @@ fn a_background_commit_span_ends_at_its_return_and_its_upload_is_a_root_span() {
         .iter()
         .filter(|s| s.name == "buckwal.upload")
         .collect();
-    // The first record carries every background commit; a later one is the close-time seal's.
+    // The first record that holds a background commit carries every one of them. The record
+    // before it is the header's, shipped alone at the first commit; a later one is the
+    // close-time seal's.
+    let first_no = commits
+        .iter()
+        .map(|c| {
+            attr(c, "buckwal.commit_no")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .min()
+        .unwrap();
     let up = *uploads
         .iter()
+        .filter(|u| attr(u, "buckwal.commit_first") == Some(first_no.to_string()))
         .min_by_key(|u| u.start_time)
         .expect("an upload");
     assert_eq!(

@@ -309,6 +309,27 @@ impl ShippingFile {
         (all, true)
     }
 
+    /// Ship the held header, if there is one, alone as an `Off` record and wait for it. On
+    /// `Ok` the header is settled (`settle_held`). On `Err` it stays held.
+    fn ship_held_alone(&self, commit: &Span) -> Result<()> {
+        let (ops, held) = self.with_held(Vec::new());
+        if !held {
+            return Ok(());
+        }
+        let sent = ops[0].clone();
+        // The header record has a span of its own: the background commit's span shows its own
+        // batching and has no `buckwal.ack_wait`. A failure shows on the commit's span.
+        let span = Span::none();
+        let ticket = self.submit(&span, ops, Batching::Off, Batching::Off);
+        let r = ticket.wait_in(&span);
+        if r.is_err() {
+            record_outcome(commit, &r);
+        }
+        r?;
+        self.settle_held(&sent, None);
+        Ok(())
+    }
+
     /// Ship the ops written since the last sync, with the held header first, as one log
     /// record and wait for it (a seal does; it acks nothing, so their commit span closes
     /// here). A held header alone ships, too. On failure the ops belong to the uploader (in
@@ -363,15 +384,29 @@ impl ShippingFile {
             return Ok(Some(span));
         }
         self.release_if_durable();
-        let (ops, held) = self.with_held(ops);
+        let b = ctx::current().unwrap_or(Batching::Off);
+        // Read once: the branch below must agree with the held header decision above.
+        let degraded = self.uploader.degraded();
+        let background = matches!(b, Batching::Background { .. }) && !degraded;
+        if background {
+            // A held header ships alone first, as an `Off` record, and the call waits for it.
+            // The background record then never starts a generation that is empty in the
+            // bucket. If this fails, the commit fails and its ops are dropped, as an `Off`
+            // failure drops them. The header stays held.
+            self.ship_held_alone(&span)?;
+        }
+        let (ops, held) = if background {
+            (ops, false)
+        } else {
+            self.with_held(ops)
+        };
         check_header_first(
             &ops,
             self.fresh_generation.load(SeqCst),
             self.uploader.generation(),
         )?;
         let sent = held.then(|| ops[0].clone());
-        let b = ctx::current().unwrap_or(Batching::Off);
-        if b == Batching::Off || self.uploader.degraded() {
+        if b == Batching::Off || degraded {
             let ticket = self.submit(&span, ops, Batching::Off, b);
             let (commit, submitted) = (ticket.commit, ticket.submitted);
             ctx::note_commit(commit);
@@ -1435,5 +1470,136 @@ mod tests {
         assert!(!f.fresh_generation.load(SeqCst));
         f.settle_held(&header_op(2), None);
         assert!(f.held.lock().unwrap().is_none());
+    }
+
+    fn background() -> Batching {
+        Batching::Background {
+            max_wait: std::time::Duration::from_millis(100),
+            max_commits: 100,
+            max_bytes: 1 << 20,
+            max_behind: 10,
+        }
+    }
+
+    fn frame_op() -> Op {
+        Op::Write {
+            off: WAL_HEADER as u64,
+            bytes: vec![7u8; 100],
+        }
+    }
+
+    /// A background commit after a WAL restart: the held header ships alone and is waited
+    /// for, then the commit is queued as a record of its own.
+    #[test]
+    fn background_commit_ships_the_held_header_first() {
+        let mem = Arc::new(MemStore::new());
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(mem.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let before = all_records(&mem, &e).len();
+        let _g = ctx::enter(background());
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+        sync_of(&f, &io).unwrap();
+        let mid = all_records(&mem, &e);
+        eprintln!(
+            "background_header_first: records {before} -> {} right after the sync",
+            mid.len()
+        );
+        assert_eq!(
+            mid.len(),
+            before + 1,
+            "the header record is waited before the sync returns"
+        );
+        assert_eq!(mid.last(), Some(&vec![header_op(1)]));
+        assert!(f.held.lock().unwrap().is_none());
+        let Some(PendingAck::Background { .. }) = ctx::take().pop() else {
+            panic!("no background ack");
+        };
+        let start = std::time::Instant::now();
+        while all_records(&mem, &e).len() < before + 2 {
+            assert!(start.elapsed().as_secs() < 5, "the commit did not land");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let all = all_records(&mem, &e);
+        eprintln!("background_header_first: records {}", all.len());
+        assert_eq!(&all[before..], &[vec![header_op(1)], vec![frame_op()]]);
+    }
+
+    /// The header record fails: the sync fails, the commit is not queued and the header
+    /// stays held.
+    #[test]
+    fn background_header_record_failure_fails_the_commit() {
+        use crate::store::FaultStore;
+        let mem = Arc::new(MemStore::new());
+        let fault = Arc::new(FaultStore::new(mem.clone()));
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(fault.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        let before = all_records(&mem, &e).len();
+        let _g = ctx::enter(background());
+        write_at(&f, &io, 0, header_of(1));
+        write_at(&f, &io, WAL_HEADER as u64, vec![7u8; 100]);
+        fault.fail_next_puts_permanently(1);
+        let r = sync_of(&f, &io);
+        eprintln!("background_header_failure: {r:?}");
+        assert!(r.is_err());
+        assert!(f.held.lock().unwrap().is_some(), "the header stays held");
+        assert!(ctx::take().is_empty(), "the commit was queued");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let after = all_records(&mem, &e).len();
+        eprintln!("background_header_failure: records {before} -> {after}");
+        assert_eq!(before, after, "a record landed");
+    }
+
+    /// A degraded uploader blocks a background commit like an Off commit: one record
+    /// holds the header, then the frames.
+    #[test]
+    fn degraded_background_commit_carries_the_header_itself() {
+        use crate::store::FaultStore;
+        let mem = Arc::new(MemStore::new());
+        let fault = Arc::new(FaultStore::new(mem.clone()));
+        let d = tempfile::tempdir().unwrap();
+        let (e, _conn) = writer(fault.clone(), d.path());
+        let (f, io) = shipping_over_local(&e, d.path());
+        // A Window commit whose flush fails: its record is owed and the uploader is degraded.
+        let window = Batching::Window {
+            max_wait: std::time::Duration::from_millis(20),
+            max_commits: 100,
+            max_bytes: 1 << 20,
+        };
+        fault.fail_puts_after(0);
+        {
+            let _g = ctx::enter(window);
+            write_at(&f, &io, 0, header_of(1));
+            write_at(&f, &io, WAL_HEADER as u64, vec![1u8; 10]);
+            sync_of(&f, &io).unwrap();
+            let Some(PendingAck::Waiting { ticket, .. }) = ctx::take().pop() else {
+                panic!("no window ack");
+            };
+            assert!(ticket.wait().is_err());
+        }
+        fault.fail_puts_after(u64::MAX);
+        eprintln!("degraded_background: degraded {}", e.uploader.degraded());
+        assert!(e.uploader.degraded(), "the uploader is not degraded");
+        assert!(f.held.lock().unwrap().is_some());
+        let _g = ctx::enter(background());
+        write_at(&f, &io, WAL_HEADER as u64 + 10, vec![2u8; 10]);
+        let r = sync_of(&f, &io);
+        eprintln!("degraded_background: {r:?}");
+        r.unwrap();
+        let all = all_records(&mem, &e);
+        for r in &all {
+            eprintln!("degraded_background: record of {} op(s)", r.len());
+        }
+        assert!(
+            !all.contains(&vec![header_op(1)]),
+            "the header shipped alone"
+        );
+        let last = all.last().unwrap();
+        assert_eq!(last[0], header_op(1));
+        assert_eq!(last.len(), 2);
+        assert!(f.held.lock().unwrap().is_none());
+        assert!(matches!(ctx::take().pop(), Some(PendingAck::Done { .. })));
     }
 }
