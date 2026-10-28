@@ -225,11 +225,15 @@ fn failed_first_commit(test: &str, b: Batching) {
     assert_eq!(db.generation(), 2, "{test}");
     assert!(log_seqs(&*mem, 2).is_empty(), "{test}: nothing was stored");
     insert(&c, 22).unwrap();
-    let seqs = log_seqs(&*mem, 2);
-    let first = *seqs.first().expect("a record");
-    let ops = ops_of(&mem, 2, first);
-    assert!(is_header(&ops[0]), "{test}: {ops:?}");
-    eprintln!("{test}: held header resent seq={first}");
+    // Record 1 is the failed record, owed and retried (the in-doubt rule), with its header.
+    // Record 2 carries the next commit (row 22) and the header again.
+    let counts = header_counts(&mem, 2);
+    eprintln!("{test}: header counts per record {counts:?}");
+    assert_eq!(counts, [(1, 1), (2, 1)], "{test}");
+    let next = counts.last().unwrap().0;
+    let ops = ops_of(&mem, 2, next);
+    assert!(is_header(&ops[0]) && ops.len() > 1, "{test}: {ops:?}");
+    eprintln!("{test}: held header resent seq={next}");
     let acked: Vec<i64> = ids(&c);
     eprintln!("{test}: local rows {} last {:?}", acked.len(), acked.last());
     // An Off failure rolls the row back. A Window failure leaves its record owed, so the
@@ -258,15 +262,20 @@ fn failed_first_commit_degraded_path_resends_header() {
     let r = insert(&c, 21);
     assert!(r.is_err(), "the Window commit was acked: {r:?}");
     fault.fail_puts_after(u64::MAX);
-    eprintln!("degraded: uploader degraded");
+    assert!(
+        db.shared.uploader.degraded(),
+        "the uploader is not degraded"
+    );
+    eprintln!("degraded: uploader degraded=true");
     c.set_batching(Some(background())).unwrap();
     insert(&c, 22).unwrap();
     let commit = c.last_commit().expect("a commit");
     db.wait_durable(commit, Duration::from_secs(20)).unwrap();
     let counts = header_counts(&mem, 2);
     eprintln!("degraded: header counts per record {counts:?}");
-    let first = counts.first().expect("a record");
-    assert!(is_header(&ops_of(&mem, 2, first.0)[0]));
+    assert_eq!(counts, [(1, 1), (2, 1)]);
+    assert!(is_header(&ops_of(&mem, 2, 2)[0]));
+    eprintln!("degraded: held header resent seq=2");
     let acked = ids(&c);
     require_restore("degraded", &mem, &acked);
     assert!(acked.contains(&22));
@@ -467,14 +476,43 @@ fn background_after_queued_window_header_crash_copy() {
         max_commits: 64,
         max_bytes: 1 << 20,
     };
-    let (held, db, c) = ready_held(&mem, t.path(), Batching::Off, &keys().log(2, 2));
+    // A hook sees the Window batch wait in the uploader.
+    let (hook, seen) = recorder();
+    let hold = Arc::new(HoldStore::new(mem.clone()));
+    let mut conf = cfg(t.path(), Batching::Off);
+    conf.on_event = Some(hook);
+    let db = open_with_store(conf, hold.clone()).unwrap();
+    let c = db.connect().unwrap();
+    create(&c);
+    for id in 1..=20 {
+        insert(&c, id).unwrap();
+    }
+    c.checkpoint(CheckpointMode::Passive).unwrap();
+    let (held_rx, go) = hold.hold_next_put(&keys().log(2, 2));
+    let held = Held {
+        hold,
+        held: held_rx,
+        go,
+    };
     c.set_batching(Some(long)).unwrap();
     let w = std::thread::spawn(move || {
         let r = insert(&c, 21);
         (c, r)
     });
-    // The window is 10 s: after this wait the commit is queued and its record is not sent.
-    std::thread::sleep(Duration::from_millis(500));
+    // The window is 10 s: wait until the batch waits in the uploader.
+    let start = Instant::now();
+    while !seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, Event::BatchWaiting { .. }))
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the Window commit never queued"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         log_seqs(&*mem, 2).is_empty(),
         "the Window record is not in the bucket"
@@ -558,7 +596,13 @@ fn background_after_failed_off_header_crash_copy() {
     );
     let c2 = db2.connect().unwrap();
     let copy_ids = ids(&c2);
-    assert!(copy_ids.starts_with(&rows(1, 20)), "{copy_ids:?}");
+    assert!(matches!(
+        db2.shared.reconciled,
+        Some(Reconciled::Ahead { .. })
+    ));
+    let mut want = rows(1, 20);
+    want.push(22);
+    assert_eq!(copy_ids, want);
     require_restore("background_after_failed_off", &mem, &copy_ids);
     // The old process goes on: its commit lands only if the new writer did not fence it.
     held.release();
@@ -608,6 +652,11 @@ fn restart_twice_before_any_commit() {
     .unwrap();
     c.execute("ROLLBACK", &[]).unwrap();
     let after_rollback = db.generation();
+    assert_eq!(after_rollback, 2);
+    assert_eq!(
+        header_counts(&mem, 1).len() as u64,
+        log_seqs(&*mem, 1).len() as u64
+    );
     c.checkpoint(CheckpointMode::Truncate).unwrap();
     let after_truncate = db.generation();
     eprintln!("restart_twice: generation {after_rollback} after the rollback, {after_truncate} after the TRUNCATE checkpoint");
@@ -625,11 +674,14 @@ fn restart_twice_before_any_commit() {
         let first_write = counts
             .iter()
             .flat_map(|&(seq, _)| ops_of(&mem, g, seq))
-            .find(|op| matches!(op, Op::Write { .. }));
-        if let Some(op) = first_write {
-            assert!(is_header(&op), "generation {g} starts without a header");
-        }
+            .find(|op| matches!(op, Op::Write { .. }))
+            .unwrap_or_else(|| panic!("generation {g} has no write"));
+        assert!(
+            is_header(&first_write),
+            "generation {g} starts without a header"
+        );
     }
+    assert_eq!(header_counts(&mem, 2)[0], (1, 1));
     assert!(
         after_truncate > after_rollback,
         "the TRUNCATE checkpoint did not switch"
@@ -711,6 +763,11 @@ fn restart_with_dropped_truncate_restores_whole_wal() {
     assert!(
         local.len() < old as usize + 4 * page,
         "the local -wal restarted"
+    );
+    eprintln!(
+        "restored wal bytes={} equal={}",
+        restored.len(),
+        restored == local
     );
     assert_eq!(restored.len(), local.len(), "the length differs");
     assert!(restored == local, "the frames differ");
