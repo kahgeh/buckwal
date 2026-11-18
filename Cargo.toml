@@ -28,7 +28,7 @@ opentelemetry_sdk = { version = "=0.31.0", default-features = false, features = 
 opentelemetry-otlp = { version = "=0.31.1", default-features = false, features = ["grpc-tonic", "trace", "logs"] }
 tracing-opentelemetry = { version = "=0.32.1", default-features = false }
 opentelemetry-appender-tracing = "=0.31.1"
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "net", "time", "signal", "sync"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "net", "time", "signal", "sync"] }
 axum = { version = "=0.8.7", default-features = false, features = ["http1", "tokio"] }
 hyper = { version = "=1.11.1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio", "server", "http1", "service", "server-graceful"] }
